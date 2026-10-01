@@ -48,7 +48,7 @@ export class NodeProcessProvider implements ProcessProvider {
 	};
 
 	launch(request: ProcessLaunchRequest): Promise<ManagedProcess> {
-		const stdio = request.stdio ?? "ignore";
+		const stdio = request.stdio === undefined ? "ignore" : request.stdio;
 		if (stdio !== "ignore" && stdio !== "pipe") {
 			return Promise.reject(new Error("Invalid process stdio mode"));
 		}

@@ -131,13 +131,13 @@ describe("NodeProcessProvider", () => {
 		expect(errorOutput).toBe(`stderr:${payload}`);
 	});
 
-	it("rejects an invalid runtime stdio mode", async () => {
+	it.each(["inherit", null])("rejects runtime stdio mode %s", async (stdio) => {
 		await expect(
 			provider.launch({
 				executable: process.execPath,
 				args: [],
 				cwd: os.tmpdir(),
-				stdio: "inherit" as "ignore",
+				stdio: stdio as "ignore",
 			}),
 		).rejects.toThrow("Invalid process stdio mode");
 	});
