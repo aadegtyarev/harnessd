@@ -11,7 +11,14 @@ import {
 } from "./errors.js";
 import type { HarnessAdapter, HarnessInstance } from "./ports.js";
 import type { SessionStore } from "./session-store.js";
-import type { AdapterId, Input, SessionId, SessionSummary } from "./types.js";
+import type {
+	AdapterId,
+	HarnessEvent,
+	Input,
+	InputId,
+	SessionId,
+	SessionSummary,
+} from "./types.js";
 
 export interface CreateSessionRequest {
 	readonly harnessId: AdapterId;
@@ -19,11 +26,25 @@ export interface CreateSessionRequest {
 	readonly id?: string;
 }
 
+export type SessionEventListener = (event: HarnessEvent) => void;
+
+interface ManagedEventPump {
+	readonly promise: Promise<void>;
+	stop(): void;
+}
+
+type EventReadResult =
+	| { readonly type: "event"; readonly result: IteratorResult<HarnessEvent> }
+	| { readonly type: "stop" };
+
 export class SessionManager {
 	private readonly harnesses: ReadonlyMap<AdapterId, HarnessAdapter>;
 	private readonly instances = new Map<SessionId, HarnessInstance>();
+	private readonly eventListeners = new Set<SessionEventListener>();
+	private readonly eventPumps = new Map<SessionId, ManagedEventPump>();
 	private readonly creating = new Set<SessionId>();
 	private readonly launching = new Map<SessionId, Promise<SessionSummary>>();
+	private readonly stopping = new Map<SessionId, Promise<void>>();
 
 	constructor(
 		private readonly store: SessionStore,
@@ -36,6 +57,11 @@ export class SessionManager {
 			registered.set(id, harness);
 		}
 		this.harnesses = registered;
+	}
+
+	subscribe(listener: SessionEventListener): () => void {
+		this.eventListeners.add(listener);
+		return () => this.eventListeners.delete(listener);
 	}
 
 	list(): Promise<readonly SessionSummary[]> {
@@ -87,6 +113,7 @@ export class SessionManager {
 						status: "running",
 					};
 					await this.store.update(running);
+					this.startEventPump(id, instance);
 					return running;
 				} catch (error) {
 					const failures: unknown[] = [error];
@@ -128,6 +155,18 @@ export class SessionManager {
 	}
 
 	async stop(id: SessionId): Promise<void> {
+		const current = this.stopping.get(id);
+		if (current) return current;
+		const stopping = this.stopSession(id);
+		this.stopping.set(id, stopping);
+		try {
+			await stopping;
+		} finally {
+			if (this.stopping.get(id) === stopping) this.stopping.delete(id);
+		}
+	}
+
+	private async stopSession(id: SessionId): Promise<void> {
 		const launch = this.launching.get(id);
 		if (launch) await launch.catch(() => undefined);
 		const session = await this.get(id);
@@ -145,10 +184,15 @@ export class SessionManager {
 			await instance.shutdown();
 			this.instances.delete(id);
 		}
+		const eventPump = this.eventPumps.get(id);
+		if (eventPump) {
+			eventPump.stop();
+			await eventPump.promise;
+		}
 		await this.store.setStatus(id, "stopped");
 	}
 
-	async submit(id: SessionId, text: string): Promise<void> {
+	async submit(id: SessionId, text: string): Promise<InputId> {
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
@@ -168,6 +212,140 @@ export class SessionManager {
 			createdAt: new Date(),
 		};
 		await instance.send(input);
+		return input.id;
+	}
+
+	async cancel(id: SessionId, inputId: InputId): Promise<void> {
+		const session = await this.get(id);
+		const harness = this.harnesses.get(session.harnessId);
+		if (!harness)
+			throw new UnsupportedCapabilityError("harness.cancel", session.harnessId);
+		requireCapability(
+			harness.descriptor.capabilities,
+			"harness.cancel",
+			harness.descriptor.id,
+		);
+		const instance = this.instances.get(id);
+		if (!instance || session.status !== "running")
+			throw new SessionNotFoundError(id);
+		await instance.cancel(inputId);
+	}
+
+	private startEventPump(id: SessionId, instance: HarnessInstance): void {
+		const controller = new AbortController();
+		let eventPump: ManagedEventPump;
+		const promise = this.consumeEvents(id, instance, controller.signal).finally(
+			() => {
+				if (this.eventPumps.get(id) === eventPump) this.eventPumps.delete(id);
+			},
+		);
+		eventPump = { promise, stop: () => controller.abort() };
+		this.eventPumps.set(id, eventPump);
+	}
+
+	private async consumeEvents(
+		id: SessionId,
+		instance: HarnessInstance,
+		signal: AbortSignal,
+	): Promise<void> {
+		try {
+			const iterator = instance.events[Symbol.asyncIterator]();
+			while (true) {
+				const next = await this.nextEventOrStop(iterator, signal);
+				if (next.type === "stop") {
+					this.closeEventIterator(iterator);
+					return;
+				}
+				if (next.result.done) return;
+				if (this.instances.get(id) !== instance) {
+					this.closeEventIterator(iterator);
+					return;
+				}
+				this.publishEvent({ ...next.result.value, sessionId: id });
+			}
+		} catch {
+			if (this.instances.get(id) === instance) {
+				this.publishEvent({
+					sessionId: id,
+					kind: "error",
+					text: "Harness event stream failed",
+				});
+			}
+		}
+	}
+
+	private nextEventOrStop(
+		iterator: AsyncIterator<HarnessEvent>,
+		signal: AbortSignal,
+	): Promise<EventReadResult> {
+		if (signal.aborted) return Promise.resolve({ type: "stop" });
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const cleanup = () => signal.removeEventListener("abort", onAbort);
+			const onAbort = () => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve({ type: "stop" });
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) {
+				onAbort();
+				return;
+			}
+			let pending: Promise<IteratorResult<HarnessEvent>>;
+			try {
+				pending = Promise.resolve(iterator.next());
+			} catch (error) {
+				settled = true;
+				cleanup();
+				reject(error);
+				return;
+			}
+			pending.then(
+				(result) => {
+					if (settled) return;
+					settled = true;
+					cleanup();
+					resolve({ type: "event", result });
+				},
+				(error: unknown) => {
+					if (settled) return;
+					settled = true;
+					cleanup();
+					reject(error);
+				},
+			);
+		});
+	}
+
+	private closeEventIterator(iterator: AsyncIterator<HarnessEvent>): void {
+		try {
+			const closing = iterator.return?.();
+			if (closing) void Promise.resolve(closing).catch(() => undefined);
+		} catch {
+			// Closing a non-conforming iterator must not hold up session shutdown.
+		}
+	}
+
+	private publishEvent(event: HarnessEvent): void {
+		for (const listener of this.eventListeners) {
+			try {
+				const result = listener(event) as unknown;
+				if (
+					result !== null &&
+					typeof result === "object" &&
+					"then" in result &&
+					typeof result.then === "function"
+				) {
+					void Promise.resolve(result).catch(() => {
+						console.error("[harnessd] Session event observer failed");
+					});
+				}
+			} catch {
+				console.error("[harnessd] Session event observer failed");
+			}
+		}
 	}
 }
 

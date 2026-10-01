@@ -8,11 +8,13 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
 	AdapterId,
 	HarnessAdapter,
+	HarnessEvent,
 	HarnessInstance,
+	InputId,
 	SessionId,
 	SessionPort,
 	TransportAdapter,
@@ -39,6 +41,7 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.all(
 		tempDirectories
 			.splice(0)
@@ -214,11 +217,294 @@ describe("SQLite session management", () => {
 			harnessId: harness.descriptor.id,
 			cwd: os.homedir(),
 		});
-		await manager.submit(session.id, "addressed input");
+		const inputId = await manager.submit(session.id, "addressed input");
+		expect(inputId).toMatch(/^[0-9a-f-]{36}$/i);
 		expect(submitted).toEqual(["addressed input"]);
 		await manager.stop(session.id);
 		expect((await manager.get(session.id)).status).toBe("stopped");
 		store.close();
+	});
+
+	it("routes cancellation by session and accepted input ID", async () => {
+		const state = await temporaryDirectory();
+		const sessionAId = "cancel-a" as SessionId;
+		const sessionBId = "cancel-b" as SessionId;
+		const submitted: { sessionId: SessionId; inputId: InputId }[] = [];
+		const cancelled: { sessionId: SessionId; inputId: InputId }[] = [];
+		const harness = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.cancel",
+				"input.submit",
+			],
+			launch: async (request) => ({
+				processId: `process-${request.sessionId}` as never,
+				events: (async function* () {})(),
+				async send(input) {
+					submitted.push({ sessionId: input.sessionId, inputId: input.id });
+				},
+				async cancel(inputId) {
+					cancelled.push({ sessionId: request.sessionId, inputId });
+				},
+				async shutdown() {},
+			}),
+		}).harness;
+		const manager = new SessionManager(await SqliteSessionStore.open(state), [
+			harness,
+		]);
+		const sessionA = await manager.create({
+			id: sessionAId,
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const sessionB = await manager.create({
+			id: sessionBId,
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const inputA = await manager.submit(sessionA.id, "cancel input A");
+		const inputB = await manager.submit(sessionB.id, "cancel input B");
+		expect(submitted).toEqual([
+			{ sessionId: sessionA.id, inputId: inputA },
+			{ sessionId: sessionB.id, inputId: inputB },
+		]);
+		await manager.cancel(sessionA.id, inputA);
+		expect(cancelled).toEqual([{ sessionId: sessionA.id, inputId: inputA }]);
+		await manager.cancel(sessionB.id, inputB);
+		expect(cancelled).toEqual([
+			{ sessionId: sessionA.id, inputId: inputA },
+			{ sessionId: sessionB.id, inputId: inputB },
+		]);
+		await manager.stop(sessionA.id);
+		await manager.stop(sessionB.id);
+	});
+
+	it("rejects cancellation when the selected harness lacks that capability", async () => {
+		const state = await temporaryDirectory();
+		let cancelCalls = 0;
+		const harness = harnessPort({
+			capabilities: ["harness.launch", "harness.stop", "input.submit"],
+			launch: async () => ({
+				processId: "process" as never,
+				events: (async function* () {})(),
+				async send() {},
+				async cancel() {
+					cancelCalls += 1;
+				},
+				async shutdown() {},
+			}),
+		}).harness;
+		const manager = new SessionManager(await SqliteSessionStore.open(state), [
+			harness,
+		]);
+		const session = await manager.create({
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		await expect(
+			manager.cancel(session.id, "input-1" as InputId),
+		).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+		expect(cancelCalls).toBe(0);
+		await manager.stop(session.id);
+	});
+
+	it("forwards ordered events and stops only the selected session's pump", async () => {
+		const state = await temporaryDirectory();
+		const sessionAId = "events-a" as SessionId;
+		const sessionBId = "events-b" as SessionId;
+		const releaseA = deferred<void>();
+		const releaseB = deferred<void>();
+		const seenFirstEvents = deferred<void>();
+		const seenAllEvents = deferred<void>();
+		const observed: HarnessEvent[] = [];
+		const observerError = vi
+			.spyOn(console, "error")
+			.mockImplementation(() => {});
+		const harness = harnessPort({
+			launch: async (request) => {
+				const gate = request.sessionId === sessionAId ? releaseA : releaseB;
+				const inputId = `input-${request.sessionId}` as InputId;
+				return {
+					processId: `process-${request.sessionId}` as never,
+					events: (async function* () {
+						yield {
+							sessionId: request.sessionId,
+							kind: "output",
+							text: `${request.sessionId}-start`,
+						};
+						await gate.promise;
+						yield {
+							sessionId: request.sessionId,
+							kind: "input",
+							inputEvent: { inputId, state: "uncertain" },
+						};
+						yield {
+							sessionId: request.sessionId,
+							kind: "output",
+							text: `${request.sessionId}-end`,
+						};
+					})(),
+					async send() {},
+					async cancel() {},
+					async shutdown() {
+						gate.resolve(undefined);
+					},
+				};
+			},
+		}).harness;
+		const manager = new SessionManager(await SqliteSessionStore.open(state), [
+			harness,
+		]);
+		manager.subscribe(() => {
+			throw new Error("observer detail must not escape");
+		});
+		manager.subscribe(async () => {
+			throw new Error("async observer detail must not escape");
+		});
+		manager.subscribe((event) => {
+			observed.push(event);
+			if (
+				observed.filter(
+					(item) => item.kind === "output" && item.text?.endsWith("-start"),
+				).length === 2
+			)
+				seenFirstEvents.resolve(undefined);
+			if (observed.length === 4) seenAllEvents.resolve(undefined);
+		});
+		await manager.create({
+			id: sessionAId,
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		await manager.create({
+			id: sessionBId,
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		await seenFirstEvents.promise;
+		await manager.stop(sessionAId);
+		releaseB.resolve(undefined);
+		await seenAllEvents.promise;
+		const eventsA = observed.filter((event) => event.sessionId === sessionAId);
+		expect(eventsA.map((event) => event.text)).toEqual([`${sessionAId}-start`]);
+		expect(eventsA.map((event) => event.kind)).toEqual(["output"]);
+		const eventsB = observed.filter((event) => event.sessionId === sessionBId);
+		expect(eventsB.map((event) => event.text).filter(Boolean)).toEqual([
+			`${sessionBId}-start`,
+			`${sessionBId}-end`,
+		]);
+		expect(eventsB.map((event) => event.kind)).toEqual([
+			"output",
+			"input",
+			"output",
+		]);
+		expect(eventsB[1]?.inputEvent?.inputId).toBe(`input-${sessionBId}`);
+		expect(eventsB[1]?.inputEvent?.state).toBe("uncertain");
+		await manager.stop(sessionBId);
+		await Promise.resolve();
+		expect(observerError).toHaveBeenCalledWith(
+			"[harnessd] Session event observer failed",
+		);
+	});
+
+	it("cancels a pending event read and coalesces concurrent stops", async () => {
+		const state = await temporaryDirectory();
+		const pendingRead = deferred<IteratorResult<HarnessEvent>>();
+		const observed: HarnessEvent[] = [];
+		const shutdownStarted = deferred<void>();
+		const finishShutdown = deferred<void>();
+		let shutdownCalls = 0;
+		let iteratorReturnCalls = 0;
+		const harness = harnessPort({
+			launch: async () => ({
+				processId: "process" as never,
+				events: {
+					[Symbol.asyncIterator]() {
+						return {
+							next: () => pendingRead.promise,
+							async return(): Promise<IteratorResult<HarnessEvent>> {
+								iteratorReturnCalls += 1;
+								return { done: true, value: undefined };
+							},
+						};
+					},
+				},
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					shutdownCalls += 1;
+					shutdownStarted.resolve(undefined);
+					await finishShutdown.promise;
+				},
+			}),
+		}).harness;
+		const manager = new SessionManager(await SqliteSessionStore.open(state), [
+			harness,
+		]);
+		const session = await manager.create({
+			id: "stop-with-open-event-read",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		manager.subscribe((event) => observed.push(event));
+		const firstStop = manager.stop(session.id);
+		await shutdownStarted.promise;
+		let secondStopCompleted = false;
+		const secondStop = manager.stop(session.id).then(() => {
+			secondStopCompleted = true;
+		});
+		await Promise.resolve();
+		expect(secondStopCompleted).toBe(false);
+		expect(shutdownCalls).toBe(1);
+		finishShutdown.resolve(undefined);
+		await Promise.all([firstStop, secondStop]);
+		expect(secondStopCompleted).toBe(true);
+		expect(iteratorReturnCalls).toBe(1);
+		pendingRead.resolve({
+			done: false,
+			value: { sessionId: session.id, kind: "output", text: "late event" },
+		});
+		await Promise.resolve();
+		expect(observed).toEqual([]);
+		expect((await manager.get(session.id)).status).toBe("stopped");
+	});
+
+	it("surfaces event-stream failure without exposing its underlying error", async () => {
+		const state = await temporaryDirectory();
+		const received = deferred<HarnessEvent>();
+		const harness = harnessPort({
+			launch: async () => ({
+				processId: "process" as never,
+				events: {
+					[Symbol.asyncIterator]() {
+						return {
+							async next(): Promise<IteratorResult<HarnessEvent>> {
+								throw new Error("sensitive adapter detail");
+							},
+						};
+					},
+				},
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		}).harness;
+		const manager = new SessionManager(await SqliteSessionStore.open(state), [
+			harness,
+		]);
+		manager.subscribe((event) => received.resolve(event));
+		const session = await manager.create({
+			id: "event-error",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		expect(await received.promise).toEqual({
+			sessionId: session.id,
+			kind: "error",
+			text: "Harness event stream failed",
+		});
+		await manager.stop(session.id);
 	});
 
 	it("waits for an in-flight launch before making an operator stop terminal", async () => {
