@@ -24,8 +24,12 @@ export interface PiRpcHarnessOptions {
 	readonly startupTimeoutMs?: number;
 	readonly commandTimeoutMs?: number;
 	readonly shutdownTimeoutMs?: number;
+	readonly exitDrainTimeoutMs?: number;
 	readonly maxRecordBytes?: number;
 }
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 
 export class UncertainInputDeliveryError extends Error {
 	readonly code = "UNCERTAIN_INPUT_DELIVERY";
@@ -60,7 +64,9 @@ const controlledFlags = [
 	"--session-id",
 	"--no-session",
 	"--continue",
+	"-c",
 	"--resume",
+	"-r",
 	"--fork",
 	"--print",
 	"-p",
@@ -92,11 +98,27 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			["startupTimeoutMs", options.startupTimeoutMs],
 			["commandTimeoutMs", options.commandTimeoutMs],
 			["shutdownTimeoutMs", options.shutdownTimeoutMs],
-			["maxRecordBytes", options.maxRecordBytes],
+			["exitDrainTimeoutMs", options.exitDrainTimeoutMs],
 		] as const) {
-			if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0))
-				throw new TypeError(`${name} must be a positive safe integer`);
+			if (
+				value !== undefined &&
+				(!Number.isSafeInteger(value) ||
+					value <= 0 ||
+					value > MAX_TIMER_DELAY_MS)
+			)
+				throw new TypeError(
+					`${name} must be an integer from 1 to ${MAX_TIMER_DELAY_MS}`,
+				);
 		}
+		if (
+			options.maxRecordBytes !== undefined &&
+			(!Number.isSafeInteger(options.maxRecordBytes) ||
+				options.maxRecordBytes <= 0 ||
+				options.maxRecordBytes > MAX_RECORD_BYTES)
+		)
+			throw new TypeError(
+				`maxRecordBytes must be from 1 to ${MAX_RECORD_BYTES}`,
+			);
 	}
 	launch(request: HarnessLaunchRequest): Promise<HarnessInstance> {
 		return this.start(request, false);
@@ -188,6 +210,7 @@ async function terminateChild(
 
 interface PendingCommand {
 	command: string;
+	inputId?: InputId;
 	resolve(value: Record<string, unknown>): void;
 	reject(error: Error): void;
 	timer?: ReturnType<typeof setTimeout>;
@@ -198,6 +221,7 @@ interface ActiveInput {
 	settled: boolean;
 	uncertain: boolean;
 	uncertainReported: boolean;
+	canceling: boolean;
 }
 class PiRpcInstance implements HarnessInstance {
 	readonly processId: ManagedProcess["id"];
@@ -209,6 +233,10 @@ class PiRpcInstance implements HarnessInstance {
 	private active?: ActiveInput;
 	private eventsClosed = false;
 	private childExited = false;
+	private stdoutEnded = false;
+	private exitDrainTimer?: ReturnType<typeof setTimeout>;
+	private exitDetail?: string;
+	private readonly stdoutEndWaiters: (() => void)[] = [];
 	private buffer = "";
 	private writeChain: Promise<void> = Promise.resolve();
 	private cleanup?: Promise<void>;
@@ -229,20 +257,22 @@ class PiRpcInstance implements HarnessInstance {
 		stdout.on("data", (chunk: string) => this.consume(chunk));
 		stdout.on("error", () => this.failProcess("Pi stdout failed"));
 		stdout.on("end", () => {
+			this.stdoutEnded = true;
+			for (const resolve of this.stdoutEndWaiters.splice(0)) resolve();
 			if (this.buffer.length) this.protocolFailure();
-			else if (this.shuttingDown) this.closeEvents("Pi harness shut down");
-			else this.failProcess("Pi stdout closed");
+			else if (this.childExited)
+				queueMicrotask(() => this.finalizeChildExit(false));
+			else this.scheduleExitDrain();
 		});
 		stdin.on("error", () => this.failProcess("Pi stdin failed"));
 		stderr.on("data", () => {});
 		stderr.on("error", () => this.failProcess("Pi stderr failed"));
 		void child.exit.then((exit) => {
 			this.childExited = true;
-			if (this.shuttingDown) this.closeEvents("Pi harness shut down");
-			else
-				this.failProcess(
-					`Pi process exited (${exit.code ?? exit.signal ?? "unknown"})`,
-				);
+			if (this.eventsClosed) return;
+			this.exitDetail = `Pi process exited (${exit.code ?? exit.signal ?? "unknown"})`;
+			if (this.stdoutEnded) queueMicrotask(() => this.finalizeChildExit(false));
+			else this.scheduleExitDrain();
 		});
 	}
 	get nativeSessionId(): string | undefined {
@@ -280,6 +310,7 @@ class PiRpcInstance implements HarnessInstance {
 		});
 	}
 	private consume(chunk: string): void {
+		if (this.eventsClosed) return;
 		this.buffer += chunk;
 		for (;;) {
 			const at = this.buffer.indexOf("\n");
@@ -300,12 +331,43 @@ class PiRpcInstance implements HarnessInstance {
 				this.protocolFailure();
 				return;
 			}
+			if (this.eventsClosed) return;
 		}
 		if (
 			Buffer.byteLength(this.buffer, "utf8") >
 			(this.options.maxRecordBytes ?? 1024 * 1024)
 		)
 			this.protocolFailure();
+	}
+	private scheduleExitDrain(): void {
+		if (this.eventsClosed || this.exitDrainTimer) return;
+		this.exitDrainTimer = setTimeout(
+			() => this.finalizeChildExit(true),
+			this.options.exitDrainTimeoutMs ?? 1000,
+		);
+	}
+	private finalizeChildExit(drainTimedOut: boolean): void {
+		if (this.eventsClosed) return;
+		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
+		this.exitDrainTimer = undefined;
+		if (this.buffer.length) {
+			this.protocolFailure();
+			return;
+		}
+		if (this.childExited && this.stdoutEnded) {
+			if (this.shuttingDown) this.closeEvents("Pi harness shut down");
+			else this.closeEvents(this.exitDetail ?? "Pi process exited");
+			return;
+		}
+		if (!drainTimedOut) return;
+		const detail = this.childExited
+			? "Pi stdout did not close after process exit"
+			: "Pi stdout closed before process exit";
+		this.failProcess(detail);
+	}
+	private waitForStdoutEnd(): Promise<void> {
+		if (this.stdoutEnded) return Promise.resolve();
+		return new Promise((resolve) => this.stdoutEndWaiters.push(resolve));
 	}
 	private protocolFailure(): void {
 		if (this.failureReported) return;
@@ -318,19 +380,33 @@ class PiRpcInstance implements HarnessInstance {
 		this.failProcess("Malformed Pi RPC protocol");
 	}
 	private record(record: Record<string, unknown>): void {
+		if (this.eventsClosed) return;
 		if (!record || typeof record.type !== "string") {
 			this.protocolFailure();
 			return;
 		}
 		if (record.type === "response") {
-			if (typeof record.id !== "string") return;
+			if (
+				typeof record.id !== "string" ||
+				typeof record.command !== "string" ||
+				typeof record.success !== "boolean"
+			) {
+				this.protocolFailure();
+				return;
+			}
 			const item = this.pending.get(record.id);
 			if (!item) return;
+			if (record.command !== item.command) {
+				this.protocolFailure();
+				return;
+			}
 			this.pending.delete(record.id);
 			if (item.timer) clearTimeout(item.timer);
-			if (record.command !== item.command)
-				item.reject(new Error("Pi RPC response command mismatch"));
-			else item.resolve(record);
+			if (item.command === "prompt")
+				this.applyPromptResponse(record, item.inputId);
+			else if (item.command === "abort")
+				this.applyAbortResponse(record, item.inputId);
+			item.resolve(record);
 			return;
 		}
 		if (record.type === "extension_ui_request") {
@@ -380,9 +456,42 @@ class PiRpcInstance implements HarnessInstance {
 			if (record.type === "agent_settled" && this.active) {
 				this.active.settled = true;
 				if (this.active.uncertain) this.active = undefined;
-				else if (this.active.accepted) this.completeActive();
+				else if (this.active.accepted && !this.active.canceling)
+					this.completeActive();
 			}
 		}
+	}
+	private applyPromptResponse(
+		response: Record<string, unknown>,
+		inputId?: InputId,
+	): void {
+		const active = this.active;
+		if (!active || active.id !== inputId) return;
+		if (response.success !== true) {
+			this.active = undefined;
+			this.delivery(active.id, "failed", "Pi rejected the prompt");
+			return;
+		}
+		active.accepted = true;
+		this.delivery(active.id, "accepted");
+		const disposition = (response.data as Record<string, unknown> | undefined)
+			?.disposition;
+		if (disposition === "handled") active.settled = true;
+		if (active.settled) this.completeActive();
+	}
+	private applyAbortResponse(
+		response: Record<string, unknown>,
+		inputId?: InputId,
+	): void {
+		const active = this.active;
+		if (!active || active.id !== inputId || !active.canceling) return;
+		if (response.success === true) {
+			this.active = undefined;
+			this.delivery(active.id, "failed", "Input canceled");
+			return;
+		}
+		active.canceling = false;
+		if (active.settled) this.completeActive();
 	}
 	private write(value: Record<string, unknown>): Promise<void> {
 		const line = `${JSON.stringify(value)}\n`;
@@ -409,6 +518,7 @@ class PiRpcInstance implements HarnessInstance {
 	private async command(
 		command: string,
 		extra: Record<string, unknown> = {},
+		inputId?: InputId,
 	): Promise<Record<string, unknown>> {
 		if (this.eventsClosed) throw new Error("Pi process is closed");
 		const id = randomUUID();
@@ -420,6 +530,7 @@ class PiRpcInstance implements HarnessInstance {
 		});
 		const pending: PendingCommand = {
 			command,
+			...(inputId !== undefined ? { inputId } : {}),
 			resolve: resolveResponse,
 			reject: rejectResponse,
 		};
@@ -471,11 +582,16 @@ class PiRpcInstance implements HarnessInstance {
 			settled: false,
 			uncertain: false,
 			uncertainReported: false,
+			canceling: false,
 		};
 		this.delivery(input.id, "pending");
 		let response: Record<string, unknown>;
 		try {
-			response = await this.command("prompt", { message: input.text });
+			response = await this.command(
+				"prompt",
+				{ message: input.text },
+				input.id,
+			);
 		} catch (error) {
 			if (this.active?.id === input.id) {
 				this.active.uncertain = true;
@@ -490,17 +606,11 @@ class PiRpcInstance implements HarnessInstance {
 			throw new UncertainInputDeliveryError(input.id, { cause: error });
 		}
 		if (response.success !== true) {
-			if (this.active?.id === input.id) this.active = undefined;
-			this.delivery(input.id, "failed", "Pi rejected the prompt");
+			if (this.active?.id === input.id) {
+				this.active = undefined;
+				this.delivery(input.id, "failed", "Pi rejected the prompt");
+			}
 			throw new Error("Pi rejected the prompt");
-		}
-		if (this.active?.id === input.id) {
-			this.active.accepted = true;
-			this.delivery(input.id, "accepted");
-			const disposition = (response.data as Record<string, unknown> | undefined)
-				?.disposition;
-			if (disposition === "handled") this.active.settled = true;
-			if (this.active.settled) this.completeActive();
 		}
 	}
 	private completeActive(): void {
@@ -513,9 +623,12 @@ class PiRpcInstance implements HarnessInstance {
 		if (this.active?.id !== inputId) throw new Error("Input is not active");
 		if (!this.active.accepted || this.active.uncertain)
 			throw new Error("Input cannot be canceled before acknowledged delivery");
+		if (this.active.canceling)
+			throw new Error("Input cancellation is already in progress");
+		this.active.canceling = true;
 		let response: Record<string, unknown>;
 		try {
-			response = await this.command("abort");
+			response = await this.command("abort", {}, inputId);
 		} catch (error) {
 			if (this.active?.id === inputId) {
 				this.active.uncertain = true;
@@ -525,11 +638,17 @@ class PiRpcInstance implements HarnessInstance {
 					"uncertain",
 					"Pi abort response was not received",
 				);
+				if (this.active.settled) this.active = undefined;
 			}
 			throw error;
 		}
-		if (response.success !== true)
+		if (response.success !== true) {
+			if (this.active?.id === inputId) {
+				this.active.canceling = false;
+				if (this.active.settled) this.completeActive();
+			}
 			throw new Error("Pi rejected the abort command");
+		}
 		if (this.active?.id === inputId) {
 			this.active = undefined;
 			this.delivery(inputId, "failed", "Input canceled");
@@ -545,6 +664,18 @@ class PiRpcInstance implements HarnessInstance {
 					this.options.shutdownTimeoutMs ?? 1000,
 				);
 			this.childExited = true;
+			if (!this.stdoutEnded) {
+				try {
+					await within(
+						this.waitForStdoutEnd(),
+						this.options.exitDrainTimeoutMs ?? 1000,
+						"Pi stdout drain timed out during shutdown",
+					);
+				} catch {
+					this.closeEvents("Pi stdout did not drain during shutdown");
+					throw new Error("Pi stdout did not drain during shutdown");
+				}
+			}
 			this.closeEvents("Pi harness shut down");
 		})();
 		return this.cleanup;
@@ -565,6 +696,8 @@ class PiRpcInstance implements HarnessInstance {
 	private closeEvents(detail: string): void {
 		if (this.eventsClosed) return;
 		this.eventsClosed = true;
+		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
+		this.exitDrainTimer = undefined;
 		if (this.active) {
 			const active = this.active;
 			this.active = undefined;

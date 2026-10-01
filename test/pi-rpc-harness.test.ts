@@ -21,7 +21,11 @@ import {
 interface FakeOptions {
 	readonly holdPrompt?: boolean;
 	readonly holdGetState?: boolean;
+	readonly holdAbort?: boolean;
+	readonly malformedPromptAck?: boolean;
 	readonly exitOnPrompt?: boolean;
+	readonly exitBeforePromptResponse?: boolean;
+	readonly exitBeforeAbortResponse?: boolean;
 	readonly sessionId?: string;
 	readonly promptSuccess?: boolean;
 	readonly promptDisposition?: string;
@@ -84,10 +88,18 @@ function fakeProvider(options: FakeOptions = {}) {
 	let launchRequest: ProcessLaunchRequest | undefined;
 	let text = "";
 	stdin.setEncoding("utf8");
-	const complete = (code: number | null, signal: string | null) => {
+	const complete = (
+		code: number | null,
+		signal: string | null,
+		closeStreams = true,
+	) => {
 		if (!exited) {
 			exited = true;
 			finish({ code, signal });
+			if (closeStreams) {
+				stdout.end();
+				stderr.end();
+			}
 		}
 	};
 	stdin.on("data", (chunk: string) => {
@@ -109,6 +121,50 @@ function fakeProvider(options: FakeOptions = {}) {
 			}
 			if (options.beforeResponse) {
 				options.beforeResponse(command, stdout);
+			}
+			if (command.type === "prompt" && options.malformedPromptAck) {
+				stdout.write(
+					`${JSON.stringify({
+						type: "response",
+						id: command.id,
+						command: "prompt",
+						success: "yes",
+					})}\n`,
+				);
+			}
+			if (command.type === "abort" && options.holdAbort) continue;
+			if (command.type === "prompt" && options.exitBeforePromptResponse) {
+				complete(0, null, false);
+				setImmediate(() => {
+					stdout.write(
+						`${JSON.stringify({
+							type: "response",
+							id: command.id,
+							command: "prompt",
+							success: true,
+							data: { disposition: "started" },
+						})}\r\n{"type":"agent_settled"}\r\n`,
+					);
+					stdout.end();
+					stderr.end();
+				});
+				continue;
+			}
+			if (command.type === "abort" && options.exitBeforeAbortResponse) {
+				complete(0, null, false);
+				setImmediate(() => {
+					stdout.write(
+						`{"type":"agent_settled"}\r\n${JSON.stringify({
+							type: "response",
+							id: command.id,
+							command: "abort",
+							success: options.abortSuccess ?? true,
+						})}\r\n`,
+					);
+					stdout.end();
+					stderr.end();
+				});
+				continue;
 			}
 			if (command.type === "prompt" && options.holdPrompt) continue;
 			const response =
@@ -138,8 +194,6 @@ function fakeProvider(options: FakeOptions = {}) {
 		}
 	});
 	stdin.on("end", () => {
-		stdout.end();
-		stderr.end();
 		if (options.exitOnTerm !== false) complete(0, null);
 	});
 	const managed: ManagedProcess = {
@@ -264,7 +318,7 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
-	it.each(["--no-session", "--continue", "--resume", "--fork"])(
+	it.each(["--no-session", "--continue", "-c", "--resume", "-r", "--fork"])(
 		"rejects conflicting option %s",
 		async (flag) => {
 			const fake = fakeProvider();
@@ -435,14 +489,19 @@ describe("PiRpcHarnessAdapter", () => {
 	});
 
 	it("aborts an acknowledged active input as failed with cancellation detail", async () => {
-		const fake = fakeProvider();
+		const fake = fakeProvider({
+			beforeResponse(command, stdout) {
+				if (command.type === "abort")
+					stdout.write('{"type":"agent_settled"}\n');
+			},
+		});
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
 			executable: "pi",
 			startupTimeoutMs: 100,
 		}).launch(request);
 		await instance.send(input("cancel", "cancel"));
 		await instance.cancel("cancel" as InputId);
-		const states = (await collectEvents(instance, 3))
+		const states = (await collectEvents(instance, 4))
 			.filter((event) => event?.inputEvent)
 			.map((event) => event?.inputEvent);
 		expect(states.map((event) => event?.state)).toEqual([
@@ -454,8 +513,86 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
-	it("keeps accepted input active when Pi rejects abort", async () => {
-		const fake = fakeProvider({ abortSuccess: false });
+	it("rejects overlapping cancellation and binds abort replies to their input", async () => {
+		const fake = fakeProvider({ holdAbort: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await instance.send(input("first", "cancel-owner-a"));
+		const firstCancel = instance.cancel("cancel-owner-a" as InputId);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const abortCommands = () =>
+			fake.commands.filter((command) => command.type === "abort");
+		const firstAbort = abortCommands()[0];
+		if (!firstAbort || typeof firstAbort.id !== "string")
+			throw new Error("first abort command was not sent");
+		await expect(instance.cancel("cancel-owner-a" as InputId)).rejects.toThrow(
+			"already in progress",
+		);
+		expect(abortCommands()).toHaveLength(1);
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "response",
+				id: firstAbort.id,
+				command: "abort",
+				success: true,
+			})}\n`,
+		);
+		await expect(firstCancel).resolves.toBeUndefined();
+
+		await instance.send(input("second", "cancel-owner-b"));
+		const secondCancel = instance.cancel("cancel-owner-b" as InputId);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const secondAbort = abortCommands()[1];
+		if (!secondAbort || typeof secondAbort.id !== "string")
+			throw new Error("second abort command was not sent");
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "response",
+				id: firstAbort.id,
+				command: "abort",
+				success: true,
+			})}\n`,
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await expect(
+			instance.send(input("blocked", "during-cancel-b")),
+		).rejects.toThrow("already active");
+		fake.stdout.write(
+			`{"type":"agent_settled"}\n${JSON.stringify({
+				type: "response",
+				id: secondAbort.id,
+				command: "abort",
+				success: true,
+			})}\n`,
+		);
+		await expect(secondCancel).resolves.toBeUndefined();
+
+		const events = await collectEvents(instance, 7);
+		expect(
+			events
+				.filter((event) => event?.inputEvent)
+				.map((event) => event?.inputEvent?.state),
+		).toEqual([
+			"pending",
+			"accepted",
+			"failed",
+			"pending",
+			"accepted",
+			"failed",
+		]);
+		await instance.shutdown();
+	});
+
+	it("completes settled work when Pi rejects abort after settlement", async () => {
+		const fake = fakeProvider({
+			abortSuccess: false,
+			beforeResponse(command, stdout) {
+				if (command.type === "abort")
+					stdout.write('{"type":"agent_settled"}\n');
+			},
+		});
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
 			executable: "pi",
 			startupTimeoutMs: 100,
@@ -464,11 +601,40 @@ describe("PiRpcHarnessAdapter", () => {
 		await expect(instance.cancel("abort-rejected" as InputId)).rejects.toThrow(
 			"rejected the abort",
 		);
-		await expect(instance.send(input("second", "blocked"))).rejects.toThrow(
-			"already active",
-		);
+		await expect(
+			instance.send(input("second", "after-settlement")),
+		).resolves.toBeUndefined();
 		fake.stdout.write('{"type":"agent_settled"}\n');
 		await new Promise((resolve) => setTimeout(resolve, 0));
+		await instance.shutdown();
+	});
+
+	it("reports uncertain cancellation when the abort response is lost after settlement", async () => {
+		const fake = fakeProvider({
+			holdAbort: true,
+			beforeResponse(command, stdout) {
+				if (command.type === "abort")
+					stdout.write('{"type":"agent_settled"}\n');
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 10,
+		}).launch(request);
+		await instance.send(input("cancel uncertainty", "abort-uncertain"));
+		await expect(instance.cancel("abort-uncertain" as InputId)).rejects.toThrow(
+			"timed out",
+		);
+		const events = await collectEvents(instance, 4);
+		expect(
+			events
+				.filter((event) => event?.inputEvent)
+				.map((event) => event?.inputEvent?.state),
+		).toEqual(["pending", "accepted", "uncertain"]);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
 		await instance.shutdown();
 	});
 
@@ -487,6 +653,49 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("drains final correlated response and events after child exit", async () => {
+		const fake = fakeProvider({ exitBeforePromptResponse: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			exitDrainTimeoutMs: 100,
+		}).launch(request);
+		await expect(
+			instance.send(input("final output", "final")),
+		).resolves.toBeUndefined();
+		const events = await collectEvents(instance, 4);
+		expect(
+			events
+				.filter((event) => event?.inputEvent)
+				.map((event) => event?.inputEvent?.state),
+		).toEqual(["pending", "accepted", "completed"]);
+		await instance.shutdown();
+	});
+
+	it("applies final abort acknowledgement and settlement before EOF after exit", async () => {
+		const fake = fakeProvider({ exitBeforeAbortResponse: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			exitDrainTimeoutMs: 100,
+		}).launch(request);
+		await instance.send(input("abort final", "abort-final"));
+		await expect(
+			instance.cancel("abort-final" as InputId),
+		).resolves.toBeUndefined();
+		const events = await collectEvents(instance, 5);
+		const deliveries = events
+			.filter((event) => event?.inputEvent)
+			.map((event) => event?.inputEvent);
+		expect(deliveries.map((event) => event?.state)).toEqual([
+			"pending",
+			"accepted",
+			"failed",
+		]);
+		expect(deliveries.at(-1)?.detail).toBe("Input canceled");
+		await instance.shutdown();
+	});
+
 	it("marks active accepted input uncertain on child exit", async () => {
 		const fake = fakeProvider();
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
@@ -499,6 +708,26 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(
 			events.some((event) => event?.inputEvent?.state === "uncertain"),
 		).toBe(true);
+		await instance.shutdown();
+	});
+
+	it("treats malformed correlated prompt acknowledgements as protocol uncertainty", async () => {
+		const fake = fakeProvider({ malformedPromptAck: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			shutdownTimeoutMs: 5,
+		}).launch(request);
+		await expect(
+			instance.send(input("untrusted ack", "malformed-ack")),
+		).rejects.toBeInstanceOf(UncertainInputDeliveryError);
+		const events = await collectEvents(instance, 3);
+		expect(
+			events.some((event) => event?.inputEvent?.state === "uncertain"),
+		).toBe(true);
+		expect(events.some((event) => event?.inputEvent?.state === "failed")).toBe(
+			false,
+		);
 		await instance.shutdown();
 	});
 
@@ -523,7 +752,7 @@ describe("PiRpcHarnessAdapter", () => {
 		},
 	);
 
-	it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+	it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648])(
 		"rejects invalid command timeout %s",
 		(value) => {
 			expect(
@@ -532,9 +761,19 @@ describe("PiRpcHarnessAdapter", () => {
 						executable: "pi",
 						commandTimeoutMs: value,
 					}),
-			).toThrow("positive safe integer");
+			).toThrow("from 1 to");
 		},
 	);
+
+	it("rejects record caps above the documented bound", () => {
+		expect(
+			() =>
+				new PiRpcHarnessAdapter(fakeProvider().provider, {
+					executable: "pi",
+					maxRecordBytes: 64 * 1024 * 1024 + 1,
+				}),
+		).toThrow("maxRecordBytes");
+	});
 
 	it.each(["stdin", "stdout", "stderr"] as const)(
 		"terminates process if %s pipe is unavailable",
