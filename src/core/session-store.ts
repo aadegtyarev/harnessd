@@ -1,8 +1,8 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { SessionStoreError } from "./errors.js";
+import { InvalidStateDirectoryError, SessionStoreError } from "./errors.js";
 import type {
 	AdapterId,
 	SessionId,
@@ -19,16 +19,54 @@ export interface SessionStore {
 }
 
 export function resolveStateDirectory(configuredPath?: string): string {
-	if (configuredPath) return path.resolve(configuredPath);
+	if (configuredPath !== undefined)
+		return requireAbsoluteStateDirectory(configuredPath, "configured path");
 	if (process.env.HARNESSD_STATE_DIR)
-		return path.resolve(process.env.HARNESSD_STATE_DIR);
+		return requireAbsoluteStateDirectory(
+			process.env.HARNESSD_STATE_DIR,
+			"HARNESSD_STATE_DIR",
+		);
 	const xdgStateHome = process.env.XDG_STATE_HOME;
-	return path.join(
-		xdgStateHome
-			? path.resolve(xdgStateHome)
-			: path.join(os.homedir(), ".local", "state"),
-		"harnessd",
-	);
+	const stateHome = xdgStateHome
+		? requireAbsoluteStateDirectory(xdgStateHome, "XDG_STATE_HOME")
+		: path.join(os.homedir(), ".local", "state");
+	return path.join(stateHome, "harnessd");
+}
+
+function requireAbsoluteStateDirectory(value: string, source: string): string {
+	if (!path.isAbsolute(value)) {
+		throw new InvalidStateDirectoryError(
+			value,
+			`${source} must be an absolute path; relative state paths depend on process cwd`,
+		);
+	}
+	return path.normalize(value);
+}
+
+async function assertPrivateStateDirectory(directory: string): Promise<void> {
+	const metadata = await stat(directory);
+	if (!metadata.isDirectory()) {
+		throw new InvalidStateDirectoryError(
+			directory,
+			`Supervisor state path is not a directory: ${directory}`,
+		);
+	}
+	if (process.platform === "win32") return;
+	if (
+		typeof process.getuid === "function" &&
+		metadata.uid !== process.getuid()
+	) {
+		throw new InvalidStateDirectoryError(
+			directory,
+			`Supervisor state directory must be owned by the current user: ${directory}`,
+		);
+	}
+	if ((metadata.mode & 0o077) !== 0) {
+		throw new InvalidStateDirectoryError(
+			directory,
+			`Supervisor state directory must not grant group/other access; secure it to mode 0700: ${directory}`,
+		);
+	}
 }
 
 export class SqliteSessionStore implements SessionStore {
@@ -44,10 +82,12 @@ export class SqliteSessionStore implements SessionStore {
 
 	static async open(configuredPath?: string): Promise<SqliteSessionStore> {
 		const stateDirectory = resolveStateDirectory(configuredPath);
+		let database: Database.Database | undefined;
 		try {
 			await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+			await assertPrivateStateDirectory(stateDirectory);
 			const databasePath = path.join(stateDirectory, "sessions.sqlite3");
-			const database = new Database(databasePath);
+			database = new Database(databasePath);
 			database.pragma("journal_mode = WAL");
 			database.pragma("foreign_keys = ON");
 			database.exec(`CREATE TABLE IF NOT EXISTS sessions (
@@ -60,6 +100,12 @@ export class SqliteSessionStore implements SessionStore {
 			)`);
 			return new SqliteSessionStore(stateDirectory, database);
 		} catch (error) {
+			try {
+				database?.close();
+			} catch {
+				// Preserve the initialization error that prevented a store from opening.
+			}
+			if (error instanceof InvalidStateDirectoryError) throw error;
 			throw new SessionStoreError(
 				`Could not open session store at ${stateDirectory}`,
 				{ cause: error },

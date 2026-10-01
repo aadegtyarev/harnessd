@@ -12,8 +12,8 @@
 	"scripts": {
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc --noEmit -p tsconfig.json",
-		"test": "vitest run",
-		"test:watch": "vitest",
+		"test": "vitest run --exclude \"**/dist/**\"",
+		"test:watch": "vitest --exclude \"**/dist/**\"",
 		"lint": "biome check src test package.json tsconfig.json",
 		"format": "biome format --write src test package.json tsconfig.json",
 		"format:check": "biome format src test package.json tsconfig.json"

@@ -2,6 +2,7 @@ export type { Capability } from "./errors.js";
 export {
 	DuplicateAdapterIdError,
 	DuplicateSessionIdError,
+	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
 	requireCapability,
 	SessionNotFoundError,

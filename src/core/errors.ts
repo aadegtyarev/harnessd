@@ -34,6 +34,19 @@ export class SessionStoreError extends Error {
 	}
 }
 
+export class InvalidStateDirectoryError extends Error {
+	readonly code = "INVALID_STATE_DIRECTORY";
+
+	constructor(
+		readonly requestedPath: string,
+		message: string,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = "InvalidStateDirectoryError";
+	}
+}
+
 export class InvalidWorkingDirectoryError extends Error {
 	readonly code = "INVALID_WORKING_DIRECTORY";
 

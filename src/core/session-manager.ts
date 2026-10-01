@@ -22,6 +22,8 @@ export interface CreateSessionRequest {
 export class SessionManager {
 	private readonly harnesses: ReadonlyMap<AdapterId, HarnessAdapter>;
 	private readonly instances = new Map<SessionId, HarnessInstance>();
+	private readonly creating = new Set<SessionId>();
+	private readonly launching = new Map<SessionId, Promise<SessionSummary>>();
 
 	constructor(
 		private readonly store: SessionStore,
@@ -48,44 +50,86 @@ export class SessionManager {
 
 	async create(request: CreateSessionRequest): Promise<SessionSummary> {
 		const id = parseSessionId(request.id ?? randomUUID());
-		if (await this.store.get(id)) throw new DuplicateSessionIdError(id);
-		const harness = this.harnesses.get(request.harnessId);
-		if (!harness)
-			throw new UnsupportedCapabilityError("harness.launch", request.harnessId);
-		requireCapability(
-			harness.descriptor.capabilities,
-			"harness.launch",
-			harness.descriptor.id,
-		);
-		const cwd = await validateWorkingDirectory(request.cwd);
-		const starting: SessionSummary = {
-			id,
-			harnessId: request.harnessId,
-			cwd,
-			status: "starting",
-		};
-		await this.store.create(starting);
-		let instance: HarnessInstance | undefined;
+		if (this.creating.has(id)) throw new DuplicateSessionIdError(id);
+		this.creating.add(id);
 		try {
-			instance = await harness.launch({ sessionId: id, cwd });
-			const running: SessionSummary = {
-				...starting,
-				...(instance.nativeSessionId
-					? { nativeSessionId: instance.nativeSessionId }
-					: {}),
-				status: "running",
+			if (await this.store.get(id)) throw new DuplicateSessionIdError(id);
+			const harness = this.harnesses.get(request.harnessId);
+			if (!harness)
+				throw new UnsupportedCapabilityError(
+					"harness.launch",
+					request.harnessId,
+				);
+			requireCapability(
+				harness.descriptor.capabilities,
+				"harness.launch",
+				harness.descriptor.id,
+			);
+			const cwd = await validateWorkingDirectory(request.cwd);
+			const starting: SessionSummary = {
+				id,
+				harnessId: request.harnessId,
+				cwd,
+				status: "starting",
 			};
-			await this.store.update(running);
-			this.instances.set(id, instance);
-			return running;
-		} catch (error) {
-			if (instance) await instance.shutdown().catch(() => undefined);
-			await this.store.setStatus(id, "failed");
-			throw error;
+			let instance: HarnessInstance | undefined;
+			let recordCreated = false;
+			const launch = this.store.create(starting).then(async () => {
+				recordCreated = true;
+				try {
+					instance = await harness.launch({ sessionId: id, cwd });
+					this.instances.set(id, instance);
+					const running: SessionSummary = {
+						...starting,
+						...(instance.nativeSessionId
+							? { nativeSessionId: instance.nativeSessionId }
+							: {}),
+						status: "running",
+					};
+					await this.store.update(running);
+					return running;
+				} catch (error) {
+					const failures: unknown[] = [error];
+					if (instance) {
+						try {
+							await instance.shutdown();
+							this.instances.delete(id);
+						} catch (shutdownError) {
+							this.instances.set(id, instance);
+							failures.push(shutdownError);
+						}
+					}
+					if (recordCreated) {
+						try {
+							await this.store.setStatus(id, "failed");
+						} catch (statusError) {
+							failures.push(statusError);
+						}
+					}
+					if (failures.length > 1) {
+						throw new AggregateError(
+							failures,
+							`Session '${id}' startup failed and cleanup was incomplete`,
+							{ cause: error },
+						);
+					}
+					throw error;
+				}
+			});
+			this.launching.set(id, launch);
+			try {
+				return await launch;
+			} finally {
+				if (this.launching.get(id) === launch) this.launching.delete(id);
+			}
+		} finally {
+			this.creating.delete(id);
 		}
 	}
 
 	async stop(id: SessionId): Promise<void> {
+		const launch = this.launching.get(id);
+		if (launch) await launch.catch(() => undefined);
 		const session = await this.get(id);
 		if (session.status === "stopped") return;
 		const instance = this.instances.get(id);

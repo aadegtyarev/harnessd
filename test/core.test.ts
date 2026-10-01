@@ -1,4 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	mkdtemp,
+	readdir,
+	readlink,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,9 +20,12 @@ import type {
 } from "../src/core/index.js";
 import {
 	DuplicateAdapterIdError,
+	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
 	requireCapability,
+	resolveStateDirectory,
 	SessionManager,
+	SessionStoreError,
 	SqliteSessionStore,
 	UnsupportedCapabilityError,
 } from "../src/core/index.js";
@@ -67,6 +77,16 @@ const mockHarness: HarnessAdapter = {
 void mockSessionPort;
 void mockTransport;
 void mockHarness;
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
 
 function harnessPort(
 	options: {
@@ -200,6 +220,43 @@ describe("SQLite session management", () => {
 		store.close();
 	});
 
+	it("waits for an in-flight launch before making an operator stop terminal", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const started = deferred<void>();
+		const launchResult = deferred<HarnessInstance>();
+		let shutdownCalls = 0;
+		const { harness } = harnessPort({
+			launch: async () => {
+				started.resolve(undefined);
+				return launchResult.promise;
+			},
+		});
+		const manager = new SessionManager(store, [harness]);
+		const id = "stop-during-launch" as SessionId;
+		const createPromise = manager.create({
+			id,
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		await started.promise;
+		const stopPromise = manager.stop(id);
+		expect((await manager.get(id)).status).toBe("starting");
+		launchResult.resolve({
+			processId: "process" as never,
+			events: (async function* () {})(),
+			async send() {},
+			async cancel() {},
+			async shutdown() {
+				shutdownCalls += 1;
+			},
+		});
+		await createPromise;
+		await stopPromise;
+		expect((await manager.get(id)).status).toBe("stopped");
+		expect(shutdownCalls).toBe(1);
+		store.close();
+	});
+
 	it("validates paths before launch and accepts broad existing directories", async () => {
 		const state = await temporaryDirectory();
 		const { harness, launched } = harnessPort();
@@ -266,6 +323,97 @@ describe("SQLite session management", () => {
 			}),
 		).rejects.toBeInstanceOf(UnsupportedCapabilityError);
 		store.close();
+	});
+
+	it("retains an instance for stop retry when startup persistence and cleanup both fail", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const update = store.update.bind(store);
+		let updateFailures = 1;
+		store.update = async (session) => {
+			if (updateFailures > 0) {
+				updateFailures -= 1;
+				throw new Error("running persistence failed");
+			}
+			await update(session);
+		};
+		let shutdownCalls = 0;
+		const { harness } = harnessPort({
+			launch: async () => ({
+				processId: "process" as never,
+				events: (async function* () {})(),
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					shutdownCalls += 1;
+					if (shutdownCalls === 1) throw new Error("shutdown failed");
+				},
+			}),
+		});
+		const manager = new SessionManager(store, [harness]);
+		const id = "cleanup-retry" as SessionId;
+		const failure = await manager
+			.create({ id, harnessId: harness.descriptor.id, cwd: os.homedir() })
+			.catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as AggregateError).errors).toHaveLength(2);
+		expect((await manager.get(id)).status).toBe("failed");
+		store.update = update;
+		await manager.stop(id);
+		expect(shutdownCalls).toBe(2);
+		expect((await manager.get(id)).status).toBe("stopped");
+		store.close();
+	});
+
+	it("rejects relative state-directory inputs without consulting process cwd", async () => {
+		const originalHarnessd = process.env.HARNESSD_STATE_DIR;
+		const originalXdg = process.env.XDG_STATE_HOME;
+		try {
+			delete process.env.HARNESSD_STATE_DIR;
+			delete process.env.XDG_STATE_HOME;
+			expect(() => resolveStateDirectory("relative/state")).toThrow(
+				InvalidStateDirectoryError,
+			);
+			process.env.HARNESSD_STATE_DIR = "relative/state";
+			expect(() => resolveStateDirectory()).toThrow(InvalidStateDirectoryError);
+			delete process.env.HARNESSD_STATE_DIR;
+			process.env.XDG_STATE_HOME = "relative/xdg";
+			expect(() => resolveStateDirectory()).toThrow(InvalidStateDirectoryError);
+		} finally {
+			if (originalHarnessd === undefined) delete process.env.HARNESSD_STATE_DIR;
+			else process.env.HARNESSD_STATE_DIR = originalHarnessd;
+			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME;
+			else process.env.XDG_STATE_HOME = originalXdg;
+		}
+	});
+
+	it("rejects an existing POSIX state directory with group or other access", async () => {
+		if (process.platform === "win32") return;
+		const state = await temporaryDirectory();
+		await chmod(state, 0o755);
+		await expect(SqliteSessionStore.open(state)).rejects.toBeInstanceOf(
+			InvalidStateDirectoryError,
+		);
+		expect(await readdir(state)).toEqual([]);
+	});
+
+	it("closes SQLite handles when initialization fails after opening the database", async () => {
+		if (process.platform !== "linux") return;
+		const state = await temporaryDirectory();
+		const databasePath = path.join(state, "sessions.sqlite3");
+		await writeFile(databasePath, "not a sqlite database");
+		await expect(SqliteSessionStore.open(state)).rejects.toBeInstanceOf(
+			SessionStoreError,
+		);
+		const descriptors = await readdir("/proc/self/fd");
+		const targets = await Promise.all(
+			descriptors.map((descriptor) =>
+				readlink(`/proc/self/fd/${descriptor}`).catch(() => ""),
+			),
+		);
+		expect(targets).not.toContain(databasePath);
+		await rm(databasePath);
+		const reopened = await SqliteSessionStore.open(state);
+		reopened.close();
 	});
 
 	it("rejects malformed session IDs", async () => {
