@@ -39,6 +39,7 @@ Provide a locally supervised, multi-session coding-agent service with independen
 ## Affected surfaces
 
 - [Core session management](../surfaces/core-session-management.md) — implemented in the bounded core-foundation milestone; this does not complete the broader v1 transport, harness, watchdog, isolation, or secret-provider scope.
+- [Direct Node process provider](../surfaces/process-provider.md) — a standalone process primitive; it does not complete end-to-end session execution.
 - Transport, harness-adapter, and process-isolation surfaces will be documented as their later milestones are implemented.
 
 ## Acceptance and validation

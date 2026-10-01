@@ -10,6 +10,8 @@ export type Capability =
 	| "harness.stop"
 	| "harness.resume"
 	| "harness.cancel"
+	| "process.launch"
+	| "process.signal"
 	| "process.isolation"
 	| "secret.scoped-grant";
 
