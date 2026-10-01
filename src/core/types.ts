@@ -42,6 +42,7 @@ export interface InputEvent {
 
 export interface HarnessEvent {
 	readonly sessionId: SessionId;
-	readonly kind: "output" | "status" | "error";
+	readonly kind: "output" | "status" | "error" | "input";
 	readonly text?: string;
+	readonly inputEvent?: InputEvent;
 }

@@ -16,7 +16,7 @@ The core owns stable session identity, working-directory validation, session met
 
 ## Interfaces and compatibility
 
-- Session, input, and adapter identities are stable opaque IDs; consumers must not infer identity from `cwd` or native harness IDs.
+- Session, input, and adapter identities are stable opaque IDs; consumers must not infer identity from `cwd` or native harness IDs. Harness events include output, status, error, and input-delivery variants. Input-delivery events carry the existing `InputEvent` input ID, state, and optional detail; states are pending, accepted, completed, uncertain, or failed.
 - Core ports declare capabilities. Adapters may provide fewer capabilities; calls to unsupported operations return an explicit error. Harness launch, stop, and input submission are checked independently.
 - Harness-native session IDs are optional adapter-owned metadata, separate from supervisor IDs.
 
@@ -34,3 +34,4 @@ The core owns stable session identity, working-directory validation, session met
 ## Related contracts
 
 - [Harnessd v1](../features/harnessd-v1.md)
+- [Pi RPC harness](pi-rpc-harness.md)
