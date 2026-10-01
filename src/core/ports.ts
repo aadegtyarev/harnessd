@@ -35,30 +35,71 @@ export interface InputPort {
 
 export type TransportEvent =
 	| {
+			readonly requestId: string;
 			readonly principalId: string;
-			readonly kind: "list-sessions";
+			readonly kind: "list";
 	  }
 	| {
+			readonly requestId: string;
 			readonly principalId: string;
-			readonly kind: "create-session";
+			readonly kind: "inspect";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "create";
 			readonly harnessId: AdapterId;
 			readonly cwd: string;
 	  }
 	| {
+			readonly requestId: string;
 			readonly principalId: string;
-			readonly kind: "stop-session";
+			readonly kind: "stop";
 			readonly sessionId: SessionId;
 	  }
 	| {
+			readonly requestId: string;
 			readonly principalId: string;
-			readonly kind: "submit-input";
+			readonly kind: "submit";
 			readonly sessionId: SessionId;
 			readonly text: string;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "cancel";
+			readonly sessionId: SessionId;
+			readonly inputId: InputId;
 	  };
+
+export type TransportResult =
+	| {
+			readonly requestId: string;
+			readonly ok: true;
+			readonly value:
+				| readonly SessionSummary[]
+				| SessionSummary
+				| InputId
+				| undefined;
+	  }
+	| {
+			readonly requestId: string;
+			readonly ok: false;
+			readonly error: { readonly code: string; readonly message: string };
+	  };
+
+export type TransportEventListener = (event: HarnessEvent) => unknown;
+export type TransportEventSubscription = (
+	listener: TransportEventListener,
+) => () => void;
 
 export interface TransportAdapter {
 	readonly descriptor: PortDescriptor;
-	start(dispatch: (event: TransportEvent) => Promise<void>): Promise<void>;
+	start(
+		dispatch: (event: TransportEvent) => Promise<TransportResult>,
+		subscribeEvents: TransportEventSubscription,
+	): Promise<void>;
 	stop(): Promise<void>;
 }
 

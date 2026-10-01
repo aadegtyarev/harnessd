@@ -2,7 +2,7 @@
 
 ## Boundary, consumers, and ownership
 
-The process-provider boundary offers reusable local child-process launch and signal delivery for future adapters. `NodeProcessProvider` implements the core `ProcessProvider` port and is exported from `src/process/`; it is not wired into session management, a harness, or the CLI.
+The process-provider boundary offers reusable local child-process launch and signal delivery. `NodeProcessProvider` implements the core `ProcessProvider` port and is exported from `src/process/`; the application runtime supplies it to the Pi RPC harness. It remains a process primitive, not a session manager or transport.
 
 ## Inputs, outputs, and guarantees
 

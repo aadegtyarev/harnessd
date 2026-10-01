@@ -43,7 +43,10 @@ export class SessionManager {
 	private readonly eventListeners = new Set<SessionEventListener>();
 	private readonly eventPumps = new Map<SessionId, ManagedEventPump>();
 	private readonly creating = new Set<SessionId>();
+	private readonly launchesInProgress = new Set<Promise<SessionSummary>>();
 	private readonly launching = new Map<SessionId, Promise<SessionSummary>>();
+	private closing = false;
+	private closePromise: Promise<void> | undefined;
 	private readonly stopping = new Map<SessionId, Promise<void>>();
 
 	constructor(
@@ -74,7 +77,20 @@ export class SessionManager {
 		return session;
 	}
 
-	async create(request: CreateSessionRequest): Promise<SessionSummary> {
+	create(request: CreateSessionRequest): Promise<SessionSummary> {
+		if (this.closing)
+			return Promise.reject(new Error("Session manager is closing"));
+		const operation = this.createSession(request);
+		this.launchesInProgress.add(operation);
+		void operation
+			.finally(() => this.launchesInProgress.delete(operation))
+			.catch(() => {});
+		return operation;
+	}
+
+	private async createSession(
+		request: CreateSessionRequest,
+	): Promise<SessionSummary> {
 		const id = parseSessionId(request.id ?? randomUUID());
 		if (this.creating.has(id)) throw new DuplicateSessionIdError(id);
 		this.creating.add(id);
@@ -152,6 +168,47 @@ export class SessionManager {
 		} finally {
 			this.creating.delete(id);
 		}
+	}
+
+	close(): Promise<void> {
+		if (!this.closePromise) {
+			this.closing = true;
+			this.closePromise = this.closeAll();
+		}
+		return this.closePromise;
+	}
+
+	private async closeAll(): Promise<void> {
+		while (this.launchesInProgress.size > 0) {
+			await Promise.allSettled([...this.launchesInProgress]);
+		}
+		const failures: unknown[] = [];
+		const sessionIds = new Set([
+			...this.instances.keys(),
+			...this.eventPumps.keys(),
+			...this.stopping.keys(),
+		]);
+		for (const id of sessionIds) {
+			try {
+				await this.stop(id);
+			} catch (error) {
+				failures.push(error);
+			}
+			const pump = this.eventPumps.get(id);
+			if (pump) {
+				pump.stop();
+				try {
+					await pump.promise;
+				} catch (error) {
+					failures.push(error);
+				}
+			}
+		}
+		if (failures.length)
+			throw new AggregateError(
+				failures,
+				"Session manager shutdown was incomplete",
+			);
 	}
 
 	async stop(id: SessionId): Promise<void> {

@@ -2,13 +2,14 @@
 
 ## Boundary and ownership
 
-The core owns stable session identity, working-directory validation, session metadata and lifecycle decisions. It consumes harness/process functionality through adapter ports and does not import transport or harness implementations. Transports request core operations; they do not own session state.
+The core owns stable session identity, working-directory validation, session metadata and lifecycle decisions. It consumes harness/process functionality through adapter ports and does not import transport or harness implementations. The application runtime composes core with process, harness, and transport adapters; transports request core operations but do not own session state.
 
 ## Observable operations
 
 - Create a session for a declared harness and existing local working directory; return its supervisor ID and current state.
 - List and inspect sessions using supervisor IDs, independently of their workspace paths.
 - Stop a session explicitly; an operator-requested stop is terminal and must not be restarted by recovery logic.
+- Close the manager during runtime shutdown: wait for in-flight launches, attempt to stop every live instance and join its event pump, retain all session records, and aggregate cleanup errors only after attempting all instances. Already terminal session records are unchanged.
 - Submit input through core-owned, supervisor-ID-addressed routing to the matching harness instance. Return the generated `InputId` only after the harness accepts the input.
 - Cancel an accepted input by its `SessionId` and `InputId`, routed to the matching live harness instance after checking its declared `harness.cancel` capability. Unsupported cancellation fails explicitly; core never substitutes an adapter.
 - Subscribe to live `HarnessEvent` notifications from all running instances. Each event is tagged with the originating supervisor `SessionId`; per-session order is preserved and one observer failure cannot block the harness or other observers. The core does not await asynchronous observer work; synchronous observers must return promptly. Stopping a session terminates its event pump; events arriving during shutdown may not be forwarded.
@@ -19,7 +20,7 @@ The core owns stable session identity, working-directory validation, session met
 ## Interfaces and compatibility
 
 - Session, input, and adapter identities are stable opaque IDs; consumers must not infer identity from `cwd` or native harness IDs. Harness events include output, status, error, and input-delivery variants. Input-delivery events carry the existing `InputEvent` input ID, state, and optional detail; states are pending, accepted, completed, uncertain, or failed. Core forwards live events only; it does not persist an input/event history.
-- Core ports declare capabilities. Adapters may provide fewer capabilities; calls to unsupported operations return an explicit error. Harness launch, stop, and input submission are checked independently.
+- Core ports declare capabilities. Adapters may provide fewer capabilities; calls to unsupported operations return an explicit error. Harness launch, stop, input submission, and cancellation are checked independently.
 - Harness-native session IDs are optional adapter-owned metadata, separate from supervisor IDs.
 
 ## Failure, security, and limits

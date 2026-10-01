@@ -40,7 +40,8 @@ Provide a locally supervised, multi-session coding-agent service with independen
 
 - [Core session management](../surfaces/core-session-management.md) — implemented in the bounded core-foundation milestone; this does not complete the broader v1 transport, harness, watchdog, isolation, or secret-provider scope.
 - [Direct Node process provider](../surfaces/process-provider.md) — a standalone process primitive; it does not complete end-to-end session execution.
-- Transport, harness-adapter, and process-isolation surfaces will be documented as their later milestones are implemented.
+- [Transport adapter](../surfaces/transport-adapter.md) defines the adapter-neutral request/result/event boundary; Telegram polling and authorization remain a later milestone.
+- Harness-adapter and process-isolation surfaces will be documented as their later milestones are implemented.
 
 ## Acceptance and validation
 
