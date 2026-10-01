@@ -131,30 +131,48 @@ function harnessPort(
 describe("core capability contracts", () => {
 	it("uses required fields for each transport event kind", () => {
 		const events: TransportEvent[] = [
-			{ principalId: "operator", kind: "list-sessions" },
+			{ requestId: "1", principalId: "operator", kind: "list" },
 			{
+				requestId: "2",
 				principalId: "operator",
-				kind: "create-session",
+				kind: "inspect",
+				sessionId: "session" as never,
+			},
+			{
+				requestId: "3",
+				principalId: "operator",
+				kind: "create",
 				harnessId: "mock" as never,
 				cwd: "/workspace",
 			},
 			{
+				requestId: "4",
 				principalId: "operator",
-				kind: "stop-session",
+				kind: "stop",
 				sessionId: "session" as never,
 			},
 			{
+				requestId: "5",
 				principalId: "operator",
-				kind: "submit-input",
+				kind: "submit",
 				sessionId: "session" as never,
 				text: "hello",
 			},
+			{
+				requestId: "6",
+				principalId: "operator",
+				kind: "cancel",
+				sessionId: "session" as never,
+				inputId: "input" as never,
+			},
 		];
 		expect(events.map((event) => event.kind)).toEqual([
-			"list-sessions",
-			"create-session",
-			"stop-session",
-			"submit-input",
+			"list",
+			"inspect",
+			"create",
+			"stop",
+			"submit",
+			"cancel",
 		]);
 	});
 
@@ -648,6 +666,40 @@ describe("SQLite session management", () => {
 		await manager.stop(id);
 		expect(shutdownCalls).toBe(2);
 		expect((await manager.get(id)).status).toBe("stopped");
+		store.close();
+	});
+
+	it("manager close attempts all live instances and retains failed sessions", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const closed: string[] = [];
+		const harness = harnessPort({
+			launch: async (request) => ({
+				processId: `process-${request.sessionId}` as never,
+				events: (async function* () {})(),
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					closed.push(request.sessionId);
+					if (request.sessionId === "close-a")
+						throw new Error("private failure");
+				},
+			}),
+		}).harness;
+		const manager = new SessionManager(store, [harness]);
+		const a = await manager.create({
+			id: "close-a",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const b = await manager.create({
+			id: "close-b",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		await expect(manager.close()).rejects.toBeInstanceOf(AggregateError);
+		expect(closed).toEqual([a.id, b.id]);
+		expect((await manager.get(a.id)).status).toBe("running");
+		expect((await manager.get(b.id)).status).toBe("stopped");
 		store.close();
 	});
 

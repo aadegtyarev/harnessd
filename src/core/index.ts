@@ -25,6 +25,9 @@ export type {
 	SessionPort,
 	TransportAdapter,
 	TransportEvent,
+	TransportEventListener,
+	TransportEventSubscription,
+	TransportResult,
 } from "./ports.js";
 export type {
 	CreateSessionRequest,
