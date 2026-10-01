@@ -9,6 +9,37 @@ import type {
 import type { AdapterId, ProcessId } from "../core/types.js";
 
 const signalNames = new Set(Object.keys(constants.signals));
+const nodeAutoPropagatedEnvironmentKeys = [
+	"NODE_V8_COVERAGE",
+	"_BPXK_AUTOCVT",
+	"_CEE_RUNOPTS",
+	"_TAG_REDIR_ERR",
+	"_TAG_REDIR_IN",
+	"_TAG_REDIR_OUT",
+	"STEPLIB",
+	"LIBPATH",
+	"_EDC_SIG_DFLT",
+	"_EDC_SUSV3",
+];
+
+function createSpawnEnvironment(
+	requested: Readonly<Record<string, string>> | undefined,
+): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...(requested ?? {}) };
+	for (const name of nodeAutoPropagatedEnvironmentKeys) {
+		if (process.platform === "win32") {
+			const existingName = Object.keys(env).find(
+				(key) => key.toUpperCase() === name.toUpperCase(),
+			);
+			if (existingName && existingName !== name) {
+				env[name] = env[existingName];
+				delete env[existingName];
+			}
+		}
+		if (!Object.hasOwn(env, name)) env[name] = undefined;
+	}
+	return env;
+}
 
 export class NodeProcessProvider implements ProcessProvider {
 	readonly descriptor = {
@@ -20,7 +51,7 @@ export class NodeProcessProvider implements ProcessProvider {
 		return new Promise((resolve, reject) => {
 			const child = spawn(request.executable, [...request.args], {
 				cwd: request.cwd,
-				env: request.env ? { ...request.env } : {},
+				env: createSpawnEnvironment(request.env),
 				shell: false,
 				stdio: "ignore",
 			});

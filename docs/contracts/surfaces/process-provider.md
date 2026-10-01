@@ -6,7 +6,7 @@ The process-provider boundary offers reusable local child-process launch and sig
 
 ## Inputs, outputs, and guarantees
 
-- Launch receives an executable, exact argument vector, cwd, and optional replacement environment. It uses Node `spawn` with `shell: false`, `stdio: ignore`, and passes only the provided environment; omitted environment is empty rather than inherited.
+- Launch receives an executable, exact argument vector, cwd, and optional replacement environment. It uses Node `spawn` with `shell: false`, `stdio: ignore`, and passes only the provided environment; omitted environment is empty rather than inherited. Node's ambient environment pass-through keys (`NODE_V8_COVERAGE` and z/OS runtime variables) are masked unless explicitly provided. When Node's permission model is active, Node may propagate its permission flags through `NODE_OPTIONS` to preserve that runtime restriction.
 - Launch resolves only after Node reports the OS spawn-success event. Startup failures reject. A handle has an opaque provider-generated process ID, an exit promise containing the OS exit code and signal, and `sendSignal`.
 - Signals must be recognized by the current Node platform. Invalid signals and unsuccessful delivery reject explicitly.
 - The provider declares `process.launch` and `process.signal`. Executable arguments and environment values are not logged.
