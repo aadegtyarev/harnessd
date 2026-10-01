@@ -26,7 +26,10 @@ export type {
 	TransportAdapter,
 	TransportEvent,
 } from "./ports.js";
-export type { CreateSessionRequest } from "./session-manager.js";
+export type {
+	CreateSessionRequest,
+	SessionEventListener,
+} from "./session-manager.js";
 export { SessionManager } from "./session-manager.js";
 export type { SessionStore } from "./session-store.js";
 export { resolveStateDirectory, SqliteSessionStore } from "./session-store.js";
