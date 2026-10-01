@@ -48,12 +48,16 @@ export class NodeProcessProvider implements ProcessProvider {
 	};
 
 	launch(request: ProcessLaunchRequest): Promise<ManagedProcess> {
+		const stdio = request.stdio ?? "ignore";
+		if (stdio !== "ignore" && stdio !== "pipe") {
+			return Promise.reject(new Error("Invalid process stdio mode"));
+		}
 		return new Promise((resolve, reject) => {
 			const child = spawn(request.executable, [...request.args], {
 				cwd: request.cwd,
 				env: createSpawnEnvironment(request.env),
 				shell: false,
-				stdio: "ignore",
+				stdio,
 			});
 
 			let started = false;
@@ -82,6 +86,9 @@ export class NodeProcessProvider implements ProcessProvider {
 				started = true;
 				resolve({
 					id: randomUUID() as ProcessId,
+					stdin: stdio === "pipe" ? child.stdin : null,
+					stdout: stdio === "pipe" ? child.stdout : null,
+					stderr: stdio === "pipe" ? child.stderr : null,
 					exit,
 					async sendSignal(signal: string): Promise<void> {
 						if (!signalNames.has(signal)) {

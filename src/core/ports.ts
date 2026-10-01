@@ -1,3 +1,4 @@
+import type { Readable, Writable } from "node:stream";
 import type { Capability } from "./errors.js";
 import type {
 	AdapterId,
@@ -87,10 +88,14 @@ export interface ProcessLaunchRequest {
 	readonly args: readonly string[];
 	readonly cwd: string;
 	readonly env?: Readonly<Record<string, string>>;
+	readonly stdio?: "ignore" | "pipe";
 }
 
 export interface ManagedProcess {
 	readonly id: ProcessId;
+	readonly stdin: Writable | null;
+	readonly stdout: Readable | null;
+	readonly stderr: Readable | null;
 	readonly exit: Promise<{
 		readonly code: number | null;
 		readonly signal: string | null;

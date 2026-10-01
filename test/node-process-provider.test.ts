@@ -86,11 +86,60 @@ describe("NodeProcessProvider", () => {
 			}),
 		);
 		expect(managed.id).toBeTruthy();
+		expect(managed.stdin).toBeNull();
+		expect(managed.stdout).toBeNull();
+		expect(managed.stderr).toBeNull();
 		expect(await managed.exit).toEqual({ code: 0, signal: null });
 		expect(JSON.parse(await readFile(output, "utf8"))).toEqual({
 			argv: ["argument with spaces", output],
 			cwd,
 		});
+	});
+
+	it("pipes stdin, stdout, and stderr independently", async () => {
+		const payload = "stdin-payload-".repeat(2048);
+		const script =
+			"let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => { process.stdout.write(input); process.stderr.write('stderr:' + input); })";
+		const managed = track(
+			await provider.launch({
+				executable: process.execPath,
+				args: ["-e", script],
+				cwd: os.tmpdir(),
+				env: { PATH: process.env.PATH ?? "" },
+				stdio: "pipe",
+			}),
+		);
+		if (!managed.stdin || !managed.stdout || !managed.stderr) {
+			throw new Error("Pipe mode must expose all child streams");
+		}
+		const stdin = managed.stdin;
+		const collect = async (stream: NodeJS.ReadableStream) => {
+			const chunks: Buffer[] = [];
+			for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+			return Buffer.concat(chunks).toString("utf8");
+		};
+		const stdout = collect(managed.stdout);
+		const stderr = collect(managed.stderr);
+		stdin.end(payload);
+		const [result, output, errorOutput] = await Promise.all([
+			managed.exit,
+			stdout,
+			stderr,
+		]);
+		expect(result).toEqual({ code: 0, signal: null });
+		expect(output).toBe(payload);
+		expect(errorOutput).toBe(`stderr:${payload}`);
+	});
+
+	it("rejects an invalid runtime stdio mode", async () => {
+		await expect(
+			provider.launch({
+				executable: process.execPath,
+				args: [],
+				cwd: os.tmpdir(),
+				stdio: "inherit" as "ignore",
+			}),
+		).rejects.toThrow("Invalid process stdio mode");
 	});
 
 	it("does not inherit ambient environment when env is omitted", async () => {
