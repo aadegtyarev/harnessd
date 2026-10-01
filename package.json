@@ -1,0 +1,33 @@
+{
+	"name": "harnessd",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"bin": {
+		"harnessd": "./dist/src/cli.js"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"typecheck": "tsc --noEmit -p tsconfig.json",
+		"test": "vitest run --exclude \"**/dist/**\"",
+		"test:watch": "vitest --exclude \"**/dist/**\"",
+		"lint": "biome check src test package.json tsconfig.json",
+		"format": "biome format --write src test package.json tsconfig.json",
+		"format:check": "biome format src test package.json tsconfig.json"
+	},
+	"dependencies": {
+		"better-sqlite3": "^12.4.1",
+		"grammy": "^1.38.3",
+		"zod": "^4.1.12"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.2.4",
+		"@types/better-sqlite3": "^7.6.13",
+		"@types/node": "^24.7.2",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.11"
+	}
+}
