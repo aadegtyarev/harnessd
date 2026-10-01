@@ -34,13 +34,32 @@ export function resolveStateDirectory(configuredPath?: string): string {
 }
 
 function requireAbsoluteStateDirectory(value: string, source: string): string {
-	if (!path.isAbsolute(value)) {
+	return validateStateDirectoryPath(value, source);
+}
+
+export function validateStateDirectoryPath(
+	value: string,
+	source: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const pathApi = platform === "win32" ? path.win32 : path.posix;
+	const isFullyQualifiedWindowsPath =
+		platform !== "win32" ||
+		/^[A-Za-z]:[\\/]/.test(value) ||
+		/^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(value) ||
+		/^\\\\\?\\[A-Za-z]:[\\/]/i.test(value) ||
+		/^\\\\\?\\UNC\\[^\\/]+\\[^\\/]+(?:\\|$)/i.test(value);
+	if (!pathApi.isAbsolute(value) || !isFullyQualifiedWindowsPath) {
+		const requirement =
+			platform === "win32"
+				? "a fully qualified Windows drive or UNC path"
+				: "an absolute path";
 		throw new InvalidStateDirectoryError(
 			value,
-			`${source} must be an absolute path; relative state paths depend on process cwd`,
+			`${source} must be ${requirement}; state paths cannot depend on process cwd`,
 		);
 	}
-	return path.normalize(value);
+	return pathApi.normalize(value);
 }
 
 async function assertPrivateStateDirectory(directory: string): Promise<void> {

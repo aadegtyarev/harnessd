@@ -29,6 +29,7 @@ import {
 	SqliteSessionStore,
 	UnsupportedCapabilityError,
 } from "../src/core/index.js";
+import { validateStateDirectoryPath } from "../src/core/session-store.js";
 
 const tempDirectories: string[] = [];
 async function temporaryDirectory(): Promise<string> {
@@ -384,6 +385,34 @@ describe("SQLite session management", () => {
 			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME;
 			else process.env.XDG_STATE_HOME = originalXdg;
 		}
+	});
+
+	it("rejects drive-less rooted Windows state paths but accepts drive and UNC paths", () => {
+		expect(() => validateStateDirectoryPath("/state", "test", "win32")).toThrow(
+			InvalidStateDirectoryError,
+		);
+		expect(() =>
+			validateStateDirectoryPath("\\state", "test", "win32"),
+		).toThrow(InvalidStateDirectoryError);
+		expect(validateStateDirectoryPath("C:\\state", "test", "win32")).toBe(
+			"C:\\state",
+		);
+		expect(
+			validateStateDirectoryPath("\\\\server\\share\\state", "test", "win32"),
+		).toBe("\\\\server\\share\\state");
+		expect(
+			validateStateDirectoryPath("//server/share/state", "test", "win32"),
+		).toBe("\\\\server\\share\\state");
+		expect(
+			validateStateDirectoryPath("\\\\?\\C:\\state", "test", "win32"),
+		).toBe("\\\\?\\C:\\state");
+		expect(
+			validateStateDirectoryPath(
+				"\\\\?\\UNC\\server\\share\\state",
+				"test",
+				"win32",
+			),
+		).toBe("\\\\?\\UNC\\server\\share\\state");
 	});
 
 	it("rejects an existing POSIX state directory with group or other access", async () => {
