@@ -17,6 +17,7 @@ import type {
 	SessionId,
 } from "../src/core/types.js";
 import {
+	PiControlError,
 	PiRpcHarnessAdapter,
 	UncertainInputDeliveryError,
 } from "../src/harness/index.js";
@@ -37,6 +38,16 @@ interface FakeOptions {
 	readonly abortSuccess?: boolean;
 	readonly exitOnTerm?: boolean;
 	readonly missingStream?: "stdin" | "stdout" | "stderr";
+	readonly rpcResponses?: Readonly<
+		Record<
+			string,
+			{
+				readonly success?: boolean;
+				readonly data?: unknown;
+				readonly error?: unknown;
+			}
+		>
+	>;
 	readonly beforeResponse?: (
 		command: Record<string, unknown>,
 		stdout: PassThrough,
@@ -199,7 +210,10 @@ function fakeProvider(options: FakeOptions = {}) {
 								? { data: { disposition: options.promptDisposition } }
 								: {}),
 						};
-			stdout.write(`${JSON.stringify(response)}\r\n`);
+			const override = options.rpcResponses?.[String(command.type)];
+			stdout.write(
+				`${JSON.stringify(override ? { ...response, ...override } : response)}\r\n`,
+			);
 		}
 	});
 	stdin.on("end", () => {
@@ -276,6 +290,11 @@ describe("PiRpcHarnessAdapter", () => {
 			"harness.stop",
 			"harness.resume",
 			"harness.cancel",
+			"harness.session.status",
+			"harness.model.list",
+			"harness.model.set",
+			"harness.effort.list",
+			"harness.effort.set",
 			"input.submit",
 		]);
 		expect(fake.launchRequest).toMatchObject({
@@ -286,6 +305,123 @@ describe("PiRpcHarnessAdapter", () => {
 			stdio: "pipe",
 		});
 		expect(instance.nativeSessionId).toBe("native-exact");
+		await instance.shutdown();
+	});
+
+	it("uses documented Pi RPC commands for live state, models, effort, and aggregate usage", async () => {
+		const fake = fakeProvider({
+			rpcResponses: {
+				get_state: {
+					data: {
+						sessionId: "native-exact",
+						model: { provider: "openai", id: "gpt-current", name: "Current" },
+						thinkingLevel: "medium",
+					},
+				},
+				get_session_stats: {
+					data: {
+						tokens: { total: 42, input: 20, output: 22, cacheRead: 4 },
+						cost: 0.123456,
+						sessionFile: "/must/not/be/exposed/session.jsonl",
+					},
+				},
+				get_available_models: {
+					data: {
+						models: [
+							{ provider: "openai", id: "gpt-current", name: "Current" },
+							{ provider: "openai", id: "gpt-next", name: "Next" },
+						],
+					},
+				},
+				get_available_thinking_levels: {
+					data: { levels: ["low", "medium", "high"] },
+				},
+				set_model: {
+					data: { provider: "openai", id: "gpt-next", name: "Next" },
+				},
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "/bin/pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const status = await instance.control?.getStatus();
+		expect(status).toEqual({
+			model: { provider: "openai", id: "gpt-current", name: "Current" },
+			effort: "medium",
+			usage: {
+				totalTokens: 42,
+				inputTokens: 20,
+				outputTokens: 22,
+				cacheReadTokens: 4,
+				costUsd: 0.123456,
+			},
+		});
+		expect(JSON.stringify(status)).not.toContain("session.jsonl");
+		expect(await instance.control?.listModels()).toHaveLength(2);
+		expect(await instance.control?.listEfforts()).toEqual([
+			"low",
+			"medium",
+			"high",
+		]);
+		expect(await instance.control?.setModel("openai", "gpt-next")).toEqual({
+			provider: "openai",
+			id: "gpt-next",
+			name: "Next",
+		});
+		await instance.control?.setEffort("high");
+		await expect(instance.control?.setEffort("xhigh")).rejects.toMatchObject({
+			code: "EFFORT_NOT_SUPPORTED",
+		});
+		expect(
+			fake.commands.some(
+				(command) =>
+					command.type === "set_thinking_level" && command.level === "xhigh",
+			),
+		).toBe(false);
+		expect(fake.commands).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "get_session_stats" }),
+				expect.objectContaining({ type: "get_available_models" }),
+				expect.objectContaining({ type: "get_available_thinking_levels" }),
+				expect.objectContaining({
+					type: "set_model",
+					provider: "openai",
+					modelId: "gpt-next",
+				}),
+				expect.objectContaining({ type: "set_thinking_level", level: "high" }),
+			]),
+		);
+		await instance.shutdown();
+	});
+
+	it("turns failed RPC control replies into safe errors without echoing Pi details", async () => {
+		const fake = fakeProvider({
+			rpcResponses: {
+				get_available_models: {
+					data: {
+						models: [{ provider: "openai", id: "gpt-next", name: "Next" }],
+					},
+				},
+				set_model: { success: false, error: "private endpoint detail" },
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "/bin/pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await expect(
+			instance.control?.setModel("openai", "gpt-next"),
+		).rejects.toMatchObject({ code: "PI_CONTROL_FAILED" });
+		await expect(
+			instance.control?.setModel("openai", "unknown"),
+		).rejects.toMatchObject({ code: "MODEL_NOT_AVAILABLE" });
+		try {
+			await instance.control?.setModel("openai", "gpt-next");
+		} catch (error) {
+			expect(error).toBeInstanceOf(PiControlError);
+			expect(String(error)).not.toContain("private endpoint detail");
+		}
 		await instance.shutdown();
 	});
 

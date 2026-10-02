@@ -20,7 +20,10 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
-import { UncertainInputDeliveryError } from "../src/harness/pi-rpc-harness.js";
+import {
+	PiControlError,
+	UncertainInputDeliveryError,
+} from "../src/harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "../src/process/node-process-provider.js";
 
 const dirs: string[] = [];
@@ -279,16 +282,55 @@ describe("application runtime", () => {
 	it("returns correlated typed results and rejects dispatch once closing starts", async () => {
 		let dispatch!: RuntimeDispatch;
 		const sent: string[] = [];
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const harness: HarnessAdapter = {
 			descriptor: {
 				id: "mock" as never,
-				capabilities: ["harness.launch", "harness.stop", "input.submit"],
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.session.status",
+					"harness.model.list",
+					"harness.model.set",
+					"harness.effort.list",
+					"harness.effort.set",
+					"input.submit",
+				],
 			},
 			async launch() {
 				return {
 					processId: "proc" as never,
 					exit: new Promise(() => {}),
 					events: (async function* () {})(),
+					control: {
+						async getSelection() {
+							return {
+								model: { provider: "openai", id: "gpt-test", name: "Test" },
+								effort: "medium",
+							};
+						},
+						async getStatus() {
+							return {
+								model: { provider: "openai", id: "gpt-test", name: "Test" },
+								effort: "medium",
+								usage: { totalTokens: 321, costUsd: 0.125 },
+							};
+						},
+						async listModels() {
+							return [{ provider: "openai", id: "gpt-test", name: "Test" }];
+						},
+						async listEfforts() {
+							return ["low", "medium", "high"];
+						},
+						async setModel(provider, modelId) {
+							return { provider, id: modelId, name: modelId };
+						},
+						async setEffort() {
+							throw new PiControlError("EFFORT_NOT_SUPPORTED", {
+								cause: new Error("sensitive provider response"),
+							});
+						},
+					},
 					async send(input) {
 						if (input.text === "uncertain private prompt")
 							throw new UncertainInputDeliveryError(input.id);
@@ -363,6 +405,87 @@ describe("application runtime", () => {
 			ok: true,
 			value: created.value,
 		});
+		const liveStatus = await dispatch({
+			requestId: "request-status",
+			principalId: "operator",
+			kind: "session_status",
+			sessionId: created.value.id,
+		});
+		expect(liveStatus).toMatchObject({
+			ok: true,
+			value: {
+				session: { id: created.value.id },
+				live: {
+					model: { provider: "openai", id: "gpt-test" },
+					effort: "medium",
+					usage: { totalTokens: 321, costUsd: 0.125 },
+				},
+			},
+		});
+		const models = await dispatch({
+			requestId: "request-model-list",
+			principalId: "operator",
+			kind: "model_list",
+			sessionId: created.value.id,
+		});
+		expect(models).toMatchObject({
+			ok: true,
+			value: {
+				current: { provider: "openai", id: "gpt-test" },
+				models: [{ provider: "openai", id: "gpt-test" }],
+			},
+		});
+		const modelChange = await dispatch({
+			requestId: "request-model-set",
+			principalId: "operator",
+			kind: "model_set",
+			sessionId: created.value.id,
+			provider: "openai",
+			modelId: "gpt-next",
+			effort: "high",
+		});
+		expect(modelChange).toMatchObject({
+			ok: true,
+			value: {
+				model: { id: "gpt-next" },
+				effort: "high",
+				effortConfirmed: false,
+			},
+		});
+		const effortLevels = await dispatch({
+			requestId: "request-effort-list",
+			principalId: "operator",
+			kind: "effort_list",
+			sessionId: created.value.id,
+		});
+		expect(effortLevels).toMatchObject({
+			ok: true,
+			value: { current: "medium", levels: ["low", "medium", "high"] },
+		});
+		const effortFailure = await dispatch({
+			requestId: "request-effort-set",
+			principalId: "operator",
+			kind: "effort_set",
+			sessionId: created.value.id,
+			effort: "xhigh",
+		});
+		expect(effortFailure).toMatchObject({
+			ok: false,
+			error: {
+				code: "EFFORT_NOT_SUPPORTED",
+				message:
+					"Effort is not supported by this model; use /effort to see valid levels.",
+			},
+		});
+		expect(JSON.stringify(effortFailure)).not.toContain(
+			"sensitive provider response",
+		);
+		expect(journal).toHaveBeenCalledWith(
+			"harnessd: Pi control failed (EFFORT_NOT_SUPPORTED)",
+		);
+		expect(journal.mock.calls.flat().join(" ")).not.toContain(
+			"sensitive provider response",
+		);
 		const input = await dispatch({
 			requestId: "request-submit",
 			principalId: "operator",

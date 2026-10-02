@@ -244,6 +244,189 @@ describe("SQLite session management", () => {
 		store.close();
 	});
 
+	it("routes live controls by session and reports partial model changes without persisting them", async () => {
+		const state = await temporaryDirectory();
+		const calls: string[] = [];
+		const harness = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.session.status",
+				"harness.model.list",
+				"harness.model.set",
+				"harness.effort.list",
+				"harness.effort.set",
+			],
+			launch: async (request) => ({
+				processId: `control-${request.sessionId}` as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				control: {
+					async getSelection() {
+						return {
+							model: { provider: "openai", id: "gpt-test", name: "Test" },
+							effort: "medium",
+						};
+					},
+					async getStatus() {
+						calls.push(`status:${request.sessionId}`);
+						return {
+							model: { provider: "openai", id: "gpt-test", name: "Test" },
+							effort: "medium",
+							usage: { totalTokens: 123, costUsd: 0.01 },
+						};
+					},
+					async listModels() {
+						calls.push(`models:${request.sessionId}`);
+						return [{ provider: "openai", id: "gpt-test", name: "Test" }];
+					},
+					async listEfforts() {
+						calls.push(`efforts:${request.sessionId}`);
+						return ["low", "medium", "high"];
+					},
+					async setModel(provider, modelId) {
+						calls.push(`model:${request.sessionId}:${provider}/${modelId}`);
+						return { provider, id: modelId, name: modelId };
+					},
+					async setEffort(level) {
+						calls.push(`effort:${request.sessionId}:${level}`);
+						throw new Error("private Pi detail");
+					},
+				},
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		}).harness;
+		const store = await SqliteSessionStore.open(state);
+		const manager = new SessionManager(store, [harness]);
+		const sessionA = await manager.create({
+			id: "control-a",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const sessionB = await manager.create({
+			id: "control-b",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const change = await manager.setModel(
+			sessionA.id,
+			"openai",
+			"gpt-next",
+			"high",
+		);
+		expect(change).toEqual({
+			model: { provider: "openai", id: "gpt-next", name: "gpt-next" },
+			effort: "high",
+			effortConfirmed: false,
+		});
+		expect(calls).toEqual([
+			"model:control-a:openai/gpt-next",
+			"effort:control-a:high",
+		]);
+		const status = await manager.getSessionStatus(sessionA.id);
+		expect(status.live?.usage).toEqual({ totalTokens: 123, costUsd: 0.01 });
+		expect((await manager.get(sessionA.id)).cwd).toBe(os.homedir());
+		await manager.stop(sessionA.id);
+		const stopped = await manager.getSessionStatus(sessionA.id);
+		expect(stopped.live).toBeUndefined();
+		expect(stopped.session).not.toHaveProperty("model");
+		await manager.stop(sessionB.id);
+		store.close();
+	});
+
+	it("enforces each declared model and effort capability before calling controls", async () => {
+		const controlCapabilities = [
+			"harness.model.list",
+			"harness.model.set",
+			"harness.effort.list",
+			"harness.effort.set",
+		] as const;
+		const cases: {
+			missing: (typeof controlCapabilities)[number];
+			run(manager: SessionManager, id: SessionId): Promise<unknown>;
+		}[] = [
+			{
+				missing: "harness.model.list",
+				run: (manager, id) => manager.listModels(id),
+			},
+			{
+				missing: "harness.model.set",
+				run: (manager, id) => manager.setModel(id, "openai", "gpt-next"),
+			},
+			{
+				missing: "harness.effort.list",
+				run: (manager, id) => manager.listEfforts(id),
+			},
+			{
+				missing: "harness.effort.set",
+				run: (manager, id) => manager.setEffort(id, "high"),
+			},
+		];
+		for (const [index, testCase] of cases.entries()) {
+			const calls: string[] = [];
+			const capabilities = [
+				"harness.launch",
+				"harness.stop",
+				...controlCapabilities.filter(
+					(capability) => capability !== testCase.missing,
+				),
+			] as HarnessAdapter["descriptor"]["capabilities"];
+			const harness = harnessPort({
+				capabilities,
+				launch: async () => ({
+					processId: "capability-test" as never,
+					exit: new Promise(() => {}),
+					events: (async function* () {})(),
+					control: {
+						async getSelection() {
+							calls.push("getSelection");
+							return {};
+						},
+						async getStatus() {
+							calls.push("getStatus");
+							return {};
+						},
+						async listModels() {
+							calls.push("listModels");
+							return [];
+						},
+						async listEfforts() {
+							calls.push("listEfforts");
+							return [];
+						},
+						async setModel(provider, id) {
+							calls.push("setModel");
+							return { provider, id, name: id };
+						},
+						async setEffort() {
+							calls.push("setEffort");
+						},
+					},
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				}),
+			}).harness;
+			const store = await SqliteSessionStore.open(await temporaryDirectory());
+			const manager = new SessionManager(store, [harness]);
+			const session = await manager.create({
+				id: `missing-control-${index}`,
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			expect((await manager.getSessionStatus(session.id)).live).toBeUndefined();
+			await expect(testCase.run(manager, session.id)).rejects.toMatchObject({
+				code: "UNSUPPORTED_CAPABILITY",
+				capability: testCase.missing,
+			});
+			expect(calls).toEqual([]);
+			await manager.stop(session.id);
+			store.close();
+		}
+	});
+
 	it("routes cancellation by session and accepted input ID", async () => {
 		const state = await temporaryDirectory();
 		const sessionAId = "cancel-a" as SessionId;

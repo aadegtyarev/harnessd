@@ -124,10 +124,15 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/new [cwd]` | Create a session in `cwd`; defaults to `HARNESSD_DEFAULT_CWD`, or the service's starting directory if unset. |
 | `/use <sessionId>` | Select a session for this private chat. |
 | `/inspect [sessionId]` | Inspect the selected or named session. |
+| `/status` | Show the selected session's folder, model, effort, aggregate tokens, and Pi-estimated cost. |
+| `/model` | List models available to the selected running session. |
+| `/model <provider/modelId> [effort]` | Select an exact model and optionally set its effort. |
+| `/effort` | Show current and available effort levels. |
+| `/effort <level>` | Set effort for the selected running session. |
 | `/stop [sessionId]` | Stop the selected or named session. |
 | `/cancel <inputId>` | Cancel an accepted input in the selected session. |
 
-Plain text is sent to the selected session. Chat selection is in memory only. A restarted service does not reattach prior Pi processes; old session rows may appear stale, and `/use` cannot restore those sessions. The supervisor accepts any existing accessible directory as `cwd`, but `cwd` is not a security boundary.
+Plain text is sent to the selected session. Chat selection is in memory only. A restarted service does not reattach prior Pi processes; old session rows may appear stale, and `/use` cannot restore those sessions. `/status` uses Pi RPC aggregate usage only (no session-file or plugin reads); its cost is an estimate, not provider billing. Live model, effort, tokens, and cost are unavailable when no live Pi instance exists. The supervisor accepts any existing accessible directory as `cwd`, but `cwd` is not a security boundary.
 
 ## Sessions, recovery, and uncertainty
 

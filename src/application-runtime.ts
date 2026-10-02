@@ -16,6 +16,7 @@ import {
 import type { HarnessEvent } from "./core/types.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
+	PiControlError,
 	PiRpcHarnessAdapter,
 	PiStartupError,
 	UncertainInputDeliveryError,
@@ -77,6 +78,15 @@ const safeErrorMessages = new Map([
 		"Pi did not start successfully; check its CLI, runtime, and authentication.",
 	],
 	["UNCERTAIN_INPUT_DELIVERY", "Input delivery is uncertain"],
+	[
+		"PI_CONTROL_FAILED",
+		"Pi did not confirm this control request; check /status before retrying.",
+	],
+	["MODEL_NOT_AVAILABLE", "Model is not available; use /model to see choices."],
+	[
+		"EFFORT_NOT_SUPPORTED",
+		"Effort is not supported by this model; use /effort to see valid levels.",
+	],
 ]);
 
 export interface ApplicationRuntimeOptions {
@@ -270,11 +280,40 @@ export class ApplicationRuntime {
 					await this.manager.cancel(request.sessionId, request.inputId);
 					value = undefined as typeof value;
 					break;
+				case "session_status":
+					value = (await this.manager.getSessionStatus(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "model_list":
+					value = (await this.manager.listModels(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "model_set":
+					value = (await this.manager.setModel(
+						request.sessionId,
+						request.provider,
+						request.modelId,
+						request.effort,
+					)) as typeof value;
+					break;
+				case "effort_list":
+					value = (await this.manager.listEfforts(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "effort_set":
+					await this.manager.setEffort(request.sessionId, request.effort);
+					value = undefined as typeof value;
+					break;
 			}
 			return { requestId: request.requestId, ok: true, value };
 		} catch (error) {
 			if (error instanceof PiStartupError)
 				console.error(`harnessd: Pi startup failed (${error.code})`);
+			if (error instanceof PiControlError)
+				console.error(`harnessd: Pi control failed (${error.code})`);
 			let candidate: unknown;
 			try {
 				candidate =

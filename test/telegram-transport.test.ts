@@ -134,7 +134,7 @@ const sessions = new Map<string, SessionSummary>([
 	],
 ]);
 function result(request: TransportEvent): TransportResult {
-	let value: readonly SessionSummary[] | SessionSummary | string | undefined;
+	let value: Extract<TransportResult, { readonly ok: true }>["value"];
 	switch (request.kind) {
 		case "list":
 			value = [...sessions.values()];
@@ -158,6 +158,51 @@ function result(request: TransportEvent): TransportResult {
 			break;
 		case "submit":
 			value = "input-1" as never;
+			break;
+		case "session_status": {
+			const session = sessions.get(request.sessionId);
+			if (!session)
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: {
+						code: "SESSION_NOT_FOUND",
+						message: "Session was not found",
+					},
+				};
+			value = {
+				session,
+				live: {
+					model: { provider: "openai", id: "gpt-test", name: "Test" },
+					effort: "medium",
+					usage: { totalTokens: 1234, costUsd: 0.125 },
+				},
+			};
+			break;
+		}
+		case "model_list":
+			value = {
+				models: [{ provider: "openai", id: "gpt-test", name: "Test" }],
+				current: { provider: "openai", id: "gpt-test", name: "Test" },
+			};
+			break;
+		case "model_set":
+			value = {
+				model: {
+					provider: request.provider,
+					id: request.modelId,
+					name: request.modelId,
+				},
+				...(request.effort !== undefined
+					? { effort: request.effort, effortConfirmed: true }
+					: {}),
+			};
+			break;
+		case "effort_list":
+			value = { levels: ["low", "medium", "high"], current: "medium" };
+			break;
+		case "effort_set":
+			value = undefined;
 			break;
 		default:
 			value = undefined;
@@ -234,6 +279,137 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/sessions", { userId: 42, chatType: "channel" });
 		expect(requests).toEqual([]);
 		expect(bot.sent).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("routes model, effort, and status commands to each chat's selected session", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use other");
+		await bot.update(100, "/status");
+		await bot.update(100, "/model");
+		await bot.update(101, "/model openai/gpt-next high");
+		await bot.update(100, "/effort");
+		await bot.update(101, "/effort high");
+		await bot.update(101, "/status");
+		await bot.update(101, "prompt for other");
+		expect(requests.map(({ kind }) => kind)).toEqual([
+			"inspect",
+			"inspect",
+			"session_status",
+			"model_list",
+			"model_set",
+			"effort_list",
+			"effort_set",
+			"session_status",
+			"submit",
+		]);
+		expect(requests[2]).toMatchObject({
+			kind: "session_status",
+			sessionId: "sid",
+		});
+		expect(requests[3]).toMatchObject({ kind: "model_list", sessionId: "sid" });
+		expect(requests[4]).toMatchObject({
+			kind: "model_set",
+			sessionId: "other",
+			provider: "openai",
+			modelId: "gpt-next",
+			effort: "high",
+		});
+		expect(requests[5]).toMatchObject({
+			kind: "effort_list",
+			sessionId: "sid",
+		});
+		expect(requests[6]).toMatchObject({
+			kind: "effort_set",
+			sessionId: "other",
+			effort: "high",
+		});
+		expect(requests[8]).toMatchObject({ kind: "submit", sessionId: "other" });
+		expect(
+			bot.sent.some(
+				({ chatId, text }) => chatId === 100 && text.includes("Tokens: 1,234"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 100 && text.includes("openai/gpt-test"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 100 &&
+					text.includes("Effort levels (current: medium): low, medium, high"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 101 &&
+					text.includes("Switched to openai/gpt-next; effort set to high."),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("reports partial model selection and saved status when live fields are unavailable", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "model_set")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: {
+							model: {
+								provider: request.provider,
+								id: request.modelId,
+								name: request.modelId,
+							},
+							effort: request.effort,
+							effortConfirmed: false,
+						},
+					};
+				if (request.kind === "session_status") {
+					const session = sessions.get(request.sessionId);
+					if (!session)
+						return {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "SESSION_NOT_FOUND",
+								message: "Session was not found",
+							},
+						};
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: { session: { ...session, status: "stopped" } },
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/model openai/gpt-next high");
+		await bot.update(42, "/status");
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Pi did not confirm effort high"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ text }) =>
+					text.includes("Folder: /work") &&
+					text.includes("Session: stopped") &&
+					text.includes("Model: unavailable") &&
+					text.includes("Live Pi data: unavailable"),
+			),
+		).toBe(true);
 		await adapter.stop();
 	});
 

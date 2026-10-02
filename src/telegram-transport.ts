@@ -3,6 +3,11 @@ import { open, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { Bot } from "grammy";
 import type {
+	HarnessEffortCatalog,
+	HarnessModelCatalog,
+	HarnessModelChangeResult,
+	HarnessModelInfo,
+	HarnessSessionStatus,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventSubscription,
@@ -194,6 +199,38 @@ function isCode(error: unknown, code: string): boolean {
 }
 function formatSession(session: SessionSummary): string {
 	return `${session.id} · ${session.status} · ${session.cwd}`;
+}
+function oneLine(value: string): string {
+	return [...value]
+		.map((character) => {
+			const code = character.codePointAt(0) ?? 0;
+			return code < 32 || code === 127 ? " " : character;
+		})
+		.join("")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+function modelId(model: HarnessModelInfo): string {
+	return `${oneLine(model.provider)}/${oneLine(model.id)}`;
+}
+function formatCount(value: number): string {
+	return Math.round(value).toLocaleString("en-US");
+}
+function formatStatus(status: HarnessSessionStatus): string {
+	const { session, live } = status;
+	const lines = [
+		`Folder: ${oneLine(session.cwd)}`,
+		`Session: ${session.status}`,
+		`Model: ${live?.model ? modelId(live.model) : "unavailable"}`,
+		`Effort: ${live?.effort ? oneLine(live.effort) : "unavailable"}`,
+	];
+	const usage = live?.usage;
+	lines.push(
+		`Tokens: ${usage?.totalTokens !== undefined ? formatCount(usage.totalTokens) : "unavailable"}`,
+		`Estimated cost: ${usage?.costUsd !== undefined ? `~$${usage.costUsd.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}` : "unavailable"}`,
+	);
+	if (!live) lines.push("Live Pi data: unavailable for this session.");
+	return lines.join("\n");
 }
 function chunks(text: string): string[] {
 	return splitChunks(text, TELEGRAM_LIMIT);
@@ -516,8 +553,99 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (name === "/help" && args.length === 0)
 			return this.sendDirect(
 				chatId,
-				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/stop [sessionId]\n/cancel <inputId>\n/help",
+				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/cancel <inputId>\n/help",
 			);
+		if (name === "/status" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "session_status",
+				sessionId,
+			});
+			return this.sendDirect(
+				chatId,
+				result.ok
+					? formatStatus(result.value as HarnessSessionStatus)
+					: result.error.message,
+			);
+		}
+		if (name === "/model" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "model_list",
+				sessionId,
+			});
+			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			const catalog = result.value as HarnessModelCatalog;
+			const choices = catalog.models.map((model) => {
+				const label = modelId(model);
+				const name = oneLine(model.name);
+				return `• ${label}${name && name !== model.id ? ` — ${name}` : ""}${catalog.current && model.provider === catalog.current.provider && model.id === catalog.current.id ? " (current)" : ""}`;
+			});
+			return this.sendDirect(
+				chatId,
+				choices.length ? choices.join("\n") : "No models available.",
+			);
+		}
+		if (name === "/model" && args.length >= 1 && args.length <= 2) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const slash = args[0].indexOf("/");
+			if (slash <= 0 || slash === args[0].length - 1)
+				return this.sendDirect(
+					chatId,
+					"Usage: /model <provider/modelId> [effort]",
+				);
+			const effort = args[1];
+			const result = await this.request(sender, {
+				kind: "model_set",
+				sessionId,
+				provider: args[0].slice(0, slash),
+				modelId: args[0].slice(slash + 1),
+				...(effort !== undefined ? { effort } : {}),
+			});
+			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			const change = result.value as HarnessModelChangeResult;
+			if (change.effortConfirmed === false)
+				return this.sendDirect(
+					chatId,
+					`Switched to ${modelId(change.model)}, but Pi did not confirm effort ${oneLine(effort ?? "")}. Check /status before retrying.`,
+				);
+			return this.sendDirect(
+				chatId,
+				effort === undefined
+					? `Switched to ${modelId(change.model)}.`
+					: `Switched to ${modelId(change.model)}; effort set to ${oneLine(effort)}.`,
+			);
+		}
+		if (name === "/effort" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "effort_list",
+				sessionId,
+			});
+			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			const catalog = result.value as HarnessEffortCatalog;
+			return this.sendDirect(
+				chatId,
+				`Effort levels${catalog.current ? ` (current: ${oneLine(catalog.current)})` : ""}: ${catalog.levels.map(oneLine).join(", ") || "unavailable"}`,
+			);
+		}
+		if (name === "/effort" && args.length === 1) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "effort_set",
+				sessionId,
+				effort: args[0],
+			});
+			return this.sendDirect(
+				chatId,
+				result.ok ? `Effort set to ${oneLine(args[0])}.` : result.error.message,
+			);
+		}
 		if (name === "/sessions" && args.length === 0) {
 			const result = await this.request(sender, { kind: "list" });
 			return this.sendDirect(

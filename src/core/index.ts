@@ -11,8 +11,17 @@ export {
 } from "./errors.js";
 export type {
 	HarnessAdapter,
+	HarnessControl,
+	HarnessEffortCatalog,
 	HarnessInstance,
 	HarnessLaunchRequest,
+	HarnessLiveStatus,
+	HarnessModelCatalog,
+	HarnessModelChangeResult,
+	HarnessModelInfo,
+	HarnessSelection,
+	HarnessSessionStatus,
+	HarnessUsageStats,
 	InputObserver,
 	InputPort,
 	ManagedProcess,

@@ -71,6 +71,40 @@ export type TransportEvent =
 			readonly kind: "cancel";
 			readonly sessionId: SessionId;
 			readonly inputId: InputId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "session_status";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "model_list";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "model_set";
+			readonly sessionId: SessionId;
+			readonly provider: string;
+			readonly modelId: string;
+			readonly effort?: string;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "effort_list";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "effort_set";
+			readonly sessionId: SessionId;
+			readonly effort: string;
 	  };
 
 export type TransportResult =
@@ -80,6 +114,10 @@ export type TransportResult =
 			readonly value:
 				| readonly SessionSummary[]
 				| SessionSummary
+				| HarnessSessionStatus
+				| HarnessModelCatalog
+				| HarnessEffortCatalog
+				| HarnessModelChangeResult
 				| InputId
 				| undefined;
 	  }
@@ -113,6 +151,60 @@ export interface HarnessLaunchRequest {
 	readonly nativeSessionId?: string;
 }
 
+export interface HarnessModelInfo {
+	readonly provider: string;
+	readonly id: string;
+	readonly name: string;
+}
+
+export interface HarnessUsageStats {
+	readonly totalTokens?: number;
+	readonly inputTokens?: number;
+	readonly outputTokens?: number;
+	readonly cacheReadTokens?: number;
+	readonly cacheWriteTokens?: number;
+	readonly costUsd?: number;
+}
+
+export interface HarnessSelection {
+	readonly model?: HarnessModelInfo;
+	readonly effort?: string;
+}
+
+export interface HarnessLiveStatus extends HarnessSelection {
+	readonly usage?: HarnessUsageStats;
+}
+
+export interface HarnessControl {
+	getSelection(): Promise<HarnessSelection>;
+	getStatus(): Promise<HarnessLiveStatus>;
+	listModels(): Promise<readonly HarnessModelInfo[]>;
+	listEfforts(): Promise<readonly string[]>;
+	setModel(provider: string, modelId: string): Promise<HarnessModelInfo>;
+	setEffort(level: string): Promise<void>;
+}
+
+export interface HarnessSessionStatus {
+	readonly session: SessionSummary;
+	readonly live?: HarnessLiveStatus;
+}
+
+export interface HarnessModelCatalog {
+	readonly models: readonly HarnessModelInfo[];
+	readonly current?: HarnessModelInfo;
+}
+
+export interface HarnessEffortCatalog {
+	readonly levels: readonly string[];
+	readonly current?: string;
+}
+
+export interface HarnessModelChangeResult {
+	readonly model: HarnessModelInfo;
+	readonly effort?: string;
+	readonly effortConfirmed?: boolean;
+}
+
 export interface HarnessInstance {
 	readonly processId: ProcessId;
 	readonly exit: Promise<{
@@ -121,6 +213,7 @@ export interface HarnessInstance {
 	}>;
 	readonly nativeSessionId?: string;
 	readonly events: AsyncIterable<HarnessEvent>;
+	readonly control?: HarnessControl;
 	send(input: Input): Promise<void>;
 	cancel(inputId: InputId): Promise<void>;
 	shutdown(): Promise<void>;

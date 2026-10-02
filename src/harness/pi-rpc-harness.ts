@@ -6,8 +6,13 @@ import type { Writable } from "node:stream";
 import { requireCapability } from "../core/errors.js";
 import type {
 	HarnessAdapter as HarnessAdapterPort,
+	HarnessControl,
 	HarnessInstance,
 	HarnessLaunchRequest,
+	HarnessLiveStatus,
+	HarnessModelInfo,
+	HarnessSelection,
+	HarnessUsageStats,
 	ManagedProcess,
 	ProcessProvider,
 } from "../core/ports.js";
@@ -59,6 +64,21 @@ export class PiStartupError extends Error {
 	) {
 		super("Pi RPC startup failed", options);
 		this.name = "PiStartupError";
+	}
+}
+
+export type PiControlErrorCode =
+	| "PI_CONTROL_FAILED"
+	| "MODEL_NOT_AVAILABLE"
+	| "EFFORT_NOT_SUPPORTED";
+
+export class PiControlError extends Error {
+	constructor(
+		readonly code: PiControlErrorCode,
+		options?: ErrorOptions,
+	) {
+		super("Pi session control request failed", options);
+		this.name = "PiControlError";
 	}
 }
 
@@ -197,6 +217,11 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			"harness.stop",
 			"harness.resume",
 			"harness.cancel",
+			"harness.session.status",
+			"harness.model.list",
+			"harness.model.set",
+			"harness.effort.list",
+			"harness.effort.set",
 			"input.submit",
 		] as const,
 	};
@@ -344,9 +369,61 @@ interface ActiveInput {
 	uncertainReported: boolean;
 	canceling: boolean;
 }
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+function modelInfo(value: unknown): HarnessModelInfo | undefined {
+	const model = recordValue(value);
+	if (
+		!model ||
+		typeof model.provider !== "string" ||
+		typeof model.id !== "string"
+	)
+		return undefined;
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: typeof model.name === "string" ? model.name : model.id,
+	};
+}
+function safeCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: undefined;
+}
+function usageStats(value: unknown): HarnessUsageStats | undefined {
+	const stats = recordValue(value);
+	if (!stats) return undefined;
+	const tokens = recordValue(stats.tokens);
+	const totalTokens = safeCount(tokens?.total);
+	const inputTokens = safeCount(tokens?.input);
+	const outputTokens = safeCount(tokens?.output);
+	const cacheReadTokens = safeCount(tokens?.cacheRead);
+	const cacheWriteTokens = safeCount(tokens?.cacheWrite);
+	const costUsd = safeCount(stats.cost);
+	const usage: HarnessUsageStats = {
+		...(totalTokens !== undefined ? { totalTokens } : {}),
+		...(inputTokens !== undefined ? { inputTokens } : {}),
+		...(outputTokens !== undefined ? { outputTokens } : {}),
+		...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+		...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+		...(costUsd !== undefined ? { costUsd } : {}),
+	};
+	return Object.keys(usage).length ? usage : undefined;
+}
 class PiRpcInstance implements HarnessInstance {
 	readonly processId: ManagedProcess["id"];
 	readonly exit: ManagedProcess["exit"];
+	readonly control: HarnessControl = {
+		getSelection: () => this.getControlSelection(),
+		getStatus: () => this.getControlStatus(),
+		listModels: () => this.listModels(),
+		listEfforts: () => this.listEfforts(),
+		setModel: (provider, modelId) => this.setModel(provider, modelId),
+		setEffort: (level) => this.setEffort(level),
+	};
 	private readonly queue: HarnessEvent[] = [];
 	private readonly waiters: ((result: IteratorResult<HarnessEvent>) => void)[] =
 		[];
@@ -400,6 +477,89 @@ class PiRpcInstance implements HarnessInstance {
 	}
 	get nativeSessionId(): string | undefined {
 		return this.nativeId;
+	}
+	private async controlData(
+		command: string,
+		extra: Record<string, unknown> = {},
+	): Promise<Record<string, unknown>> {
+		let response: Record<string, unknown>;
+		try {
+			response = await this.command(command, extra);
+		} catch (error) {
+			throw new PiControlError("PI_CONTROL_FAILED", { cause: error });
+		}
+		const data = recordValue(response.data);
+		if (response.success !== true || !data)
+			throw new PiControlError("PI_CONTROL_FAILED");
+		return data;
+	}
+	private async getControlSelection(): Promise<HarnessSelection> {
+		const state = await this.controlData("get_state");
+		const model =
+			state.model === undefined ? undefined : modelInfo(state.model);
+		if (state.model !== undefined && !model)
+			throw new PiControlError("PI_CONTROL_FAILED");
+		return {
+			...(model ? { model } : {}),
+			...(typeof state.thinkingLevel === "string"
+				? { effort: state.thinkingLevel }
+				: {}),
+		};
+	}
+	private async getControlStatus(): Promise<HarnessLiveStatus> {
+		const [selection, stats] = await Promise.all([
+			this.getControlSelection(),
+			this.controlData("get_session_stats"),
+		]);
+		const usage = usageStats(stats);
+		return { ...selection, ...(usage ? { usage } : {}) };
+	}
+	private async listModels(): Promise<readonly HarnessModelInfo[]> {
+		const data = await this.controlData("get_available_models");
+		if (!Array.isArray(data.models))
+			throw new PiControlError("PI_CONTROL_FAILED");
+		const models = data.models.map(modelInfo);
+		if (models.some((model) => model === undefined))
+			throw new PiControlError("PI_CONTROL_FAILED");
+		return models as HarnessModelInfo[];
+	}
+	private async listEfforts(): Promise<readonly string[]> {
+		const data = await this.controlData("get_available_thinking_levels");
+		if (
+			!Array.isArray(data.levels) ||
+			data.levels.some((level) => typeof level !== "string")
+		)
+			throw new PiControlError("PI_CONTROL_FAILED");
+		return data.levels as string[];
+	}
+	private async setModel(
+		provider: string,
+		modelId: string,
+	): Promise<HarnessModelInfo> {
+		const available = await this.listModels();
+		if (
+			!available.some(
+				(model) => model.provider === provider && model.id === modelId,
+			)
+		)
+			throw new PiControlError("MODEL_NOT_AVAILABLE");
+		const data = await this.controlData("set_model", { provider, modelId });
+		const selected = modelInfo(data);
+		if (!selected) throw new PiControlError("PI_CONTROL_FAILED");
+		return selected;
+	}
+	private async setEffort(level: string): Promise<void> {
+		const available = await this.listEfforts();
+		if (!available.includes(level))
+			throw new PiControlError("EFFORT_NOT_SUPPORTED");
+		try {
+			const response = await this.command("set_thinking_level", { level });
+			if (response.success !== true)
+				throw new PiControlError("PI_CONTROL_FAILED");
+		} catch (error) {
+			if (error instanceof PiControlError) throw error;
+			throw new PiControlError("PI_CONTROL_FAILED", { cause: error });
+		}
 	}
 	get events(): AsyncIterable<HarnessEvent> {
 		const self = this;

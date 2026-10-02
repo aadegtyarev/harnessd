@@ -14,9 +14,9 @@
 
 ## Commands and session routing
 
-- Supported commands: `/help`, `/sessions`, `/new [cwd]`, `/use <sessionId>`, `/inspect [sessionId]`, `/stop [sessionId]`, and `/cancel <inputId>`. Plain text submits to the session currently selected by that private chat.
+- Supported commands: `/help`, `/sessions`, `/new [cwd]`, `/use <sessionId>`, `/inspect [sessionId]`, `/status`, `/model [provider/modelId [effort]]`, `/effort [level]`, `/stop [sessionId]`, and `/cancel <inputId>`. Plain text submits to the session currently selected by that private chat. `/model` without arguments lists the selected live session's available models, stable `provider/modelId` identifiers, and current choice; a display name is never used as a selector. `/effort` without arguments lists the current and available levels. Model/effort control commands require a selected running session and return safe errors when unavailable.
 - `/new` treats the entire remaining command text as one `cwd` path; paths with spaces work unquoted, and one matching pair of outer single or double quotes is stripped. Unmatched leading quotes receive a safe syntax hint. It performs no shell expansion or execution. If omitted, `/new` uses `HARNESSD_DEFAULT_CWD` or falls back to the CLI process working directory. Core canonicalizes and validates either path. `/use` inspects before selection, and a failed lookup leaves the existing selection unchanged. Inspect/stop default to the selected session; cancel requires a selected session and exact `InputId`.
-- Selection is volatile and private-chat-scoped. After service restart, use `/use` again. Session IDs and working directories are shown only to authorized chats.
+- Selection is volatile and private-chat-scoped. After service restart, use `/use` again. Session IDs and working directories are shown only to authorized chats. `/status` reports saved cwd/lifecycle plus live model, effort, aggregate token totals, and Pi-reported estimated USD cost; when no live status is available, it marks live fields unavailable. The displayed cost is an estimate, not provider billing, and excludes optional plugin-only per-model/subagent breakdowns. When a model change succeeds but optional effort setting fails, the reply explicitly reports the partial success without claiming rollback.
 
 ## Event presentation and backpressure
 

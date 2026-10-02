@@ -9,7 +9,16 @@ import {
 	SessionNotFoundError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
-import type { HarnessAdapter, HarnessInstance } from "./ports.js";
+import type {
+	HarnessAdapter,
+	HarnessControl,
+	HarnessEffortCatalog,
+	HarnessInstance,
+	HarnessModelCatalog,
+	HarnessModelChangeResult,
+	HarnessSelection,
+	HarnessSessionStatus,
+} from "./ports.js";
 import type { SessionStore } from "./session-store.js";
 import type {
 	AdapterId,
@@ -340,6 +349,106 @@ export class SessionManager {
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
 		await instance.cancel(inputId);
+	}
+
+	async getSessionStatus(id: SessionId): Promise<HarnessSessionStatus> {
+		const session = await this.get(id);
+		const harness = this.harnesses.get(session.harnessId);
+		const instance = this.instances.get(id);
+		if (
+			!harness ||
+			!instance?.control ||
+			session.status !== "running" ||
+			!harness.descriptor.capabilities.includes("harness.session.status")
+		)
+			return { session };
+		return { session, live: await instance.control.getStatus() };
+	}
+
+	async listModels(id: SessionId): Promise<HarnessModelCatalog> {
+		const { control, harness } = await this.requireControl(
+			id,
+			"harness.model.list",
+		);
+		const models = await control.listModels();
+		let current: HarnessSelection | undefined;
+		if (harness.descriptor.capabilities.includes("harness.session.status"))
+			current = await control.getSelection();
+		return {
+			models,
+			...(current?.model ? { current: current.model } : {}),
+		};
+	}
+
+	async listEfforts(id: SessionId): Promise<HarnessEffortCatalog> {
+		const { control, harness } = await this.requireControl(
+			id,
+			"harness.effort.list",
+		);
+		const levels = await control.listEfforts();
+		let current: HarnessSelection | undefined;
+		if (harness.descriptor.capabilities.includes("harness.session.status"))
+			current = await control.getSelection();
+		return {
+			levels,
+			...(current?.effort ? { current: current.effort } : {}),
+		};
+	}
+
+	async setModel(
+		id: SessionId,
+		provider: string,
+		modelId: string,
+		effort?: string,
+	): Promise<HarnessModelChangeResult> {
+		const { control, harness } = await this.requireControl(
+			id,
+			"harness.model.set",
+		);
+		if (effort !== undefined)
+			requireCapability(
+				harness.descriptor.capabilities,
+				"harness.effort.set",
+				harness.descriptor.id,
+			);
+		const model = await control.setModel(provider, modelId);
+		if (effort === undefined) return { model };
+		try {
+			await control.setEffort(effort);
+			return { model, effort, effortConfirmed: true };
+		} catch {
+			return { model, effort, effortConfirmed: false };
+		}
+	}
+
+	async setEffort(id: SessionId, effort: string): Promise<void> {
+		const { control } = await this.requireControl(id, "harness.effort.set");
+		await control.setEffort(effort);
+	}
+
+	private async requireControl(
+		id: SessionId,
+		capability:
+			| "harness.model.list"
+			| "harness.model.set"
+			| "harness.effort.list"
+			| "harness.effort.set",
+	): Promise<{ control: HarnessControl; harness: HarnessAdapter }> {
+		const session = await this.get(id);
+		const harness = this.harnesses.get(session.harnessId);
+		if (!harness)
+			throw new UnsupportedCapabilityError(capability, session.harnessId);
+		requireCapability(
+			harness.descriptor.capabilities,
+			capability,
+			harness.descriptor.id,
+		);
+		const instance = this.instances.get(id);
+		if (!instance || session.status !== "running")
+			throw new SessionNotFoundError(id);
+		if (!instance.control)
+			throw new UnsupportedCapabilityError(capability, harness.descriptor.id);
+		return { control: instance.control, harness };
 	}
 
 	private watchExit(id: SessionId, instance: HarnessInstance): void {
