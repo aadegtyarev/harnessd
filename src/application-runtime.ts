@@ -1,5 +1,6 @@
 import type {
 	HarnessAdapter,
+	ProcessProvider,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventListener,
@@ -20,6 +21,26 @@ import {
 } from "./harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "./process/node-process-provider.js";
 
+export type ExecutionMode = "direct" | "isolated";
+
+export class IsolationUnavailableError extends Error {
+	readonly code = "ISOLATION_UNAVAILABLE";
+
+	constructor() {
+		super("Isolated execution is unavailable");
+		this.name = "IsolationUnavailableError";
+	}
+}
+
+export class InvalidExecutionModeError extends Error {
+	readonly code = "INVALID_EXECUTION_MODE";
+
+	constructor() {
+		super("Execution mode is invalid");
+		this.name = "InvalidExecutionModeError";
+	}
+}
+
 export type ApplicationRequest = TransportEvent;
 export type ApplicationResult = TransportResult;
 export type RuntimeDispatch = (
@@ -39,6 +60,8 @@ const safeErrorMessages = new Map([
 
 export interface ApplicationRuntimeOptions {
 	readonly piExecutable: string;
+	readonly executionMode?: ExecutionMode;
+	readonly processProvider?: ProcessProvider;
 	readonly piOptions?: Omit<PiRpcHarnessOptions, "executable">;
 	readonly transports: readonly TransportAdapter[];
 	readonly harnesses?: readonly HarnessAdapter[];
@@ -71,6 +94,28 @@ export class ApplicationRuntime {
 	static async start(
 		options: ApplicationRuntimeOptions,
 	): Promise<ApplicationRuntime> {
+		const mode: unknown =
+			options.executionMode === undefined ? "direct" : options.executionMode;
+		if (mode !== "direct" && mode !== "isolated")
+			throw new InvalidExecutionModeError();
+		const processProvider = options.processProvider;
+		if (mode === "isolated") {
+			if (options.harnesses !== undefined)
+				throw new IsolationUnavailableError();
+			if (!processProvider) throw new IsolationUnavailableError();
+			const capabilities = processProvider.descriptor.capabilities;
+			const requiredCapabilities = [
+				"process.isolation",
+				"process.launch",
+				"process.signal",
+			] as const;
+			if (
+				!requiredCapabilities.every((capability) =>
+					capabilities.includes(capability),
+				)
+			)
+				throw new IsolationUnavailableError();
+		}
 		if (!options.piExecutable) throw new TypeError("Pi executable is required");
 		let store: (SessionStore & { close(): void }) | undefined;
 		let manager: SessionManager | undefined;
@@ -85,10 +130,13 @@ export class ApplicationRuntime {
 			manager = new SessionManager(
 				store,
 				options.harnesses ?? [
-					new PiRpcHarnessAdapter(new NodeProcessProvider(), {
-						...options.piOptions,
-						executable: options.piExecutable,
-					}),
+					new PiRpcHarnessAdapter(
+						processProvider ?? new NodeProcessProvider(),
+						{
+							...options.piOptions,
+							executable: options.piExecutable,
+						},
+					),
 				],
 			);
 			const runtime = new ApplicationRuntime(

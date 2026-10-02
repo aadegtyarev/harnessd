@@ -2,7 +2,11 @@
 
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { ApplicationRuntime } from "./application-runtime.js";
+import {
+	ApplicationRuntime,
+	InvalidExecutionModeError,
+	IsolationUnavailableError,
+} from "./application-runtime.js";
 import { resolveStateDirectory } from "./core/session-store.js";
 import { TelegramTransportAdapter } from "./telegram-transport.js";
 
@@ -17,6 +21,7 @@ Required environment:
 Optional environment:
   HARNESSD_PI_EXECUTABLE            Pi executable (default: pi)
   HARNESSD_STATE_DIR                Supervisor state directory
+  HARNESSD_EXECUTION_MODE           direct (default, trusted; cwd is not a sandbox) or isolated (unavailable in this CLI; requires a registered isolation provider)
 
 Private-chat commands:
   /sessions
@@ -48,6 +53,10 @@ export async function main(options: CliOptions = {}): Promise<void> {
 	}
 	if (argv.length) throw new Error("Unsupported command-line arguments");
 	const env = options.env ?? process.env;
+	const executionMode = env.HARNESSD_EXECUTION_MODE ?? "direct";
+	if (executionMode !== "direct" && executionMode !== "isolated")
+		throw new InvalidExecutionModeError();
+	if (executionMode === "isolated") throw new IsolationUnavailableError();
 	const token = env.HARNESSD_TELEGRAM_BOT_TOKEN;
 	const ids = parseAllowedIds(env.HARNESSD_TELEGRAM_ALLOWED_USER_IDS);
 	if (!token?.trim())
@@ -96,6 +105,7 @@ export async function main(options: CliOptions = {}): Promise<void> {
 	try {
 		try {
 			runtime = await runtimeStart({
+				executionMode,
 				piExecutable: env.HARNESSD_PI_EXECUTABLE || "pi",
 				stateDirectory,
 				transports: [transport],

@@ -14,10 +14,63 @@ function transportOptions(options: unknown): {
 }
 
 describe("CLI", () => {
-	it("shows help without requiring configuration", async () => {
+	it("shows trusted direct and isolated availability in help", async () => {
 		const write = vi.fn();
 		await main({ argv: ["--help"], env: {}, write });
 		expect(write).toHaveBeenCalledWith(HELP);
+		expect(HELP).toContain("HARNESSD_EXECUTION_MODE");
+		expect(HELP).toContain("direct (default, trusted; cwd is not a sandbox)");
+		expect(HELP).toContain("isolated (unavailable in this CLI");
+	});
+
+	it.each([undefined, "direct"] as const)(
+		"selects direct execution by default or explicitly (%s)",
+		async (mode) => {
+			const runtimeStart = vi.fn(
+				async () => ({ close: async () => {} }) as never,
+			);
+			const running = main({
+				argv: [],
+				env: {
+					HARNESSD_TELEGRAM_BOT_TOKEN: "token",
+					HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+					...(mode ? { HARNESSD_EXECUTION_MODE: mode } : {}),
+				},
+				runtimeStart: runtimeStart as never,
+			});
+			await vi.waitFor(() => expect(runtimeStart).toHaveBeenCalledOnce());
+			const [runtimeOptions] = runtimeStart.mock.calls[0] as unknown as [
+				Record<string, unknown>,
+			];
+			expect(runtimeOptions.executionMode).toBe("direct");
+			process.emit("SIGINT");
+			await running;
+		},
+	);
+
+	it("rejects isolated and invalid mode before transport or runtime startup", async () => {
+		const runtimeStart = vi.fn();
+		for (const mode of ["isolated", "invalid-secret-value"]) {
+			const writeError = vi.fn();
+			await expect(
+				main({
+					argv: [],
+					env: {
+						HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
+						HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+						HARNESSD_EXECUTION_MODE: mode,
+					},
+					runtimeStart: runtimeStart as never,
+					writeError,
+				}),
+			).rejects.toMatchObject({
+				code:
+					mode === "isolated"
+						? "ISOLATION_UNAVAILABLE"
+						: "INVALID_EXECUTION_MODE",
+			});
+		}
+		expect(runtimeStart).not.toHaveBeenCalled();
 	});
 
 	it("validates required environment without exposing credentials", async () => {

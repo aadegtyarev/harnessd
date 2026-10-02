@@ -12,6 +12,11 @@ The process-provider boundary offers reusable local child-process launch and sig
 - Signals must be recognized by the current Node platform. Invalid signals and unsuccessful delivery reject explicitly.
 - The provider declares `process.launch` and `process.signal`. Executable arguments and environment values are not logged.
 
+## Runtime process selection
+
+- `NodeProcessProvider` supports direct trusted process execution and does not declare `process.isolation`; `cwd` does not constrain OS permissions.
+- `ApplicationRuntime` defaults to direct mode. Explicit isolated mode requires an injected provider declaring `process.isolation`, `process.launch`, and `process.signal`. It checks those capabilities before opening session storage or starting transports and never substitutes the Node provider. Because runtime cannot verify caller-built harness arrays, isolated mode rejects custom harness arrays.
+
 ## Security limits and non-goals
 
 Execution is direct and trusted with the supervisor user's OS permissions; cwd is not a sandbox. The provider does not capture output, launch through a shell, automatically terminate/retry/escalate, supervise or restart processes, or guarantee identical signal behavior across operating systems. The process primitive alone is not end-to-end session execution.
