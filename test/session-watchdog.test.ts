@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -258,6 +258,250 @@ describe("in-process watchdog", () => {
 		expect((await store.get(other.id))?.status).toBe("running");
 		await manager.close();
 		store.close();
+	});
+
+	it("keeps input, events, cancellation and recovery bound to distinct workspace and native IDs", async () => {
+		vi.useFakeTimers();
+		const stateDirectory = await mkdtemp(
+			path.join(os.tmpdir(), "watchdog-state-"),
+		);
+		directories.push(stateDirectory);
+		const workspaceA = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-workspace-a-")),
+		);
+		directories.push(workspaceA);
+		const workspaceB = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-workspace-b-")),
+		);
+		directories.push(workspaceB);
+		const exits = new Map<
+			string,
+			ReturnType<
+				typeof deferred<{ code: number | null; signal: string | null }>
+			>
+		>();
+		const launches: { sessionId: string; cwd: string }[] = [];
+		const submissions: { sessionId: string; cwd: string; text: string }[] = [];
+		const cancellations: {
+			sessionId: string;
+			cwd: string;
+			inputId: string;
+		}[] = [];
+		const resumptions: {
+			sessionId: string;
+			cwd: string;
+			nativeSessionId: string;
+		}[] = [];
+		const observed: { sessionId: string; kind: string; text?: string }[] = [];
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "distinct-contexts" as never,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"input.submit",
+					"harness.cancel",
+				],
+			},
+			async launch(request) {
+				launches.push({ sessionId: request.sessionId, cwd: request.cwd });
+				const childExit = deferred<{
+					code: number | null;
+					signal: string | null;
+				}>();
+				exits.set(request.sessionId, childExit);
+				const nativeSessionId =
+					request.cwd === workspaceA ? "native-A" : "native-B";
+				return {
+					...instance(childExit.promise),
+					nativeSessionId,
+					events: (async function* () {
+						yield {
+							sessionId: request.sessionId,
+							kind: "output" as const,
+							text: `event-${nativeSessionId}`,
+						};
+					})(),
+					async send(input) {
+						submissions.push({
+							sessionId: request.sessionId,
+							cwd: request.cwd,
+							text: input.text,
+						});
+					},
+					async cancel(inputId) {
+						cancellations.push({
+							sessionId: request.sessionId,
+							cwd: request.cwd,
+							inputId,
+						});
+					},
+				};
+			},
+			async resume(request) {
+				if (request.nativeSessionId === undefined)
+					throw new Error("Expected native session ID for recovery");
+				resumptions.push({
+					sessionId: request.sessionId,
+					cwd: request.cwd,
+					nativeSessionId: request.nativeSessionId,
+				});
+				return { ...instance(), nativeSessionId: request.nativeSessionId };
+			},
+		};
+		const store = await SqliteSessionStore.open(stateDirectory);
+		const manager = new SessionManager(store, [harness]);
+		manager.subscribe((event) => {
+			observed.push({
+				sessionId: event.sessionId,
+				kind: event.kind,
+				...(event.text === undefined ? {} : { text: event.text }),
+			});
+		});
+		try {
+			const sessionA = await manager.create({
+				id: "distinct-A",
+				harnessId: harness.descriptor.id,
+				cwd: workspaceA,
+			});
+			const sessionB = await manager.create({
+				id: "distinct-B",
+				harnessId: harness.descriptor.id,
+				cwd: workspaceB,
+			});
+			await flush();
+			expect(launches).toEqual([
+				{ sessionId: sessionA.id, cwd: workspaceA },
+				{ sessionId: sessionB.id, cwd: workspaceB },
+			]);
+			expect(observed.filter((event) => event.kind === "output")).toEqual([
+				{ sessionId: sessionA.id, kind: "output", text: "event-native-A" },
+				{ sessionId: sessionB.id, kind: "output", text: "event-native-B" },
+			]);
+			expect((await store.get(sessionA.id))?.nativeSessionId).toBe("native-A");
+			expect((await store.get(sessionB.id))?.nativeSessionId).toBe("native-B");
+
+			const inputA = await manager.submit(sessionA.id, "input-A");
+			const inputB = await manager.submit(sessionB.id, "input-B");
+			await manager.cancel(sessionA.id, inputA);
+			await manager.cancel(sessionB.id, inputB);
+			expect(submissions).toEqual([
+				{ sessionId: sessionA.id, cwd: workspaceA, text: "input-A" },
+				{ sessionId: sessionB.id, cwd: workspaceB, text: "input-B" },
+			]);
+			expect(cancellations).toEqual([
+				{ sessionId: sessionA.id, cwd: workspaceA, inputId: inputA },
+				{ sessionId: sessionB.id, cwd: workspaceB, inputId: inputB },
+			]);
+
+			exits.get(sessionA.id)?.resolve({ code: 1, signal: null });
+			await flush();
+			await vi.advanceTimersByTimeAsync(250);
+			await flush();
+			expect(resumptions).toEqual([
+				{
+					sessionId: sessionA.id,
+					cwd: workspaceA,
+					nativeSessionId: "native-A",
+				},
+			]);
+			expect((await store.get(sessionA.id))?.status).toBe("running");
+			expect((await store.get(sessionB.id))?.status).toBe("running");
+			await manager.submit(sessionB.id, "peer-still-active");
+			expect(submissions.at(-1)).toEqual({
+				sessionId: sessionB.id,
+				cwd: workspaceB,
+				text: "peer-still-active",
+			});
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("keeps a credential sentinel out of supervisor diagnostics and metadata", async () => {
+		const stateDirectory = await mkdtemp(
+			path.join(os.tmpdir(), "watchdog-credential-state-"),
+		);
+		directories.push(stateDirectory);
+		const workspaceA = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-credential-workspace-a-")),
+		);
+		directories.push(workspaceA);
+		const workspaceB = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-credential-workspace-b-")),
+		);
+		directories.push(workspaceB);
+		const sentinel = "known-credential-sentinel-7f92";
+		const store = await SqliteSessionStore.open(stateDirectory);
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "credential-sentinel" as never,
+				capabilities: ["harness.launch", "harness.stop"],
+			},
+			async launch({ sessionId }) {
+				return {
+					...instance(),
+					events: (async function* () {
+						yield { sessionId, kind: "status" as const, text: "started" };
+					})(),
+				};
+			},
+		};
+		const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new SessionManager(store, [harness]);
+		const bothEventsObserved = deferred<void>();
+		let observedCount = 0;
+		manager.subscribe(() => {
+			throw new Error(sentinel);
+		});
+		manager.subscribe(() => {
+			observedCount += 1;
+			if (observedCount === 2) bothEventsObserved.resolve(undefined);
+		});
+		const credentialVariable = "HARNESSD_TELEGRAM_BOT_TOKEN";
+		const previousCredential = process.env[credentialVariable];
+		process.env[credentialVariable] = sentinel;
+		try {
+			expect(process.env[credentialVariable]).toBe(sentinel);
+			await manager.create({
+				id: "credential-A",
+				harnessId: harness.descriptor.id,
+				cwd: workspaceA,
+			});
+			await manager.create({
+				id: "credential-B",
+				harnessId: harness.descriptor.id,
+				cwd: workspaceB,
+			});
+			await bothEventsObserved.promise;
+			const records = await store.list();
+			expect(new Set(records.map(({ cwd }) => cwd))).toEqual(
+				new Set([workspaceA, workspaceB]),
+			);
+			expect(JSON.stringify(records)).not.toContain(sentinel);
+			expect(diagnostic.mock.calls).toEqual([
+				["[harnessd] Session event observer failed"],
+				["[harnessd] Session event observer failed"],
+			]);
+			expect(await readdir(workspaceA)).toEqual([]);
+			expect(await readdir(workspaceB)).toEqual([]);
+			expect(await readdir(stateDirectory)).toContain("sessions.sqlite3");
+		} finally {
+			try {
+				await manager.close();
+			} finally {
+				try {
+					store.close();
+				} finally {
+					diagnostic.mockRestore();
+					if (previousCredential === undefined)
+						delete process.env[credentialVariable];
+					else process.env[credentialVariable] = previousCredential;
+				}
+			}
+		}
 	});
 
 	it("keeps another session submit-capable while one exhausts recovery", async () => {
