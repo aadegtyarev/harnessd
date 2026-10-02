@@ -1,6 +1,6 @@
 # harnessd v1 feature contract
 
-**Status:** approved for implementation
+**Status:** implemented; automated acceptance verified; live Telegram smoke unavailable without dedicated test credentials
 **Repository:** `Hobby/harnessd` (`aadegtyarev/harnessd`, private GitHub repo)
 **License:** MIT
 
@@ -54,3 +54,10 @@ Provide a locally supervised, multi-session coding-agent service with independen
 - Missing adapter capabilities, failed startup, failed recovery, and unavailable selected isolation produce explicit safe errors and never silent no-ops or fallback.
 - Verify supervisor-managed credential values do not appear in supervisor metadata/logs and state is written only under the supervisor-owned state path. Test known credential values; do not claim universal detection of secrets in harness-produced content.
 - Run the repository's formatter, static checks, unit/integration tests, and end-to-end Telegram/Pi smoke checks established during implementation; report any unavailable live checks.
+
+## Verification record
+
+- PRs #1–#10 are merged to `main`. On merged commit `9f553abbeb3fa090e0a2b811d4a188fe8e8e25f3`, `npm test` passed (130 tests), and typecheck, build, lint, format check, and `git diff --check` passed.
+- PR #9 and PR #10 received independent GPT-6.1-sol high reviews with no blocking findings. The v1 closure audit found and closed the missing distinct-workspace/native-ID and credential-sentinel regression evidence in PR #10.
+- A safe Pi RPC smoke using temporary HOME/workspace/state reached readiness and shut down without sending a prompt; this does not verify real prompt acceptance, cancellation, or crash-mid-input recovery.
+- Live Telegram smoke was not run because dedicated non-production test credentials were unavailable. Production credentials were not used. GitHub has no configured status checks.
