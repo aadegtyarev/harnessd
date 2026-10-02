@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,7 @@ import type {
 import { ApplicationRuntime } from "../src/application-runtime.js";
 import type {
 	HarnessAdapter,
+	ProcessProvider,
 	TransportAdapter,
 	TransportEventSubscription,
 } from "../src/core/ports.js";
@@ -20,6 +21,7 @@ import type {
 	SessionSummary,
 } from "../src/core/types.js";
 import { UncertainInputDeliveryError } from "../src/harness/pi-rpc-harness.js";
+import { NodeProcessProvider } from "../src/process/node-process-provider.js";
 
 const dirs: string[] = [];
 function deferred<T>() {
@@ -68,6 +70,176 @@ function transport(
 }
 
 describe("application runtime", () => {
+	it.each([undefined, "direct"] as const)(
+		"delegates create launch to NodeProcessProvider in direct mode %s",
+		async (executionMode) => {
+			const launch = vi
+				.spyOn(NodeProcessProvider.prototype, "launch")
+				.mockRejectedValue(new Error("fake launch failure"));
+			const runtime = await ApplicationRuntime.start({
+				piExecutable: "/unused/pi",
+				...(executionMode ? { executionMode } : {}),
+				stateDirectory: await state(),
+				transports: [],
+			});
+			const result = await runtime.dispatch({
+				requestId: "create-direct",
+				principalId: "test",
+				kind: "create",
+				harnessId: "pi-rpc" as never,
+				cwd: os.tmpdir(),
+			});
+			expect(result).toMatchObject({ ok: false });
+			expect(launch).toHaveBeenCalledOnce();
+			expect(launch).toHaveBeenCalledWith({
+				executable: "/unused/pi",
+				args: ["--mode", "rpc"],
+				cwd: await realpath(os.tmpdir()),
+				stdio: "pipe",
+			});
+			await runtime.close();
+		},
+	);
+
+	it("routes an injected provider to the default Pi harness", async () => {
+		const store = await SqliteSessionStore.open(await state());
+		const launch = vi.fn(async () => {
+			throw new Error("fake launch failure");
+		});
+		const provider: ProcessProvider = {
+			descriptor: {
+				id: "fake-process" as never,
+				capabilities: ["process.isolation", "process.launch", "process.signal"],
+			},
+			launch,
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			executionMode: "isolated",
+			processProvider: provider,
+			store,
+			transports: [],
+		});
+		const result = await runtime.dispatch({
+			requestId: "create",
+			principalId: "test",
+			kind: "create",
+			harnessId: "pi-rpc" as never,
+			cwd: os.tmpdir(),
+		});
+		expect(launch).toHaveBeenCalledOnce();
+		expect(result).toMatchObject({ ok: false });
+		await runtime.close();
+	});
+
+	it.each([
+		["process.isolation"],
+		["process.launch"],
+		["process.signal"],
+	] as const)(
+		"fails isolated preflight without %s before side effects",
+		async (missing) => {
+			const openStore = vi.spyOn(SqliteSessionStore, "open");
+			const launch = vi.fn(async () => {
+				throw new Error("must not launch");
+			});
+			const provider: ProcessProvider = {
+				descriptor: {
+					id: "fake-process" as never,
+					capabilities: (
+						["process.isolation", "process.launch", "process.signal"] as const
+					).filter((item) => item !== missing),
+				},
+				launch,
+			};
+			const startTransport = vi.fn(async () => {});
+			await expect(
+				ApplicationRuntime.start({
+					piExecutable: "/unused/pi",
+					executionMode: "isolated",
+					processProvider: provider,
+					transports: [transport("test", startTransport, async () => {})],
+				}),
+			).rejects.toMatchObject({
+				code: "ISOLATION_UNAVAILABLE",
+				message: "Isolated execution is unavailable",
+			});
+			expect(openStore).not.toHaveBeenCalled();
+			expect(startTransport).not.toHaveBeenCalled();
+			expect(launch).not.toHaveBeenCalled();
+		},
+	);
+
+	it("rejects custom harnesses in isolated mode before any startup side effects", async () => {
+		const openStore = vi.spyOn(SqliteSessionStore, "open");
+		const processLaunch = vi.fn(async () => {
+			throw new Error("must not launch process");
+		});
+		const provider: ProcessProvider = {
+			descriptor: {
+				id: "capable-process" as never,
+				capabilities: ["process.isolation", "process.launch", "process.signal"],
+			},
+			launch: processLaunch,
+		};
+		const harnessLaunch = vi.fn(async () => {
+			throw new Error("must not launch harness");
+		});
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "custom-harness" as never,
+				capabilities: ["harness.launch"],
+			},
+			launch: harnessLaunch,
+		};
+		const transportStart = vi.fn(async () => {});
+		await expect(
+			ApplicationRuntime.start({
+				piExecutable: "/unused/pi",
+				executionMode: "isolated",
+				processProvider: provider,
+				harnesses: [harness],
+				transports: [transport("test", transportStart, async () => {})],
+			}),
+		).rejects.toMatchObject({
+			code: "ISOLATION_UNAVAILABLE",
+			message: "Isolated execution is unavailable",
+		});
+		expect(openStore).not.toHaveBeenCalled();
+		expect(transportStart).not.toHaveBeenCalled();
+		expect(harnessLaunch).not.toHaveBeenCalled();
+		expect(processLaunch).not.toHaveBeenCalled();
+	});
+
+	it("fails isolated preflight without an injected provider before side effects", async () => {
+		const openStore = vi.spyOn(SqliteSessionStore, "open");
+		const startTransport = vi.fn(async () => {});
+		await expect(
+			ApplicationRuntime.start({
+				piExecutable: "/unused/pi",
+				executionMode: "isolated",
+				transports: [transport("test", startTransport, async () => {})],
+			}),
+		).rejects.toMatchObject({ code: "ISOLATION_UNAVAILABLE" });
+		expect(openStore).not.toHaveBeenCalled();
+		expect(startTransport).not.toHaveBeenCalled();
+	});
+
+	it("rejects an invalid mode without runtime side effects", async () => {
+		const startTransport = vi.fn(async () => {});
+		await expect(
+			ApplicationRuntime.start({
+				piExecutable: "/unused/pi",
+				executionMode: "unsafe" as never,
+				transports: [transport("test", startTransport, async () => {})],
+			}),
+		).rejects.toMatchObject({
+			code: "INVALID_EXECUTION_MODE",
+			message: "Execution mode is invalid",
+		});
+		expect(startTransport).not.toHaveBeenCalled();
+	});
+
 	it("returns correlated typed results and rejects dispatch once closing starts", async () => {
 		let dispatch!: RuntimeDispatch;
 		const sent: string[] = [];

@@ -7,6 +7,7 @@
 ## Configuration and authorization
 
 - `HARNESSD_TELEGRAM_BOT_TOKEN` and a nonempty comma-separated `HARNESSD_TELEGRAM_ALLOWED_USER_IDS` are required. IDs must be positive safe integers. `HARNESSD_PI_EXECUTABLE` defaults to `pi`; `HARNESSD_STATE_DIR` uses the core's standard resolution. `harnessd --help` reports usage without requiring configuration.
+- `HARNESSD_EXECUTION_MODE` defaults to `direct` (trusted; `cwd` is not a sandbox). The CLI accepts only `direct` or `isolated`; because it registers no isolation provider, an isolated request fails safely before transport startup. Invalid values are rejected before configuration-driven transport construction.
 - Every Telegram update passes middleware before handlers: the sender must exist, have a positive safe numeric ID in the allowlist, and the chat must be `private`. Unauthorized/missing/malformed senders and groups/channels receive no reply, session data, or core dispatch. No callback action UI is implemented.
 - Allowlisted operators share access to all local sessions. The bot token is not logged or passed to Pi; child environment behavior remains the process-provider contract. Direct Pi is trusted local execution with the supervisor user's OS permissions; `cwd` is not a sandbox.
 

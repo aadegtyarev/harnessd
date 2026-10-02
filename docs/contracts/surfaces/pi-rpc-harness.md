@@ -2,7 +2,7 @@
 
 ## Boundary and ownership
 
-`PiRpcHarnessAdapter` in `src/harness/` owns Pi RPC process arguments, JSONL framing, command correlation, event decoding, prompt delivery, cancellation, and bounded shutdown. It consumes the generic `ProcessProvider`; Pi protocol details do not enter the process-provider port. It advertises launch, stop, resume, cancel, and input-submit capabilities. `SessionManager` routes input cancellation and forwards live harness events. The application runtime composes it with the process provider and configured transports. `src/cli.ts` composes the runtime with the Telegram transport; see [Telegram transport](telegram-transport.md) for external commands and presentation.
+`PiRpcHarnessAdapter` in `src/harness/` owns Pi RPC process arguments, JSONL framing, command correlation, event decoding, prompt delivery, cancellation, and bounded shutdown. It consumes the generic `ProcessProvider`; Pi protocol details do not enter the process-provider port. It advertises launch, stop, resume, cancel, and input-submit capabilities. `SessionManager` routes input cancellation and forwards live harness events. The application runtime composes it with the process provider and configured transports. `PiRpcHarnessAdapter` consumes only the generic process port and does not infer isolation; runtime selection determines which provider is passed to the default Pi harness. `src/cli.ts` composes the runtime with the Telegram transport; see [Telegram transport](telegram-transport.md) for external commands and presentation.
 
 ## Observable behavior
 

@@ -4,7 +4,7 @@ harnessd runs a locally supervised Pi RPC session service and exposes it through
 
 ## Telegram setup
 
-Set `HARNESSD_TELEGRAM_BOT_TOKEN` and `HARNESSD_TELEGRAM_ALLOWED_USER_IDS` (comma-separated positive numeric Telegram user IDs), then build with `npm run build` and run `node dist/src/cli.js` or install the package's `harnessd` executable. `HARNESSD_PI_EXECUTABLE` defaults to `pi`. `HARNESSD_STATE_DIR` is optional; when absent the core resolves its standard supervisor-owned state directory. Run `harnessd --help` for the command list.
+Set `HARNESSD_TELEGRAM_BOT_TOKEN` and `HARNESSD_TELEGRAM_ALLOWED_USER_IDS` (comma-separated positive numeric Telegram user IDs), then build with `npm run build` and run `node dist/src/cli.js` or install the package's `harnessd` executable. `HARNESSD_PI_EXECUTABLE` defaults to `pi`. `HARNESSD_STATE_DIR` is optional; when absent the core resolves its standard supervisor-owned state directory. `HARNESSD_EXECUTION_MODE` defaults to `direct` (trusted; `cwd` is not a sandbox). The CLI currently has no isolation provider, so `isolated` fails safely rather than falling back. Run `harnessd --help` for the command list.
 
 Only allowlisted users in private chats can interact. Each chat's selected session exists only in memory; use `/use <sessionId>` after a service restart. All allowlisted operators share local session authority. `/new [cwd]` uses the service's starting directory by default. Plain text is submitted to the selected session. Inputs reported as uncertain are never resent automatically.
 
