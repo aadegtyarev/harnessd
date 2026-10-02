@@ -1,3 +1,6 @@
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
@@ -17,10 +20,12 @@ import {
 	PiRpcHarnessAdapter,
 	UncertainInputDeliveryError,
 } from "../src/harness/index.js";
+import { NodeProcessProvider } from "../src/process/node-process-provider.js";
 
 interface FakeOptions {
 	readonly holdPrompt?: boolean;
 	readonly holdGetState?: boolean;
+	readonly exitOnGetState?: boolean;
 	readonly holdAbort?: boolean;
 	readonly malformedPromptAck?: boolean;
 	readonly exitOnPrompt?: boolean;
@@ -115,6 +120,10 @@ function fakeProvider(options: FakeOptions = {}) {
 			commands.push(command);
 			if (command.type === "extension_ui_response") continue;
 			if (command.type === "get_state" && options.holdGetState) continue;
+			if (command.type === "get_state" && options.exitOnGetState) {
+				complete(1, null);
+				continue;
+			}
 			if (command.type === "prompt" && options.exitOnPrompt) {
 				complete(1, null);
 				continue;
@@ -280,6 +289,143 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("runs env-node Pi scripts with harnessd's Node and keeps the replacement env contract", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-node-script-"));
+		const executable = path.join(cwd, "pi");
+		await writeFile(executable, "#!/usr/bin/env node\nprocess.exit(0);\n");
+		await chmod(executable, 0o700);
+		const fake = fakeProvider();
+		try {
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable,
+				startupTimeoutMs: 100,
+			}).launch(request);
+			expect(fake.launchRequest).toMatchObject({
+				executable: process.execPath,
+				args: [executable, "--mode", "rpc"],
+				cwd: request.cwd,
+				env: undefined,
+				stdio: "pipe",
+			});
+			await instance.shutdown();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves relative PATH entries against the child cwd and skips directories", async () => {
+		const supervisorCwd = await mkdtemp(
+			path.join(os.tmpdir(), "pi-supervisor-search-"),
+		);
+		const childCwd = await mkdtemp(path.join(os.tmpdir(), "pi-child-search-"));
+		const supervisorDirectory = path.join(supervisorCwd, "bad", "pi");
+		const childDirectory = path.join(childCwd, "bad", "pi");
+		const executable = path.join(childCwd, "bin", "pi");
+		await mkdir(supervisorDirectory, { recursive: true });
+		await chmod(supervisorDirectory, 0o700);
+		await mkdir(childDirectory, { recursive: true });
+		await chmod(childDirectory, 0o700);
+		await mkdir(path.dirname(executable), { recursive: true });
+		await writeFile(executable, "#!/usr/bin/env node\nprocess.exit(0);\n");
+		await chmod(executable, 0o700);
+		const fake = fakeProvider();
+		const originalCwd = process.cwd();
+		try {
+			process.chdir(supervisorCwd);
+			const envPath = ["bad", "bin"].join(path.delimiter);
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable: "pi",
+				env: { PATH: envPath },
+				startupTimeoutMs: 100,
+			}).launch({ ...request, cwd: childCwd });
+			expect(fake.launchRequest).toMatchObject({
+				executable: process.execPath,
+				args: [executable, "--mode", "rpc"],
+				env: { PATH: envPath },
+			});
+			await instance.shutdown();
+		} finally {
+			process.chdir(originalCwd);
+			await Promise.all([
+				rm(supervisorCwd, { recursive: true, force: true }),
+				rm(childCwd, { recursive: true, force: true }),
+			]);
+		}
+	});
+
+	it("runs an env-node RPC script under the harness Node with an empty child environment", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-rpc-shebang-"));
+		const executable = path.join(cwd, "pi");
+		const script = [
+			"#!/usr/bin/env node",
+			'import { createInterface } from "node:readline";',
+			"const lines = createInterface({ input: process.stdin });",
+			'lines.on("line", (line) => {',
+			"  const command = JSON.parse(line);",
+			'  if (command.type === "get_state") {',
+			'    process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "get_state", success: true, data: { sessionId: JSON.stringify({ version: process.version, env: Object.keys(process.env).sort() }) } }) + "\\n");',
+			"  }",
+			"});",
+		].join("\n");
+		await writeFile(executable, `${script}\n`);
+		await chmod(executable, 0o700);
+		try {
+			const instance = await new PiRpcHarnessAdapter(
+				new NodeProcessProvider(),
+				{ executable, startupTimeoutMs: 1000, shutdownTimeoutMs: 1000 },
+			).launch({ ...request, cwd });
+			expect(JSON.parse(instance.nativeSessionId ?? "null")).toEqual({
+				version: process.version,
+				env: [],
+			});
+			await instance.shutdown();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps non-Node executables unchanged", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-native-script-"));
+		const executable = path.join(cwd, "pi");
+		await writeFile(executable, "not a node shebang\n");
+		await chmod(executable, 0o700);
+		const fake = fakeProvider();
+		try {
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable,
+				startupTimeoutMs: 100,
+			}).launch(request);
+			expect(fake.launchRequest?.executable).toBe(executable);
+			expect(fake.launchRequest?.args).toEqual(["--mode", "rpc"]);
+			await instance.shutdown();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("maps process launch errno to a safe Pi startup error", async () => {
+		const provider: ProcessProvider = {
+			descriptor: {
+				id: "failed-process" as AdapterId,
+				capabilities: ["process.launch", "process.signal"],
+			},
+			async launch() {
+				throw Object.assign(new Error("private executable path"), {
+					code: "ENOENT",
+				});
+			},
+		};
+		await expect(
+			new PiRpcHarnessAdapter(provider, { executable: "/private/pi" }).launch(
+				request,
+			),
+		).rejects.toMatchObject({
+			name: "PiStartupError",
+			code: "PI_EXECUTABLE_NOT_FOUND",
+			message: "Pi RPC startup failed",
+		});
+	});
+
 	it("does not report an expected process exit during shutdown as an error", async () => {
 		const fake = fakeProvider();
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
@@ -375,7 +521,31 @@ describe("PiRpcHarnessAdapter", () => {
 				commandTimeoutMs: 100,
 				shutdownTimeoutMs: 5,
 			}).launch(request),
-		).rejects.toThrow("startup timed out");
+		).rejects.toMatchObject({ code: "PI_RPC_STARTUP_TIMEOUT" });
+		expect(fake.child.stdin?.writableEnded).toBe(true);
+	});
+
+	it("classifies a Pi process exit before readiness", async () => {
+		const fake = fakeProvider({ exitOnGetState: true });
+		await expect(
+			new PiRpcHarnessAdapter(fake.provider, {
+				executable: "pi",
+				startupTimeoutMs: 100,
+				shutdownTimeoutMs: 5,
+			}).launch(request),
+		).rejects.toMatchObject({ code: "PI_EXITED_BEFORE_READY" });
+	});
+
+	it("classifies the get_state command timeout as a startup timeout", async () => {
+		const fake = fakeProvider({ holdGetState: true });
+		await expect(
+			new PiRpcHarnessAdapter(fake.provider, {
+				executable: "pi",
+				startupTimeoutMs: 100,
+				commandTimeoutMs: 5,
+				shutdownTimeoutMs: 5,
+			}).launch(request),
+		).rejects.toMatchObject({ code: "PI_RPC_STARTUP_TIMEOUT" });
 		expect(fake.child.stdin?.writableEnded).toBe(true);
 	});
 
@@ -784,7 +954,10 @@ describe("PiRpcHarnessAdapter", () => {
 					executable: "pi",
 					shutdownTimeoutMs: 5,
 				}).launch(request),
-			).rejects.toThrow("requires");
+			).rejects.toMatchObject({
+				code: "PI_STARTUP_FAILED",
+				message: "Pi RPC startup failed",
+			});
 		},
 	);
 

@@ -17,6 +17,7 @@ import type { HarnessEvent } from "./core/types.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
 	PiRpcHarnessAdapter,
+	PiStartupError,
 	UncertainInputDeliveryError,
 } from "./harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "./process/node-process-provider.js";
@@ -55,6 +56,26 @@ const safeErrorMessages = new Map([
 	["DUPLICATE_SESSION_ID", "Session already exists"],
 	["SESSION_STORE_ERROR", "Session storage failed"],
 	["INVALID_STATE_DIRECTORY", "Runtime state configuration is invalid"],
+	[
+		"PI_EXECUTABLE_NOT_FOUND",
+		"Pi CLI was not found; check HARNESSD_PI_EXECUTABLE.",
+	],
+	[
+		"PI_EXECUTABLE_NOT_ACCESSIBLE",
+		"Pi CLI cannot be executed; check its path and permissions.",
+	],
+	[
+		"PI_RPC_STARTUP_TIMEOUT",
+		"Pi did not answer its startup RPC in time; check its Node.js version and configuration.",
+	],
+	[
+		"PI_EXITED_BEFORE_READY",
+		"Pi exited before session startup; check the installed Pi CLI and runtime.",
+	],
+	[
+		"PI_STARTUP_FAILED",
+		"Pi did not start successfully; check its CLI, runtime, and authentication.",
+	],
 	["UNCERTAIN_INPUT_DELIVERY", "Input delivery is uncertain"],
 ]);
 
@@ -252,6 +273,8 @@ export class ApplicationRuntime {
 			}
 			return { requestId: request.requestId, ok: true, value };
 		} catch (error) {
+			if (error instanceof PiStartupError)
+				console.error(`harnessd: Pi startup failed (${error.code})`);
 			let candidate: unknown;
 			try {
 				candidate =

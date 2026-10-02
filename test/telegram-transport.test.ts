@@ -297,6 +297,28 @@ describe("Telegram transport", () => {
 		expect(bot.sent).toHaveLength(sentCount);
 	});
 
+	it("accepts unquoted and matching quoted cwd paths without shell parsing", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/new /tmp/project with spaces");
+		await bot.update(42, '/new "/tmp/project with spaces"');
+		await bot.update(42, "/new '/tmp/project with spaces'");
+		await bot.update(42, '/new "/tmp/project with spaces');
+		expect(
+			requests
+				.filter((request) => request.kind === "create")
+				.map((request) => request.cwd),
+		).toEqual([
+			"/tmp/project with spaces",
+			"/tmp/project with spaces",
+			"/tmp/project with spaces",
+		]);
+		expect(bot.sent.at(-1)?.text).toBe(
+			"Use matching quotes around the entire path, or remove the quotes.",
+		);
+		await adapter.stop();
+	});
+
 	it("uses the configured default cwd when /new has no explicit path", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
@@ -316,9 +338,13 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "private prompt text");
-		expect(bot.sent.some(({ text }) => text === "Operation failed.")).toBe(
-			true,
-		);
+		expect(
+			bot.sent.some(
+				({ text }) =>
+					text ===
+					"Request failed unexpectedly. Check the harnessd service journal.",
+			),
+		).toBe(true);
 		expect(
 			bot.sent.some(({ text }) => text.includes("private dispatch detail")),
 		).toBe(false);

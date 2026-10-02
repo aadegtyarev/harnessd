@@ -101,6 +101,42 @@ describe("application runtime", () => {
 		},
 	);
 
+	it("returns actionable Pi startup errors and logs only a safe error code", async () => {
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const launchError = Object.assign(new Error("secret path detail"), {
+			code: "ENOENT",
+		});
+		vi.spyOn(NodeProcessProvider.prototype, "launch").mockRejectedValue(
+			launchError,
+		);
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/private/pi",
+			stateDirectory: await state(),
+			transports: [],
+		});
+		const result = await runtime.dispatch({
+			requestId: "create-pi-startup-failure",
+			principalId: "test",
+			kind: "create",
+			harnessId: "pi-rpc" as never,
+			cwd: os.tmpdir(),
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			error: {
+				code: "PI_EXECUTABLE_NOT_FOUND",
+				message: "Pi CLI was not found; check HARNESSD_PI_EXECUTABLE.",
+			},
+		});
+		expect(journal).toHaveBeenCalledWith(
+			"harnessd: Pi startup failed (PI_EXECUTABLE_NOT_FOUND)",
+		);
+		expect(journal).not.toHaveBeenCalledWith(
+			expect.stringContaining("secret path detail"),
+		);
+		await runtime.close();
+	});
+
 	it("routes an injected provider to the default Pi harness", async () => {
 		const store = await SqliteSessionStore.open(await state());
 		const launch = vi.fn(async () => {

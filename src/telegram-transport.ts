@@ -254,6 +254,30 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 	});
 }
 
+function parseNewWorkingDirectory(
+	value: string | undefined,
+	defaultCwd: string,
+):
+	| { readonly ok: true; readonly cwd: string }
+	| { readonly ok: false; readonly error: string } {
+	const candidate = value?.trim();
+	if (!candidate) return { ok: true, cwd: defaultCwd };
+	const quote = candidate[0];
+	if (quote === '"' || quote === "'") {
+		if (candidate.length < 2 || candidate.at(-1) !== quote)
+			return {
+				ok: false,
+				error:
+					"Use matching quotes around the entire path, or remove the quotes.",
+			};
+		const cwd = candidate.slice(1, -1);
+		if (!cwd)
+			return { ok: false, error: "Working directory path cannot be empty." };
+		return { ok: true, cwd };
+	}
+	return { ok: true, cwd: candidate };
+}
+
 export class TelegramTransportAdapter implements TransportAdapter {
 	readonly descriptor = {
 		id: "telegram" as AdapterId,
@@ -458,7 +482,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				);
 			}
 		} catch {
-			await this.sendDirect(chatId, "Operation failed.");
+			await this.sendDirect(
+				chatId,
+				"Request failed unexpectedly. Check the harnessd service journal.",
+			);
 		}
 	}
 
@@ -469,11 +496,15 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	): Promise<void> {
 		const newCommand = /^\/new(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (newCommand) {
-			const cwd = newCommand[1]?.trim() || this.options.defaultCwd;
+			const parsedCwd = parseNewWorkingDirectory(
+				newCommand[1],
+				this.options.defaultCwd,
+			);
+			if (!parsedCwd.ok) return this.sendDirect(chatId, parsedCwd.error);
 			const result = await this.request(sender, {
 				kind: "create",
 				harnessId: "pi-rpc" as never,
-				cwd,
+				cwd: parsedCwd.cwd,
 			});
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;

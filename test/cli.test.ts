@@ -1,9 +1,18 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { HELP, main } from "../src/cli.js";
+import { HELP, isDirectInvocation, main } from "../src/cli.js";
 
 const EMPTY_CWD = path.join(os.tmpdir(), `harnessd-cli-${randomUUID()}`);
 
@@ -39,6 +48,90 @@ describe("CLI", () => {
 		expect(HELP).toContain("isolated (unavailable in this CLI");
 		expect(HELP).toContain("HARNESSD_DEFAULT_CWD");
 		expect(HELP).toContain("harnessd service install");
+	});
+
+	it("recognizes direct invocation through an npm-style symlink", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-bin-"));
+		const entryPath = path.join(cwd, "dist", "cli.js");
+		const binPath = path.join(cwd, "node_modules", ".bin", "harnessd");
+		await mkdir(path.dirname(binPath), { recursive: true });
+		await mkdir(path.dirname(entryPath), { recursive: true });
+		await writeFile(entryPath, "");
+		await symlink(entryPath, binPath);
+		try {
+			expect(isDirectInvocation(pathToFileURL(entryPath).href, binPath)).toBe(
+				true,
+			);
+			expect(isDirectInvocation(pathToFileURL(entryPath).href, undefined)).toBe(
+				false,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("prints help through both direct and npm-style symlink invocations", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-smoke-"));
+		try {
+			const root = process.cwd();
+			const outputDir = path.join(cwd, "dist");
+			const compiledCli = path.join(outputDir, "src", "cli.js");
+			const binDir = path.join(cwd, "consumer", "node_modules", ".bin");
+			const binPath = path.join(binDir, "harnessd");
+			await mkdir(binDir, { recursive: true });
+			await writeFile(path.join(cwd, "package.json"), '{"type":"module"}');
+			await symlink(
+				path.join(root, "node_modules"),
+				path.join(cwd, "node_modules"),
+				"dir",
+			);
+			const compile = spawnSync(
+				process.execPath,
+				[
+					path.join(root, "node_modules", "typescript", "bin", "tsc"),
+					"--target",
+					"ES2023",
+					"--module",
+					"NodeNext",
+					"--moduleResolution",
+					"NodeNext",
+					"--rootDir",
+					".",
+					"--outDir",
+					outputDir,
+					"--strict",
+					"--esModuleInterop",
+					"--skipLibCheck",
+					"src/cli.ts",
+				],
+				{ cwd: root, encoding: "utf8" },
+			);
+			expect(compile.status, compile.stderr).toBe(0);
+			await chmod(compiledCli, 0o755);
+			await symlink(compiledCli, binPath);
+			const nodeHelp = spawnSync(process.execPath, [compiledCli, "--help"], {
+				cwd,
+				encoding: "utf8",
+				env: {},
+			});
+			const symlinkHelp = spawnSync(binPath, ["--help"], {
+				cwd,
+				encoding: "utf8",
+				env: {
+					PATH: [path.dirname(process.execPath), "/usr/bin", "/bin"].join(
+						path.delimiter,
+					),
+				},
+			});
+			for (const result of [nodeHelp, symlinkHelp]) {
+				expect(result.status, result.stderr).toBe(0);
+				expect(result.stdout).toContain(
+					"harnessd - locally supervised Pi sessions",
+				);
+			}
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it("loads .env before validating config and uses its default cwd", async () => {

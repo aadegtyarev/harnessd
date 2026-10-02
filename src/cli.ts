@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
 	ApplicationRuntime,
 	InvalidExecutionModeError,
@@ -207,10 +207,19 @@ function parseAllowedIds(value: string | undefined): number[] {
 		: [];
 }
 
-if (
-	process.argv[1] &&
-	import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
-) {
+export function isDirectInvocation(
+	moduleUrl: string,
+	entryPath: string | undefined,
+): boolean {
+	if (!entryPath) return false;
+	try {
+		return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(entryPath);
+	} catch {
+		return false;
+	}
+}
+
+if (isDirectInvocation(import.meta.url, process.argv[1])) {
 	void main().catch((error: unknown) => {
 		const message =
 			error instanceof Error && error.message.startsWith("HARNESSD_")

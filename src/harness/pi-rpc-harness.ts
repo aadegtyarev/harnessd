@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { access, open, stat } from "node:fs/promises";
+import path from "node:path";
 import type { Writable } from "node:stream";
 import { requireCapability } from "../core/errors.js";
 import type {
@@ -40,6 +43,114 @@ export class UncertainInputDeliveryError extends Error {
 		super("Input delivery is uncertain", options);
 		this.name = "UncertainInputDeliveryError";
 	}
+}
+
+export type PiStartupErrorCode =
+	| "PI_EXECUTABLE_NOT_FOUND"
+	| "PI_EXECUTABLE_NOT_ACCESSIBLE"
+	| "PI_RPC_STARTUP_TIMEOUT"
+	| "PI_EXITED_BEFORE_READY"
+	| "PI_STARTUP_FAILED";
+
+export class PiStartupError extends Error {
+	constructor(
+		readonly code: PiStartupErrorCode,
+		options?: ErrorOptions,
+	) {
+		super("Pi RPC startup failed", options);
+		this.name = "PiStartupError";
+	}
+}
+
+async function resolveNodeShebang(
+	executable: string,
+	cwd: string,
+	env: Readonly<Record<string, string>> | undefined,
+): Promise<
+	| { readonly executable: string; readonly argsPrefix: readonly string[] }
+	| undefined
+> {
+	const candidates = path.isAbsolute(executable)
+		? [executable]
+		: executable.includes(path.sep)
+			? [path.resolve(cwd, executable)]
+			: (env?.PATH ?? (process.platform === "win32" ? "" : "/usr/bin:/bin"))
+					.split(path.delimiter)
+					.map((directory) => path.resolve(cwd, directory || ".", executable));
+	for (const candidate of candidates) {
+		try {
+			await access(candidate, fsConstants.X_OK);
+			if (!(await stat(candidate)).isFile()) continue;
+		} catch {
+			continue;
+		}
+		if (await hasEnvNodeShebang(candidate))
+			return { executable: process.execPath, argsPrefix: [candidate] };
+		return undefined;
+	}
+	return undefined;
+}
+
+async function hasEnvNodeShebang(filePath: string): Promise<boolean> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		if (!(await stat(filePath)).isFile()) return false;
+		handle = await open(
+			filePath,
+			fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0),
+		);
+		if (!(await handle.stat()).isFile()) return false;
+		const buffer = Buffer.alloc(128);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+		const firstLine = buffer
+			.subarray(0, bytesRead)
+			.toString("utf8")
+			.split("\n", 1)[0];
+		return /^#!\s*\/usr\/bin\/env[ \t]+node[ \t]*\r?$/.test(firstLine ?? "");
+	} catch {
+		return false;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
+
+function toPiStartupError(
+	error: unknown,
+	phase: "launch" | "ready",
+): PiStartupError {
+	if (error instanceof PiStartupError) return error;
+	const code = nestedErrorCode(error);
+	if (code === "ENOENT")
+		return new PiStartupError("PI_EXECUTABLE_NOT_FOUND", { cause: error });
+	if (code === "EACCES" || code === "EPERM")
+		return new PiStartupError("PI_EXECUTABLE_NOT_ACCESSIBLE", {
+			cause: error,
+		});
+	const message = error instanceof Error ? error.message : "";
+	if (
+		message === "Pi RPC startup timed out" ||
+		(phase === "ready" && message === "Pi RPC get_state timed out")
+	)
+		return new PiStartupError("PI_RPC_STARTUP_TIMEOUT", { cause: error });
+	if (message.startsWith("Pi process exited ("))
+		return new PiStartupError("PI_EXITED_BEFORE_READY", { cause: error });
+	if (
+		phase === "ready" &&
+		message !== "Pi RPC get_state returned no session ID"
+	)
+		throw error;
+	return new PiStartupError("PI_STARTUP_FAILED", { cause: error });
+}
+
+function nestedErrorCode(error: unknown): string | undefined {
+	let current = error;
+	for (let depth = 0; depth < 5; depth++) {
+		if (typeof current !== "object" || current === null) return undefined;
+		if ("code" in current && typeof current.code === "string")
+			return current.code;
+		current = "cause" in current ? current.cause : undefined;
+	}
+	return undefined;
 }
 
 function within<T>(
@@ -157,16 +268,26 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			);
 		args.push("--mode", "rpc");
 		if (resume) args.push("--session", request.nativeSessionId as string);
-		const child = await this.processes.launch({
-			executable: this.options.executable,
-			args,
-			cwd: request.cwd,
-			env: this.options.env,
-			stdio: "pipe",
-		});
+		const launch = await resolveNodeShebang(
+			this.options.executable,
+			request.cwd,
+			this.options.env,
+		);
+		let child: ManagedProcess;
+		try {
+			child = await this.processes.launch({
+				executable: launch?.executable ?? this.options.executable,
+				args: [...(launch?.argsPrefix ?? []), ...args],
+				cwd: request.cwd,
+				env: this.options.env,
+				stdio: "pipe",
+			});
+		} catch (error) {
+			throw toPiStartupError(error, "launch");
+		}
 		if (!child.stdin || !child.stdout || !child.stderr) {
 			await terminateChild(child, this.options.shutdownTimeoutMs ?? 1000);
-			throw new Error("Pi RPC requires stdin, stdout, and stderr pipes");
+			throw new PiStartupError("PI_STARTUP_FAILED");
 		}
 		const instance = new PiRpcInstance(child, request.sessionId, this.options);
 		try {
@@ -174,7 +295,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			return instance;
 		} catch (error) {
 			await instance.shutdown().catch(() => {});
-			throw error;
+			throw toPiStartupError(error, "ready");
 		}
 	}
 }
