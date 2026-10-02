@@ -41,5 +41,4 @@ The core owns stable session identity, working-directory validation, session met
 
 ## Related contracts
 
-- [Harnessd v1](../features/harnessd-v1.md)
 - [Pi RPC harness](pi-rpc-harness.md)

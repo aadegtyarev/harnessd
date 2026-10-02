@@ -33,4 +33,4 @@
 
 ## Non-goals and related contracts
 
-Groups/channels, inline keyboard/callback actions, persistent chat selection/event history, per-user session ownership, automatic input retries, Telegram-owned watchdog policy, recovery after supervisor restart, sandboxing, and secret-wallet behavior are not provided by this surface. See [harnessd v1](../features/harnessd-v1.md), [core session management](core-session-management.md), and [Pi RPC harness](pi-rpc-harness.md).
+Groups/channels, inline keyboard/callback actions, persistent chat selection/event history, per-user session ownership, automatic input retries, Telegram-owned watchdog policy, recovery after supervisor restart, sandboxing, and secret-wallet behavior are not provided by this surface. See [core session management](core-session-management.md) and [Pi RPC harness](pi-rpc-harness.md).
