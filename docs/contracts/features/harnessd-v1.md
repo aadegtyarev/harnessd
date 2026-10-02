@@ -40,8 +40,8 @@ Provide a locally supervised, multi-session coding-agent service with independen
 
 - [Core session management](../surfaces/core-session-management.md) — implemented in the bounded core-foundation milestone; this does not complete the broader v1 transport, harness, watchdog, isolation, or secret-provider scope.
 - [Direct Node process provider](../surfaces/process-provider.md) — a standalone process primitive; it does not complete end-to-end session execution.
-- [Transport adapter](../surfaces/transport-adapter.md) defines the adapter-neutral request/result/event boundary; Telegram polling and authorization remain a later milestone.
-- Harness-adapter and process-isolation surfaces will be documented as their later milestones are implemented.
+- [Transport adapter](../surfaces/transport-adapter.md) defines the adapter-neutral request/result/event boundary; [Telegram transport and CLI](../surfaces/telegram-transport.md) implement allowlisted private-chat operation and presentation. Watchdog/recovery remains a separate milestone.
+- Pi RPC harness support is implemented; watchdog/recovery, process-isolation, and secret-provider behavior remain separate approved v1 milestones and do not imply sandboxing or automatic input resend.
 
 ## Acceptance and validation
 

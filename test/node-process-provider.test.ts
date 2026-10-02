@@ -148,8 +148,10 @@ describe("NodeProcessProvider", () => {
 		const ambientCoverage = path.join(cwd, "ambient-coverage");
 		await mkdir(ambientCoverage);
 		const previousValue = process.env.HARNESSD_PROCESS_PROVIDER_TEST_SECRET;
+		const previousToken = process.env.HARNESSD_TELEGRAM_BOT_TOKEN;
 		const previousCoverage = process.env.NODE_V8_COVERAGE;
 		process.env.HARNESSD_PROCESS_PROVIDER_TEST_SECRET = "ambient-value";
+		process.env.HARNESSD_TELEGRAM_BOT_TOKEN = "known-telegram-token";
 		process.env.NODE_V8_COVERAGE = ambientCoverage;
 		try {
 			const managed = track(
@@ -157,7 +159,7 @@ describe("NodeProcessProvider", () => {
 					executable: process.execPath,
 					args: [
 						"-e",
-						`require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({ secret: process.env.HARNESSD_PROCESS_PROVIDER_TEST_SECRET ?? 'missing', coverage: process.env.NODE_V8_COVERAGE ?? 'missing' }))`,
+						`require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({ secret: process.env.HARNESSD_PROCESS_PROVIDER_TEST_SECRET ?? 'missing', telegram: process.env.HARNESSD_TELEGRAM_BOT_TOKEN ?? 'missing', coverage: process.env.NODE_V8_COVERAGE ?? 'missing' }))`,
 					],
 					cwd,
 				}),
@@ -165,6 +167,7 @@ describe("NodeProcessProvider", () => {
 			expect(await managed.exit).toEqual({ code: 0, signal: null });
 			expect(JSON.parse(await readFile(output, "utf8"))).toEqual({
 				secret: "missing",
+				telegram: "missing",
 				coverage: "missing",
 			});
 			expect(await readdir(ambientCoverage)).toEqual([]);
@@ -174,6 +177,9 @@ describe("NodeProcessProvider", () => {
 			} else {
 				process.env.HARNESSD_PROCESS_PROVIDER_TEST_SECRET = previousValue;
 			}
+			if (previousToken === undefined)
+				delete process.env.HARNESSD_TELEGRAM_BOT_TOKEN;
+			else process.env.HARNESSD_TELEGRAM_BOT_TOKEN = previousToken;
 			if (previousCoverage === undefined) delete process.env.NODE_V8_COVERAGE;
 			else process.env.NODE_V8_COVERAGE = previousCoverage;
 		}
