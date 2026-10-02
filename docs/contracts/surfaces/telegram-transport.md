@@ -6,7 +6,8 @@
 
 ## Configuration and authorization
 
-- `HARNESSD_TELEGRAM_BOT_TOKEN` and a nonempty comma-separated `HARNESSD_TELEGRAM_ALLOWED_USER_IDS` are required. IDs must be positive safe integers. `HARNESSD_PI_EXECUTABLE` defaults to `pi`; `HARNESSD_STATE_DIR` uses the core's standard resolution. `harnessd --help` reports usage without requiring configuration.
+- Runtime startup loads an optional `.env` from the process current working directory before validating configuration. Process-environment values take precedence, file values are parsed as Node dotenv syntax (never executed as shell), and read errors are reported without exposing contents. See [CLI configuration](cli-configuration.md).
+- `HARNESSD_TELEGRAM_BOT_TOKEN` and a nonempty comma-separated `HARNESSD_TELEGRAM_ALLOWED_USER_IDS` are required. IDs must be positive safe integers. `HARNESSD_PI_EXECUTABLE` defaults to `pi`; `HARNESSD_STATE_DIR` uses the core's standard resolution; `HARNESSD_DEFAULT_CWD` optionally selects the default `/new` workspace. `harnessd --help` reports usage without requiring or loading configuration.
 - `HARNESSD_EXECUTION_MODE` defaults to `direct` (trusted; `cwd` is not a sandbox). The CLI accepts only `direct` or `isolated`; because it registers no isolation provider, an isolated request fails safely before transport startup. Invalid values are rejected before configuration-driven transport construction.
 - Every Telegram update passes middleware before handlers: the sender must exist, have a positive safe numeric ID in the allowlist, and the chat must be `private`. Unauthorized/missing/malformed senders and groups/channels receive no reply, session data, or core dispatch. No callback action UI is implemented.
 - Allowlisted operators share access to all local sessions. The bot token is not logged or passed to Pi; child environment behavior remains the process-provider contract. Direct Pi is trusted local execution with the supervisor user's OS permissions; `cwd` is not a sandbox.
@@ -14,7 +15,7 @@
 ## Commands and session routing
 
 - Supported commands: `/help`, `/sessions`, `/new [cwd]`, `/use <sessionId>`, `/inspect [sessionId]`, `/stop [sessionId]`, and `/cancel <inputId>`. Plain text submits to the session currently selected by that private chat.
-- `/new` treats the entire remaining command text as one `cwd` path (or uses the CLI's starting directory when omitted); core canonicalizes and validates it. `/use` inspects before selection, and a failed lookup leaves the existing selection unchanged. Inspect/stop default to the selected session; cancel requires a selected session and exact `InputId`.
+- `/new` treats the entire remaining command text as one `cwd` path; if omitted, it uses `HARNESSD_DEFAULT_CWD` or falls back to the CLI process working directory. Core canonicalizes and validates either path. `/use` inspects before selection, and a failed lookup leaves the existing selection unchanged. Inspect/stop default to the selected session; cancel requires a selected session and exact `InputId`.
 - Selection is volatile and private-chat-scoped. After service restart, use `/use` again. Session IDs and working directories are shown only to authorized chats.
 
 ## Event presentation and backpressure
@@ -33,4 +34,4 @@
 
 ## Non-goals and related contracts
 
-Groups/channels, inline keyboard/callback actions, persistent chat selection/event history, per-user session ownership, automatic input retries, Telegram-owned watchdog policy, recovery after supervisor restart, sandboxing, and secret-wallet behavior are not provided by this surface. See [core session management](core-session-management.md) and [Pi RPC harness](pi-rpc-harness.md).
+Groups/channels, inline keyboard/callback actions, persistent chat selection/event history, per-user session ownership, automatic input retries, Telegram-owned watchdog policy, recovery after supervisor restart, sandboxing, and secret-wallet behavior are not provided by this surface. CLI environment loading and user-level service management are defined by [CLI configuration](cli-configuration.md) and [user service](user-service.md). See [core session management](core-session-management.md) and [Pi RPC harness](pi-rpc-harness.md).

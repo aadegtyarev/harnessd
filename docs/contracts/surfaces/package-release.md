@@ -14,7 +14,7 @@ This surface defines the package identity, version compatibility promise, local 
 
 ## Local installation and package contents
 
-- The supported owner-test flow installs a Git URL into a non-global local npm prefix or consumer project. npm runs the package `prepare` lifecycle to build TypeScript output before installing the dependency. Global installation directly from a Git URL is not claimed in this phase.
+- The supported owner-test flow installs a Git URL into a non-global local npm prefix or consumer project. npm runs the package `prepare` lifecycle to build TypeScript output before installing the dependency. Global installation directly from a Git URL is not claimed in this phase. Installing the npm package never modifies system services; an owner may explicitly use `harnessd service install` for a Linux per-user systemd unit after preparing `.env`.
 - The declared `harnessd` binary and every module it imports under `dist/src` must be included in the package payload, so a future approved registry installation can link the CLI without building from Git source.
 - The package allowlist includes runtime output, user-facing documentation, and the published package surface contracts; tests, local state, credentials, caches, and inbox data are not distributable package contents.
 - Private Git installation requires the user's normal repository access. Never place access tokens or other credentials in a saved Git URL or documentation example.
@@ -38,3 +38,5 @@ The package is `0.1.0`, `private: true`, and intended for local Git-based owner 
 - [Direct Node process provider](process-provider.md)
 - [Transport adapter](transport-adapter.md)
 - [Telegram transport and CLI](telegram-transport.md)
+- [CLI configuration](cli-configuration.md)
+- [Per-user systemd service](user-service.md)

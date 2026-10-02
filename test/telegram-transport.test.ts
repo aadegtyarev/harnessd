@@ -297,6 +297,14 @@ describe("Telegram transport", () => {
 		expect(bot.sent).toHaveLength(sentCount);
 	});
 
+	it("uses the configured default cwd when /new has no explicit path", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/new");
+		expect(requests[0]).toMatchObject({ kind: "create", cwd: "/work" });
+		await adapter.stop();
+	});
+
 	it("contains dispatch rejections with a safe message and no prompt echo", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp(), {

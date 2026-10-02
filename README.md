@@ -65,14 +65,53 @@ node dist/src/cli.js --help
 | `HARNESSD_PI_EXECUTABLE` | No | `pi` | Pi CLI executable. An absolute path avoids `PATH` surprises. |
 | `HARNESSD_STATE_DIR` | No | `$XDG_STATE_HOME/harnessd`, otherwise `~/.local/state/harnessd` | Absolute supervisor state directory. On POSIX it must be owned by the current user and inaccessible to group/others. |
 | `HARNESSD_EXECUTION_MODE` | No | `direct` | `direct` is trusted execution. `isolated` currently fails safely because the CLI has no isolation provider. |
+| `HARNESSD_DEFAULT_CWD` | No | process working directory | Default workspace for `/new` when no path is supplied. An explicit `/new <cwd>` takes precedence. |
 
-For example, configure the two required Telegram values in your local environment, then run:
+The CLI loads an optional `.env` file from its current working directory before checking required settings. Values already exported in the shell take precedence. Use Node dotenv syntax; the file is not executed as shell code. Keep credentials out of source control and restrict the file on POSIX:
 
 ```sh
-harnessd
+chmod 600 .env
 ```
 
-The Pi child does **not** inherit the supervisor's full environment. Exporting a model/API key in the shell that starts harnessd therefore does not guarantee Pi receives it. Use Pi's supported configuration mechanism; this CLI does not currently expose a Pi child-environment option.
+Example `.env` entries (replace placeholders locally; `.env` is gitignored):
+
+```dotenv
+HARNESSD_TELEGRAM_BOT_TOKEN=replace-with-your-bot-token
+HARNESSD_TELEGRAM_ALLOWED_USER_IDS=123456789
+HARNESSD_DEFAULT_CWD=/absolute/path/to/your/workspace
+# Prefer an absolute path for services if Pi is not on systemd's PATH.
+# HARNESSD_PI_EXECUTABLE=/absolute/path/to/pi
+```
+
+Run harnessd from the directory containing that `.env`:
+
+```sh
+cd /path/to/harnessd
+"$HOME/.local/share/harnessd/node_modules/.bin/harnessd"
+```
+
+`HARNESSD_DEFAULT_CWD` applies only when `/new` has no explicit path. If unset, the current process working directory remains the default. Relative values resolve against the process working directory; an absolute path is recommended, particularly for services.
+
+The Pi child does **not** inherit the supervisor's full environment, including values loaded from `.env`. Use Pi's supported configuration mechanism; this CLI does not expose a Pi child-environment option.
+
+## Run as a per-user service (Linux)
+
+To install a `systemd --user` service, first put the required Telegram settings in `.env`, then run the install command from the directory containing that file:
+
+```sh
+cd /path/to/harnessd
+"$HOME/.local/share/harnessd/node_modules/.bin/harnessd" service install
+systemctl --user status harnessd.service
+journalctl --user -u harnessd.service -f
+```
+
+Installation creates a user unit, enables it for the user's `default.target`, and starts it immediately. It does not use `sudo`, create a system-wide service, copy secrets into the unit, or enable lingering. Without systemd lingering, running after logout is not guaranteed. The service does not automatically restart on failure; use `systemctl --user restart harnessd.service` when needed. To remove it:
+
+```sh
+"$HOME/.local/share/harnessd/node_modules/.bin/harnessd" service uninstall
+```
+
+Package installation itself never creates a service. The service unit uses the installation command's current directory and loads `.env` there. Its unit location follows `XDG_CONFIG_HOME` from the invoking shell, or `~/.config` when unset; use the same shell setting when uninstalling. Values from `.env` do not change the user-manager path. See the [user-service contract](docs/contracts/surfaces/user-service.md) for ownership and failure behavior.
 
 ## Telegram commands
 
@@ -82,7 +121,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | --- | --- |
 | `/help` | Show available commands. |
 | `/sessions` | List sessions. |
-| `/new [cwd]` | Create a session in `cwd`; defaults to the service's starting directory. |
+| `/new [cwd]` | Create a session in `cwd`; defaults to `HARNESSD_DEFAULT_CWD`, or the service's starting directory if unset. |
 | `/use <sessionId>` | Select a session for this private chat. |
 | `/inspect [sessionId]` | Inspect the selected or named session. |
 | `/stop [sessionId]` | Stop the selected or named session. |
@@ -121,4 +160,4 @@ npm run version:check
 npm pack --dry-run
 ```
 
-The package remains private. See the [package-release contract](docs/contracts/surfaces/package-release.md) before preparing a version bump or distribution change.
+The package remains private. See the [package-release contract](docs/contracts/surfaces/package-release.md) before preparing a version bump or distribution change. CLI configuration is specified in [cli-configuration.md](docs/contracts/surfaces/cli-configuration.md).

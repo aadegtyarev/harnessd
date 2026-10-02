@@ -1,18 +1,29 @@
 #!/usr/bin/env node
 
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	ApplicationRuntime,
 	InvalidExecutionModeError,
 	IsolationUnavailableError,
 } from "./application-runtime.js";
 import { resolveStateDirectory } from "./core/session-store.js";
+import { loadDotEnv } from "./dotenv.js";
 import { TelegramTransportAdapter } from "./telegram-transport.js";
+import {
+	manageUserService,
+	type UserServiceAction,
+	type UserServiceOptions,
+} from "./user-service.js";
 
 export const HELP = `harnessd - locally supervised Pi sessions over Telegram
 
-Usage: harnessd [--help]
+Usage:
+  harnessd [--help]
+  harnessd service install|uninstall
+
+An optional .env in the current directory is loaded before configuration checks;
+existing process environment variables take precedence. --help skips config loading.
 
 Required environment:
   HARNESSD_TELEGRAM_BOT_TOKEN       Telegram bot token
@@ -22,6 +33,11 @@ Optional environment:
   HARNESSD_PI_EXECUTABLE            Pi executable (default: pi)
   HARNESSD_STATE_DIR                Supervisor state directory
   HARNESSD_EXECUTION_MODE           direct (default, trusted; cwd is not a sandbox) or isolated (unavailable in this CLI; requires a registered isolation provider)
+  HARNESSD_DEFAULT_CWD              Default workspace for /new when no cwd is supplied
+
+Service commands (Linux systemd --user):
+  harnessd service install          Install, enable, and start the user service
+  harnessd service uninstall        Stop, disable, and remove the user service
 
 Private-chat commands:
   /sessions
@@ -42,6 +58,10 @@ export interface CliOptions {
 	readonly runtimeStart?: typeof ApplicationRuntime.start;
 	readonly write?: (text: string) => void;
 	readonly writeError?: (text: string) => void;
+	readonly serviceManager?: (
+		action: UserServiceAction,
+		options: UserServiceOptions,
+	) => Promise<void>;
 }
 
 export async function main(options: CliOptions = {}): Promise<void> {
@@ -51,20 +71,33 @@ export async function main(options: CliOptions = {}): Promise<void> {
 		write(HELP);
 		return;
 	}
-	if (argv.length) throw new Error("Unsupported command-line arguments");
 	const env = options.env ?? process.env;
+	const cwd = options.cwd ?? process.cwd();
+	if (argv[0] === "service") {
+		const action = argv[1];
+		if ((action !== "install" && action !== "uninstall") || argv.length !== 2)
+			throw new Error("HARNESSD_UNSUPPORTED_SERVICE_COMMAND");
+		if (action === "install") {
+			const dotenvValues = await loadDotEnv(cwd, {});
+			validateServiceDotEnv(dotenvValues);
+		}
+		const serviceManager = options.serviceManager ?? manageUserService;
+		await serviceManager(action, {
+			env,
+			cwd,
+			nodeExecutable: process.execPath,
+			cliEntryPoint: fileURLToPath(import.meta.url),
+			write,
+		});
+		return;
+	}
+	if (argv.length) throw new Error("Unsupported command-line arguments");
+	await loadDotEnv(cwd, env);
 	const executionMode = env.HARNESSD_EXECUTION_MODE ?? "direct";
 	if (executionMode !== "direct" && executionMode !== "isolated")
 		throw new InvalidExecutionModeError();
 	if (executionMode === "isolated") throw new IsolationUnavailableError();
-	const token = env.HARNESSD_TELEGRAM_BOT_TOKEN;
-	const ids = parseAllowedIds(env.HARNESSD_TELEGRAM_ALLOWED_USER_IDS);
-	if (!token?.trim())
-		throw new Error("HARNESSD_TELEGRAM_BOT_TOKEN is required");
-	if (!ids.length)
-		throw new Error(
-			"HARNESSD_TELEGRAM_ALLOWED_USER_IDS must contain positive numeric IDs",
-		);
+	const { token, ids } = validateTelegramConfiguration(env);
 	const stateDirectory = resolveStateDirectory(env.HARNESSD_STATE_DIR);
 	const writeError =
 		options.writeError ?? ((text: string) => process.stderr.write(text));
@@ -92,7 +125,7 @@ export async function main(options: CliOptions = {}): Promise<void> {
 		token,
 		allowedUserIds: ids,
 		stateDirectory,
-		defaultCwd: options.cwd ?? process.cwd(),
+		defaultCwd: env.HARNESSD_DEFAULT_CWD || cwd,
 		signal: startupAbort.signal,
 		onFatal: () => {
 			try {
@@ -130,6 +163,38 @@ export async function main(options: CliOptions = {}): Promise<void> {
 		process.removeListener("SIGTERM", onSignal);
 		if (runtime && !closePromise) await runtime.close();
 	}
+}
+
+function validateTelegramConfiguration(env: NodeJS.ProcessEnv): {
+	readonly token: string;
+	readonly ids: number[];
+} {
+	const token = env.HARNESSD_TELEGRAM_BOT_TOKEN;
+	const ids = parseAllowedIds(env.HARNESSD_TELEGRAM_ALLOWED_USER_IDS);
+	if (!token?.trim())
+		throw new Error("HARNESSD_TELEGRAM_BOT_TOKEN is required");
+	if (!ids.length)
+		throw new Error(
+			"HARNESSD_TELEGRAM_ALLOWED_USER_IDS must contain positive numeric IDs",
+		);
+	return { token, ids };
+}
+
+function validateServiceDotEnv(
+	dotenvValues: Readonly<NodeJS.ProcessEnv>,
+): void {
+	const executionMode = dotenvValues.HARNESSD_EXECUTION_MODE ?? "direct";
+	if (executionMode !== "direct" && executionMode !== "isolated")
+		throw new InvalidExecutionModeError();
+	if (executionMode === "isolated") throw new IsolationUnavailableError();
+	if (!dotenvValues.HARNESSD_TELEGRAM_BOT_TOKEN?.trim())
+		throw new Error(
+			"HARNESSD_SERVICE_DOTENV_MUST_CONTAIN_TELEGRAM_CONFIGURATION",
+		);
+	if (!parseAllowedIds(dotenvValues.HARNESSD_TELEGRAM_ALLOWED_USER_IDS).length)
+		throw new Error(
+			"HARNESSD_SERVICE_DOTENV_MUST_CONTAIN_TELEGRAM_CONFIGURATION",
+		);
 }
 
 function parseAllowedIds(value: string | undefined): number[] {

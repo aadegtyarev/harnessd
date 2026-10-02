@@ -9,7 +9,7 @@ flowchart LR
     OP["Allowlisted operator<br/>private chat"] <--> TG["Telegram API"]
 
     subgraph SERVICE["harnessd control plane"]
-        CLI["CLI<br/>configuration and signals"] --> RT["ApplicationRuntime<br/>composition and lifecycle"]
+        CLI["CLI<br/>dotenv config, service commands,<br/>signals"] --> RT["ApplicationRuntime<br/>composition and lifecycle"]
         TR["Telegram transport<br/>authorization, chat selection,<br/>bounded message queues"] <--> RT
         RT <--> CORE["SessionManager<br/>IDs, routing, events,<br/>bounded in-process recovery"]
         CORE <--> DB[("SQLite<br/>supervisor state directory")]
@@ -17,6 +17,8 @@ flowchart LR
         RT --> MODE{"Execution mode"}
     end
 
+    US["Optional systemd --user unit"]
+    CLI -. "explicit install/uninstall" .-> US
     TG <-->|"long polling and replies"| TR
     MODE -->|"direct default: trusted"| H["PiRpcHarnessAdapter<br/>RPC JSONL, prompts, cancel"]
     MODE -.->|"isolated: requires injected<br/>capable provider"| CLOSED["CLI has no provider;<br/>fails closed"]
@@ -33,11 +35,13 @@ The transport, core, harness, and process provider are separate boundaries. Core
 
 ## A request and response
 
-1. The CLI validates configuration, opens supervisor state, builds the runtime, and waits for Telegram polling readiness.
+1. The CLI loads an optional `.env` from its current working directory (without overriding existing process variables), validates configuration, opens supervisor state, builds the runtime, and waits for Telegram polling readiness. `--help` does not require or load configuration.
 2. Before a Telegram update reaches the core, middleware requires an allowlisted numeric sender and a private chat. Selection of a session is kept in memory per chat.
 3. A command or text update becomes a typed runtime request. `SessionManager` routes it by supervisor `SessionId` to the matching Pi RPC instance.
 4. Pi communicates with its adapter using line-delimited JSON over standard input/output. The adapter decodes events and acknowledgements; the runtime returns safe results to Telegram.
 5. Live events are tagged with their supervisor session ID and sent in order to chats that have selected that session, subject to bounded queues. Chat selection and event history are not persisted.
+
+On Linux, `harnessd service install` explicitly installs/enables/starts a per-user systemd unit; `service uninstall` removes only that managed unit. The unit uses the install command's working directory, so harnessd loads `.env` there. npm installation has no service side effects, and the unit does not configure automatic restarts or logout lingering.
 
 ## Process failure and uncertain input
 
@@ -54,4 +58,4 @@ After harnessd itself exits, existing SQLite rows do not prove that their Pi pro
 - There is no secret wallet, durable chat selection, durable event/input history, or supervisor-restart recovery.
 - The Telegram polling lock protects only processes sharing the configured state directory; it cannot stop an unrelated program from polling the same bot token.
 
-See the [README](../README.md) for installation and operation, and the [package-release contract](contracts/surfaces/package-release.md) for versioning and Git installation.
+A `/new` command without a path uses `HARNESSD_DEFAULT_CWD`, or the process working directory when unset. See the [README](../README.md) for installation and operation, [CLI configuration](contracts/surfaces/cli-configuration.md), [user service](contracts/surfaces/user-service.md), and the [package-release contract](contracts/surfaces/package-release.md) for versioning and Git installation.
