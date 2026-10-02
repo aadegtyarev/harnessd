@@ -22,4 +22,3 @@ Startup, command, protocol, process, and shutdown failures reject or emit explic
 
 - [Core session management](core-session-management.md)
 - [Direct Node process provider](process-provider.md)
-- [Harnessd v1](../features/harnessd-v1.md)

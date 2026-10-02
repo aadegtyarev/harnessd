@@ -24,5 +24,4 @@ Execution is direct and trusted with the supervisor user's OS permissions; cwd i
 ## Related contracts
 
 - [Core session management](core-session-management.md)
-- [Harnessd v1](../features/harnessd-v1.md)
 - [Pi RPC harness](pi-rpc-harness.md)

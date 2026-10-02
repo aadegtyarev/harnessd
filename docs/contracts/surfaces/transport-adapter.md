@@ -29,4 +29,3 @@ A transport adapter translates its external protocol and authenticated principal
 - [Core session management](core-session-management.md)
 - [Pi RPC harness](pi-rpc-harness.md)
 - [Direct Node process provider](process-provider.md)
-- [Harnessd v1](../features/harnessd-v1.md)
