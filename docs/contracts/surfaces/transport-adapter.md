@@ -8,8 +8,8 @@ A transport adapter translates its external protocol and authenticated principal
 
 - `TransportAdapter.start` receives a request dispatcher and an event-subscription function. The subscription returns a disposer; adapters release subscriptions during `stop`. `start` resolves when the adapter is ready to receive requests.
 - The adapter dispatches list, inspect, create, stop, submit, and cancel requests through the application boundary. Every request identifies its authenticated `principalId`; the adapter must authorize each external update before dispatch.
-- Dispatch returns a typed success or safe error result. List/inspect/create return session data, submit returns the accepted `InputId`, and stop/cancel return success without inventing an input state. Unsupported capabilities and invalid requests fail explicitly; they are not silent no-ops or fallback opportunities.
-- The adapter can subscribe to live `HarnessEvent`s from the runtime. Events carry supervisor `SessionId` and retain per-session order. The adapter owns mapping session identity to its authenticated principals/chats and decides which authorized recipients should see an event.
+- Dispatch returns a typed success or safe error result. List/inspect/create return session data, submit returns the accepted `InputId`, and stop/cancel return success without inventing an input state. An uncertain submit error preserves its original `InputId` when available, without exposing prompt content. Unsupported capabilities and invalid requests fail explicitly; they are not silent no-ops or fallback opportunities.
+- The adapter can subscribe to live `HarnessEvent`s from the runtime. Events carry supervisor `SessionId` and arrive in per-session order. An adapter may batch or coalesce notifications for bounded delivery only if the relative order of retained notifications is preserved and uncertainty remains discoverable by its original `InputId`. The adapter owns mapping session identity to its authenticated principals/chats and decides which authorized recipients should see an event.
 - Event and result presentation must not expose raw exceptions, prompt contents, stderr, secret values, or environment configuration. Harness uncertainty is shown with its original `InputId` and state and must never trigger an automatic resend.
 
 ## Lifecycle and failure behavior
@@ -21,7 +21,7 @@ A transport adapter translates its external protocol and authenticated principal
 ## Security and non-goals
 
 - A transport authenticates/authorizes before dispatch on every external command, callback, or message. The runtime does not infer authorization from a claimed `principalId`.
-- This surface defines the adapter-neutral boundary only. Telegram polling, Telegram allowlists/private-chat rules, bot credential management, UI formatting, CLI UX, watchdog/recovery, and persistence of event history are specified by later milestones.
+- This surface defines the adapter-neutral boundary only. Telegram polling, Telegram allowlists/private-chat rules, bot credential management, Telegram event formatting, and CLI configuration are specified by [Telegram transport](telegram-transport.md). Watchdog/recovery and persistence of event history remain separate milestones.
 
 ## Related contracts
 

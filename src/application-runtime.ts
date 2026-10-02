@@ -14,7 +14,10 @@ import {
 } from "./core/session-store.js";
 import type { HarnessEvent } from "./core/types.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
-import { PiRpcHarnessAdapter } from "./harness/pi-rpc-harness.js";
+import {
+	PiRpcHarnessAdapter,
+	UncertainInputDeliveryError,
+} from "./harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "./process/node-process-provider.js";
 
 export type ApplicationRequest = TransportEvent;
@@ -214,12 +217,19 @@ export class ApplicationRuntime {
 				typeof candidate === "string" && safeErrorMessages.has(candidate)
 					? candidate
 					: "OPERATION_FAILED";
+			const inputId =
+				error instanceof UncertainInputDeliveryError
+					? error.inputId
+					: undefined;
 			return {
 				requestId: request.requestId,
 				ok: false,
 				error: {
 					code,
 					message: safeErrorMessages.get(code) ?? "Operation failed",
+					...(code === "UNCERTAIN_INPUT_DELIVERY" && inputId
+						? { inputId }
+						: {}),
 				},
 			};
 		}

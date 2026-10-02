@@ -86,7 +86,11 @@ export type TransportResult =
 	| {
 			readonly requestId: string;
 			readonly ok: false;
-			readonly error: { readonly code: string; readonly message: string };
+			readonly error: {
+				readonly code: string;
+				readonly message: string;
+				readonly inputId?: InputId;
+			};
 	  };
 
 export type TransportEventListener = (event: HarnessEvent) => unknown;

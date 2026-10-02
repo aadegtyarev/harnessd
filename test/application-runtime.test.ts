@@ -19,6 +19,7 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
+import { UncertainInputDeliveryError } from "../src/harness/pi-rpc-harness.js";
 
 const dirs: string[] = [];
 function deferred<T>() {
@@ -80,6 +81,8 @@ describe("application runtime", () => {
 					processId: "proc" as never,
 					events: (async function* () {})(),
 					async send(input) {
+						if (input.text === "uncertain private prompt")
+							throw new UncertainInputDeliveryError(input.id);
 						if (input.text === "sensitive failure")
 							throw Object.assign(new Error("private detail"), {
 								code: "SECRET_PRIVATE_DETAIL",
@@ -175,6 +178,24 @@ describe("application runtime", () => {
 			error: { code: "OPERATION_FAILED", message: "Operation failed" },
 		});
 		expect(JSON.stringify(safeFailure)).not.toContain("private detail");
+		const uncertain = await dispatch({
+			requestId: "request-uncertain",
+			principalId: "operator",
+			kind: "submit",
+			sessionId: created.value.id,
+			text: "uncertain private prompt",
+		});
+		expect(uncertain).toMatchObject({
+			requestId: "request-uncertain",
+			ok: false,
+			error: {
+				code: "UNCERTAIN_INPUT_DELIVERY",
+				message: "Input delivery is uncertain",
+			},
+		});
+		if (uncertain.ok) throw new Error("Expected uncertain input result");
+		expect(uncertain.error.inputId).toBeTruthy();
+		expect(JSON.stringify(uncertain)).not.toContain("uncertain private prompt");
 		const cancel = await dispatch({
 			requestId: "request-cancel",
 			principalId: "operator",
