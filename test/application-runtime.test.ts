@@ -79,6 +79,7 @@ describe("application runtime", () => {
 			async launch() {
 				return {
 					processId: "proc" as never,
+					exit: new Promise(() => {}),
 					events: (async function* () {})(),
 					async send(input) {
 						if (input.text === "uncertain private prompt")
@@ -272,6 +273,7 @@ describe("application runtime", () => {
 				gates.set(request.sessionId, gate);
 				return {
 					processId: `process-${request.sessionId}` as never,
+					exit: new Promise(() => {}),
 					events: (async function* () {
 						await gate.promise;
 						yield {

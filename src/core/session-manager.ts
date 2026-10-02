@@ -48,6 +48,12 @@ export class SessionManager {
 	private closing = false;
 	private closePromise: Promise<void> | undefined;
 	private readonly stopping = new Map<SessionId, Promise<void>>();
+	private readonly terminal = new Set<SessionId>();
+	private readonly recovery = new Map<SessionId, Promise<void>>();
+	private readonly attempts = new Map<SessionId, number>();
+	private readonly delays = new Map<SessionId, () => void>();
+	private readonly unsettledInputs = new Map<SessionId, Set<InputId>>();
+	private readonly recoveryErrors = new Map<SessionId, unknown>();
 
 	constructor(
 		private readonly store: SessionStore,
@@ -130,6 +136,7 @@ export class SessionManager {
 					};
 					await this.store.update(running);
 					this.startEventPump(id, instance);
+					this.watchExit(id, instance);
 					return running;
 				} catch (error) {
 					const failures: unknown[] = [error];
@@ -186,6 +193,7 @@ export class SessionManager {
 		const sessionIds = new Set([
 			...this.instances.keys(),
 			...this.eventPumps.keys(),
+			...this.recovery.keys(),
 			...this.stopping.keys(),
 		]);
 		for (const id of sessionIds) {
@@ -224,10 +232,26 @@ export class SessionManager {
 	}
 
 	private async stopSession(id: SessionId): Promise<void> {
+		await this.get(id);
+		this.terminal.add(id);
+		this.delays.get(id)?.();
 		const launch = this.launching.get(id);
 		if (launch) await launch.catch(() => undefined);
 		const session = await this.get(id);
-		if (session.status === "stopped") return;
+		const failures: unknown[] = [];
+		const recovery = this.recovery.get(id);
+		if (recovery) {
+			try {
+				await recovery;
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		const recoveryError = this.recoveryErrors.get(id);
+		if (recoveryError !== undefined) {
+			failures.push(recoveryError);
+			this.recoveryErrors.delete(id);
+		}
 		const instance = this.instances.get(id);
 		if (instance) {
 			const harness = this.harnesses.get(session.harnessId);
@@ -238,15 +262,34 @@ export class SessionManager {
 				"harness.stop",
 				harness.descriptor.id,
 			);
-			await instance.shutdown();
-			this.instances.delete(id);
+			try {
+				await instance.shutdown();
+				this.instances.delete(id);
+			} catch (error) {
+				failures.push(error);
+			}
 		}
 		const eventPump = this.eventPumps.get(id);
 		if (eventPump) {
 			eventPump.stop();
-			await eventPump.promise;
+			try {
+				await eventPump.promise;
+			} catch (error) {
+				failures.push(error);
+			}
 		}
-		await this.store.setStatus(id, "stopped");
+		if (!this.instances.has(id) && session.status !== "stopped") {
+			try {
+				await this.store.setStatus(id, "stopped");
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length)
+			throw new AggregateError(
+				failures,
+				`Session '${id}' shutdown was incomplete`,
+			);
 	}
 
 	async submit(id: SessionId, text: string): Promise<InputId> {
@@ -268,7 +311,18 @@ export class SessionManager {
 			text,
 			createdAt: new Date(),
 		};
-		await instance.send(input);
+		let unsettled = this.unsettledInputs.get(id);
+		if (!unsettled) {
+			unsettled = new Set();
+			this.unsettledInputs.set(id, unsettled);
+		}
+		unsettled.add(input.id);
+		try {
+			await instance.send(input);
+		} catch (error) {
+			if (!isUncertainDelivery(error, input.id)) unsettled.delete(input.id);
+			throw error;
+		}
 		return input.id;
 	}
 
@@ -286,6 +340,220 @@ export class SessionManager {
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
 		await instance.cancel(inputId);
+	}
+
+	private watchExit(id: SessionId, instance: HarnessInstance): void {
+		void instance.exit
+			.then(async () => {
+				if (
+					this.instances.get(id) !== instance ||
+					this.terminal.has(id) ||
+					this.closing
+				)
+					return;
+				const pump = this.eventPumps.get(id);
+				if (pump) await pump.promise.catch(() => undefined);
+				if (
+					this.instances.get(id) !== instance ||
+					this.terminal.has(id) ||
+					this.closing
+				)
+					return;
+				for (const inputId of this.unsettledInputs.get(id) ?? []) {
+					this.publishEvent({
+						sessionId: id,
+						kind: "input",
+						inputEvent: { inputId, state: "uncertain" },
+					});
+				}
+				this.unsettledInputs.delete(id);
+				this.instances.delete(id);
+				let task!: Promise<void>;
+				task = this.recover(id)
+					.catch(async (error) => {
+						this.recoveryErrors.set(id, error);
+						if (this.terminal.has(id) || this.closing) return;
+						try {
+							await this.store.setStatus(id, "failed");
+						} catch (statusError) {
+							this.recoveryErrors.set(
+								id,
+								new AggregateError([error, statusError], "Recovery failed"),
+							);
+							if (!this.terminal.has(id) && !this.closing)
+								this.publishEvent({
+									sessionId: id,
+									kind: "status",
+									text: "harness_recovery_failed",
+								});
+							return;
+						}
+						if (!this.terminal.has(id) && !this.closing)
+							this.publishEvent({
+								sessionId: id,
+								kind: "status",
+								text: "harness_recovery_failed",
+							});
+					})
+					.finally(() => {
+						if (this.recovery.get(id) === task) this.recovery.delete(id);
+					});
+				this.recovery.set(id, task);
+				try {
+					await task;
+				} catch (error) {
+					this.recoveryErrors.set(id, error);
+					try {
+						await this.store.setStatus(id, "failed");
+						this.publishEvent({
+							sessionId: id,
+							kind: "status",
+							text: "harness_recovery_failed",
+						});
+					} catch (statusError) {
+						this.recoveryErrors.set(
+							id,
+							new AggregateError([error, statusError], "Recovery failed"),
+						);
+					}
+				} finally {
+					if (this.recovery.get(id) === task) this.recovery.delete(id);
+				}
+			})
+			.catch(() => {});
+	}
+
+	private async recover(id: SessionId): Promise<void> {
+		const session = await this.get(id);
+		if (this.terminal.has(id) || this.closing) return;
+		const harness = this.harnesses.get(session.harnessId);
+		this.publishEvent({
+			sessionId: id,
+			kind: "status",
+			text: "harness_restarting",
+		});
+		const resume = harness?.resume;
+		const canResume =
+			resume &&
+			harness.descriptor.capabilities.includes("harness.resume") &&
+			session.nativeSessionId;
+		if (!canResume) {
+			if (this.terminal.has(id) || this.closing) return;
+			await this.store.setStatus(id, "failed");
+			if (!this.terminal.has(id) && !this.closing)
+				this.publishEvent({
+					sessionId: id,
+					kind: "status",
+					text: "harness_recovery_failed",
+				});
+			return;
+		}
+		await this.store.setStatus(id, "starting");
+		if (this.terminal.has(id) || this.closing) return;
+		const waits = [250, 1000, 4000];
+		while ((this.attempts.get(id) ?? 0) < waits.length) {
+			const delay = waits[this.attempts.get(id) ?? 0] as number;
+			if (this.terminal.has(id) || this.closing) return;
+			await this.waitRecoveryDelay(id, delay);
+			if (this.terminal.has(id) || this.closing) return;
+			const attempt = (this.attempts.get(id) ?? 0) + 1;
+			this.attempts.set(id, attempt);
+			await this.store.setStatus(id, "starting");
+			if (this.terminal.has(id) || this.closing) return;
+			let replacement: HarnessInstance;
+			try {
+				replacement = await resume.call(harness, {
+					sessionId: id,
+					cwd: session.cwd,
+					nativeSessionId: session.nativeSessionId,
+				});
+			} catch {
+				if (attempt >= waits.length) {
+					if (this.terminal.has(id) || this.closing) return;
+					await this.store.setStatus(id, "failed");
+					if (!this.terminal.has(id) && !this.closing)
+						this.publishEvent({
+							sessionId: id,
+							kind: "status",
+							text: "harness_recovery_failed",
+						});
+					return;
+				}
+				continue;
+			}
+			this.instances.set(id, replacement);
+			if (replacement.nativeSessionId !== session.nativeSessionId) {
+				await replacement.shutdown();
+				this.instances.delete(id);
+				if (this.terminal.has(id) || this.closing) return;
+				await this.store.setStatus(id, "failed");
+				if (!this.terminal.has(id) && !this.closing)
+					this.publishEvent({
+						sessionId: id,
+						kind: "status",
+						text: "harness_recovery_failed",
+					});
+				return;
+			}
+			if (this.terminal.has(id) || this.closing) {
+				await replacement.shutdown();
+				this.instances.delete(id);
+				return;
+			}
+			try {
+				await this.store.setStatus(id, "running");
+			} catch (error) {
+				try {
+					await replacement.shutdown();
+					this.instances.delete(id);
+				} catch (shutdownError) {
+					throw new AggregateError(
+						[error, shutdownError],
+						"Recovered harness cleanup failed",
+					);
+				}
+				throw error;
+			}
+			if (this.terminal.has(id) || this.closing) {
+				await replacement.shutdown();
+				this.instances.delete(id);
+				return;
+			}
+			this.startEventPump(id, replacement);
+			this.watchExit(id, replacement);
+			this.publishEvent({
+				sessionId: id,
+				kind: "status",
+				text: "harness_recovered",
+			});
+			return;
+		}
+		if (!this.terminal.has(id) && !this.closing) {
+			await this.store.setStatus(id, "failed");
+			if (!this.terminal.has(id) && !this.closing)
+				this.publishEvent({
+					sessionId: id,
+					kind: "status",
+					text: "harness_recovery_failed",
+				});
+		}
+	}
+
+	private waitRecoveryDelay(
+		id: SessionId,
+		milliseconds: number,
+	): Promise<void> {
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				this.delays.delete(id);
+				resolve();
+			}, milliseconds);
+			this.delays.set(id, () => {
+				clearTimeout(timer);
+				this.delays.delete(id);
+				resolve();
+			});
+		});
 	}
 
 	private startEventPump(id: SessionId, instance: HarnessInstance): void {
@@ -318,7 +586,13 @@ export class SessionManager {
 					this.closeEventIterator(iterator);
 					return;
 				}
-				this.publishEvent({ ...next.result.value, sessionId: id });
+				const event = { ...next.result.value, sessionId: id };
+				if (event.kind === "input" && event.inputEvent) {
+					const state = event.inputEvent.state;
+					if (["completed", "failed", "uncertain"].includes(state))
+						this.unsettledInputs.get(id)?.delete(event.inputEvent.inputId);
+				}
+				this.publishEvent(event);
 			}
 		} catch {
 			if (this.instances.get(id) === instance) {
@@ -404,6 +678,18 @@ export class SessionManager {
 			}
 		}
 	}
+}
+
+function isUncertainDelivery(error: unknown, inputId: InputId): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const candidate = error as {
+		readonly code?: unknown;
+		readonly inputId?: unknown;
+	};
+	return (
+		candidate.code === "UNCERTAIN_INPUT_DELIVERY" &&
+		candidate.inputId === inputId
+	);
 }
 
 function parseSessionId(value: string): SessionId {
