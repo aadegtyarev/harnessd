@@ -225,6 +225,7 @@ interface ActiveInput {
 }
 class PiRpcInstance implements HarnessInstance {
 	readonly processId: ManagedProcess["id"];
+	readonly exit: ManagedProcess["exit"];
 	private readonly queue: HarnessEvent[] = [];
 	private readonly waiters: ((result: IteratorResult<HarnessEvent>) => void)[] =
 		[];
@@ -248,6 +249,7 @@ class PiRpcInstance implements HarnessInstance {
 		private readonly options: PiRpcHarnessOptions,
 	) {
 		this.processId = child.id;
+		this.exit = child.exit;
 		const stdin = child.stdin;
 		const stdout = child.stdout;
 		const stderr = child.stderr;

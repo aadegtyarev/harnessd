@@ -115,6 +115,10 @@ export interface HarnessLaunchRequest {
 
 export interface HarnessInstance {
 	readonly processId: ProcessId;
+	readonly exit: Promise<{
+		readonly code: number | null;
+		readonly signal: string | null;
+	}>;
 	readonly nativeSessionId?: string;
 	readonly events: AsyncIterable<HarnessEvent>;
 	send(input: Input): Promise<void>;

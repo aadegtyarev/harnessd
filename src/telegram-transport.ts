@@ -228,6 +228,12 @@ function statusMessage(value: string | undefined): string {
 			return "Agent finished.";
 		case "agent_settled":
 			return "Agent is waiting for input.";
+		case "harness_restarting":
+			return "Harness is restarting.";
+		case "harness_recovered":
+			return "Harness recovered.";
+		case "harness_recovery_failed":
+			return "Harness recovery failed.";
 		default:
 			return "Session status changed.";
 	}

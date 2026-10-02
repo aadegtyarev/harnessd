@@ -114,6 +114,7 @@ function harnessPort(
 			if (options.launch) return options.launch(request);
 			const instance: HarnessInstance = {
 				processId: "process" as never,
+				exit: new Promise(() => {}),
 				nativeSessionId: "native-1",
 				events: (async function* () {})(),
 				async send(input) {
@@ -258,6 +259,7 @@ describe("SQLite session management", () => {
 			],
 			launch: async (request) => ({
 				processId: `process-${request.sessionId}` as never,
+				exit: new Promise(() => {}),
 				events: (async function* () {})(),
 				async send(input) {
 					submitted.push({ sessionId: input.sessionId, inputId: input.id });
@@ -305,6 +307,7 @@ describe("SQLite session management", () => {
 			capabilities: ["harness.launch", "harness.stop", "input.submit"],
 			launch: async () => ({
 				processId: "process" as never,
+				exit: new Promise(() => {}),
 				events: (async function* () {})(),
 				async send() {},
 				async cancel() {
@@ -345,6 +348,7 @@ describe("SQLite session management", () => {
 				const inputId = `input-${request.sessionId}` as InputId;
 				return {
 					processId: `process-${request.sessionId}` as never,
+					exit: new Promise(() => {}),
 					events: (async function* () {
 						yield {
 							sessionId: request.sessionId,
@@ -437,6 +441,7 @@ describe("SQLite session management", () => {
 		const harness = harnessPort({
 			launch: async () => ({
 				processId: "process" as never,
+				exit: new Promise(() => {}),
 				events: {
 					[Symbol.asyncIterator]() {
 						return {
@@ -494,6 +499,7 @@ describe("SQLite session management", () => {
 		const harness = harnessPort({
 			launch: async () => ({
 				processId: "process" as never,
+				exit: new Promise(() => {}),
 				events: {
 					[Symbol.asyncIterator]() {
 						return {
@@ -548,6 +554,7 @@ describe("SQLite session management", () => {
 		expect((await manager.get(id)).status).toBe("starting");
 		launchResult.resolve({
 			processId: "process" as never,
+			exit: new Promise(() => {}),
 			events: (async function* () {})(),
 			async send() {},
 			async cancel() {},
@@ -645,6 +652,7 @@ describe("SQLite session management", () => {
 		const { harness } = harnessPort({
 			launch: async () => ({
 				processId: "process" as never,
+				exit: new Promise(() => {}),
 				events: (async function* () {})(),
 				async send() {},
 				async cancel() {},
@@ -675,6 +683,7 @@ describe("SQLite session management", () => {
 		const harness = harnessPort({
 			launch: async (request) => ({
 				processId: `process-${request.sessionId}` as never,
+				exit: new Promise(() => {}),
 				events: (async function* () {})(),
 				async send() {},
 				async cancel() {},

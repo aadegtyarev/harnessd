@@ -361,6 +361,9 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(43, "/use other");
 		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		emit(harnessEvent("sid", "status", "harness_recovered"));
+		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
 		emit(harnessEvent("sid", "status", "agent_end"));
 		emit(harnessEvent("sid", "status", "secret-unknown-state"));
 		emit({
@@ -386,6 +389,22 @@ describe("Telegram transport", () => {
 		);
 		expect(sidMessages.map(({ text }) => text)).toContain(
 			"[sid] Agent started.",
+		);
+		expect(sidMessages.map(({ text }) => text)).toContain(
+			"[sid] Harness is restarting.",
+		);
+		expect(sidMessages.map(({ text }) => text)).toContain(
+			"[sid] Harness recovered.",
+		);
+		expect(sidMessages.map(({ text }) => text)).toContain(
+			"[sid] Harness recovery failed.",
+		);
+		const recoveryMessages = sidMessages.map(({ text }) => text);
+		expect(
+			recoveryMessages.indexOf("[sid] Harness is restarting."),
+		).toBeLessThan(recoveryMessages.indexOf("[sid] Harness recovered."));
+		expect(recoveryMessages.indexOf("[sid] Harness recovered.")).toBeLessThan(
+			recoveryMessages.indexOf("[sid] Harness recovery failed."),
 		);
 		expect(sidMessages.map(({ text }) => text)).toContain(
 			"[sid] Agent finished.",
