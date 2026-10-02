@@ -1,6 +1,6 @@
 # harnessd v1 feature contract
 
-**Status:** implemented; automated acceptance verified; live Telegram smoke unavailable without dedicated test credentials
+**Status:** complete for final verification
 **Repository:** `Hobby/harnessd` (`aadegtyarev/harnessd`, private GitHub repo)
 **License:** MIT
 
