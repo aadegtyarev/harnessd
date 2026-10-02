@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -266,12 +266,12 @@ describe("in-process watchdog", () => {
 			path.join(os.tmpdir(), "watchdog-state-"),
 		);
 		directories.push(stateDirectory);
-		const workspaceA = await mkdtemp(
-			path.join(os.tmpdir(), "watchdog-workspace-a-"),
+		const workspaceA = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-workspace-a-")),
 		);
 		directories.push(workspaceA);
-		const workspaceB = await mkdtemp(
-			path.join(os.tmpdir(), "watchdog-workspace-b-"),
+		const workspaceB = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-workspace-b-")),
 		);
 		directories.push(workspaceB);
 		const exits = new Map<
@@ -425,12 +425,12 @@ describe("in-process watchdog", () => {
 			path.join(os.tmpdir(), "watchdog-credential-state-"),
 		);
 		directories.push(stateDirectory);
-		const workspaceA = await mkdtemp(
-			path.join(os.tmpdir(), "watchdog-credential-workspace-a-"),
+		const workspaceA = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-credential-workspace-a-")),
 		);
 		directories.push(workspaceA);
-		const workspaceB = await mkdtemp(
-			path.join(os.tmpdir(), "watchdog-credential-workspace-b-"),
+		const workspaceB = await realpath(
+			await mkdtemp(path.join(os.tmpdir(), "watchdog-credential-workspace-b-")),
 		);
 		directories.push(workspaceB);
 		const sentinel = "known-credential-sentinel-7f92";
@@ -460,7 +460,11 @@ describe("in-process watchdog", () => {
 			observedCount += 1;
 			if (observedCount === 2) bothEventsObserved.resolve(undefined);
 		});
+		const credentialVariable = "HARNESSD_TELEGRAM_BOT_TOKEN";
+		const previousCredential = process.env[credentialVariable];
+		process.env[credentialVariable] = sentinel;
 		try {
+			expect(process.env[credentialVariable]).toBe(sentinel);
 			await manager.create({
 				id: "credential-A",
 				harnessId: harness.descriptor.id,
@@ -477,18 +481,26 @@ describe("in-process watchdog", () => {
 				new Set([workspaceA, workspaceB]),
 			);
 			expect(JSON.stringify(records)).not.toContain(sentinel);
-			expect(diagnostic).toHaveBeenCalledTimes(2);
-			expect(diagnostic).toHaveBeenCalledWith(
-				"[harnessd] Session event observer failed",
-			);
-			expect(JSON.stringify(diagnostic.mock.calls)).not.toContain(sentinel);
+			expect(diagnostic.mock.calls).toEqual([
+				["[harnessd] Session event observer failed"],
+				["[harnessd] Session event observer failed"],
+			]);
 			expect(await readdir(workspaceA)).toEqual([]);
 			expect(await readdir(workspaceB)).toEqual([]);
 			expect(await readdir(stateDirectory)).toContain("sessions.sqlite3");
 		} finally {
-			await manager.close();
-			store.close();
-			diagnostic.mockRestore();
+			try {
+				await manager.close();
+			} finally {
+				try {
+					store.close();
+				} finally {
+					diagnostic.mockRestore();
+					if (previousCredential === undefined)
+						delete process.env[credentialVariable];
+					else process.env[credentialVariable] = previousCredential;
+				}
+			}
 		}
 	});
 
