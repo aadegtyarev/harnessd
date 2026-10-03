@@ -4,6 +4,8 @@ import {
 	readFile,
 	rm,
 	stat,
+	symlink,
+	truncate,
 	writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -24,12 +26,22 @@ import {
 const roots: string[] = [];
 function telegramBody(text: string): string {
 	const footerStart = text.lastIndexOf("\n\n");
-	return footerStart < 0 ? text : text.slice(0, footerStart);
+	const body = footerStart < 0 ? text : text.slice(0, footerStart);
+	return body
+		.replace(/<[^>]+>/g, "")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'");
 }
 function hasSessionFooter(text: string, sessionId: string): boolean {
 	const footerStart = text.lastIndexOf("\n\n");
 	if (footerStart < 0) return false;
-	const footer = text.slice(footerStart + 2).replace(/ · \d+\/\d+$/, "");
+	const footer = text
+		.slice(footerStart + 2)
+		.replace(/<\/?code>/g, "")
+		.replace(/ · \d+\/\d+$/, "");
 	return footer === sessionId || footer.endsWith(` · ${sessionId}`);
 }
 async function temp() {
@@ -49,6 +61,9 @@ type Context = {
 	chat?: { id: number; type: string };
 	message?: {
 		text?: string;
+		caption?: string;
+		document?: { file_id: string; file_name?: string; file_size?: number };
+		photo?: readonly { file_id: string; file_size?: number }[];
 		message_id?: number;
 		reply_to_message?: { message_id: number };
 	};
@@ -61,6 +76,7 @@ type Context = {
 class MockBot {
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
+	photoHandler?: (ctx: Context) => Promise<void>;
 	callbackHandler?: (ctx: Context) => Promise<void>;
 	sent: { chatId: number; text: string }[] = [];
 	nextMessageId = 1000;
@@ -119,7 +135,11 @@ class MockBot {
 			this.pinned.push({ chatId, messageId });
 			return true;
 		}),
+		sendChatAction: vi.fn(async (_chatId: number) => true),
+		sendDocument: vi.fn(async () => true),
 		answerCallbackQuery: vi.fn(async () => true),
+		getFile: vi.fn(async () => ({ file_path: "photo.jpg", file_size: 5 })),
+		getFileLink: vi.fn(async () => new URL("data:image/jpeg;base64,aGVsbG8=")),
 		setMyCommands: vi.fn(
 			async (
 				commands: readonly { command: string; description: string }[],
@@ -135,6 +155,8 @@ class MockBot {
 	}
 	on(filter: string, handler: (ctx: Context) => Promise<void>) {
 		if (filter === "message:text") this.handler = handler;
+		if (filter === "message:photo") this.photoHandler = handler;
+		if (filter === "message:document") this.photoHandler = handler;
 		if (filter === "callback_query:data") this.callbackHandler = handler;
 	}
 	init(signal?: AbortSignal): Promise<void> {
@@ -190,6 +212,17 @@ class MockBot {
 			},
 		};
 		await this.middleware?.(ctx, async () => this.handler?.(ctx));
+	}
+	async updatePhoto(chatId: number, caption?: string, userId = 42) {
+		const ctx: Context = {
+			from: { id: userId },
+			chat: { id: chatId, type: "private" },
+			message: {
+				photo: [{ file_id: "photo-id", file_size: 5 }],
+				...(caption ? { caption } : {}),
+			},
+		};
+		await this.middleware?.(ctx, async () => this.photoHandler?.(ctx));
 	}
 	async callback(
 		chatId: number,
@@ -1143,7 +1176,129 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("sends one accepted-input confirmation and marks only the footer ID monospace", async () => {
+	it("downloads selected-session photos and submits image content with the caption", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updatePhoto(42, "describe this");
+		const submission = requests.find((request) => request.kind === "submit");
+		expect(submission).toMatchObject({
+			kind: "submit",
+			text: expect.stringContaining(
+				"Caption (untrusted user text): describe this",
+			),
+			images: [{ mimeType: "image/jpeg", data: "aGVsbG8=" }],
+		});
+		const savedPath =
+			submission?.kind === "submit"
+				? submission.text.match(/saved at (.+)\. Caption/)?.[1]
+				: undefined;
+		expect(savedPath).toBeDefined();
+		if (!savedPath) throw new Error("Photo path missing from submitted prompt");
+		expect(await readFile(savedPath, "utf8")).toBe("hello");
+		await adapter.stop();
+	});
+
+	it("allows the model file-send callback only for regular files inside the selected session cwd", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const outside = await temp();
+		const file = path.join(dir, "report.txt");
+		const outsideFile = path.join(outside, "private.txt");
+		await writeFile(file, "report");
+		await writeFile(outsideFile, "private");
+		let symlinkAvailable = false;
+		try {
+			await symlink(outsideFile, path.join(dir, "escape.txt"));
+			symlinkAvailable = true;
+		} catch (error) {
+			if (process.platform !== "win32") throw error;
+		}
+		const largeFile = path.join(dir, "large.txt");
+		await writeFile(largeFile, "");
+		await truncate(largeFile, 20 * 1024 * 1024 + 1);
+		await mkdir(path.join(dir, "folder"));
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		expect(
+			await adapter.sendFileFromSession("sid" as SessionId, file, "42"),
+		).toBe(true);
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.api.sendDocument).toHaveBeenCalledWith(
+			42,
+			expect.anything(),
+			{},
+			expect.any(AbortSignal),
+		);
+		expect(
+			await adapter.sendFileFromSession(
+				"sid" as SessionId,
+				"../outside.txt",
+				"42",
+			),
+		).toBe(false);
+		if (symlinkAvailable)
+			expect(
+				await adapter.sendFileFromSession(
+					"sid" as SessionId,
+					"escape.txt",
+					"42",
+				),
+			).toBe(false);
+		expect(
+			await adapter.sendFileFromSession("sid" as SessionId, "large.txt", "42"),
+		).toBe(false);
+		expect(
+			await adapter.sendFileFromSession("sid" as SessionId, "folder", "42"),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("refreshes authorized chat typing while a session is processing", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledWith(
+				42,
+				"typing",
+				{},
+				expect.any(AbortSignal),
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+	});
+
+	it("stops typing for a chat immediately when it switches away from an active session", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid", { userId: 42 });
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(2),
+		);
+		await bot.update(42, "/use other");
+		expect(bot.api.sendChatAction.mock.calls.map(([chatId]) => chatId)).toEqual(
+			[42, 43, 43],
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+	});
+
+	it("sends one accepted-input confirmation and renders safe assistant Markdown", async () => {
 		const bot = new MockBot();
 		let emitEvent!: (event: HarnessEvent) => void;
 		const { adapter, emit } = await startAdapter(bot, await temp(), {
@@ -1160,11 +1315,21 @@ describe("Telegram transport", () => {
 		emitEvent = emit;
 		await bot.update(42, "/use sid");
 		await bot.update(42, "send this");
-		emit(harnessEvent("sid", "output", "literal <b>markup</b> & text"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				"**bold** literal <b>markup</b> & text [unsafe](javascript:alert(1))",
+			),
+		);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
-				bot.sent.some(({ text }) => text.includes("literal <b>markup</b>")),
+				bot.sent.some(
+					({ text }) =>
+						text.includes("<b>bold</b>") &&
+						text.includes("literal &lt;b&gt;markup&lt;/b&gt;"),
+				),
 			).toBe(true),
 		);
 		const acceptanceMessages = bot.sent.filter(({ text }) =>
@@ -1174,24 +1339,19 @@ describe("Telegram transport", () => {
 			"Input accepted: input-1",
 		]);
 		const outputIndex = bot.sent.findIndex(({ text }) =>
-			text.includes("literal <b>markup</b>"),
+			text.includes("<b>bold</b> literal &lt;b&gt;markup&lt;/b&gt;"),
 		);
 		const output = bot.sent[outputIndex];
 		const options = bot.sendOptions[outputIndex] as {
 			entities?: readonly { type: string; offset: number; length: number }[];
 			parse_mode?: string;
 		};
-		expect(output?.text).toContain("literal <b>markup</b> & text");
-		expect(options.parse_mode).toBeUndefined();
-		expect(options.entities).toHaveLength(1);
-		const entity = options.entities?.[0];
-		expect(entity?.type).toBe("code");
-		expect(
-			output?.text.slice(
-				entity?.offset,
-				(entity?.offset ?? 0) + (entity?.length ?? 0),
-			),
-		).toBe("sid");
+		expect(output?.text).toContain(
+			"<b>bold</b> literal &lt;b&gt;markup&lt;/b&gt; &amp; text",
+		);
+		expect(output?.text).not.toContain("javascript:");
+		expect(options.parse_mode).toBe("HTML");
+		expect(output?.text).toContain("<code>sid</code>");
 		expect(hasSessionFooter(output?.text ?? "", "sid")).toBe(true);
 		await adapter.stop();
 	});
@@ -1309,15 +1469,10 @@ describe("Telegram transport", () => {
 		).toBe(true);
 		for (const message of chunks) {
 			const options = bot.sendOptions[bot.sent.indexOf(message)] as {
-				entities?: readonly { type: string; offset: number; length: number }[];
+				parse_mode?: string;
 			};
-			const entity = options?.entities?.find(({ type }) => type === "code");
-			expect(
-				message.text.slice(
-					entity?.offset,
-					(entity?.offset ?? 0) + (entity?.length ?? 0),
-				),
-			).toBe("other");
+			expect(options.parse_mode).toBe("HTML");
+			expect(message.text).toContain("<code>other</code>");
 		}
 		expect(chunks.map(({ text }) => telegramBody(text)).join("")).toBe(
 			longOutput,
@@ -1333,7 +1488,9 @@ describe("Telegram transport", () => {
 			expect(unicodeParts).toHaveLength(2);
 		});
 		expect(
-			unicodeParts.map(({ text }) => text.match(/other · (\d+\/\d+)$/)?.[1]),
+			unicodeParts.map(
+				({ text }) => text.match(/<code>other<\/code> · (\d+\/\d+)$/)?.[1],
+			),
 		).toEqual(["1/2", "2/2"]);
 		expect(unicodeParts.map(({ text }) => telegramBody(text)).join("")).toBe(
 			unicodeReply,

@@ -94,12 +94,18 @@ describe("application runtime", () => {
 			});
 			expect(result).toMatchObject({ ok: false });
 			expect(launch).toHaveBeenCalledOnce();
-			expect(launch).toHaveBeenCalledWith({
-				executable: "/unused/pi",
-				args: ["--mode", "rpc"],
-				cwd: await realpath(os.tmpdir()),
-				stdio: "pipe",
-			});
+			expect(launch).toHaveBeenCalledWith(
+				expect.objectContaining({
+					executable: "/unused/pi",
+					args: ["--mode", "rpc", "--extension", expect.any(String)],
+					cwd: await realpath(os.tmpdir()),
+					env: expect.objectContaining({
+						HARNESSD_FILE_SOCKET: expect.any(String),
+						HARNESSD_FILE_SECRET: expect.any(String),
+					}),
+					stdio: "pipe",
+				}),
+			);
 			await runtime.close();
 		},
 	);

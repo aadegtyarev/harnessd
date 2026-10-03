@@ -1,6 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, open, stat } from "node:fs/promises";
+import { access, mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
+import type { Server, Socket } from "node:net";
+import { createServer } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import type { Writable } from "node:stream";
 import { requireCapability } from "../core/errors.js";
@@ -38,6 +41,7 @@ export interface PiRpcHarnessOptions {
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
+const MAX_FILE_TOOL_CONNECTIONS = 8;
 
 export class UncertainInputDeliveryError extends Error {
 	readonly code = "UNCERTAIN_INPUT_DELIVERY";
@@ -206,8 +210,118 @@ const controlledFlags = [
 	"-h",
 	"--version",
 	"-v",
+	"--extension",
 	"--",
 ];
+
+type FileSendRequest = (
+	sessionId: SessionId,
+	filePath: string,
+	replyTargetId: string,
+) => Promise<boolean>;
+interface FileToolBridge {
+	readonly socketPath: string;
+	readonly secret: string;
+	readonly extensionPath: string;
+	readonly directory: string;
+	readonly server: Server;
+	setReplyTargetId(replyTargetId: string | undefined): void;
+	close(): Promise<void>;
+}
+
+async function createFileToolBridge(
+	sessionId: SessionId,
+	sendFile?: FileSendRequest,
+): Promise<FileToolBridge> {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "hdf-"));
+	let closed = false;
+	const socketPath =
+		process.platform === "win32"
+			? `\\\\.\\pipe\\harnessd-${randomUUID()}`
+			: path.join(directory, "s.sock");
+	const extensionPath = path.join(directory, "send-file.mjs");
+	const secret = randomBytes(32).toString("hex");
+	const extension = `import net from "node:net";\nimport { Type } from "typebox";\nexport default (pi) => pi.registerTool({ name: "send_file", label: "Send file to Telegram", description: "Send a requested regular file from this session working directory to the current Telegram chat.", parameters: Type.Object({ path: Type.String({ description: "Path relative to this session working directory" }) }), async execute(_id, params) { return await new Promise((resolve) => { const socket = net.createConnection(process.env.HARNESSD_FILE_SOCKET); let response = ""; socket.setTimeout(30000); socket.on("connect", () => socket.write(JSON.stringify({ secret: process.env.HARNESSD_FILE_SECRET, path: params.path }) + "\\n")); socket.on("data", (chunk) => { response += chunk.toString(); if (response.includes("\\n")) { socket.destroy(); try { const result = JSON.parse(response); resolve({ content: [{ type: "text", text: result.message }], details: undefined }); } catch { resolve({ content: [{ type: "text", text: "File could not be sent safely." }], details: undefined }); } } }); socket.on("error", () => resolve({ content: [{ type: "text", text: "File could not be sent safely." }], details: undefined })); socket.on("timeout", () => { socket.destroy(); resolve({ content: [{ type: "text", text: "File send request timed out." }], details: undefined }); }); }); } });`;
+	try {
+		await writeFile(extensionPath, extension, { mode: 0o600, flag: "wx" });
+	} catch (error) {
+		await rm(directory, { recursive: true, force: true }).catch(() => {});
+		throw error;
+	}
+	let replyTargetId: string | undefined;
+	const sockets = new Set<Socket>();
+	const server = createServer((socket: Socket) => {
+		if (sockets.size >= MAX_FILE_TOOL_CONNECTIONS) {
+			socket.destroy();
+			return;
+		}
+		sockets.add(socket);
+		socket.once("close", () => sockets.delete(socket));
+		socket.setTimeout(30_000);
+		socket.on("timeout", () => socket.destroy());
+		let buffer = "";
+		socket.on("data", (chunk) => {
+			buffer += chunk.toString("utf8");
+			if (buffer.length > 8192) {
+				socket.destroy();
+				return;
+			}
+			const end = buffer.indexOf("\n");
+			if (end < 0) return;
+			void (async () => {
+				let message = "File could not be sent safely.";
+				try {
+					const request = JSON.parse(buffer.slice(0, end)) as {
+						secret?: unknown;
+						path?: unknown;
+					};
+					const supplied = Buffer.from(
+						typeof request.secret === "string" ? request.secret : "",
+					);
+					const expected = Buffer.from(secret);
+					if (
+						supplied.length === expected.length &&
+						timingSafeEqual(supplied, expected) &&
+						typeof request.path === "string" &&
+						sendFile &&
+						replyTargetId &&
+						(await sendFile(sessionId, request.path, replyTargetId))
+					)
+						message = "File sent to Telegram.";
+				} catch {
+					/* Keep the IPC response safe and fixed. */
+				}
+				if (!socket.destroyed) socket.end(`${JSON.stringify({ message })}\n`);
+			})();
+		});
+	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+	} catch (error) {
+		await rm(directory, { recursive: true, force: true });
+		throw error;
+	}
+	return {
+		socketPath,
+		secret,
+		extensionPath,
+		directory,
+		server,
+		setReplyTargetId: (value) => {
+			replyTargetId = value;
+		},
+		close: async () => {
+			if (closed) return;
+			closed = true;
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await rm(directory, { recursive: true, force: true });
+		},
+	};
+}
 
 export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 	readonly descriptor = {
@@ -228,6 +342,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 	constructor(
 		private readonly processes: ProcessProvider,
 		private readonly options: PiRpcHarnessOptions,
+		private readonly sendFile?: FileSendRequest,
 	) {
 		if (!options.executable) throw new TypeError("Pi executable is required");
 		for (const [name, value] of [
@@ -293,6 +408,13 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			);
 		args.push("--mode", "rpc");
 		if (resume) args.push("--session", request.nativeSessionId as string);
+		let bridge: FileToolBridge;
+		try {
+			bridge = await createFileToolBridge(request.sessionId, this.sendFile);
+		} catch {
+			throw new PiStartupError("PI_STARTUP_FAILED");
+		}
+		args.push("--extension", bridge.extensionPath);
 		const launch = await resolveNodeShebang(
 			this.options.executable,
 			request.cwd,
@@ -304,17 +426,28 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 				executable: launch?.executable ?? this.options.executable,
 				args: [...(launch?.argsPrefix ?? []), ...args],
 				cwd: request.cwd,
-				env: this.options.env,
+				env: {
+					...(this.options.env ?? {}),
+					HARNESSD_FILE_SOCKET: bridge.socketPath,
+					HARNESSD_FILE_SECRET: bridge.secret,
+				},
 				stdio: "pipe",
 			});
 		} catch (error) {
+			await bridge.close();
 			throw toPiStartupError(error, "launch");
 		}
 		if (!child.stdin || !child.stdout || !child.stderr) {
 			await terminateChild(child, this.options.shutdownTimeoutMs ?? 1000);
+			await bridge.close();
 			throw new PiStartupError("PI_STARTUP_FAILED");
 		}
-		const instance = new PiRpcInstance(child, request.sessionId, this.options);
+		const instance = new PiRpcInstance(
+			child,
+			request.sessionId,
+			this.options,
+			bridge,
+		);
 		try {
 			await instance.ready(resume ? request.nativeSessionId : undefined);
 			return instance;
@@ -445,6 +578,7 @@ class PiRpcInstance implements HarnessInstance {
 		private readonly child: ManagedProcess,
 		private readonly sessionId: SessionId,
 		private readonly options: PiRpcHarnessOptions,
+		private readonly bridge: FileToolBridge,
 	) {
 		this.processId = child.id;
 		this.exit = child.exit;
@@ -738,7 +872,7 @@ class PiRpcInstance implements HarnessInstance {
 			});
 			if (record.type === "agent_settled" && this.active) {
 				this.active.settled = true;
-				if (this.active.uncertain) this.active = undefined;
+				if (this.active.uncertain) this.clearActive();
 				else if (this.active.accepted && !this.active.canceling)
 					this.completeActive();
 			}
@@ -751,7 +885,7 @@ class PiRpcInstance implements HarnessInstance {
 		const active = this.active;
 		if (!active || active.id !== inputId) return;
 		if (response.success !== true) {
-			this.active = undefined;
+			this.clearActive();
 			this.delivery(active.id, "failed", "Pi rejected the prompt");
 			return;
 		}
@@ -769,7 +903,7 @@ class PiRpcInstance implements HarnessInstance {
 		const active = this.active;
 		if (!active || active.id !== inputId || !active.canceling) return;
 		if (response.success === true) {
-			this.active = undefined;
+			this.clearActive();
 			this.delivery(active.id, "failed", "Input canceled");
 			return;
 		}
@@ -859,6 +993,7 @@ class PiRpcInstance implements HarnessInstance {
 	async send(input: Input): Promise<void> {
 		if (this.eventsClosed) throw new Error("Pi harness is closed");
 		if (this.active) throw new Error("An input is already active");
+		this.bridge.setReplyTargetId(input.replyTargetId);
 		this.active = {
 			id: input.id,
 			accepted: false,
@@ -872,7 +1007,18 @@ class PiRpcInstance implements HarnessInstance {
 		try {
 			response = await this.command(
 				"prompt",
-				{ message: input.text },
+				{
+					message: input.text,
+					...(input.images?.length
+						? {
+								images: input.images.map((image) => ({
+									type: "image",
+									data: image.data,
+									mimeType: image.mimeType,
+								})),
+							}
+						: {}),
+				},
 				input.id,
 			);
 		} catch (error) {
@@ -884,22 +1030,26 @@ class PiRpcInstance implements HarnessInstance {
 					"uncertain",
 					"Pi prompt response was not received",
 				);
-				if (this.active.settled) this.active = undefined;
+				if (this.active.settled) this.clearActive();
 			}
 			throw new UncertainInputDeliveryError(input.id, { cause: error });
 		}
 		if (response.success !== true) {
 			if (this.active?.id === input.id) {
-				this.active = undefined;
+				this.clearActive();
 				this.delivery(input.id, "failed", "Pi rejected the prompt");
 			}
 			throw new Error("Pi rejected the prompt");
 		}
 	}
+	private clearActive(): void {
+		this.active = undefined;
+		this.bridge.setReplyTargetId(undefined);
+	}
 	private completeActive(): void {
 		const active = this.active;
 		if (!active) return;
-		this.active = undefined;
+		this.clearActive();
 		this.delivery(active.id, "completed");
 	}
 	async cancel(inputId: InputId): Promise<void> {
@@ -921,7 +1071,7 @@ class PiRpcInstance implements HarnessInstance {
 					"uncertain",
 					"Pi abort response was not received",
 				);
-				if (this.active.settled) this.active = undefined;
+				if (this.active.settled) this.clearActive();
 			}
 			throw error;
 		}
@@ -933,7 +1083,7 @@ class PiRpcInstance implements HarnessInstance {
 			throw new Error("Pi rejected the abort command");
 		}
 		if (this.active?.id === inputId) {
-			this.active = undefined;
+			this.clearActive();
 			this.delivery(inputId, "failed", "Input canceled");
 		}
 	}
@@ -979,6 +1129,7 @@ class PiRpcInstance implements HarnessInstance {
 	private closeEvents(detail: string): void {
 		if (this.eventsClosed) return;
 		this.eventsClosed = true;
+		void this.bridge.close().catch(() => {});
 		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
 		this.exitDrainTimer = undefined;
 		if (this.active) {

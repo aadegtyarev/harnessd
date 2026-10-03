@@ -87,6 +87,11 @@ export type TransportEvent =
 			readonly kind: "submit";
 			readonly sessionId: SessionId;
 			readonly text: string;
+			readonly images?: readonly {
+				readonly mimeType: string;
+				readonly data: string;
+			}[];
+			readonly replyTargetId?: string;
 	  }
 	| {
 			readonly requestId: string;
@@ -165,6 +170,11 @@ export interface TransportAdapter {
 		dispatch: (event: TransportEvent) => Promise<TransportResult>,
 		subscribeEvents: TransportEventSubscription,
 	): Promise<void>;
+	sendFileFromSession?(
+		sessionId: SessionId,
+		filePath: string,
+		replyTargetId: string,
+	): Promise<boolean>;
 	stop(): Promise<void>;
 }
 

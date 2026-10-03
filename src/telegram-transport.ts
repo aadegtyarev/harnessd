@@ -1,8 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
-import { open, readFile, unlink } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import {
+	open,
+	readFile,
+	realpath,
+	rename,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Bot } from "grammy";
+import { Bot, InputFile } from "grammy";
 import {
 	getTelegramCommands,
 	getTelegramHelpUsages,
@@ -42,6 +50,8 @@ const MAX_INPUT_MESSAGES = 8;
 const MAX_QUEUED_CHARACTERS = 32_768;
 const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
+const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
+const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
 type UpdateContext = {
@@ -49,7 +59,20 @@ type UpdateContext = {
 	chat?: { id: number; type: string };
 	message?: {
 		text?: string;
+		caption?: string;
 		message_id?: number;
+		document?: {
+			file_id: string;
+			file_name?: string;
+			mime_type?: string;
+			file_size?: number;
+		};
+		photo?: readonly {
+			file_id: string;
+			file_size?: number;
+			width?: number;
+			height?: number;
+		}[];
 		reply_to_message?: { message_id?: number };
 	};
 	callbackQuery?: {
@@ -76,6 +99,23 @@ type TelegramBot = {
 		pinChatMessage(
 			chatId: number,
 			messageId: number,
+			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
+		getFile(
+			fileId: string,
+			signal?: AbortSignal,
+		): Promise<{ file_path?: string; file_size?: number }>;
+		getFileLink(fileId: string): Promise<URL>;
+		sendChatAction(
+			chatId: number,
+			action: string,
+			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
+		sendDocument(
+			chatId: number,
+			document: unknown,
 			other?: unknown,
 			signal?: AbortSignal,
 		): Promise<unknown>;
@@ -274,6 +314,58 @@ function isCode(error: unknown, code: string): boolean {
 		error.code === code
 	);
 }
+class TelegramAttachmentTooLargeError extends Error {}
+async function readBoundedFile(filePath: string): Promise<Buffer> {
+	const handle = await open(
+		filePath,
+		fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+	);
+	try {
+		const info = await handle.stat();
+		if (!info.isFile()) throw new Error("not a regular file");
+		if (info.size > MAX_TELEGRAM_FILE_BYTES)
+			throw new TelegramAttachmentTooLargeError();
+		const chunks: Buffer[] = [];
+		let length = 0;
+		for await (const chunk of handle.createReadStream({ autoClose: false })) {
+			const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			length += data.length;
+			if (length > MAX_TELEGRAM_FILE_BYTES)
+				throw new TelegramAttachmentTooLargeError();
+			chunks.push(data);
+		}
+		return Buffer.concat(chunks, length);
+	} finally {
+		await handle.close();
+	}
+}
+async function readBoundedResponse(response: Response): Promise<Buffer> {
+	if (!response.body) throw new Error("empty response");
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		length += value.byteLength;
+		if (length > MAX_TELEGRAM_FILE_BYTES) {
+			await reader.cancel();
+			throw new TelegramAttachmentTooLargeError();
+		}
+		chunks.push(value);
+	}
+	return Buffer.concat(chunks, length);
+}
+function safeAttachmentName(value: string): string {
+	const basename = path
+		.basename(value)
+		.replace(/[\\/\\\\]/g, "_")
+		.replace(/[^A-Za-z0-9._-]/g, "_")
+		.slice(0, 100);
+	return basename && basename !== "." && basename !== ".."
+		? basename
+		: "attachment";
+}
 function escapeHtml(value: string): string {
 	return value.replace(/[&<>"']/g, (character) => {
 		switch (character) {
@@ -414,6 +506,52 @@ function formatStatus(status: HarnessSessionStatus): string {
 	if (!live) lines.push("Live Pi data: unavailable for this session.");
 	return lines.join("\n");
 }
+function markdownToTelegramHtml(
+	markdown: string,
+	sessionId: SessionId,
+): string {
+	const idAt = markdown.lastIndexOf(sessionId);
+	const marker = `HARNESSD${randomUUID().replace(/-/g, "")}`;
+	const sessionMarker = `${marker}SESSION`;
+	let source =
+		idAt < 0
+			? markdown
+			: `${markdown.slice(0, idAt)}${sessionMarker}${markdown.slice(idAt + sessionId.length)}`;
+	const code: string[] = [];
+	const placeholder = (html: string) => {
+		const index = code.push(html) - 1;
+		return `${marker}CODE${index}END`;
+	};
+	source = source.replace(
+		/```([^\n]*)\n([\s\S]*?)```/g,
+		(_match, _language: string, body: string) =>
+			placeholder(`<pre>${escapeHtml(body)}</pre>`),
+	);
+	source = escapeHtml(source);
+	source = source.replace(/`([^`\n]+)`/g, (_match, body: string) =>
+		placeholder(`<code>${body}</code>`),
+	);
+	source = source.replace(
+		/\[([^\]]+)\]\(([^)]+)\)/g,
+		(_match, label: string, href: string) =>
+			/^(https?:|mailto:)/i.test(href)
+				? placeholder(`<a href="${href}">${label}</a>`)
+				: label,
+	);
+	source = source
+		.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+		.replace(/__([^_]+)__/g, "<b>$1</b>");
+	source = source
+		.replace(/\*([^*\n]+)\*/g, "<i>$1</i>")
+		.replace(/_([^_\n]+)_/g, "<i>$1</i>")
+		.replace(/~~([^~]+)~~/g, "<s>$1</s>");
+	source = source.replace(
+		new RegExp(`${marker}CODE(\\d+)END`, "g"),
+		(_match, index: string) => code[Number(index)] ?? "",
+	);
+	source = source.replace(sessionMarker, `<code>${sessionId}</code>`);
+	return source;
+}
 function chunks(text: string): string[] {
 	return splitChunks(text, TELEGRAM_LIMIT);
 }
@@ -445,7 +583,7 @@ function splitMessageWithFooter(text: string, footer: string): string[] {
 			const suffix = total > 1 ? ` · ${index}/${total}` : "";
 			const ending = `\n\n${footer}${suffix}`;
 			const remaining = body.slice(offset);
-			const contentLimit = TELEGRAM_LIMIT - ending.length;
+			const contentLimit = TELEGRAM_LIMIT - ending.length - 13;
 			if (contentLimit < 1)
 				throw new Error("Telegram footer exceeds message limit");
 			const length =
@@ -547,11 +685,18 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	private readonly modelPages = new Map<number, number>();
 	private readonly effortPages = new Map<number, number>();
 	private readonly queues = new Map<number, ChatQueue>();
+	private readonly typingTimers = new Map<
+		SessionId,
+		ReturnType<typeof setInterval>
+	>();
+	private readonly typingChats = new Map<SessionId, Set<number>>();
+	private readonly sessionCwds = new Map<SessionId, string>();
 	private panelStore?: TelegramPanelStore;
 	private readonly pendingSends = new Set<AbortController>();
 	private readonly activeSends = new Set<Promise<boolean>>();
 	private readonly bot: TelegramBot;
 	private readonly authorized: Set<number>;
+	private readonly authorizedChatPrincipals = new Map<number, number>();
 	private dispatch?: (event: TransportEvent) => Promise<TransportResult>;
 	private unsubscribe?: () => void;
 	private releaseLock?: () => Promise<void>;
@@ -596,6 +741,17 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				if (this.isAuthorized(ctx)) await next();
 			});
 			this.bot.on("message:text", async (ctx) => this.onText(ctx));
+			this.bot.on("message:document", async (ctx) => this.onMedia(ctx));
+			this.bot.on("message:photo", async (ctx) => this.onMedia(ctx));
+			for (const filter of [
+				"message:video",
+				"message:audio",
+				"message:voice",
+				"message:animation",
+				"message:sticker",
+				"message:video_note",
+			])
+				this.bot.on(filter, async (ctx) => this.onUnsupportedMedia(ctx));
 			this.bot.on("callback_query:data", async (ctx) =>
 				this.onCallback(ctx as CallbackQueryContext),
 			);
@@ -696,6 +852,9 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		this.unsubscribe = undefined;
 		this.initializationAbort?.abort();
 		for (const controller of this.pendingSends) controller.abort();
+		for (const timer of this.typingTimers.values()) clearInterval(timer);
+		this.typingTimers.clear();
+		this.typingChats.clear();
 		for (const queue of this.queues.values()) {
 			if (queue.drainTimer) clearTimeout(queue.drainTimer);
 			queue.messages.length = 0;
@@ -729,14 +888,32 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 	}
 
+	private setSelected(chatId: number, sessionId: SessionId): void {
+		const previous = this.selected.get(chatId);
+		this.selected.set(chatId, sessionId);
+		if (previous && previous !== sessionId && this.typingTimers.has(previous))
+			this.refreshTyping(previous);
+		if (this.typingTimers.has(sessionId)) this.refreshTyping(sessionId);
+	}
+
+	private clearSelected(chatId: number): void {
+		const previous = this.selected.get(chatId);
+		this.selected.delete(chatId);
+		if (previous && this.typingTimers.has(previous))
+			this.refreshTyping(previous);
+	}
+
 	private isAuthorized(ctx: UpdateContext): boolean {
-		return (
-			ctx.from !== undefined &&
-			Number.isSafeInteger(ctx.from.id) &&
-			ctx.from.id > 0 &&
-			this.authorized.has(ctx.from.id) &&
-			ctx.chat?.type === "private"
-		);
+		if (
+			ctx.from === undefined ||
+			!Number.isSafeInteger(ctx.from.id) ||
+			ctx.from.id <= 0 ||
+			!this.authorized.has(ctx.from.id) ||
+			ctx.chat?.type !== "private"
+		)
+			return false;
+		this.authorizedChatPrincipals.set(ctx.chat.id, ctx.from.id);
+		return true;
 	}
 
 	private async onText(ctx: UpdateContext): Promise<void> {
@@ -769,6 +946,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					kind: "submit",
 					sessionId,
 					text,
+					replyTargetId: String(chatId),
 				});
 				await this.sendDirect(
 					chatId,
@@ -781,6 +959,145 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			await this.sendDirect(
 				chatId,
 				"Request failed unexpectedly. Check the harnessd service journal.",
+			);
+		}
+	}
+
+	async sendFileFromSession(
+		sessionId: SessionId,
+		filePath: string,
+		replyTargetId: string,
+	): Promise<boolean> {
+		const cwd = this.sessionCwds.get(sessionId);
+		if (!cwd || !/^\d+$/.test(replyTargetId)) return false;
+		const chatId = Number(replyTargetId);
+		if (
+			!Number.isSafeInteger(chatId) ||
+			!this.authorized.has(this.authorizedChatPrincipals.get(chatId) ?? -1) ||
+			this.selected.get(chatId) !== sessionId
+		)
+			return false;
+		try {
+			const candidate = path.resolve(cwd, filePath);
+			const canonicalRoot = await realpath(cwd);
+			const canonicalFile = await realpath(candidate);
+			const relative = path.relative(canonicalRoot, canonicalFile);
+			if (
+				!relative ||
+				relative === ".." ||
+				relative.startsWith(`..${path.sep}`) ||
+				path.isAbsolute(relative)
+			)
+				return false;
+			const data = await readBoundedFile(canonicalFile);
+			if (this.stopping || this.selected.get(chatId) !== sessionId)
+				return false;
+			const sent = await this.telegramCall((signal) =>
+				this.bot.api.sendDocument(
+					chatId,
+					new InputFile(data, path.basename(canonicalFile)),
+					{},
+					signal,
+				),
+			);
+			return sent.ok;
+		} catch {
+			return false;
+		}
+	}
+
+	private async onUnsupportedMedia(ctx: UpdateContext): Promise<void> {
+		const chatId = ctx.chat?.id;
+		if (chatId !== undefined)
+			await this.sendDirect(
+				chatId,
+				"Unsupported attachment type. Send a Telegram document or photo instead.",
+			);
+	}
+
+	private async onMedia(ctx: UpdateContext): Promise<void> {
+		const chatId = ctx.chat?.id;
+		const sender = ctx.from?.id;
+		const message = ctx.message;
+		if (chatId === undefined || sender === undefined || !message) return;
+		const sessionId = this.selected.get(chatId);
+		if (!sessionId)
+			return this.sendDirect(
+				chatId,
+				"Select a session with /use before sending files.",
+			);
+		const document = message.document;
+		const photo = message.photo?.at(-1);
+		if (!document && !photo)
+			return this.sendDirect(chatId, "Unsupported attachment type.");
+		const fileId = document?.file_id ?? photo?.file_id;
+		if (!fileId)
+			return this.sendDirect(chatId, "Could not identify the attachment.");
+		const declaredSize = document?.file_size ?? photo?.file_size;
+		if (declaredSize !== undefined && declaredSize > MAX_TELEGRAM_FILE_BYTES)
+			return this.sendDirect(chatId, "Attachment exceeds the 20 MiB limit.");
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId,
+		});
+		if (!inspected.ok) return this.sendDirect(chatId, inspected.error.message);
+		const session = inspected.value as SessionSummary;
+		this.rememberSession(session);
+		try {
+			const file = await this.bot.api.getFile(fileId);
+			if ((file.file_size ?? 0) > MAX_TELEGRAM_FILE_BYTES)
+				throw new TelegramAttachmentTooLargeError();
+			if (!file.file_path) throw new Error("file unavailable");
+			const url = await this.bot.api.getFileLink(fileId);
+			const response = await fetch(url);
+			if (!response.ok) throw new Error("download failed");
+			const data = await readBoundedResponse(response);
+			if (!data.length || data.length > MAX_TELEGRAM_FILE_BYTES)
+				throw new Error("file size invalid");
+			const safeName = safeAttachmentName(
+				document?.file_name ?? (photo ? "photo.jpg" : "attachment"),
+			);
+			const target = path.join(
+				session.cwd,
+				`${Date.now()}-${randomBytes(6).toString("hex")}-${safeName}`,
+			);
+			const temporary = `${target}.part`;
+			try {
+				await writeFile(temporary, data, { flag: "wx", mode: 0o600 });
+				await rename(temporary, target);
+			} catch (error) {
+				await unlink(temporary).catch(() => {});
+				throw error;
+			}
+			const canonical = await realpath(target);
+			if (path.dirname(canonical) !== (await realpath(session.cwd))) {
+				await unlink(target).catch(() => {});
+				throw new Error("attachment path invalid");
+			}
+			const caption = message.caption?.trim();
+			const text = `The user sent an attachment saved at ${canonical}.${caption ? ` Caption (untrusted user text): ${caption}` : ""}`;
+			const image = photo
+				? [{ mimeType: "image/jpeg", data: data.toString("base64") }]
+				: undefined;
+			const submitted = await this.request(sender, {
+				kind: "submit",
+				sessionId,
+				text,
+				replyTargetId: String(chatId),
+				...(image ? { images: image } : {}),
+			});
+			if (!submitted.ok)
+				return this.sendDirect(chatId, submitted.error.message);
+			return this.sendDirect(
+				chatId,
+				`Attachment saved and submitted: ${canonical}`,
+			);
+		} catch (error) {
+			if (error instanceof TelegramAttachmentTooLargeError)
+				return this.sendDirect(chatId, "Attachment exceeds the 20 MiB limit.");
+			return this.sendDirect(
+				chatId,
+				"Could not safely download or save this attachment. Check that the selected session folder is writable and try a smaller file.",
 			);
 		}
 	}
@@ -816,7 +1133,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
-			this.selected.set(chatId, session.id);
+			this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
@@ -992,7 +1309,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
-			this.selected.set(chatId, session.id);
+			this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(chatId, `Selected ${sessionLabel(session)}.`);
@@ -1046,7 +1363,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				);
 			const result = await this.request(sender, { kind: "stop", sessionId });
 			if (result.ok && this.selected.get(chatId) === sessionId) {
-				this.selected.delete(chatId);
+				this.clearSelected(chatId);
 				this.previews.delete(chatId);
 			}
 			if (result.ok) await this.refreshExistingPanel(chatId, sender);
@@ -1227,7 +1544,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
-			this.selected.set(chatId, session.id);
+			this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
@@ -1274,7 +1591,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (listed.ok) this.rememberSessions(sessions);
 		const selectedId = this.selected.get(chatId);
 		if (selectedId && !sessions.some((session) => session.id === selectedId)) {
-			this.selected.delete(chatId);
+			this.clearSelected(chatId);
 			this.previews.delete(chatId);
 		}
 		let previewId = this.previews.get(chatId);
@@ -1654,7 +1971,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
-		this.selected.set(chatId, session.id);
+		this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
 		await this.renderPanel(chatId, sender, messageId);
 	}
@@ -1672,7 +1989,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
-		this.selected.set(chatId, session.id);
+		this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
 		await this.renderPanel(chatId, sender, messageId);
 	}
@@ -2172,7 +2489,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 		if (action === "stop") {
 			if (this.selected.get(chatId) === sessionId) {
-				this.selected.delete(chatId);
+				this.clearSelected(chatId);
 				this.previews.delete(chatId);
 			}
 		} else {
@@ -2194,6 +2511,36 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			await this.sendWithDeadline(chatId, chunk, { parse_mode: "HTML" });
 	}
 
+	private startTyping(sessionId: SessionId): void {
+		if (![...this.selected.values()].includes(sessionId)) return;
+		this.stopTyping(sessionId);
+		const send = () => this.refreshTyping(sessionId);
+		this.typingTimers.set(sessionId, setInterval(send, TYPING_REFRESH_MS));
+		this.refreshTyping(sessionId);
+	}
+
+	private refreshTyping(sessionId: SessionId): void {
+		if (!this.typingTimers.has(sessionId)) return;
+		const chats = new Set(
+			[...this.selected]
+				.filter(([, id]) => id === sessionId)
+				.map(([chatId]) => chatId),
+		);
+		this.typingChats.set(sessionId, chats);
+		for (const chatId of chats)
+			void this.telegramCall((signal) =>
+				this.bot.api.sendChatAction(chatId, "typing", {}, signal),
+			);
+		if (!chats.size) this.stopTyping(sessionId);
+	}
+
+	private stopTyping(sessionId: SessionId): void {
+		const timer = this.typingTimers.get(sessionId);
+		if (timer) clearInterval(timer);
+		this.typingTimers.delete(sessionId);
+		this.typingChats.delete(sessionId);
+	}
+
 	private onEvent(event: HarnessEvent): void {
 		if (event.kind === "output" && typeof event.text === "string") {
 			this.appendTurnOutput(event.sessionId, event.text);
@@ -2203,6 +2550,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (event.text === "harness_recovered")
 				this.reportedErrors.delete(event.sessionId);
 			if (event.text === "agent_start") {
+				this.startTyping(event.sessionId);
 				this.turnBuffers.set(event.sessionId, {
 					chunks: [],
 					characters: 0,
@@ -2212,6 +2560,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			}
 			if (event.text === "agent_end") return;
 			if (event.text === "agent_settled") {
+				this.stopTyping(event.sessionId);
 				this.flushTurn(event.sessionId);
 				return;
 			}
@@ -2225,6 +2574,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			return;
 		}
 		if (event.kind === "error") {
+			this.stopTyping(event.sessionId);
 			this.flushTurn(event.sessionId, true);
 			if (this.reportedErrors.has(event.sessionId)) return;
 			this.reportedErrors.add(event.sessionId);
@@ -2233,6 +2583,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 		if (event.kind === "input" && event.inputEvent) {
 			const { inputId, state } = event.inputEvent;
+			if (state === "failed" || state === "uncertain")
+				this.stopTyping(event.sessionId);
 			if (state === "accepted") return;
 			this.enqueueForSelected(
 				event.sessionId,
@@ -2301,6 +2653,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
 	private rememberSession(session: SessionSummary): void {
 		this.knownSessions.add(session.id);
+		this.sessionCwds.set(session.id, session.cwd);
 		if (session.name) this.sessionNames.set(session.id, session.name);
 		else this.sessionNames.delete(session.id);
 	}
@@ -2457,8 +2810,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (this.selected.get(chatId) !== message.sessionId) continue;
 			const delivered = await this.sendWithDeadline(
 				chatId,
-				message.text,
-				sessionIdEntity(message.text, message.sessionId),
+				message.output
+					? markdownToTelegramHtml(message.text, message.sessionId)
+					: message.text,
+				message.output
+					? { parse_mode: "HTML" }
+					: sessionIdEntity(message.text, message.sessionId),
 			);
 			if (!delivered) {
 				queue.failed = true;
