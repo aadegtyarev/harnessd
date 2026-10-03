@@ -23,7 +23,7 @@ function runMain(options: Parameters<typeof main>[0] = {}): Promise<void> {
 function transportOptions(options: unknown): {
 	signal: AbortSignal;
 	token: string;
-	defaultCwd: string;
+	initialCwd: string;
 	onFatal: () => void;
 } {
 	const transport = (options as { transports: readonly unknown[] })
@@ -31,7 +31,7 @@ function transportOptions(options: unknown): {
 		options: {
 			signal: AbortSignal;
 			token: string;
-			defaultCwd: string;
+			initialCwd: string;
 			onFatal: () => void;
 		};
 	};
@@ -46,8 +46,13 @@ describe("CLI", () => {
 		expect(HELP).toContain("HARNESSD_EXECUTION_MODE");
 		expect(HELP).toContain("direct (default, trusted; cwd is not a sandbox)");
 		expect(HELP).toContain("isolated (unavailable in this CLI");
-		expect(HELP).toContain("HARNESSD_DEFAULT_CWD");
+		expect(HELP).toContain("HARNESSD_HOME");
+		expect(HELP).not.toContain("HARNESSD_DEFAULT_CWD");
+		expect(HELP).toContain("/ls [path]");
+		expect(HELP).toContain("/cd [path]");
 		expect(HELP).toContain("harnessd service install");
+		expect(HELP).toContain("Install, enable, and start the user service.");
+		expect(HELP).toContain("Stop, disable, and remove the user service.");
 		expect(HELP).toContain("/resume [sessionId]");
 	});
 
@@ -138,6 +143,8 @@ describe("CLI", () => {
 	it("loads .env before validating config and uses its default cwd", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-env-"));
 		const close = vi.fn(async () => {});
+		const home = path.join(cwd, "workspace");
+		await mkdir(home);
 		let runtimeOptions: unknown;
 		const runtimeStart = vi.fn(async (options: unknown) => {
 			runtimeOptions = options;
@@ -145,7 +152,7 @@ describe("CLI", () => {
 		});
 		await writeFile(
 			path.join(cwd, ".env"),
-			"HARNESSD_TELEGRAM_BOT_TOKEN=file-token\nHARNESSD_TELEGRAM_ALLOWED_USER_IDS=42\nHARNESSD_DEFAULT_CWD=/workspace\n",
+			`HARNESSD_TELEGRAM_BOT_TOKEN=file-token\nHARNESSD_TELEGRAM_ALLOWED_USER_IDS=42\nHARNESSD_HOME=${home}\n`,
 		);
 		try {
 			const running = runMain({
@@ -156,7 +163,7 @@ describe("CLI", () => {
 			});
 			await vi.waitFor(() => expect(runtimeStart).toHaveBeenCalledOnce());
 			expect(transportOptions(runtimeOptions).token).toBe("shell-token");
-			expect(transportOptions(runtimeOptions).defaultCwd).toBe("/workspace");
+			expect(transportOptions(runtimeOptions).initialCwd).toBe(home);
 			process.emit("SIGINT");
 			await running;
 		} finally {
@@ -277,6 +284,28 @@ describe("CLI", () => {
 		expect(runtimeStart).not.toHaveBeenCalled();
 	});
 
+	it("rejects an inaccessible HARNESSD_HOME before runtime startup without exposing its path", async () => {
+		const inaccessible = path.join(
+			os.tmpdir(),
+			`harnessd-missing-${randomUUID()}`,
+		);
+		const runtimeStart = vi.fn();
+		await expect(
+			runMain({
+				argv: [],
+				env: {
+					HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
+					HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+					HARNESSD_HOME: inaccessible,
+				},
+				runtimeStart: runtimeStart as never,
+			}),
+		).rejects.toThrow(
+			"Directory is missing, inaccessible, or not a directory.",
+		);
+		expect(runtimeStart).not.toHaveBeenCalled();
+	});
+
 	it("validates required environment without exposing credentials", async () => {
 		await expect(
 			runMain({ argv: [], env: { HARNESSD_TELEGRAM_BOT_TOKEN: "secret" } }),
@@ -324,7 +353,9 @@ describe("CLI", () => {
 			});
 			expect(runtimeOptions).not.toHaveProperty("piOptions");
 			expect(transportOptions(runtimeOptions).token).toBe("secret-token");
-			expect(transportOptions(runtimeOptions).defaultCwd).toBe("/work");
+			expect(transportOptions(runtimeOptions).initialCwd).toBe(
+				path.parse(process.cwd()).root,
+			);
 			expect(
 				JSON.stringify({
 					piExecutable: (runtimeOptions as { piExecutable: string })

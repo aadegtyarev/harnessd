@@ -65,7 +65,7 @@ node dist/src/cli.js --help
 | `HARNESSD_PI_EXECUTABLE` | No | `pi` | Pi CLI executable. An absolute path avoids `PATH` surprises. |
 | `HARNESSD_STATE_DIR` | No | `$XDG_STATE_HOME/harnessd`, otherwise `~/.local/state/harnessd` | Absolute supervisor state directory. On POSIX it must be owned by the current user and inaccessible to group/others. |
 | `HARNESSD_EXECUTION_MODE` | No | `direct` | `direct` is trusted execution. `isolated` currently fails safely because the CLI has no isolation provider. |
-| `HARNESSD_DEFAULT_CWD` | No | process working directory | Default workspace for `/new` when no path is supplied. An explicit `/new <cwd>` takes precedence. |
+| `HARNESSD_HOME` | No | `/` | Initial folder for Telegram navigation and `/new` without a path. This is not a sandbox or access boundary. `~` always means the OS user's home. |
 
 The CLI loads an optional `.env` file from its current working directory before checking required settings. Values already exported in the shell take precedence. Use Node dotenv syntax; the file is not executed as shell code. Keep credentials out of source control and restrict the file on POSIX:
 
@@ -78,7 +78,7 @@ Example `.env` entries (replace placeholders locally; `.env` is gitignored):
 ```dotenv
 HARNESSD_TELEGRAM_BOT_TOKEN=replace-with-your-bot-token
 HARNESSD_TELEGRAM_ALLOWED_USER_IDS=123456789
-HARNESSD_DEFAULT_CWD=/absolute/path/to/your/workspace
+HARNESSD_HOME=/absolute/path/to/your/workspace
 # Prefer an absolute path for services if Pi is not on systemd's PATH.
 # HARNESSD_PI_EXECUTABLE=/absolute/path/to/pi
 ```
@@ -90,7 +90,7 @@ cd /path/to/harnessd
 "$HOME/.local/share/harnessd/node_modules/.bin/harnessd"
 ```
 
-`HARNESSD_DEFAULT_CWD` applies only when `/new` has no explicit path. If unset, the current process working directory remains the default. Relative values resolve against the process working directory; an absolute path is recommended, particularly for services.
+`HARNESSD_HOME` sets the initial per-chat folder; if unset, navigation starts at `/`. A relative value resolves from the service process's working directory and must name an existing accessible directory. `/cd` can move to any directory accessible to the service user. `/new` without a path uses that chat's current folder, while an explicit relative path is resolved from it. Absolute paths are also accepted. `~` always expands to the operating-system user's home directory, not `HARNESSD_HOME`. Directory navigation is not a sandbox.
 
 The Pi child does **not** inherit the supervisor's full environment, including values loaded from `.env`. Use Pi's supported configuration mechanism; this CLI does not expose a Pi child-environment option.
 
@@ -121,7 +121,9 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | --- | --- |
 | `/help` | Show available commands. |
 | `/sessions` | List sessions. |
-| `/new [cwd]` | Create a session in `cwd`; defaults to `HARNESSD_DEFAULT_CWD`, or the service's starting directory if unset. |
+| `/new [cwd]` | Create a session in `cwd`; defaults to the current folder for this chat. Explicit relative paths resolve from that folder; absolute and `~` paths are accepted. |
+| `/ls [path]` | List immediate files and folders in the current chat folder or the supplied path. Dotfiles are hidden; output is bounded. |
+| `/cd [path]` | Change this chat's folder; relative paths work, and `/cd` without a path goes to the OS user's home. Does not change running sessions. |
 | `/use <sessionId>` | Select a session for this private chat. |
 | `/resume [sessionId]` | Resume a stopped session by its saved Pi-native ID; defaults to the selected session. |
 | `/inspect [sessionId]` | Inspect the selected or named session. |
