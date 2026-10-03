@@ -48,6 +48,7 @@ describe("CLI", () => {
 		expect(HELP).toContain("isolated (unavailable in this CLI");
 		expect(HELP).toContain("HARNESSD_DEFAULT_CWD");
 		expect(HELP).toContain("harnessd service install");
+		expect(HELP).toContain("/resume [sessionId]");
 	});
 
 	it("recognizes direct invocation through an npm-style symlink", async () => {

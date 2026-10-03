@@ -43,6 +43,7 @@ Private-chat commands:
   /sessions
   /new [cwd]
   /use <sessionId>
+  /resume [sessionId]
   /inspect [sessionId]
   /stop [sessionId]
   /cancel <inputId>
