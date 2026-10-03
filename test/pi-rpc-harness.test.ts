@@ -1,5 +1,4 @@
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -300,13 +299,7 @@ describe("PiRpcHarnessAdapter", () => {
 		]);
 		expect(fake.launchRequest).toMatchObject({
 			executable: options.executable,
-			args: expect.arrayContaining([
-				"--model",
-				"model name",
-				"--mode",
-				"rpc",
-				"--extension",
-			]),
+			args: ["--model", "model name", "--mode", "rpc"],
 			cwd: request.cwd,
 			env: options.env,
 			stdio: "pipe",
@@ -445,17 +438,9 @@ describe("PiRpcHarnessAdapter", () => {
 			}).launch(request);
 			expect(fake.launchRequest).toMatchObject({
 				executable: process.execPath,
-				args: expect.arrayContaining([
-					executable,
-					"--mode",
-					"rpc",
-					"--extension",
-				]),
+				args: [executable, "--mode", "rpc"],
 				cwd: request.cwd,
-				env: expect.objectContaining({
-					HARNESSD_FILE_SOCKET: expect.any(String),
-					HARNESSD_FILE_SECRET: expect.any(String),
-				}),
+				env: undefined,
 				stdio: "pipe",
 			});
 			await instance.shutdown();
@@ -491,17 +476,8 @@ describe("PiRpcHarnessAdapter", () => {
 			}).launch({ ...request, cwd: childCwd });
 			expect(fake.launchRequest).toMatchObject({
 				executable: process.execPath,
-				args: expect.arrayContaining([
-					executable,
-					"--mode",
-					"rpc",
-					"--extension",
-				]),
-				env: {
-					PATH: envPath,
-					HARNESSD_FILE_SOCKET: expect.any(String),
-					HARNESSD_FILE_SECRET: expect.any(String),
-				},
+				args: [executable, "--mode", "rpc"],
+				env: { PATH: envPath },
 			});
 			await instance.shutdown();
 		} finally {
@@ -536,7 +512,7 @@ describe("PiRpcHarnessAdapter", () => {
 			).launch({ ...request, cwd });
 			expect(JSON.parse(instance.nativeSessionId ?? "null")).toEqual({
 				version: process.version,
-				env: ["HARNESSD_FILE_SECRET", "HARNESSD_FILE_SOCKET"],
+				env: [],
 			});
 			await instance.shutdown();
 		} finally {
@@ -556,9 +532,7 @@ describe("PiRpcHarnessAdapter", () => {
 				startupTimeoutMs: 100,
 			}).launch(request);
 			expect(fake.launchRequest?.executable).toBe(executable);
-			expect(fake.launchRequest?.args).toEqual(
-				expect.arrayContaining(["--mode", "rpc", "--extension"]),
-			);
+			expect(fake.launchRequest?.args).toEqual(["--mode", "rpc"]);
 			await instance.shutdown();
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
@@ -598,49 +572,6 @@ describe("PiRpcHarnessAdapter", () => {
 		const seen: HarnessEvent[] = [];
 		for await (const event of instance.events) seen.push(event);
 		expect(seen.some((event) => event.kind === "error")).toBe(false);
-	});
-
-	it("routes authenticated file-tool IPC to the bound supervisor session", async () => {
-		const fake = fakeProvider();
-		const forwarded: [SessionId, string, string][] = [];
-		const instance = await new PiRpcHarnessAdapter(
-			fake.provider,
-			{ executable: "pi", startupTimeoutMs: 100 },
-			async (sessionId, filePath, replyTargetId) => {
-				forwarded.push([sessionId, filePath, replyTargetId]);
-				return true;
-			},
-		).launch(request);
-		await instance.send({
-			...input("send the report", "file-send"),
-			replyTargetId: "42",
-		});
-		const env = fake.launchRequest?.env;
-		if (!env?.HARNESSD_FILE_SOCKET || !env.HARNESSD_FILE_SECRET)
-			throw new Error("File tool bridge environment missing");
-		const reply = await new Promise<string>((resolve, reject) => {
-			const socket = createConnection(env.HARNESSD_FILE_SOCKET);
-			let response = "";
-			socket.once("error", reject);
-			socket.on("data", (chunk) => {
-				response += chunk.toString();
-				if (response.includes("\n")) {
-					socket.destroy();
-					resolve(response);
-				}
-			});
-			socket.once("connect", () =>
-				socket.write(
-					`${JSON.stringify({
-						secret: env.HARNESSD_FILE_SECRET,
-						path: "reports/out.txt",
-					})}\n`,
-				),
-			);
-		});
-		expect(JSON.parse(reply)).toEqual({ message: "File sent to Telegram." });
-		expect(forwarded).toEqual([["supervisor", "reports/out.txt", "42"]]);
-		await instance.shutdown();
 	});
 
 	it("sends image input as Pi RPC image content", async () => {
@@ -711,15 +642,12 @@ describe("PiRpcHarnessAdapter", () => {
 			nativeSessionId: "saved-id",
 		});
 		expect(instance.nativeSessionId).toBe("saved-id");
-		expect(fake.launchRequest?.args).toEqual(
-			expect.arrayContaining([
-				"--mode",
-				"rpc",
-				"--session",
-				"saved-id",
-				"--extension",
-			]),
-		);
+		expect(fake.launchRequest?.args).toEqual([
+			"--mode",
+			"rpc",
+			"--session",
+			"saved-id",
+		]);
 		await instance.shutdown();
 	});
 

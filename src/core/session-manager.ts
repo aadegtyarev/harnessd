@@ -472,7 +472,6 @@ export class SessionManager {
 		id: SessionId,
 		text: string,
 		images?: readonly { readonly mimeType: string; readonly data: string }[],
-		replyTargetId?: string,
 	): Promise<InputId> {
 		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
@@ -500,7 +499,6 @@ export class SessionManager {
 			sessionId: id,
 			text,
 			...(images ? { images } : {}),
-			...(replyTargetId ? { replyTargetId } : {}),
 			createdAt: new Date(),
 		};
 		let unsettled = this.unsettledInputs.get(id);

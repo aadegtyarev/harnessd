@@ -13,7 +13,7 @@ import {
 	resolveStateDirectory,
 	SqliteSessionStore,
 } from "./core/session-store.js";
-import type { HarnessEvent, SessionId } from "./core/types.js";
+import type { HarnessEvent } from "./core/types.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
 	PiControlError,
@@ -176,12 +176,6 @@ export class ApplicationRuntime {
 							...options.piOptions,
 							executable: options.piExecutable,
 						},
-						(sessionId, filePath, replyTargetId) =>
-							runtimeToClose?.sendFileFromSession(
-								sessionId,
-								filePath,
-								replyTargetId,
-							) ?? Promise.resolve(false),
 					),
 				],
 			);
@@ -261,24 +255,6 @@ export class ApplicationRuntime {
 		return this.closePromise;
 	}
 
-	async sendFileFromSession(
-		sessionId: SessionId,
-		filePath: string,
-		replyTargetId: string,
-	): Promise<boolean> {
-		for (const transport of this.transports)
-			if (
-				transport.sendFileFromSession &&
-				(await transport.sendFileFromSession(
-					sessionId,
-					filePath,
-					replyTargetId,
-				))
-			)
-				return true;
-		return false;
-	}
-
 	private async perform(
 		request: ApplicationRequest,
 	): Promise<ApplicationResult> {
@@ -324,7 +300,6 @@ export class ApplicationRuntime {
 						request.sessionId,
 						request.text,
 						request.images,
-						request.replyTargetId,
 					)) as typeof value;
 					break;
 				case "cancel":

@@ -26,22 +26,12 @@ import {
 const roots: string[] = [];
 function telegramBody(text: string): string {
 	const footerStart = text.lastIndexOf("\n\n");
-	const body = footerStart < 0 ? text : text.slice(0, footerStart);
-	return body
-		.replace(/<[^>]+>/g, "")
-		.replace(/&lt;/g, "<")
-		.replace(/&gt;/g, ">")
-		.replace(/&amp;/g, "&")
-		.replace(/&quot;/g, '"')
-		.replace(/&#39;/g, "'");
+	return footerStart < 0 ? text : text.slice(0, footerStart);
 }
 function hasSessionFooter(text: string, sessionId: string): boolean {
 	const footerStart = text.lastIndexOf("\n\n");
 	if (footerStart < 0) return false;
-	const footer = text
-		.slice(footerStart + 2)
-		.replace(/<\/?code>/g, "")
-		.replace(/ · \d+\/\d+$/, "");
+	const footer = text.slice(footerStart + 2).replace(/ · \d+\/\d+$/, "");
 	return footer === sessionId || footer.endsWith(` · ${sessionId}`);
 }
 async function temp() {
@@ -1315,7 +1305,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("allows the model file-send callback only for regular files inside the selected session cwd", async () => {
+	it("restricts /send to regular files inside the selected session cwd", async () => {
 		const bot = new MockBot();
 		const dir = await temp();
 		const outside = await temp();
@@ -1340,10 +1330,8 @@ describe("Telegram transport", () => {
 		});
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
-		await bot.update(43, "/use sid");
-		expect(
-			await adapter.sendFileFromSession("sid" as SessionId, file, "42"),
-		).toBe(true);
+		await bot.update(43, "/use sid", { userId: 42 });
+		await bot.update(42, "/send report.txt");
 		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
 		expect(bot.api.sendDocument).toHaveBeenCalledWith(
 			42,
@@ -1351,27 +1339,11 @@ describe("Telegram transport", () => {
 			{},
 			expect.any(AbortSignal),
 		);
-		expect(
-			await adapter.sendFileFromSession(
-				"sid" as SessionId,
-				"../outside.txt",
-				"42",
-			),
-		).toBe(false);
-		if (symlinkAvailable)
-			expect(
-				await adapter.sendFileFromSession(
-					"sid" as SessionId,
-					"escape.txt",
-					"42",
-				),
-			).toBe(false);
-		expect(
-			await adapter.sendFileFromSession("sid" as SessionId, "large.txt", "42"),
-		).toBe(false);
-		expect(
-			await adapter.sendFileFromSession("sid" as SessionId, "folder", "42"),
-		).toBe(false);
+		await bot.update(42, `/send ${outsideFile}`);
+		if (symlinkAvailable) await bot.update(42, "/send escape.txt");
+		await bot.update(42, "/send large.txt");
+		await bot.update(42, "/send folder");
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
 		await adapter.stop();
 	});
 
@@ -1441,7 +1413,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("sends one accepted-input confirmation and renders safe assistant Markdown", async () => {
+	it("sends one accepted-input confirmation and marks only the footer ID monospace", async () => {
 		const bot = new MockBot();
 		let emitEvent!: (event: HarnessEvent) => void;
 		const { adapter, emit } = await startAdapter(bot, await temp(), {
@@ -1458,21 +1430,11 @@ describe("Telegram transport", () => {
 		emitEvent = emit;
 		await bot.update(42, "/use sid");
 		await bot.update(42, "send this");
-		emit(
-			harnessEvent(
-				"sid",
-				"output",
-				"**bold** literal <b>markup</b> & text [unsafe](javascript:alert(1))",
-			),
-		);
+		emit(harnessEvent("sid", "output", "literal <b>markup</b> & text"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
-				bot.sent.some(
-					({ text }) =>
-						text.includes("<b>bold</b>") &&
-						text.includes("literal &lt;b&gt;markup&lt;/b&gt;"),
-				),
+				bot.sent.some(({ text }) => text.includes("literal <b>markup</b>")),
 			).toBe(true),
 		);
 		const acceptanceMessages = bot.sent.filter(({ text }) =>
@@ -1482,19 +1444,24 @@ describe("Telegram transport", () => {
 			"Input accepted: input-1",
 		]);
 		const outputIndex = bot.sent.findIndex(({ text }) =>
-			text.includes("<b>bold</b> literal &lt;b&gt;markup&lt;/b&gt;"),
+			text.includes("literal <b>markup</b>"),
 		);
 		const output = bot.sent[outputIndex];
 		const options = bot.sendOptions[outputIndex] as {
 			entities?: readonly { type: string; offset: number; length: number }[];
 			parse_mode?: string;
 		};
-		expect(output?.text).toContain(
-			"<b>bold</b> literal &lt;b&gt;markup&lt;/b&gt; &amp; text",
-		);
-		expect(output?.text).not.toContain("javascript:");
-		expect(options.parse_mode).toBe("HTML");
-		expect(output?.text).toContain("<code>sid</code>");
+		expect(output?.text).toContain("literal <b>markup</b> & text");
+		expect(options.parse_mode).toBeUndefined();
+		expect(options.entities).toHaveLength(1);
+		const entity = options.entities?.[0];
+		expect(entity?.type).toBe("code");
+		expect(
+			output?.text.slice(
+				entity?.offset,
+				(entity?.offset ?? 0) + (entity?.length ?? 0),
+			),
+		).toBe("sid");
 		expect(hasSessionFooter(output?.text ?? "", "sid")).toBe(true);
 		await adapter.stop();
 	});
@@ -1612,10 +1579,15 @@ describe("Telegram transport", () => {
 		).toBe(true);
 		for (const message of chunks) {
 			const options = bot.sendOptions[bot.sent.indexOf(message)] as {
-				parse_mode?: string;
+				entities?: readonly { type: string; offset: number; length: number }[];
 			};
-			expect(options.parse_mode).toBe("HTML");
-			expect(message.text).toContain("<code>other</code>");
+			const entity = options?.entities?.find(({ type }) => type === "code");
+			expect(
+				message.text.slice(
+					entity?.offset,
+					(entity?.offset ?? 0) + (entity?.length ?? 0),
+				),
+			).toBe("other");
 		}
 		expect(chunks.map(({ text }) => telegramBody(text)).join("")).toBe(
 			longOutput,
@@ -1631,9 +1603,7 @@ describe("Telegram transport", () => {
 			expect(unicodeParts).toHaveLength(2);
 		});
 		expect(
-			unicodeParts.map(
-				({ text }) => text.match(/<code>other<\/code> · (\d+\/\d+)$/)?.[1],
-			),
+			unicodeParts.map(({ text }) => text.match(/other · (\d+\/\d+)$/)?.[1]),
 		).toEqual(["1/2", "2/2"]);
 		expect(unicodeParts.map(({ text }) => telegramBody(text)).join("")).toBe(
 			unicodeReply,

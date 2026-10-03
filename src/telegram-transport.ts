@@ -154,7 +154,6 @@ type TelegramRequest = TransportEvent extends infer Event
 type QueuedMessage = {
 	readonly sessionId: SessionId;
 	readonly text: string;
-	readonly output: boolean;
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
@@ -522,52 +521,6 @@ function formatStatus(status: HarnessSessionStatus): string {
 	if (!live) lines.push("Live Pi data: unavailable for this session.");
 	return lines.join("\n");
 }
-function markdownToTelegramHtml(
-	markdown: string,
-	sessionId: SessionId,
-): string {
-	const idAt = markdown.lastIndexOf(sessionId);
-	const marker = `HARNESSD${randomUUID().replace(/-/g, "")}`;
-	const sessionMarker = `${marker}SESSION`;
-	let source =
-		idAt < 0
-			? markdown
-			: `${markdown.slice(0, idAt)}${sessionMarker}${markdown.slice(idAt + sessionId.length)}`;
-	const code: string[] = [];
-	const placeholder = (html: string) => {
-		const index = code.push(html) - 1;
-		return `${marker}CODE${index}END`;
-	};
-	source = source.replace(
-		/```([^\n]*)\n([\s\S]*?)```/g,
-		(_match, _language: string, body: string) =>
-			placeholder(`<pre>${escapeHtml(body)}</pre>`),
-	);
-	source = escapeHtml(source);
-	source = source.replace(/`([^`\n]+)`/g, (_match, body: string) =>
-		placeholder(`<code>${body}</code>`),
-	);
-	source = source.replace(
-		/\[([^\]]+)\]\(([^)]+)\)/g,
-		(_match, label: string, href: string) =>
-			/^(https?:|mailto:)/i.test(href)
-				? placeholder(`<a href="${href}">${label}</a>`)
-				: label,
-	);
-	source = source
-		.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
-		.replace(/__([^_]+)__/g, "<b>$1</b>");
-	source = source
-		.replace(/\*([^*\n]+)\*/g, "<i>$1</i>")
-		.replace(/_([^_\n]+)_/g, "<i>$1</i>")
-		.replace(/~~([^~]+)~~/g, "<s>$1</s>");
-	source = source.replace(
-		new RegExp(`${marker}CODE(\\d+)END`, "g"),
-		(_match, index: string) => code[Number(index)] ?? "",
-	);
-	source = source.replace(sessionMarker, `<code>${sessionId}</code>`);
-	return source;
-}
 function chunks(text: string): string[] {
 	return splitChunks(text, TELEGRAM_LIMIT);
 }
@@ -599,7 +552,7 @@ function splitMessageWithFooter(text: string, footer: string): string[] {
 			const suffix = total > 1 ? ` · ${index}/${total}` : "";
 			const ending = `\n\n${footer}${suffix}`;
 			const remaining = body.slice(offset);
-			const contentLimit = TELEGRAM_LIMIT - ending.length - 13;
+			const contentLimit = TELEGRAM_LIMIT - ending.length;
 			if (contentLimit < 1)
 				throw new Error("Telegram footer exceeds message limit");
 			const length =
@@ -962,7 +915,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					kind: "submit",
 					sessionId,
 					text,
-					replyTargetId: String(chatId),
 				});
 				await this.sendDirect(
 					chatId,
@@ -979,14 +931,13 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 	}
 
-	async sendFileFromSession(
+	private async sendFileToChat(
 		sessionId: SessionId,
 		filePath: string,
-		replyTargetId: string,
+		chatId: number,
 	): Promise<boolean> {
 		const cwd = this.sessionCwds.get(sessionId);
-		if (!cwd || !/^\d+$/.test(replyTargetId)) return false;
-		const chatId = Number(replyTargetId);
+		if (!cwd) return false;
 		if (
 			!Number.isSafeInteger(chatId) ||
 			!this.authorized.has(this.authorizedChatPrincipals.get(chatId) ?? -1) ||
@@ -1099,7 +1050,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				kind: "submit",
 				sessionId,
 				text,
-				replyTargetId: String(chatId),
 				...(image ? { images: image } : {}),
 			});
 			if (!submitted.ok)
@@ -1164,10 +1114,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				return this.sendDirect(chatId, "Usage: /send <path>");
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
-			const sent = await this.sendFileFromSession(
+			const sent = await this.sendFileToChat(
 				sessionId,
 				parsedPath.path,
-				String(chatId),
+				chatId,
 			);
 			return this.sendDirect(
 				chatId,
@@ -2661,18 +2611,17 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (buffer.overflow)
 			text +=
 				"\n\n[Additional output omitted because the response reached the queue limit.]";
-		this.enqueueForSelected(sessionId, text, undefined, true);
+		this.enqueueForSelected(sessionId, text);
 	}
 
 	private enqueueForSelected(
 		sessionId: SessionId,
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
-		output = false,
 	): void {
 		for (const [chatId, selectedId] of this.selected) {
 			if (selectedId === sessionId)
-				this.enqueue(chatId, sessionId, text, output, input);
+				this.enqueue(chatId, sessionId, text, input);
 		}
 	}
 
@@ -2709,7 +2658,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		chatId: number,
 		sessionId: SessionId,
 		text: string,
-		output: boolean,
 		input?: { readonly inputId: string; readonly state: string },
 	): void {
 		let queue = this.queues.get(chatId);
@@ -2742,7 +2690,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				this.queueOverflow(queue, sessionId);
 				break;
 			}
-			queue.messages.push({ sessionId, text: part, output });
+			queue.messages.push({ sessionId, text: part });
 			queue.pendingCharacters += part.length;
 		}
 		this.scheduleDrain(chatId, queue);
@@ -2792,7 +2740,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		queue.messages.push({
 			sessionId,
 			text,
-			output: false,
 			inputId: input.inputId,
 			inputState: input.state,
 		});
@@ -2809,7 +2756,6 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					OVERFLOW_NOTICE,
 					this.eventFooter(sessionId),
 				)[0] ?? OVERFLOW_NOTICE,
-			output: false,
 			overflow: true as const,
 		};
 		queue.messages.push(notice);
@@ -2845,12 +2791,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (this.selected.get(chatId) !== message.sessionId) continue;
 			const delivered = await this.sendWithDeadline(
 				chatId,
-				message.output
-					? markdownToTelegramHtml(message.text, message.sessionId)
-					: message.text,
-				message.output
-					? { parse_mode: "HTML" }
-					: sessionIdEntity(message.text, message.sessionId),
+				message.text,
+				sessionIdEntity(message.text, message.sessionId),
 			);
 			if (!delivered) {
 				queue.failed = true;

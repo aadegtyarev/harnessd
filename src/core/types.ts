@@ -29,7 +29,6 @@ export interface Input {
 		readonly mimeType: string;
 		readonly data: string;
 	}[];
-	readonly replyTargetId?: string;
 	readonly createdAt: Date;
 }
 

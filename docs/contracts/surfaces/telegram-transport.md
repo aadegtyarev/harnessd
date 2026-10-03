@@ -37,12 +37,10 @@
 - `SIGINT`/`SIGTERM` stop the runtime. Polling stop, initialization, and notification shutdown are awaited within bounded deadlines. The lock is released only after polling termination is confirmed; incomplete cleanup retains ownership rather than allowing a second poller. Telegram API conflicts with an unrelated poller are treated as fatal; this local lock does not prevent another program from using the same bot token.
 - Persisted session rows are not sufficient to prove that a Pi process is live. While the supervisor is alive, core provides bounded native-session recovery and sends the fixed status events above; Telegram only presents these events and does not own retry policy. After an unclean supervisor exit, this milestone does not reattach or restart prior processes.
 
-## Incoming files, typing, and assistant formatting
+## Incoming files and typing
 
 - Authorized private-chat documents and photos are downloaded with a 20 MiB bound, written using collision-resistant names and private file permissions to the selected session's canonical working directory, and submitted with a local path and any caption as untrusted prompt text. Photos are also passed to Pi as image content. Incomplete temporary files are removed; unsupported, missing-selection, oversized, download, and write failures receive fixed actionable replies without submitting partial content.
 - While Pi reports an agent turn active, the transport refreshes the Telegram `typing` action for authorized chats currently selecting that session. It stops on settlement, error, selection change, or transport shutdown.
-- Completed assistant Markdown is rendered as safely escaped Telegram HTML for common emphasis, code, and safe HTTP(S)/mailto links. Raw HTML is escaped and unsupported link schemes are not made clickable. Event chunking and the searchable session footer remain in each part; command/user replies remain plain text.
-- The model can invoke the Pi `send_file` tool. Its authenticated, per-instance local IPC request is routed by the runtime to the Telegram adapter with the active input's reply target. Uploads go only to that authorized private chat if it still selects the session; they are never broadcast to other chats selecting the same session. Only regular files whose canonical path is contained by the session's canonical cwd and whose size is at most 20 MiB are accepted. The bot token is never sent through the bridge.
 
 ## Non-goals and related contracts
 
