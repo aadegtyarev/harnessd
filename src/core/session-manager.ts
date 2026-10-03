@@ -7,6 +7,7 @@ import {
 	InvalidWorkingDirectoryError,
 	requireCapability,
 	SessionNotFoundError,
+	SessionNotStoppedError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
 import type {
@@ -90,6 +91,26 @@ export class SessionManager {
 		const session = await this.store.get(id);
 		if (!session) throw new SessionNotFoundError(id);
 		return session;
+	}
+
+	async delete(id: SessionId): Promise<void> {
+		const session = await this.get(id);
+		if (
+			this.closing ||
+			session.status !== "stopped" ||
+			this.instances.has(id) ||
+			this.creating.has(id) ||
+			this.launching.has(id) ||
+			this.stopping.has(id) ||
+			this.recovery.has(id)
+		)
+			throw new SessionNotStoppedError(id);
+		if (!(await this.store.delete(id))) throw new SessionNotFoundError(id);
+		this.terminal.delete(id);
+		this.delays.delete(id);
+		this.eventPumps.delete(id);
+		this.unsettledInputs.delete(id);
+		this.recoveryErrors.delete(id);
 	}
 
 	create(request: CreateSessionRequest): Promise<SessionSummary> {

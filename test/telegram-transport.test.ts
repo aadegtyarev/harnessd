@@ -36,6 +36,12 @@ class MockBot {
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
 	sent: { chatId: number; text: string }[] = [];
+	sendOptions: unknown[] = [];
+	commandRegistrations: {
+		commands: readonly { command: string; description: string }[];
+		other?: unknown;
+	}[] = [];
+	setMyCommandsBehavior: () => Promise<void> = async () => {};
 	startCalled?: () => void;
 	startResolve?: () => void;
 	startReject?: (error: Error) => void;
@@ -56,6 +62,16 @@ class MockBot {
 				_signal?: AbortSignal,
 			) => {
 				this.sent.push({ chatId, text });
+				this.sendOptions.push(_other);
+			},
+		),
+		setMyCommands: vi.fn(
+			async (
+				commands: readonly { command: string; description: string }[],
+				other?: unknown,
+			) => {
+				this.commandRegistrations.push({ commands, other });
+				await this.setMyCommandsBehavior();
 			},
 		),
 	};
@@ -202,6 +218,7 @@ function result(request: TransportEvent): TransportResult {
 			value = { levels: ["low", "medium", "high"], current: "medium" };
 			break;
 		case "effort_set":
+		case "delete":
 			value = undefined;
 			break;
 		default:
@@ -271,6 +288,7 @@ describe("Telegram transport", () => {
 		const dir = await temp();
 		const { adapter, requests } = await startAdapter(bot, dir);
 		await bot.update(42, "/sessions", { userId: 7 });
+		await bot.update(42, "/delete sid", { userId: 7 });
 		await bot.update(42, "/sessions", { missingSender: true });
 		await bot.update(42, "/sessions", { userId: 0 });
 		await bot.update(42, "/sessions", { userId: 42.2 });
@@ -279,6 +297,79 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/sessions", { userId: 42, chatType: "channel" });
 		expect(requests).toEqual([]);
 		expect(bot.sent).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("registers commands and formats IDs as safely escaped code", async () => {
+		const bot = new MockBot();
+		const sid = sessions.get("sid");
+		if (!sid) throw new Error("Missing session fixture");
+		const unsafeSession = { ...sid, cwd: "/work<&" };
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: [unsafeSession],
+						}
+					: result(request),
+		});
+		expect(bot.api.setMyCommands).toHaveBeenCalledOnce();
+		expect(bot.commandRegistrations[0]).toMatchObject({
+			other: { scope: { type: "all_private_chats" } },
+		});
+		expect(
+			bot.commandRegistrations[0]?.commands.map(({ command }) => command),
+		).toEqual([
+			"help",
+			"sessions",
+			"new",
+			"use",
+			"inspect",
+			"status",
+			"model",
+			"effort",
+			"stop",
+			"delete",
+			"cancel",
+		]);
+
+		await bot.update(100, "/help");
+		expect(bot.sent.at(-1)?.text).toContain("/delete <sessionId>");
+		await bot.update(100, "/sessions");
+		expect(requests.at(-1)).toMatchObject({ kind: "list" });
+		const sessionReply = bot.sent.at(-1);
+		expect(sessionReply?.text).toContain("<code>sid</code>");
+		expect(sessionReply?.text).toContain("/work&lt;&amp;");
+		expect(bot.sendOptions.at(-1)).toEqual({ parse_mode: "HTML" });
+
+		await bot.update(100, "/use other");
+		await bot.update(100, "/delete other");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "delete",
+			sessionId: "other",
+		});
+		expect(bot.sent.at(-1)?.text).toContain("Deleted stopped session other");
+		await bot.update(100, "plain text after deletion");
+		expect(requests.map(({ kind }) => kind)).not.toContain("submit");
+		await bot.update(100, "/delete");
+		expect(bot.sent.at(-1)?.text).toBe("Usage: /delete <sessionId>");
+		await adapter.stop();
+	});
+
+	it("keeps polling if Telegram command registration fails without logging raw errors", async () => {
+		const bot = new MockBot();
+		bot.setMyCommandsBehavior = async () => {
+			throw new Error("PRIVATE Telegram API failure");
+		};
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		expect(bot.api.setMyCommands).toHaveBeenCalledOnce();
+		expect(log).toHaveBeenCalledWith(
+			"harnessd: Telegram command menu registration failed",
+		);
+		expect(log.mock.calls.flat().join(" ")).not.toContain("PRIVATE");
 		await adapter.stop();
 	});
 

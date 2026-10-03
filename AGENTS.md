@@ -11,6 +11,13 @@
 - End every task with a concise user-facing report of what changed, checks and outcomes, and remaining risks or blockers. Do not finish with tool output alone or end silently; this rule requires no installed skills.
 <!-- END ad-pi-addons contract workflow -->
 
+## Git workflow
+- Before code changes, verify the target branch and worktree, then create a task-specific branch from the up-to-date target; do not implement directly on `main`. Keep unrelated existing changes out of the task branch/PR unless approved.
+- Commit meaningful verified increments during implementation.
+- At completion, push the branch and open a PR to `main`; merge when all required checks are green, required review is clear, and no blockers/conflicts remain. Do not wait for a separate merge confirmation.
+- Do not merge while required checks are pending/failing or blocking review remains. If remote access/checks block delivery, report that and leave the change unmerged.
+- Merge does not authorize deployment or service restart; do those only when explicitly requested.
+
 ## Project-specific commands and conventions
 - Stack and important paths: Node.js 24+, TypeScript strict ESM (`NodeNext`); npm. Core adapter contracts live in `src/core/`, CLI entrypoint in `src/cli.ts`, and tests in `test/`.
 - Tests / typecheck / build: `npm test`, `npm run typecheck`, `npm run build`.

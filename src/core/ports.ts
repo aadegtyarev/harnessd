@@ -61,6 +61,12 @@ export type TransportEvent =
 	| {
 			readonly requestId: string;
 			readonly principalId: string;
+			readonly kind: "delete";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
 			readonly kind: "submit";
 			readonly sessionId: SessionId;
 			readonly text: string;

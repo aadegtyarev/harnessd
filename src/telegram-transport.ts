@@ -31,6 +31,22 @@ const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
+const TELEGRAM_COMMANDS = [
+	{ command: "help", description: "Show available commands." },
+	{ command: "sessions", description: "List saved sessions." },
+	{ command: "new", description: "Create a session, optionally in a folder." },
+	{ command: "use", description: "Select a session by ID." },
+	{ command: "inspect", description: "Show a session's details." },
+	{ command: "status", description: "Show the selected session's status." },
+	{ command: "model", description: "List or select a model." },
+	{ command: "effort", description: "List or set model effort." },
+	{ command: "stop", description: "Stop a session." },
+	{ command: "delete", description: "Delete a stopped session record." },
+	{
+		command: "cancel",
+		description: "Cancel an input in the selected session.",
+	},
+] as const;
 
 type UpdateContext = {
 	from?: { id: number };
@@ -43,6 +59,14 @@ type TelegramBot = {
 			chatId: number,
 			text: string,
 			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
+		setMyCommands(
+			commands: readonly {
+				readonly command: string;
+				readonly description: string;
+			}[],
+			other?: { readonly scope?: { readonly type: "all_private_chats" } },
 			signal?: AbortSignal,
 		): Promise<unknown>;
 	};
@@ -197,8 +221,27 @@ function isCode(error: unknown, code: string): boolean {
 		error.code === code
 	);
 }
+function escapeHtml(value: string): string {
+	return value.replace(/[&<>"']/g, (character) => {
+		switch (character) {
+			case "&":
+				return "&amp;";
+			case "<":
+				return "&lt;";
+			case ">":
+				return "&gt;";
+			case '"':
+				return "&quot;";
+			default:
+				return "&#39;";
+		}
+	});
+}
 function formatSession(session: SessionSummary): string {
-	return `${session.id} · ${session.status} · ${session.cwd}`;
+	const cwd = [...oneLine(session.cwd)];
+	const displayCwd =
+		cwd.length > 600 ? `${cwd.slice(0, 599).join("")}…` : cwd.join("");
+	return `<code>${escapeHtml(session.id)}</code> · ${escapeHtml(session.status)}\n${escapeHtml(displayCwd)}`;
 }
 function oneLine(value: string): string {
 	return [...value]
@@ -388,6 +431,18 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					);
 				const initialized = await this.initializationPromise;
 				if (!initialized.ok) throw new Error("Telegram initialization failed");
+				try {
+					await withDeadline(
+						this.bot.api.setMyCommands(
+							TELEGRAM_COMMANDS,
+							{ scope: { type: "all_private_chats" } },
+							this.initializationAbort.signal,
+						),
+						SEND_TIMEOUT_MS,
+					);
+				} catch {
+					console.error("harnessd: Telegram command menu registration failed");
+				}
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortInitialization);
 			}
@@ -553,7 +608,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (name === "/help" && args.length === 0)
 			return this.sendDirect(
 				chatId,
-				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/cancel <inputId>\n/help",
+				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/delete <sessionId>\n/cancel <inputId>\n/help",
 			);
 		if (name === "/status" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
@@ -648,13 +703,13 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 		if (name === "/sessions" && args.length === 0) {
 			const result = await this.request(sender, { kind: "list" });
-			return this.sendDirect(
+			return this.sendDirectHtml(
 				chatId,
 				result.ok
 					? (result.value as readonly SessionSummary[])
 							.map(formatSession)
-							.join("\n") || "No sessions."
-					: result.error.message,
+							.join("\n\n") || "No sessions."
+					: escapeHtml(result.error.message),
 			);
 		}
 		if (name === "/use" && args.length === 1) {
@@ -678,11 +733,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					"Provide a session ID or select a session first.",
 				);
 			const result = await this.request(sender, { kind: "inspect", sessionId });
-			return this.sendDirect(
+			return this.sendDirectHtml(
 				chatId,
 				result.ok
 					? formatSession(result.value as SessionSummary)
-					: result.error.message,
+					: escapeHtml(result.error.message),
 			);
 		}
 		if (name === "/stop" && args.length <= 1) {
@@ -699,6 +754,23 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			return this.sendDirect(
 				chatId,
 				result.ok ? `Session ${sessionId} stopped.` : result.error.message,
+			);
+		}
+		if (name === "/delete") {
+			if (args.length !== 1)
+				return this.sendDirect(chatId, "Usage: /delete <sessionId>");
+			const sessionId = args[0] as SessionId;
+			const result = await this.request(sender, { kind: "delete", sessionId });
+			if (result.ok) {
+				for (const [selectedChat, selectedId] of this.selected) {
+					if (selectedId === sessionId) this.selected.delete(selectedChat);
+				}
+			}
+			return this.sendDirect(
+				chatId,
+				result.ok
+					? `Deleted stopped session ${sessionId} from harnessd.`
+					: result.error.message,
 			);
 		}
 		if (name === "/cancel" && args.length === 1) {
@@ -734,6 +806,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	private async sendDirect(chatId: number, text: string): Promise<void> {
 		for (const chunk of chunks(text || " "))
 			await this.sendWithDeadline(chatId, chunk);
+	}
+
+	private async sendDirectHtml(chatId: number, text: string): Promise<void> {
+		for (const chunk of chunks(text || " "))
+			await this.sendWithDeadline(chatId, chunk, { parse_mode: "HTML" });
 	}
 
 	private onEvent(event: HarnessEvent): void {
@@ -929,20 +1006,28 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 	}
 
-	private sendWithDeadline(chatId: number, text: string): Promise<boolean> {
+	private sendWithDeadline(
+		chatId: number,
+		text: string,
+		other?: unknown,
+	): Promise<boolean> {
 		if (this.stopping) return Promise.resolve(false);
-		const sending = this.performSend(chatId, text);
+		const sending = this.performSend(chatId, text, other);
 		this.activeSends.add(sending);
 		void sending.finally(() => this.activeSends.delete(sending));
 		return sending;
 	}
 
-	private async performSend(chatId: number, text: string): Promise<boolean> {
+	private async performSend(
+		chatId: number,
+		text: string,
+		other?: unknown,
+	): Promise<boolean> {
 		const controller = new AbortController();
 		this.pendingSends.add(controller);
 		try {
 			await withDeadline(
-				this.bot.api.sendMessage(chatId, text, undefined, controller.signal),
+				this.bot.api.sendMessage(chatId, text, other, controller.signal),
 				SEND_TIMEOUT_MS,
 			);
 			return true;

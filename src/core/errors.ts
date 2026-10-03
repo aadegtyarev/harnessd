@@ -78,6 +78,15 @@ export class SessionNotFoundError extends Error {
 	}
 }
 
+export class SessionNotStoppedError extends Error {
+	readonly code = "SESSION_NOT_STOPPED";
+
+	constructor(readonly sessionId: string) {
+		super(`Session '${sessionId}' must be stopped before it can be deleted`);
+		this.name = "SessionNotStoppedError";
+	}
+}
+
 export class DuplicateSessionIdError extends Error {
 	readonly code = "DUPLICATE_SESSION_ID";
 

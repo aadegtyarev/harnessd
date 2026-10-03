@@ -54,6 +54,7 @@ const safeErrorMessages = new Map([
 	["UNSUPPORTED_CAPABILITY", "Operation is not supported"],
 	["INVALID_WORKING_DIRECTORY", "Working directory is invalid or inaccessible"],
 	["SESSION_NOT_FOUND", "Session was not found"],
+	["SESSION_NOT_STOPPED", "Stop the session before deleting it with /stop."],
 	["DUPLICATE_SESSION_ID", "Session already exists"],
 	["SESSION_STORE_ERROR", "Session storage failed"],
 	["INVALID_STATE_DIRECTORY", "Runtime state configuration is invalid"],
@@ -268,6 +269,10 @@ export class ApplicationRuntime {
 					break;
 				case "stop":
 					await this.manager.stop(request.sessionId);
+					value = undefined as typeof value;
+					break;
+				case "delete":
+					await this.manager.delete(request.sessionId);
 					value = undefined as typeof value;
 					break;
 				case "submit":

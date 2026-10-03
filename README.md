@@ -130,9 +130,10 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/effort` | Show current and available effort levels. |
 | `/effort <level>` | Set effort for the selected running session. |
 | `/stop [sessionId]` | Stop the selected or named session. |
+| `/delete <sessionId>` | Delete a stopped session record from harnessd. |
 | `/cancel <inputId>` | Cancel an accepted input in the selected session. |
 
-Plain text is sent to the selected session. Chat selection is in memory only. A restarted service does not reattach prior Pi processes; old session rows may appear stale, and `/use` cannot restore those sessions. `/status` uses Pi RPC aggregate usage only (no session-file or plugin reads); its cost is an estimate, not provider billing. Live model, effort, tokens, and cost are unavailable when no live Pi instance exists. The supervisor accepts any existing accessible directory as `cwd`, but `cwd` is not a security boundary.
+Plain text is sent to the selected session. Chat selection is in memory only. A restarted service does not reattach prior Pi processes; old session rows may appear stale, and `/use` cannot restore those sessions. `/sessions` formats session IDs as code. `/delete <sessionId>` requires an explicitly named stopped session; it removes only the harnessd SQLite record, not Pi-native session files or the working directory. Stop the session first with `/stop <sessionId>`. The bot registers its command menu for private chats through Telegram's `setMyCommands` API; if registration fails, manual command handling remains available. `/status` uses Pi RPC aggregate usage only (no session-file or plugin reads); its cost is an estimate, not provider billing. Live model, effort, tokens, and cost are unavailable when no live Pi instance exists. The supervisor accepts any existing accessible directory as `cwd`, but `cwd` is not a security boundary.
 
 ## Sessions, recovery, and uncertainty
 

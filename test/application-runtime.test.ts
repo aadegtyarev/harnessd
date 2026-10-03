@@ -104,6 +104,78 @@ describe("application runtime", () => {
 		},
 	);
 
+	it("routes delete through the runtime and returns safe stopped-session errors", async () => {
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [],
+			harnesses: [
+				{
+					descriptor: {
+						id: "delete-test" as never,
+						capabilities: ["harness.launch", "harness.stop"],
+					},
+					async launch() {
+						return {
+							processId: "delete-test-process" as never,
+							exit: new Promise(() => {}),
+							events: (async function* () {})(),
+							async send() {},
+							async cancel() {},
+							async shutdown() {},
+						};
+					},
+				},
+			],
+		});
+		const created = await runtime.dispatch({
+			requestId: "create-before-delete",
+			principalId: "test",
+			kind: "create",
+			harnessId: "delete-test" as never,
+			cwd: os.tmpdir(),
+		});
+		const session = sessionFrom(created);
+		const activeDelete = await runtime.dispatch({
+			requestId: "delete-active",
+			principalId: "test",
+			kind: "delete",
+			sessionId: session.id,
+		});
+		expect(activeDelete).toMatchObject({
+			ok: false,
+			error: {
+				code: "SESSION_NOT_STOPPED",
+				message: "Stop the session before deleting it with /stop.",
+			},
+		});
+		await runtime.dispatch({
+			requestId: "stop-before-delete",
+			principalId: "test",
+			kind: "stop",
+			sessionId: session.id,
+		});
+		expect(
+			await runtime.dispatch({
+				requestId: "delete-stopped",
+				principalId: "test",
+				kind: "delete",
+				sessionId: session.id,
+			}),
+		).toMatchObject({
+			requestId: "delete-stopped",
+			ok: true,
+			value: undefined,
+		});
+		const listed = await runtime.dispatch({
+			requestId: "list-after-delete",
+			principalId: "test",
+			kind: "list",
+		});
+		expect(listed).toMatchObject({ ok: true, value: [] });
+		await runtime.close();
+	});
+
 	it("returns actionable Pi startup errors and logs only a safe error code", async () => {
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const launchError = Object.assign(new Error("secret path detail"), {

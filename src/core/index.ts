@@ -6,6 +6,7 @@ export {
 	InvalidWorkingDirectoryError,
 	requireCapability,
 	SessionNotFoundError,
+	SessionNotStoppedError,
 	SessionStoreError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
