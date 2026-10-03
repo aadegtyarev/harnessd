@@ -25,6 +25,10 @@ export interface Input {
 	readonly id: InputId;
 	readonly sessionId: SessionId;
 	readonly text: string;
+	readonly images?: readonly {
+		readonly mimeType: string;
+		readonly data: string;
+	}[];
 	readonly createdAt: Date;
 }
 

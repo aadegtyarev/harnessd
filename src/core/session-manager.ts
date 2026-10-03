@@ -468,7 +468,11 @@ export class SessionManager {
 		return running;
 	}
 
-	async submit(id: SessionId, text: string): Promise<InputId> {
+	async submit(
+		id: SessionId,
+		text: string,
+		images?: readonly { readonly mimeType: string; readonly data: string }[],
+	): Promise<InputId> {
 		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
@@ -494,6 +498,7 @@ export class SessionManager {
 			id: randomUUID() as Input["id"],
 			sessionId: id,
 			text,
+			...(images ? { images } : {}),
 			createdAt: new Date(),
 		};
 		let unsettled = this.unsettledInputs.get(id);

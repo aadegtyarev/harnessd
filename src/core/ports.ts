@@ -87,6 +87,10 @@ export type TransportEvent =
 			readonly kind: "submit";
 			readonly sessionId: SessionId;
 			readonly text: string;
+			readonly images?: readonly {
+				readonly mimeType: string;
+				readonly data: string;
+			}[];
 	  }
 	| {
 			readonly requestId: string;

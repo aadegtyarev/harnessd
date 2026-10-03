@@ -299,6 +299,7 @@ export class ApplicationRuntime {
 					value = (await this.manager.submit(
 						request.sessionId,
 						request.text,
+						request.images,
 					)) as typeof value;
 					break;
 				case "cancel":

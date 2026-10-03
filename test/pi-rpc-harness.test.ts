@@ -574,6 +574,24 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(seen.some((event) => event.kind === "error")).toBe(false);
 	});
 
+	it("sends image input as Pi RPC image content", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await instance.send({
+			...input("inspect photo", "image-input"),
+			images: [{ mimeType: "image/jpeg", data: "aW1hZ2U=" }],
+		});
+		const prompt = fake.commands.find((command) => command.type === "prompt");
+		expect(prompt?.message).toBe("inspect photo");
+		expect(prompt?.images).toEqual([
+			{ type: "image", mimeType: "image/jpeg", data: "aW1hZ2U=" },
+		]);
+		await instance.shutdown();
+	});
+
 	it("treats a handled prompt as immediately complete", async () => {
 		const fake = fakeProvider({ promptDisposition: "handled" });
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {

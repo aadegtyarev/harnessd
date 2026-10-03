@@ -96,6 +96,12 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		telegram: { command: "cd", description: "Change the working folder." },
 	},
 	{
+		visibility: "telegram-only",
+		section: "private-chat",
+		usage: "/send <path>",
+		telegram: { command: "send", description: "Send a session file." },
+	},
+	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/use <sessionId>",

@@ -8,7 +8,7 @@ It is currently being tested from Git, not published to npm. The manifest and lo
 
 - Accepts commands and prompts from allowlisted Telegram users in private chats only.
 - Creates, lists, selects, inspects, resumes, cancels, and stops independent Pi sessions.
-- Provides a pinned session panel, optional session names, current-session usage, and whole-turn output with searchable session IDs.
+- Provides a pinned session panel, optional session names, current-session usage, typing indicators, and whole-turn output with searchable session IDs.
 - Watches Pi process exits and attempts bounded resume of the same native session while harnessd remains running.
 - Keeps supervisor metadata in SQLite under a private state directory, independently of each session workspace.
 
@@ -126,6 +126,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/new [cwd]` | Create an unnamed session in `cwd`; defaults to the current folder. The `/menu` create flow can also set a name. |
 | `/ls [path]` | List immediate files and folders in the current chat folder or the supplied path. Dotfiles are hidden; output is bounded. |
 | `/cd [path]` | Change this chat's folder; relative paths work, and `/cd` without a path goes to the OS user's home. Does not change running sessions. |
+| `/send <path>` | Send a regular file from the selected session's working directory (up to 20 MiB). |
 | `/use <sessionId>` | Select a session for this private chat. |
 | `/resume [sessionId]` | Resume a stopped session by its saved Pi-native ID; defaults to the selected session. |
 | `/inspect [sessionId]` | Inspect the selected or named session. |
@@ -138,11 +139,11 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/delete <sessionId>` | Delete a stopped session record from harnessd. |
 | `/cancel <inputId>` | Cancel an accepted input in the selected session. |
 
-`/menu` previews sessions with previous/next; only **Choose** changes selection. Selection and folder navigation remain in memory. After service restart, select again; harnessd does not reattach prior Pi processes, so old rows may be stale and `/use` cannot restore them. Completed assistant turns are sent whole when possible, with a plain `Name · #<full SessionId>` footer; longer turns use numbered parts.
+`/menu` previews sessions with previous/next; only **Choose** changes selection. Selection and folder navigation remain in memory. After service restart, select again; harnessd does not reattach prior Pi processes, so old rows may be stale and `/use` cannot restore them. Completed assistant turns are sent whole when possible, with a searchable `Name · <full SessionId>` footer (or just the ID when unnamed); the ID is monospace and has no leading `#`. Longer turns are split into numbered parts.
 
 Session names are optional, limited to 64 Unicode code points, and persisted in harnessd metadata—not Pi-native session data. `/sessions` and `/inspect` show the optional name and a plain searchable `#<full SessionId>` tag. All allowlisted operators share access to these names and sessions.
 
-Plain text goes to the selected session. If it is deliberately stopped, harnessd resumes that same Pi-native session and submits the new text once; it never creates a fresh session as fallback. `/stop` clears selection when it stops the selected session, so use `/use <sessionId>` before `/resume` without an ID or text-driven auto-resume.
+Plain text goes to the selected session. Telegram shows a typing indicator while Pi is working. Send a document or photo to the chat to save it under the selected session's working directory and submit its path and caption; photos are also passed as image content. Use `/send <path>` to upload a regular file from the selected session's working directory to that chat (maximum 20 MiB); relative paths are resolved from the session directory, and paths outside it are rejected. The selected model must support images to interpret photos, and document inspection depends on Pi's available tools. If it is deliberately stopped, harnessd resumes that same Pi-native session and submits the new text once; it never creates a fresh session as fallback. `/stop` clears selection when it stops the selected session, so use `/use <sessionId>` before `/resume` without an ID or text-driven auto-resume.
 
 `/delete <sessionId>` requires a stopped session and removes only its harnessd SQLite record, not Pi-native files or the working directory. `/status` uses Pi RPC aggregate usage only; it does not read session files or invoke plugin commands. Cost is an estimate, not provider billing, and live model, effort, tokens, and cost are unavailable without a live Pi instance. The command menu is registered through Telegram's `setMyCommands`; on registration failure, manual commands remain available. Any accessible directory is valid as `cwd`, but it is not a security boundary.
 
@@ -154,7 +155,7 @@ An operator can resume a deliberately stopped session with `/resume [sessionId]`
 
 ## Trust and limitations
 
-- `direct` runs Pi with the supervisor user's operating-system permissions. There is no sandbox: Pi may access files outside `cwd` that the user can access.
+- `direct` runs Pi with the supervisor user's operating-system permissions. There is no sandbox: Pi may access files outside `cwd` that the user can access. `/send` is narrower: it only uploads regular files inside the selected session's canonical `cwd` and at most 20 MiB.
 - `isolated` is not implemented in this CLI and is rejected before runtime startup; it never silently falls back to direct mode.
 - Telegram operators share access to local sessions. Output may include sensitive workspace data and is not universally redacted; a full output queue can cause additional notifications to be omitted.
 - Session metadata is stored, but chat selection and event/input history are not persisted.

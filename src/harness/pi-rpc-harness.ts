@@ -872,7 +872,18 @@ class PiRpcInstance implements HarnessInstance {
 		try {
 			response = await this.command(
 				"prompt",
-				{ message: input.text },
+				{
+					message: input.text,
+					...(input.images?.length
+						? {
+								images: input.images.map((image) => ({
+									type: "image",
+									data: image.data,
+									mimeType: image.mimeType,
+								})),
+							}
+						: {}),
+				},
 				input.id,
 			);
 		} catch (error) {

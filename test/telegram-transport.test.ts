@@ -4,6 +4,8 @@ import {
 	readFile,
 	rm,
 	stat,
+	symlink,
+	truncate,
 	writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -49,6 +51,9 @@ type Context = {
 	chat?: { id: number; type: string };
 	message?: {
 		text?: string;
+		caption?: string;
+		document?: { file_id: string; file_name?: string; file_size?: number };
+		photo?: readonly { file_id: string; file_size?: number }[];
 		message_id?: number;
 		reply_to_message?: { message_id: number };
 	};
@@ -61,6 +66,7 @@ type Context = {
 class MockBot {
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
+	photoHandler?: (ctx: Context) => Promise<void>;
 	callbackHandler?: (ctx: Context) => Promise<void>;
 	sent: { chatId: number; text: string }[] = [];
 	nextMessageId = 1000;
@@ -119,7 +125,11 @@ class MockBot {
 			this.pinned.push({ chatId, messageId });
 			return true;
 		}),
+		sendChatAction: vi.fn(async (_chatId: number) => true),
+		sendDocument: vi.fn(async () => true),
 		answerCallbackQuery: vi.fn(async () => true),
+		getFile: vi.fn(async () => ({ file_path: "photo.jpg", file_size: 5 })),
+		getFileLink: vi.fn(async () => new URL("data:image/jpeg;base64,aGVsbG8=")),
 		setMyCommands: vi.fn(
 			async (
 				commands: readonly { command: string; description: string }[],
@@ -135,6 +145,8 @@ class MockBot {
 	}
 	on(filter: string, handler: (ctx: Context) => Promise<void>) {
 		if (filter === "message:text") this.handler = handler;
+		if (filter === "message:photo") this.photoHandler = handler;
+		if (filter === "message:document") this.photoHandler = handler;
 		if (filter === "callback_query:data") this.callbackHandler = handler;
 	}
 	init(signal?: AbortSignal): Promise<void> {
@@ -190,6 +202,43 @@ class MockBot {
 			},
 		};
 		await this.middleware?.(ctx, async () => this.handler?.(ctx));
+	}
+	async updateDocument(
+		chatId: number,
+		options: {
+			caption?: string;
+			fileId?: string;
+			fileName?: string;
+			fileSize?: number;
+			userId?: number;
+		} = {},
+	) {
+		const ctx: Context = {
+			from: { id: options.userId ?? 42 },
+			chat: { id: chatId, type: "private" },
+			message: {
+				document: {
+					file_id: options.fileId ?? "document-id",
+					file_name: options.fileName ?? "notes.txt",
+					...(options.fileSize === undefined
+						? {}
+						: { file_size: options.fileSize }),
+				},
+				...(options.caption ? { caption: options.caption } : {}),
+			},
+		};
+		await this.middleware?.(ctx, async () => this.photoHandler?.(ctx));
+	}
+	async updatePhoto(chatId: number, caption?: string, userId = 42) {
+		const ctx: Context = {
+			from: { id: userId },
+			chat: { id: chatId, type: "private" },
+			message: {
+				photo: [{ file_id: "photo-id", file_size: 5 }],
+				...(caption ? { caption } : {}),
+			},
+		};
+		await this.middleware?.(ctx, async () => this.photoHandler?.(ctx));
 	}
 	async callback(
 		chatId: number,
@@ -495,7 +544,10 @@ describe("Telegram transport", () => {
 
 	it("requires confirmation before callback stop and delete operations", async () => {
 		const bot = new MockBot();
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() => expect(bot.api.sendChatAction).toHaveBeenCalled());
 		await bot.update(42, "/menu");
 		const panelMessageId = bot.lastMessageId;
 		await bot.callback(42, "menu:sessions", panelMessageId);
@@ -507,7 +559,10 @@ describe("Telegram transport", () => {
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		await bot.callback(42, "session:delete:sid", panelMessageId);
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		expect(clearIntervalSpy).toHaveBeenCalled();
+		clearIntervalSpy.mockRestore();
 		expect(requests.some((request) => request.kind === "delete")).toBe(true);
 		const requestsAfterDelete = requests.length;
 		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
@@ -640,6 +695,7 @@ describe("Telegram transport", () => {
 			"new",
 			"ls",
 			"cd",
+			"send",
 			"use",
 			"resume",
 			"inspect",
@@ -656,6 +712,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("/resume [sessionId]");
 		expect(bot.sent.at(-1)?.text).toContain("/ls [path]");
 		expect(bot.sent.at(-1)?.text).toContain("/cd [path]");
+		expect(bot.sent.at(-1)?.text).toContain("/send <path>");
 		await bot.update(100, "/sessions");
 		expect(requests.at(-1)).toMatchObject({ kind: "list" });
 		const sessionReply = bot.sent.at(-1);
@@ -1089,10 +1146,13 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(43, "/use other");
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "status", "harness_restarting"));
 		emit(harnessEvent("sid", "status", "harness_recovered"));
 		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		expect(clearIntervalSpy).toHaveBeenCalled();
+		clearIntervalSpy.mockRestore();
 		emit(harnessEvent("sid", "status", "agent_end"));
 		emit(harnessEvent("sid", "status", "secret-unknown-state"));
 		emit({
@@ -1140,6 +1200,239 @@ describe("Telegram transport", () => {
 		expect(telegramBody(otherMessages[0]?.text ?? "")).toBe(
 			"private other session",
 		);
+		await adapter.stop();
+	});
+
+	it("downloads selected-session photos and submits image content with the caption", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updatePhoto(42, "describe this");
+		const submission = requests.find((request) => request.kind === "submit");
+		expect(submission).toMatchObject({
+			kind: "submit",
+			text: expect.stringContaining(
+				"Caption (untrusted user text): describe this",
+			),
+			images: [{ mimeType: "image/jpeg", data: "aGVsbG8=" }],
+		});
+		const savedPath =
+			submission?.kind === "submit"
+				? submission.text.match(/saved at (.+)\. Caption/)?.[1]
+				: undefined;
+		expect(savedPath).toBeDefined();
+		if (!savedPath) throw new Error("Photo path missing from submitted prompt");
+		expect(await readFile(savedPath, "utf8")).toBe("hello");
+		await adapter.stop();
+	});
+
+	it("downloads selected-session documents and submits their path with the caption", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42, { caption: "summarize this" });
+
+		const submission = requests.find((request) => request.kind === "submit");
+		expect(submission).toMatchObject({
+			kind: "submit",
+			text: expect.stringContaining(
+				"Caption (untrusted user text): summarize this",
+			),
+		});
+		const savedPath =
+			submission?.kind === "submit"
+				? submission.text.match(/saved at (.+)\. Caption/)?.[1]
+				: undefined;
+		expect(savedPath).toBeDefined();
+		if (!savedPath)
+			throw new Error("Document path missing from submitted prompt");
+		expect(await readFile(savedPath, "utf8")).toBe("hello");
+		await adapter.stop();
+	});
+
+	it("does not submit oversized or failed incoming documents", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42, { fileSize: 20 * 1024 * 1024 + 1 });
+		const submissions = () =>
+			requests.filter((request) => request.kind === "submit");
+		expect(submissions()).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain("20 MiB limit");
+
+		bot.api.getFileLink = vi.fn(async () => {
+			throw new Error("secret download failure");
+		});
+		await bot.updateDocument(42);
+		expect(submissions()).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Could not safely download or save",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("secret");
+		await adapter.stop();
+	});
+
+	it("does not submit an incoming document when saving into the session folder fails", async () => {
+		const bot = new MockBot();
+		const root = await temp();
+		const notDirectory = path.join(root, "not-directory");
+		await writeFile(notDirectory, "file");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: notDirectory,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Could not safely download or save",
+		);
+		await adapter.stop();
+	});
+
+	it("restricts /send to regular files inside the selected session cwd", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const outside = await temp();
+		const file = path.join(dir, "report.txt");
+		const outsideFile = path.join(outside, "private.txt");
+		await writeFile(file, "report");
+		await writeFile(outsideFile, "private");
+		let symlinkAvailable = false;
+		try {
+			await symlink(outsideFile, path.join(dir, "escape.txt"));
+			symlinkAvailable = true;
+		} catch (error) {
+			if (process.platform !== "win32") throw error;
+		}
+		const largeFile = path.join(dir, "large.txt");
+		await writeFile(largeFile, "");
+		await truncate(largeFile, 20 * 1024 * 1024 + 1);
+		await mkdir(path.join(dir, "folder"));
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid", { userId: 42 });
+		await bot.update(42, "/send report.txt");
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.api.sendDocument).toHaveBeenCalledWith(
+			42,
+			expect.anything(),
+			{},
+			expect.any(AbortSignal),
+		);
+		await bot.update(42, `/send ${outsideFile}`);
+		if (symlinkAvailable) await bot.update(42, "/send escape.txt");
+		await bot.update(42, "/send large.txt");
+		await bot.update(42, "/send folder");
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		await adapter.stop();
+	});
+
+	it("sends only selected-session files through /send with paths containing spaces", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const file = path.join(dir, "report file.txt");
+		await writeFile(file, "report");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+
+		await bot.update(100, '/send "report file.txt"');
+		expect(bot.api.sendDocument).not.toHaveBeenCalled();
+		expect(bot.sent.at(-1)?.text).toBe("Select a session first.");
+
+		await bot.update(100, "/use sid");
+		await bot.update(100, '/send "report file.txt"');
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.sent.at(-1)?.text).toBe("File sent.");
+
+		await bot.update(100, "/send ../outside.txt");
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.sent.at(-1)?.text).toContain(
+			"inside the selected session folder",
+		);
+		await adapter.stop();
+	});
+
+	it("refreshes authorized chat typing while a session is processing", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledWith(
+				42,
+				"typing",
+				{},
+				expect.any(AbortSignal),
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+	});
+
+	it("stops typing for a chat immediately when it switches away from an active session", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid", { userId: 42 });
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(2),
+		);
+		await bot.update(42, "/use other");
+		expect(bot.api.sendChatAction.mock.calls.map(([chatId]) => chatId)).toEqual(
+			[42, 43, 43],
+		);
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+		await bot.update(43, "/delete sid");
+		expect(clearIntervalSpy).toHaveBeenCalled();
+		clearIntervalSpy.mockRestore();
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+	});
+
+	it("restarts typing when a chat reselects a session with an active turn", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1),
+		);
+
+		await bot.update(42, "/use other");
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(2),
+		);
+
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await adapter.stop();
 	});
 
