@@ -417,6 +417,24 @@ function formatStatus(status: HarnessSessionStatus): string {
 function chunks(text: string): string[] {
 	return splitChunks(text, TELEGRAM_LIMIT);
 }
+function sessionIdEntity(
+	text: string,
+	sessionId: SessionId,
+):
+	| {
+			readonly entities: readonly {
+				readonly type: "code";
+				readonly offset: number;
+				readonly length: number;
+			}[];
+	  }
+	| undefined {
+	const offset = text.lastIndexOf(sessionId);
+	if (offset < 0) return undefined;
+	return {
+		entities: [{ type: "code", offset, length: sessionId.length }],
+	};
+}
 function splitMessageWithFooter(text: string, footer: string): string[] {
 	const body = text || " ";
 	let total = 1;
@@ -513,6 +531,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	private readonly selected = new Map<number, SessionId>();
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
+	private readonly reportedErrors = new Set<SessionId>();
 	private readonly previews = new Map<number, SessionId>();
 	private readonly pendingNames = new Map<
 		number,
@@ -1046,6 +1065,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (result.ok) {
 				this.sessionNames.delete(sessionId);
 				this.knownSessions.delete(sessionId);
+				this.reportedErrors.delete(sessionId);
 				for (const [selectedChat, selectedId] of this.selected) {
 					if (selectedId === sessionId) {
 						this.selected.delete(selectedChat);
@@ -2158,6 +2178,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		} else {
 			this.sessionNames.delete(sessionId);
 			this.knownSessions.delete(sessionId);
+			this.reportedErrors.delete(sessionId);
 			for (const [selectedChat, selectedId] of this.selected) {
 				if (selectedId === sessionId) {
 					this.selected.delete(selectedChat);
@@ -2179,6 +2200,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			return;
 		}
 		if (event.kind === "status") {
+			if (event.text === "harness_recovered")
+				this.reportedErrors.delete(event.sessionId);
 			if (event.text === "agent_start") {
 				this.turnBuffers.set(event.sessionId, {
 					chunks: [],
@@ -2203,11 +2226,14 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 		if (event.kind === "error") {
 			this.flushTurn(event.sessionId, true);
+			if (this.reportedErrors.has(event.sessionId)) return;
+			this.reportedErrors.add(event.sessionId);
 			this.enqueueForSelected(event.sessionId, "Session reported an error.");
 			return;
 		}
 		if (event.kind === "input" && event.inputEvent) {
 			const { inputId, state } = event.inputEvent;
+			if (state === "accepted") return;
 			this.enqueueForSelected(
 				event.sessionId,
 				`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`,
@@ -2268,6 +2294,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		return `${name ? `${oneLine(name)} · ` : ""}#${sessionId}`;
 	}
 
+	private eventFooter(sessionId: SessionId): string {
+		const name = this.sessionNames.get(sessionId);
+		return `${name ? `${oneLine(name)} · ` : ""}${sessionId}`;
+	}
+
 	private rememberSession(session: SessionSummary): void {
 		this.knownSessions.add(session.id);
 		if (session.name) this.sessionNames.set(session.id, session.name);
@@ -2280,6 +2311,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (!present.has(sessionId)) {
 				this.knownSessions.delete(sessionId);
 				this.sessionNames.delete(sessionId);
+				this.reportedErrors.delete(sessionId);
 			}
 		}
 		for (const session of sessions) this.rememberSession(session);
@@ -2303,7 +2335,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			this.queues.set(chatId, queue);
 		}
 		if (queue.failed || this.stopping) return;
-		const parts = splitMessageWithFooter(text, this.sessionFooter(sessionId));
+		const parts = splitMessageWithFooter(text, this.eventFooter(sessionId));
 		if (input) {
 			this.enqueueInput(queue, sessionId, parts[0] ?? text, input);
 			this.scheduleDrain(chatId, queue);
@@ -2387,7 +2419,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			text:
 				splitMessageWithFooter(
 					OVERFLOW_NOTICE,
-					this.sessionFooter(sessionId),
+					this.eventFooter(sessionId),
 				)[0] ?? OVERFLOW_NOTICE,
 			output: false,
 			overflow: true as const,
@@ -2423,7 +2455,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			queue.pendingCharacters -= message.text.length;
 			if (message.overflow) queue.overflowQueued = false;
 			if (this.selected.get(chatId) !== message.sessionId) continue;
-			const delivered = await this.sendWithDeadline(chatId, message.text);
+			const delivered = await this.sendWithDeadline(
+				chatId,
+				message.text,
+				sessionIdEntity(message.text, message.sessionId),
+			);
 			if (!delivered) {
 				queue.failed = true;
 				queue.messages.length = 0;

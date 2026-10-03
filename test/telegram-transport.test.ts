@@ -23,11 +23,14 @@ import {
 
 const roots: string[] = [];
 function telegramBody(text: string): string {
-	const footerStart = text.lastIndexOf("\n\n#");
+	const footerStart = text.lastIndexOf("\n\n");
 	return footerStart < 0 ? text : text.slice(0, footerStart);
 }
 function hasSessionFooter(text: string, sessionId: string): boolean {
-	return new RegExp(`\\n\\n#${sessionId}(?: · \\d+\\/\\d+)?$`).test(text);
+	const footerStart = text.lastIndexOf("\n\n");
+	if (footerStart < 0) return false;
+	const footer = text.slice(footerStart + 2).replace(/ · \d+\/\d+$/, "");
+	return footer === sessionId || footer.endsWith(` · ${sessionId}`);
 }
 async function temp() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "telegram-adapter-"));
@@ -1140,6 +1143,83 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("sends one accepted-input confirmation and marks only the footer ID monospace", async () => {
+		const bot = new MockBot();
+		let emitEvent!: (event: HarnessEvent) => void;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit")
+					emitEvent({
+						sessionId: request.sessionId,
+						kind: "input",
+						inputEvent: { inputId: "input-1" as never, state: "accepted" },
+					});
+				return result(request);
+			},
+		});
+		emitEvent = emit;
+		await bot.update(42, "/use sid");
+		await bot.update(42, "send this");
+		emit(harnessEvent("sid", "output", "literal <b>markup</b> & text"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("literal <b>markup</b>")),
+			).toBe(true),
+		);
+		const acceptanceMessages = bot.sent.filter(({ text }) =>
+			text.includes("input-1"),
+		);
+		expect(acceptanceMessages.map(({ text }) => text)).toEqual([
+			"Input accepted: input-1",
+		]);
+		const outputIndex = bot.sent.findIndex(({ text }) =>
+			text.includes("literal <b>markup</b>"),
+		);
+		const output = bot.sent[outputIndex];
+		const options = bot.sendOptions[outputIndex] as {
+			entities?: readonly { type: string; offset: number; length: number }[];
+			parse_mode?: string;
+		};
+		expect(output?.text).toContain("literal <b>markup</b> & text");
+		expect(options.parse_mode).toBeUndefined();
+		expect(options.entities).toHaveLength(1);
+		const entity = options.entities?.[0];
+		expect(entity?.type).toBe("code");
+		expect(
+			output?.text.slice(
+				entity?.offset,
+				(entity?.offset ?? 0) + (entity?.length ?? 0),
+			),
+		).toBe("sid");
+		expect(hasSessionFooter(output?.text ?? "", "sid")).toBe(true);
+		await adapter.stop();
+	});
+
+	it("deduplicates identical session errors until successful recovery", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		for (let index = 0; index < 3; index++)
+			emit(harnessEvent("sid", "error", `failure ${index}`));
+		emit(harnessEvent("sid", "status", "harness_recovered"));
+		for (let index = 0; index < 2; index++)
+			emit(harnessEvent("sid", "error", `failure after recovery ${index}`));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.filter(
+					({ text }) => telegramBody(text) === "Session reported an error.",
+				).length,
+			).toBe(2),
+		);
+		expect(
+			bot.sent.filter(
+				({ text }) => telegramBody(text) === "Session reported an error.",
+			),
+		).toHaveLength(2);
+		await adapter.stop();
+	});
+
 	it("keeps repeated input states in event order with intervening output and status", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
@@ -1177,9 +1257,10 @@ describe("Telegram transport", () => {
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		bot.api.sendMessage.mockImplementation(async (chatId, text) => {
+		bot.api.sendMessage.mockImplementation(async (chatId, text, other) => {
 			if (telegramBody(text) === "in-flight") await gate;
 			bot.sent.push({ chatId, text });
+			bot.sendOptions.push(other);
 		});
 		emit(harnessEvent("sid", "output", "in-flight"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
@@ -1226,6 +1307,18 @@ describe("Telegram transport", () => {
 				({ text }) => text.length <= 4096 && hasSessionFooter(text, "other"),
 			),
 		).toBe(true);
+		for (const message of chunks) {
+			const options = bot.sendOptions[bot.sent.indexOf(message)] as {
+				entities?: readonly { type: string; offset: number; length: number }[];
+			};
+			const entity = options?.entities?.find(({ type }) => type === "code");
+			expect(
+				message.text.slice(
+					entity?.offset,
+					(entity?.offset ?? 0) + (entity?.length ?? 0),
+				),
+			).toBe("other");
+		}
 		expect(chunks.map(({ text }) => telegramBody(text)).join("")).toBe(
 			longOutput,
 		);
@@ -1240,7 +1333,7 @@ describe("Telegram transport", () => {
 			expect(unicodeParts).toHaveLength(2);
 		});
 		expect(
-			unicodeParts.map(({ text }) => text.match(/#other · (\d+\/\d+)$/)?.[1]),
+			unicodeParts.map(({ text }) => text.match(/other · (\d+\/\d+)$/)?.[1]),
 		).toEqual(["1/2", "2/2"]);
 		expect(unicodeParts.map(({ text }) => telegramBody(text)).join("")).toBe(
 			unicodeReply,
