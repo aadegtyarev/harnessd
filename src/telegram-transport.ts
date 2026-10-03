@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { open, readFile, unlink } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { Bot } from "grammy";
+import {
+	getTelegramCommands,
+	getTelegramHelpUsages,
+} from "./command-catalog.js";
 import type {
 	HarnessEffortCatalog,
 	HarnessModelCatalog,
@@ -19,6 +24,12 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "./core/types.js";
+import {
+	listDirectoryEntries,
+	parsePathArgument,
+	resolveExistingDirectory,
+	resolvePathFrom,
+} from "./telegram-filesystem.js";
 
 const TELEGRAM_LIMIT = 4096;
 const SEND_TIMEOUT_MS = 5000;
@@ -31,24 +42,6 @@ const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
-const TELEGRAM_COMMANDS = [
-	{ command: "help", description: "Show available commands." },
-	{ command: "sessions", description: "List saved sessions." },
-	{ command: "new", description: "Create a session, optionally in a folder." },
-	{ command: "use", description: "Select a session by ID." },
-	{ command: "resume", description: "Resume a stopped session." },
-	{ command: "inspect", description: "Show a session's details." },
-	{ command: "status", description: "Show the selected session's status." },
-	{ command: "model", description: "List or select a model." },
-	{ command: "effort", description: "List or set model effort." },
-	{ command: "stop", description: "Stop a session." },
-	{ command: "delete", description: "Delete a stopped session record." },
-	{
-		command: "cancel",
-		description: "Cancel an input in the selected session.",
-	},
-] as const;
-
 type UpdateContext = {
 	from?: { id: number };
 	chat?: { id: number; type: string };
@@ -109,7 +102,7 @@ export interface TelegramTransportOptions {
 	readonly token: string;
 	readonly allowedUserIds: readonly number[];
 	readonly stateDirectory: string;
-	readonly defaultCwd: string;
+	readonly initialCwd: string;
 	readonly signal?: AbortSignal;
 	readonly onFatal?: () => void;
 	readonly botFactory?: BotFactory;
@@ -335,36 +328,13 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 	});
 }
 
-function parseNewWorkingDirectory(
-	value: string | undefined,
-	defaultCwd: string,
-):
-	| { readonly ok: true; readonly cwd: string }
-	| { readonly ok: false; readonly error: string } {
-	const candidate = value?.trim();
-	if (!candidate) return { ok: true, cwd: defaultCwd };
-	const quote = candidate[0];
-	if (quote === '"' || quote === "'") {
-		if (candidate.length < 2 || candidate.at(-1) !== quote)
-			return {
-				ok: false,
-				error:
-					"Use matching quotes around the entire path, or remove the quotes.",
-			};
-		const cwd = candidate.slice(1, -1);
-		if (!cwd)
-			return { ok: false, error: "Working directory path cannot be empty." };
-		return { ok: true, cwd };
-	}
-	return { ok: true, cwd: candidate };
-}
-
 export class TelegramTransportAdapter implements TransportAdapter {
 	readonly descriptor = {
 		id: "telegram" as AdapterId,
 		capabilities: ["transport.poll"] as const,
 	};
 	private readonly selected = new Map<number, SessionId>();
+	private readonly currentDirectories = new Map<number, string>();
 	private readonly queues = new Map<number, ChatQueue>();
 	private readonly pendingSends = new Set<AbortController>();
 	private readonly activeSends = new Set<Promise<boolean>>();
@@ -435,7 +405,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				try {
 					await withDeadline(
 						this.bot.api.setMyCommands(
-							TELEGRAM_COMMANDS,
+							getTelegramCommands(),
 							{ scope: { type: "all_private_chats" } },
 							this.initializationAbort.signal,
 						),
@@ -589,28 +559,82 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	): Promise<void> {
 		const newCommand = /^\/new(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (newCommand) {
-			const parsedCwd = parseNewWorkingDirectory(
-				newCommand[1],
-				this.options.defaultCwd,
-			);
-			if (!parsedCwd.ok) return this.sendDirect(chatId, parsedCwd.error);
+			const parsedPath = parsePathArgument(newCommand[1]);
+			if (!parsedPath.ok)
+				return this.sendDirect(
+					chatId,
+					"Use matching quotes around the entire path, or remove the quotes.",
+				);
+			const currentDirectory =
+				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
+			const cwd = parsedPath.path
+				? resolvePathFrom(parsedPath.path, currentDirectory)
+				: currentDirectory;
 			const result = await this.request(sender, {
 				kind: "create",
 				harnessId: "pi-rpc" as never,
-				cwd: parsedCwd.cwd,
+				cwd,
 			});
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.selected.set(chatId, session.id);
 			return this.sendDirect(chatId, `Created and selected ${session.id}.`);
 		}
+		const pathCommand = /^\/(ls|cd)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
+		if (pathCommand) {
+			const parsedPath = parsePathArgument(pathCommand[2]);
+			if (!parsedPath.ok)
+				return this.sendDirect(
+					chatId,
+					"Use matching quotes around the entire path, or remove the quotes.",
+				);
+			const currentDirectory =
+				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
+			if (pathCommand[1] === "cd") {
+				const target = parsedPath.path
+					? resolvePathFrom(parsedPath.path, currentDirectory)
+					: os.homedir();
+				try {
+					const directory = await resolveExistingDirectory(target);
+					this.currentDirectories.set(chatId, directory);
+					return this.sendDirect(
+						chatId,
+						`Working folder: ${oneLine(directory)}`,
+					);
+				} catch {
+					return this.sendDirect(
+						chatId,
+						"Directory is missing, inaccessible, or not a directory; current folder unchanged.",
+					);
+				}
+			}
+			const target = parsedPath.path
+				? resolvePathFrom(parsedPath.path, currentDirectory)
+				: currentDirectory;
+			try {
+				const listing = await listDirectoryEntries(target);
+				const entries = listing.entries.map((entry) =>
+					entry.kind === "directory"
+						? `📁 ${oneLine(entry.name)}/`
+						: `📄 ${oneLine(entry.name)}`,
+				);
+				if (listing.truncated)
+					entries.push(`… showing first 100 of ${listing.total} entries`);
+				return this.sendDirect(
+					chatId,
+					[`Directory: ${oneLine(listing.cwd)}`, ...entries].join("\n"),
+				);
+			} catch {
+				return this.sendDirect(
+					chatId,
+					"Directory is missing, inaccessible, or not a directory.",
+				);
+			}
+		}
 		const [command, ...args] = raw.trim().split(/\s+/);
 		const name = command.split("@")[0];
 		if (name === "/help" && args.length === 0)
-			return this.sendDirect(
-				chatId,
-				"/sessions\n/new [cwd]\n/use <sessionId>\n/resume [sessionId]\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/delete <sessionId>\n/cancel <inputId>\n/help",
-			);
+			return this.sendDirect(chatId, getTelegramHelpUsages().join("\n"));
 		if (name === "/status" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");

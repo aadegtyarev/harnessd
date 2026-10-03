@@ -7,14 +7,24 @@ import {
 	InvalidExecutionModeError,
 	IsolationUnavailableError,
 } from "./application-runtime.js";
+import { getCliCommandUsages } from "./command-catalog.js";
 import { resolveStateDirectory } from "./core/session-store.js";
 import { loadDotEnv } from "./dotenv.js";
+import { resolveInitialDirectory } from "./telegram-filesystem.js";
 import { TelegramTransportAdapter } from "./telegram-transport.js";
 import {
 	manageUserService,
 	type UserServiceAction,
 	type UserServiceOptions,
 } from "./user-service.js";
+
+function renderCliUsages(section: "service" | "private-chat"): string {
+	return getCliCommandUsages(section)
+		.map(({ usage, description }) =>
+			description ? `  ${usage.padEnd(34)}${description}` : `  ${usage}`,
+		)
+		.join("\n");
+}
 
 export const HELP = `harnessd - locally supervised Pi sessions over Telegram
 
@@ -33,22 +43,16 @@ Optional environment:
   HARNESSD_PI_EXECUTABLE            Pi executable (default: pi)
   HARNESSD_STATE_DIR                Supervisor state directory
   HARNESSD_EXECUTION_MODE           direct (default, trusted; cwd is not a sandbox) or isolated (unavailable in this CLI; requires a registered isolation provider)
-  HARNESSD_DEFAULT_CWD              Default workspace for /new when no cwd is supplied
+  HARNESSD_HOME                     Initial Telegram working folder (default: /; not a sandbox)
 
 Service commands (Linux systemd --user):
-  harnessd service install          Install, enable, and start the user service
-  harnessd service uninstall        Stop, disable, and remove the user service
+${renderCliUsages("service")}
 
 Private-chat commands:
-  /sessions
-  /new [cwd]
-  /use <sessionId>
-  /resume [sessionId]
-  /inspect [sessionId]
-  /stop [sessionId]
-  /cancel <inputId>
-  /help
+${renderCliUsages("private-chat")}
 
+Paths may be relative to the chat's current folder or absolute. ~ always means the
+operating-system user's home; navigation is not restricted to HARNESSD_HOME.
 Plain text is submitted to the session selected in that private chat.
 `;
 
@@ -99,6 +103,7 @@ export async function main(options: CliOptions = {}): Promise<void> {
 		throw new InvalidExecutionModeError();
 	if (executionMode === "isolated") throw new IsolationUnavailableError();
 	const { token, ids } = validateTelegramConfiguration(env);
+	const initialCwd = await resolveInitialDirectory(env.HARNESSD_HOME, cwd);
 	const stateDirectory = resolveStateDirectory(env.HARNESSD_STATE_DIR);
 	const writeError =
 		options.writeError ?? ((text: string) => process.stderr.write(text));
@@ -126,7 +131,7 @@ export async function main(options: CliOptions = {}): Promise<void> {
 		token,
 		allowedUserIds: ids,
 		stateDirectory,
-		defaultCwd: env.HARNESSD_DEFAULT_CWD || cwd,
+		initialCwd,
 		signal: startupAbort.signal,
 		onFatal: () => {
 			try {

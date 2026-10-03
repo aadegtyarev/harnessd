@@ -28,7 +28,7 @@ describe("dotenv configuration", () => {
 			[
 				"HARNESSD_TELEGRAM_BOT_TOKEN=from-file",
 				"HARNESSD_TELEGRAM_ALLOWED_USER_IDS=42,43",
-				"HARNESSD_DEFAULT_CWD='/work/project root'",
+				"HARNESSD_HOME='/work/project root'",
 			].join("\n"),
 		);
 		const env: NodeJS.ProcessEnv = {
@@ -39,7 +39,7 @@ describe("dotenv configuration", () => {
 
 		expect(env.HARNESSD_TELEGRAM_BOT_TOKEN).toBe("from-shell");
 		expect(env.HARNESSD_TELEGRAM_ALLOWED_USER_IDS).toBe("42,43");
-		expect(env.HARNESSD_DEFAULT_CWD).toBe("/work/project root");
+		expect(env.HARNESSD_HOME).toBe("/work/project root");
 		expect(values.HARNESSD_TELEGRAM_BOT_TOKEN).toBe("from-file");
 	});
 

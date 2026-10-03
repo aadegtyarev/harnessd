@@ -1,4 +1,11 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -246,6 +253,7 @@ async function startAdapter(
 	extras: {
 		signal?: AbortSignal;
 		onFatal?: () => void;
+		initialCwd?: string;
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
 	} = {},
 ) {
@@ -256,7 +264,7 @@ async function startAdapter(
 		token: "secret-token",
 		allowedUserIds: [42],
 		stateDirectory: dir,
-		defaultCwd: "/work",
+		initialCwd: extras.initialCwd ?? "/work",
 		botFactory: () => bot as never,
 		...extras,
 	});
@@ -292,6 +300,8 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, dir);
 		await bot.update(42, "/sessions", { userId: 7 });
 		await bot.update(42, "/delete sid", { userId: 7 });
+		await bot.update(42, "/ls", { userId: 7 });
+		await bot.update(42, "/cd /tmp", { userId: 7 });
 		await bot.update(42, "/sessions", { missingSender: true });
 		await bot.update(42, "/sessions", { userId: 0 });
 		await bot.update(42, "/sessions", { userId: 42.2 });
@@ -328,6 +338,8 @@ describe("Telegram transport", () => {
 			"help",
 			"sessions",
 			"new",
+			"ls",
+			"cd",
 			"use",
 			"resume",
 			"inspect",
@@ -342,6 +354,8 @@ describe("Telegram transport", () => {
 		await bot.update(100, "/help");
 		expect(bot.sent.at(-1)?.text).toContain("/delete <sessionId>");
 		expect(bot.sent.at(-1)?.text).toContain("/resume [sessionId]");
+		expect(bot.sent.at(-1)?.text).toContain("/ls [path]");
+		expect(bot.sent.at(-1)?.text).toContain("/cd [path]");
 		await bot.update(100, "/sessions");
 		expect(requests.at(-1)).toMatchObject({ kind: "list" });
 		const sessionReply = bot.sent.at(-1);
@@ -613,7 +627,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent).toHaveLength(sentCount);
 	});
 
-	it("accepts unquoted and matching quoted cwd paths without shell parsing", async () => {
+	it("accepts unquoted and matching quoted paths without shell parsing", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/new /tmp/project with spaces");
@@ -635,11 +649,76 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("uses the configured default cwd when /new has no explicit path", async () => {
+	it("uses the initial cwd when /new has no explicit path", async () => {
 		const bot = new MockBot();
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: "/work",
+		});
 		await bot.update(42, "/new");
 		expect(requests[0]).toMatchObject({ kind: "create", cwd: "/work" });
+		await adapter.stop();
+	});
+
+	it("uses per-chat navigation for ls, cd, and relative new paths without confinement", async () => {
+		const bot = new MockBot();
+		const initial = await temp();
+		const child = path.join(initial, "child folder");
+		const outside = await temp();
+		await mkdir(child);
+		await writeFile(
+			path.join(initial, "visible.txt"),
+			"secret contents are not read",
+		);
+		await writeFile(path.join(initial, ".hidden"), "");
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: initial,
+		});
+
+		await bot.update(100, "/ls");
+		const firstListing = bot.sent.at(-1)?.text ?? "";
+		expect(firstListing).toContain(`Directory: ${initial}`);
+		expect(firstListing).toContain("📄 visible.txt");
+		expect(firstListing).not.toContain(".hidden");
+		expect(firstListing).not.toContain("secret contents");
+
+		await bot.update(100, "/cd child folder");
+		await bot.update(100, "/new relative project");
+		await bot.update(101, "/new");
+		await bot.update(100, `/cd ${outside}`);
+		await bot.update(100, "/new");
+		await bot.update(100, "/cd");
+		await bot.update(100, "/new");
+
+		expect(
+			requests
+				.filter(({ kind }) => kind === "create")
+				.map((request) => (request.kind === "create" ? request.cwd : "")),
+		).toEqual([
+			path.join(child, "relative project"),
+			initial,
+			outside,
+			os.homedir(),
+		]);
+		expect(
+			bot.sent.some(({ text }) => text === `Working folder: ${outside}`),
+		).toBe(true);
+		expect(requests.filter(({ kind }) => kind !== "create")).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("leaves the chat cwd unchanged when cd fails", async () => {
+		const bot = new MockBot();
+		const initial = await temp();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: initial,
+		});
+		await bot.update(42, "/cd missing-directory");
+		await bot.update(42, "/new relative");
+		expect(bot.sent[0]?.text).toContain("current folder unchanged");
+		expect(requests[0]).toMatchObject({
+			kind: "create",
+			cwd: path.join(initial, "relative"),
+		});
 		await adapter.stop();
 	});
 
@@ -1057,7 +1136,7 @@ describe("Telegram transport", () => {
 			token: "secret-token",
 			allowedUserIds: [42],
 			stateDirectory: dir,
-			defaultCwd: "/work",
+			initialCwd: "/work",
 			signal: controller.signal,
 			botFactory: () => bot as never,
 		});
@@ -1107,7 +1186,7 @@ describe("Telegram transport", () => {
 			token: "secret-token",
 			allowedUserIds: [42],
 			stateDirectory: dir,
-			defaultCwd: "/work",
+			initialCwd: "/work",
 			signal: controller.signal,
 			botFactory: () => bot as never,
 		});
