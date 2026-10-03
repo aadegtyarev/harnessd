@@ -16,12 +16,16 @@ describe("shared command catalog", () => {
 
 		expect(cliUsages).toContain("/ls [path]");
 		expect(cliUsages).toContain("/cd [path]");
+		expect(cliUsages).not.toContain("/menu");
+		expect(cliUsages).not.toContain("/rename [sessionId] <name|--clear>");
 		expect(cliUsages).not.toContain("/status");
 		expect(cliUsages).not.toContain("/delete <sessionId>");
 		expect(telegramCommands.map(({ command }) => command)).toContain("ls");
 		expect(telegramCommands.map(({ command }) => command)).toContain("cd");
 		expect(telegramUsages).toContain("/ls [path]");
 		expect(telegramUsages).toContain("/cd [path]");
+		expect(telegramUsages).toContain("/menu");
+		expect(telegramUsages).toContain("/rename [sessionId] <name|--clear>");
 		expect(telegramUsages).toContain("/status");
 		expect(getCliCommandUsages("service")).toEqual([
 			{

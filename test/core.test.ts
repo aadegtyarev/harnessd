@@ -8,6 +8,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
 	AdapterId,
@@ -22,6 +23,7 @@ import type {
 } from "../src/core/index.js";
 import {
 	DuplicateAdapterIdError,
+	InvalidSessionNameError,
 	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
 	requireCapability,
@@ -63,6 +65,9 @@ const mockSessionPort: SessionPort = {
 	},
 	async create() {
 		throw new UnsupportedCapabilityError("session.create", "memory");
+	},
+	async rename() {
+		throw new UnsupportedCapabilityError("session.rename", "memory");
 	},
 	async stop() {
 		throw new UnsupportedCapabilityError("session.stop", "memory");
@@ -238,9 +243,11 @@ describe("SQLite session management", () => {
 			id: "session-1",
 			harnessId: harness.descriptor.id,
 			cwd: workspace,
+			name: "MCP migration",
 		});
 		expect(session).toMatchObject({
 			id: "session-1",
+			name: "MCP migration",
 			cwd: await import("node:fs/promises").then(({ realpath }) =>
 				realpath(workspace),
 			),
@@ -253,6 +260,88 @@ describe("SQLite session management", () => {
 		expect(reopened.stateDirectory).toBe(state);
 		expect(reopened.databasePath.startsWith(workspace)).toBe(false);
 		reopened.close();
+	});
+
+	it("migrates an existing SQLite database by adding nullable session names", async () => {
+		const state = await temporaryDirectory();
+		const database = new Database(path.join(state, "sessions.sqlite3"));
+		database.exec(`CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			harness_id TEXT NOT NULL,
+			cwd TEXT NOT NULL,
+			native_session_id TEXT,
+			status TEXT NOT NULL CHECK (status IN ('starting', 'running', 'stopped', 'failed', 'uncertain')),
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`);
+		database
+			.prepare(
+				"INSERT INTO sessions (id, harness_id, cwd, status) VALUES (?, ?, ?, ?)",
+			)
+			.run("legacy-session", "pi-rpc", "/workspace", "stopped");
+		database.close();
+
+		const store = await SqliteSessionStore.open(state);
+		expect(await store.get("legacy-session" as SessionId)).toMatchObject({
+			id: "legacy-session",
+			cwd: "/workspace",
+			status: "stopped",
+		});
+		expect(await store.get("legacy-session" as SessionId)).not.toHaveProperty(
+			"name",
+		);
+		await store.setName("legacy-session" as SessionId, "Recovered session");
+		expect(await store.get("legacy-session" as SessionId)).toMatchObject({
+			name: "Recovered session",
+		});
+		store.close();
+	});
+
+	it("persists, renames, and clears shared session labels without launching Pi again", async () => {
+		const state = await temporaryDirectory();
+		const workspace = await temporaryDirectory();
+		const store = await SqliteSessionStore.open(state);
+		const { harness, launched } = harnessPort();
+		const manager = new SessionManager(store, [harness]);
+		const first = await manager.create({
+			harnessId: harness.descriptor.id,
+			cwd: workspace,
+			name: "MCP migration",
+		});
+		const second = await manager.create({
+			harnessId: harness.descriptor.id,
+			cwd: workspace,
+			name: "MCP migration",
+		});
+		expect(first.id).not.toBe(second.id);
+		expect((await manager.list()).map((item) => item.name)).toEqual([
+			"MCP migration",
+			"MCP migration",
+		]);
+		await expect(
+			manager.rename(first.id, "Renamed session"),
+		).resolves.toMatchObject({
+			name: "Renamed session",
+		});
+		await expect(manager.rename(first.id)).resolves.not.toHaveProperty("name");
+		await expect(manager.rename(first.id, "bad\nname")).rejects.toBeInstanceOf(
+			InvalidSessionNameError,
+		);
+		await expect(
+			manager.rename(first.id, "x".repeat(65)),
+		).rejects.toBeInstanceOf(InvalidSessionNameError);
+		await expect(
+			manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: workspace,
+				name: "bad\nname",
+			}),
+		).rejects.toBeInstanceOf(InvalidSessionNameError);
+		expect(launched).toHaveLength(2);
+		const reopened = await SqliteSessionStore.open(state);
+		expect(await reopened.get(first.id)).not.toHaveProperty("name");
+		reopened.close();
+		await manager.close();
+		store.close();
 	});
 
 	it("deletes only stopped session metadata and leaves its workspace intact", async () => {

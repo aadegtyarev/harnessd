@@ -104,6 +104,58 @@ describe("application runtime", () => {
 		},
 	);
 
+	it("routes optional session names and renames through the application boundary", async () => {
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [],
+			harnesses: [
+				{
+					descriptor: {
+						id: "rename-test" as never,
+						capabilities: ["harness.launch", "harness.stop"],
+					},
+					async launch() {
+						return {
+							processId: "rename-test-process" as never,
+							exit: new Promise(() => {}),
+							events: (async function* () {})(),
+							async send() {},
+							async cancel() {},
+							async shutdown() {},
+						};
+					},
+				},
+			],
+		});
+		const created = await runtime.dispatch({
+			requestId: "create-named",
+			principalId: "test",
+			kind: "create",
+			harnessId: "rename-test" as never,
+			cwd: os.tmpdir(),
+			name: "Menu session",
+		});
+		const session = sessionFrom(created);
+		expect(session.name).toBe("Menu session");
+		const renamed = await runtime.dispatch({
+			requestId: "rename-session",
+			principalId: "test",
+			kind: "rename",
+			sessionId: session.id,
+			name: "Renamed session",
+		});
+		expect(sessionFrom(renamed).name).toBe("Renamed session");
+		const cleared = await runtime.dispatch({
+			requestId: "clear-session-name",
+			principalId: "test",
+			kind: "rename",
+			sessionId: session.id,
+		});
+		expect(sessionFrom(cleared)).not.toHaveProperty("name");
+		await runtime.close();
+	});
+
 	it("routes delete through the runtime and returns safe stopped-session errors", async () => {
 		const runtime = await ApplicationRuntime.start({
 			piExecutable: "/unused/pi",

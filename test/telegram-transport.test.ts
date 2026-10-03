@@ -8,7 +8,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TransportEvent, TransportResult } from "../src/core/ports.js";
 import type {
 	HarnessEvent,
@@ -22,6 +22,13 @@ import {
 } from "../src/telegram-transport.js";
 
 const roots: string[] = [];
+function telegramBody(text: string): string {
+	const footerStart = text.lastIndexOf("\n\n#");
+	return footerStart < 0 ? text : text.slice(0, footerStart);
+}
+function hasSessionFooter(text: string, sessionId: string): boolean {
+	return new RegExp(`\\n\\n#${sessionId}(?: · \\d+\\/\\d+)?$`).test(text);
+}
 async function temp() {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "telegram-adapter-"));
 	roots.push(dir);
@@ -37,12 +44,31 @@ afterEach(async () => {
 type Context = {
 	from?: { id: number };
 	chat?: { id: number; type: string };
-	message?: { text?: string };
+	message?: {
+		text?: string;
+		message_id?: number;
+		reply_to_message?: { message_id: number };
+	};
+	callbackQuery?: {
+		id: string;
+		data?: string;
+		message?: { message_id: number };
+	};
 };
 class MockBot {
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
+	callbackHandler?: (ctx: Context) => Promise<void>;
 	sent: { chatId: number; text: string }[] = [];
+	nextMessageId = 1000;
+	lastMessageId?: number;
+	edited: {
+		chatId: number;
+		messageId: number;
+		text: string;
+		options?: unknown;
+	}[] = [];
+	pinned: { chatId: number; messageId: number }[] = [];
 	sendOptions: unknown[] = [];
 	commandRegistrations: {
 		commands: readonly { command: string; description: string }[];
@@ -67,11 +93,30 @@ class MockBot {
 				text: string,
 				_other?: unknown,
 				_signal?: AbortSignal,
-			) => {
+			): Promise<unknown> => {
 				this.sent.push({ chatId, text });
 				this.sendOptions.push(_other);
+				const message_id = this.nextMessageId++;
+				this.lastMessageId = message_id;
+				return { message_id };
 			},
 		),
+		editMessageText: vi.fn(
+			async (
+				chatId: number,
+				messageId: number,
+				text: string,
+				options?: unknown,
+			) => {
+				this.edited.push({ chatId, messageId, text, options });
+				return { message_id: messageId };
+			},
+		),
+		pinChatMessage: vi.fn(async (chatId: number, messageId: number) => {
+			this.pinned.push({ chatId, messageId });
+			return true;
+		}),
+		answerCallbackQuery: vi.fn(async () => true),
 		setMyCommands: vi.fn(
 			async (
 				commands: readonly { command: string; description: string }[],
@@ -85,8 +130,9 @@ class MockBot {
 	use(handler: (ctx: Context, next: () => Promise<void>) => Promise<void>) {
 		this.middleware = handler;
 	}
-	on(_filter: string, handler: (ctx: Context) => Promise<void>) {
-		this.handler = handler;
+	on(filter: string, handler: (ctx: Context) => Promise<void>) {
+		if (filter === "message:text") this.handler = handler;
+		if (filter === "callback_query:data") this.callbackHandler = handler;
 	}
 	init(signal?: AbortSignal): Promise<void> {
 		this.initCalled = true;
@@ -121,6 +167,7 @@ class MockBot {
 			userId?: number;
 			chatType?: string;
 			missingSender?: boolean;
+			replyToMessageId?: number;
 		} = {},
 	) {
 		const {
@@ -131,9 +178,33 @@ class MockBot {
 		const ctx: Context = {
 			from: missingSender ? undefined : { id: userId },
 			chat: { id: chatId, type: chatType },
-			message: { text },
+			message: {
+				text,
+				message_id: this.nextMessageId++,
+				...(options.replyToMessageId === undefined
+					? {}
+					: { reply_to_message: { message_id: options.replyToMessageId } }),
+			},
 		};
 		await this.middleware?.(ctx, async () => this.handler?.(ctx));
+	}
+	async callback(
+		chatId: number,
+		data: string,
+		messageId = this.lastMessageId ?? 1,
+		userId = 42,
+		chatType: "private" | "group" = "private",
+	) {
+		const ctx: Context = {
+			from: { id: userId },
+			chat: { id: chatId, type: chatType },
+			callbackQuery: {
+				id: "callback-id",
+				data,
+				message: { message_id: messageId },
+			},
+		};
+		await this.middleware?.(ctx, async () => this.callbackHandler?.(ctx));
 	}
 }
 const sessions = new Map<string, SessionSummary>([
@@ -156,6 +227,11 @@ const sessions = new Map<string, SessionSummary>([
 		},
 	],
 ]);
+const initialSessions = [...sessions];
+beforeEach(() => {
+	sessions.clear();
+	for (const [id, session] of initialSessions) sessions.set(id, session);
+});
 function result(request: TransportEvent): TransportResult {
 	let value: Extract<TransportResult, { readonly ok: true }>["value"];
 	switch (request.kind) {
@@ -182,6 +258,23 @@ function result(request: TransportEvent): TransportResult {
 		case "resume":
 			value = sessions.get(request.sessionId);
 			break;
+		case "rename": {
+			const session = sessions.get(request.sessionId);
+			if (!session)
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: {
+						code: "SESSION_NOT_FOUND",
+						message: "Session was not found",
+					},
+				};
+			value = {
+				...session,
+				...(request.name === undefined ? {} : { name: request.name }),
+			};
+			break;
+		}
 		case "submit":
 			value = "input-1" as never;
 			break;
@@ -228,7 +321,10 @@ function result(request: TransportEvent): TransportResult {
 			value = { levels: ["low", "medium", "high"], current: "medium" };
 			break;
 		case "effort_set":
+			value = undefined;
+			break;
 		case "delete":
+			sessions.delete(request.sessionId);
 			value = undefined;
 			break;
 		default:
@@ -294,6 +390,205 @@ async function startAdapter(
 }
 
 describe("Telegram transport", () => {
+	it("creates one pinned panel, browses sessions, selects explicitly, and guards callbacks", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		expect(panelMessageId).toBeDefined();
+		expect(bot.pinned).toEqual([{ chatId: 42, messageId: panelMessageId }]);
+		expect(bot.sent.at(-1)?.text).toContain("Выбрана: не выбрана");
+		await bot.update(42, "/menu");
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		expect(bot.api.pinChatMessage).toHaveBeenCalledOnce();
+
+		await bot.callback(42, "session:next", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
+		await bot.callback(42, "session:choose", panelMessageId);
+		await bot.update(42, "/model");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "model_list",
+			sessionId: "other",
+		});
+		await bot.callback(42, "menu:models", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("Модель · #other");
+		await bot.callback(42, "model:select:0", panelMessageId);
+		expect(
+			requests.some(
+				(request) =>
+					request.kind === "model_set" && request.sessionId === "other",
+			),
+		).toBe(true);
+
+		const callsBeforeUnauthorized = requests.length;
+		const answersBeforeUnauthorized =
+			bot.api.answerCallbackQuery.mock.calls.length;
+		await bot.callback(42, "session:prev", panelMessageId, 7);
+		expect(requests).toHaveLength(callsBeforeUnauthorized);
+		expect(bot.api.answerCallbackQuery).toHaveBeenCalledTimes(
+			answersBeforeUnauthorized,
+		);
+		await bot.callback(42, "session:select:missing", panelMessageId);
+		await bot.callback(42, "session:select:bad/id", panelMessageId);
+		await bot.callback(42, "session:select:sid", panelMessageId, 42, "group");
+		expect(requests).toHaveLength(callsBeforeUnauthorized);
+		await adapter.stop();
+	});
+
+	it("browses folders and creates a named session in the selected folder", async () => {
+		const directory = await temp();
+		const childDirectory = path.join(directory, "child folder");
+		await mkdir(childDirectory);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:folders", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain(directory);
+		await bot.callback(42, "folder:open:0", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain(childDirectory);
+		await bot.update(42, "/inspect");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "inspect",
+			sessionId: "sid",
+		});
+		expect(bot.sent.at(-1)?.text).toContain("/work");
+		await bot.callback(42, "folder:new", panelMessageId);
+		const promptMessageId = bot.lastMessageId;
+		await bot.update(42, "nested task", { replyToMessageId: promptMessageId });
+		expect(requests.find((request) => request.kind === "create")).toMatchObject(
+			{
+				cwd: childDirectory,
+				name: "nested task",
+			},
+		);
+		await adapter.stop();
+	});
+
+	it("renames and clears the selected session using the slash command", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/rename other Explicit target");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "rename",
+			sessionId: "other",
+			name: "Explicit target",
+		});
+		await bot.update(42, "/rename A name with spaces");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "rename",
+			sessionId: "sid",
+			name: "A name with spaces",
+		});
+		await bot.update(42, "/rename --clear");
+		expect(requests.at(-1)).toMatchObject({ kind: "rename", sessionId: "sid" });
+		expect(requests.at(-1)).not.toHaveProperty("name");
+		await adapter.stop();
+	});
+
+	it("requires confirmation before callback stop and delete operations", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:sessions", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:stop:sid", panelMessageId);
+		expect(requests.some((request) => request.kind === "stop")).toBe(false);
+		expect(bot.edited.at(-1)?.text).toContain("Остановить #sid?");
+		await bot.callback(42, "action:cancel", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:delete:sid", panelMessageId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(true);
+		const requestsAfterDelete = requests.length;
+		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		expect(requests).toHaveLength(requestsAfterDelete);
+		await adapter.stop();
+	});
+
+	it("does not resend after an uncertain panel edit and recovers a known-deleted panel", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const sendsAfterCreate = bot.api.sendMessage.mock.calls.length;
+		bot.api.editMessageText.mockRejectedValueOnce(
+			new Error("temporary API failure"),
+		);
+		await bot.update(42, "/menu");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
+
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Telegram rejected edit"), {
+				description: "Bad Request: message to edit not found",
+			}),
+		);
+		await bot.update(42, "/menu");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
+		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(2);
+		await bot.update(42, "/sessions");
+		expect(bot.sent.at(-1)?.text).toContain("#sid");
+		await adapter.stop();
+	});
+
+	it("keeps slash commands available when Telegram cannot pin the panel", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		bot.api.pinChatMessage.mockRejectedValueOnce(new Error("pin unavailable"));
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Telegram не закрепил");
+		await bot.update(42, "/sessions");
+		expect(requests.at(-1)).toMatchObject({ kind: "list" });
+		expect(bot.sent.at(-1)?.text).toContain("#sid");
+		await adapter.stop();
+	});
+
+	it("reuses the saved panel message after a transport restart", async () => {
+		const directory = await temp();
+		const firstBot = new MockBot();
+		const first = await startAdapter(firstBot, directory);
+		await firstBot.update(42, "/menu");
+		const panelMessageId = firstBot.lastMessageId;
+		expect(panelMessageId).toBeDefined();
+		await first.adapter.stop();
+
+		const secondBot = new MockBot();
+		const second = await startAdapter(secondBot, directory);
+		await secondBot.update(42, "/menu");
+		expect(secondBot.edited[0]?.messageId).toBe(panelMessageId);
+		expect(secondBot.pinned).toHaveLength(0);
+		await second.adapter.stop();
+	});
+
+	it("uses ForceReply to create named sessions and consumes only replies to its prompt", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		await bot.callback(42, "menu:new");
+		const promptMessageId = bot.lastMessageId;
+		expect(bot.sendOptions.at(-1)).toMatchObject({
+			reply_markup: { force_reply: true },
+		});
+		await bot.update(42, "A named task", { replyToMessageId: promptMessageId });
+		expect(requests.find((request) => request.kind === "create")).toMatchObject(
+			{
+				kind: "create",
+				name: "A named task",
+				cwd: "/work",
+			},
+		);
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		await bot.update(42, "stale prompt response", { replyToMessageId: 999999 });
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		await adapter.stop();
+	});
+
 	it("rejects unauthorized, malformed sender, group, and channel updates before dispatch", async () => {
 		const bot = new MockBot();
 		const dir = await temp();
@@ -336,6 +631,8 @@ describe("Telegram transport", () => {
 			bot.commandRegistrations[0]?.commands.map(({ command }) => command),
 		).toEqual([
 			"help",
+			"menu",
+			"rename",
 			"sessions",
 			"new",
 			"ls",
@@ -359,7 +656,7 @@ describe("Telegram transport", () => {
 		await bot.update(100, "/sessions");
 		expect(requests.at(-1)).toMatchObject({ kind: "list" });
 		const sessionReply = bot.sent.at(-1);
-		expect(sessionReply?.text).toContain("<code>sid</code>");
+		expect(sessionReply?.text).toContain("#sid · running");
 		expect(sessionReply?.text).toContain("/work&lt;&amp;");
 		expect(bot.sendOptions.at(-1)).toEqual({ parse_mode: "HTML" });
 
@@ -381,7 +678,7 @@ describe("Telegram transport", () => {
 			kind: "delete",
 			sessionId: "other",
 		});
-		expect(bot.sent.at(-1)?.text).toContain("Deleted stopped session other");
+		expect(bot.sent.at(-1)?.text).toContain("Deleted stopped session #other");
 		const submitsBeforeDeletedText = requests.filter(
 			({ kind }) => kind === "submit",
 		).length;
@@ -800,6 +1097,7 @@ describe("Telegram transport", () => {
 			text: "raw-secret-error",
 		});
 		emit(harnessEvent("other", "output", "private other session"));
+		emit(harnessEvent("other", "status", "agent_settled"));
 		emit({
 			sessionId: "sid" as SessionId,
 			kind: "input",
@@ -811,36 +1109,22 @@ describe("Telegram transport", () => {
 			).toBe(true),
 		);
 		const sidMessages = bot.sent.filter(
-			({ chatId, text }) => chatId === 42 && text.startsWith("[sid]"),
+			({ chatId, text }) => chatId === 42 && hasSessionFooter(text, "sid"),
 		);
 		const otherMessages = bot.sent.filter(
-			({ chatId, text }) => chatId === 43 && text.startsWith("[other]"),
+			({ chatId, text }) => chatId === 43 && hasSessionFooter(text, "other"),
 		);
-		expect(sidMessages.map(({ text }) => text)).toContain(
-			"[sid] Agent started.",
+		const recoveryMessages = sidMessages.map(({ text }) => telegramBody(text));
+		expect(recoveryMessages).toContain("Harness is restarting.");
+		expect(recoveryMessages).toContain("Harness recovered.");
+		expect(recoveryMessages).toContain("Harness recovery failed.");
+		expect(recoveryMessages.indexOf("Harness is restarting.")).toBeLessThan(
+			recoveryMessages.indexOf("Harness recovered."),
 		);
-		expect(sidMessages.map(({ text }) => text)).toContain(
-			"[sid] Harness is restarting.",
+		expect(recoveryMessages.indexOf("Harness recovered.")).toBeLessThan(
+			recoveryMessages.indexOf("Harness recovery failed."),
 		);
-		expect(sidMessages.map(({ text }) => text)).toContain(
-			"[sid] Harness recovered.",
-		);
-		expect(sidMessages.map(({ text }) => text)).toContain(
-			"[sid] Harness recovery failed.",
-		);
-		const recoveryMessages = sidMessages.map(({ text }) => text);
-		expect(
-			recoveryMessages.indexOf("[sid] Harness is restarting."),
-		).toBeLessThan(recoveryMessages.indexOf("[sid] Harness recovered."));
-		expect(recoveryMessages.indexOf("[sid] Harness recovered.")).toBeLessThan(
-			recoveryMessages.indexOf("[sid] Harness recovery failed."),
-		);
-		expect(sidMessages.map(({ text }) => text)).toContain(
-			"[sid] Agent finished.",
-		);
-		expect(sidMessages.map(({ text }) => text)).toContain(
-			"[sid] Session status changed.",
-		);
+		expect(recoveryMessages).toContain("Session status changed.");
 		expect(
 			sidMessages.some(({ text }) => text.includes("raw-secret-error")),
 		).toBe(false);
@@ -850,6 +1134,9 @@ describe("Telegram transport", () => {
 			),
 		).toBe(true);
 		expect(otherMessages).toHaveLength(1);
+		expect(telegramBody(otherMessages[0]?.text ?? "")).toBe(
+			"private other session",
+		);
 		await adapter.stop();
 	});
 
@@ -869,17 +1156,16 @@ describe("Telegram transport", () => {
 			kind: "input",
 			inputEvent: { inputId: "input-X" as never, state: "completed" },
 		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		const eventMessages = () =>
 			bot.sent
-				.filter(({ chatId, text }) => chatId === 42 && text.startsWith("[sid]"))
-				.map(({ text }) => text);
-		await vi.waitFor(() => expect(eventMessages()).toHaveLength(3));
-		expect(eventMessages()).toEqual([
-			"[sid] answer",
-			"[sid] Agent is waiting for input.",
-			"[sid] Input input-X: completed",
-		]);
-		expect(eventMessages()).not.toContain("[sid] Input input-X: accepted");
+				.filter(
+					({ chatId, text }) => chatId === 42 && hasSessionFooter(text, "sid"),
+				)
+				.map(({ text }) => telegramBody(text));
+		await vi.waitFor(() => expect(eventMessages()).toHaveLength(2));
+		expect(eventMessages()).toEqual(["answer", "Input input-X: completed"]);
+		expect(eventMessages()).not.toContain("Input input-X: accepted");
 		await adapter.stop();
 	});
 
@@ -892,51 +1178,85 @@ describe("Telegram transport", () => {
 			release = resolve;
 		});
 		bot.api.sendMessage.mockImplementation(async (chatId, text) => {
-			if (text === "[sid] in-flight") await gate;
+			if (telegramBody(text) === "in-flight") await gate;
 			bot.sent.push({ chatId, text });
 		});
 		emit(harnessEvent("sid", "output", "in-flight"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
 				bot.api.sendMessage.mock.calls.some(
-					([chatId, text]) => chatId === 42 && text === "[sid] in-flight",
+					([chatId, text]) =>
+						chatId === 42 && telegramBody(text) === "in-flight",
 				),
 			).toBe(true),
 		);
 		emit(harnessEvent("sid", "output", "stale queued"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await bot.update(42, "/use other");
 		release();
 		await new Promise((resolve) => setTimeout(resolve, 80));
-		expect(bot.sent.some(({ text }) => text === "[sid] stale queued")).toBe(
-			false,
-		);
+		expect(
+			bot.sent.some(({ text }) => telegramBody(text) === "stale queued"),
+		).toBe(false);
 		emit(harnessEvent("other", "output", "delta-a"));
 		emit(harnessEvent("other", "output", "delta-b"));
+		emit(harnessEvent("other", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
-				bot.sent.some(({ text }) => text === "[other] delta-adelta-b"),
+				bot.sent.some(({ text }) => telegramBody(text) === "delta-adelta-b"),
 			).toBe(true),
 		);
 		const longOutput = `${"y".repeat(4080)}\n${"y".repeat(4920)}`;
 		emit(harnessEvent("other", "output", longOutput));
+		emit(harnessEvent("other", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.filter(
-					({ chatId, text }) => chatId === 42 && text.includes("y"),
+					({ chatId, text }) =>
+						chatId === 42 && telegramBody(text).includes("y"),
 				),
 			).toHaveLength(3),
 		);
 		const chunks = bot.sent.filter(
-			({ chatId, text }) => chatId === 42 && text.includes("y"),
+			({ chatId, text }) => chatId === 42 && telegramBody(text).includes("y"),
 		);
 		expect(
 			chunks.every(
-				({ text }) => text.length <= 4096 && text.startsWith("[other] "),
+				({ text }) => text.length <= 4096 && hasSessionFooter(text, "other"),
 			),
 		).toBe(true);
+		expect(chunks.map(({ text }) => telegramBody(text)).join("")).toBe(
+			longOutput,
+		);
+		const unicodeReply = `x${"🙂".repeat(2200)}`;
+		emit(harnessEvent("other", "output", unicodeReply));
+		emit(harnessEvent("other", "status", "agent_settled"));
+		let unicodeParts: typeof bot.sent = [];
+		await vi.waitFor(() => {
+			unicodeParts = bot.sent.filter(
+				({ chatId, text }) => chatId === 42 && text.includes("🙂"),
+			);
+			expect(unicodeParts).toHaveLength(2);
+		});
 		expect(
-			chunks.map(({ text }) => text.slice("[other] ".length)).join(""),
-		).toBe(longOutput);
+			unicodeParts.map(({ text }) => text.match(/#other · (\d+\/\d+)$/)?.[1]),
+		).toEqual(["1/2", "2/2"]);
+		expect(unicodeParts.map(({ text }) => telegramBody(text)).join("")).toBe(
+			unicodeReply,
+		);
+		for (const { text } of unicodeParts) {
+			const body = telegramBody(text);
+			expect(text.length).toBeLessThanOrEqual(4096);
+			for (let index = 0; index < body.length; index++) {
+				const codePoint = body.charCodeAt(index);
+				if (codePoint >= 0xd800 && codePoint <= 0xdbff) {
+					expect(body.charCodeAt(index + 1)).toBeGreaterThanOrEqual(0xdc00);
+					expect(body.charCodeAt(index + 1)).toBeLessThanOrEqual(0xdfff);
+					index++;
+				} else expect(codePoint < 0xdc00 || codePoint > 0xdfff).toBe(true);
+			}
+		}
 		await adapter.stop();
 	});
 
@@ -945,14 +1265,18 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		emit(harnessEvent("sid", "output", "stale A"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await bot.update(42, "/use other");
 		await new Promise((resolve) => setTimeout(resolve, 80));
-		expect(bot.sent.some(({ text }) => text === "[sid] stale A")).toBe(false);
+		expect(bot.sent.some(({ text }) => telegramBody(text) === "stale A")).toBe(
+			false,
+		);
 		emit(harnessEvent("other", "output", "current B"));
+		emit(harnessEvent("other", "status", "agent_settled"));
 		await vi.waitFor(() =>
-			expect(bot.sent.some(({ text }) => text === "[other] current B")).toBe(
-				true,
-			),
+			expect(
+				bot.sent.some(({ text }) => telegramBody(text) === "current B"),
+			).toBe(true),
 		);
 		await adapter.stop();
 	});
@@ -967,7 +1291,7 @@ describe("Telegram transport", () => {
 			release = resolve;
 		});
 		bot.api.sendMessage.mockImplementation(async (chatId, text) => {
-			if (chatId === 42 && text.startsWith("[sid]")) await gate;
+			if (chatId === 42 && hasSessionFooter(text, "sid")) await gate;
 			bot.sent.push({ chatId, text });
 		});
 		for (let i = 0; i < 45; i++) emit(harnessEvent("sid", "status", "unknown"));
@@ -975,7 +1299,7 @@ describe("Telegram transport", () => {
 			expect(
 				bot.api.sendMessage.mock.calls.some(
 					([chatId, text]) =>
-						chatId === 43 && text === "[sid] Session status changed.",
+						chatId === 43 && telegramBody(text) === "Session status changed.",
 				),
 			).toBe(true),
 		);
@@ -1001,21 +1325,22 @@ describe("Telegram transport", () => {
 			release = resolve;
 		});
 		bot.api.sendMessage.mockImplementation(async (chatId, text) => {
-			if (text === "[sid] first output") await gate;
+			if (telegramBody(text) === "first output") await gate;
 			bot.sent.push({ chatId, text });
 		});
 		emit(harnessEvent("sid", "output", "first output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
 				bot.api.sendMessage.mock.calls.some(
-					([, text]) => text === "[sid] first output",
+					([, text]) => telegramBody(text) === "first output",
 				),
 			).toBe(true),
 		);
 		await new Promise((resolve) => setTimeout(resolve, 60));
 		for (let index = 0; index < 40; index++) {
 			emit(harnessEvent("sid", "output", `output ${index}`));
-			emit(harnessEvent("sid", "status", "unknown"));
+			emit(harnessEvent("sid", "status", "agent_settled"));
 		}
 		emit({
 			sessionId: "sid" as SessionId,
@@ -1046,7 +1371,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		bot.api.sendMessage.mockClear();
 		bot.api.sendMessage.mockImplementation(() => new Promise(() => {}));
-		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "status", "custom"));
 		await vi.advanceTimersByTimeAsync(40);
 		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
 		await vi.advanceTimersByTimeAsync(5000);
@@ -1094,7 +1419,7 @@ describe("Telegram transport", () => {
 				),
 			);
 		});
-		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "status", "custom"));
 		await vi.waitFor(() => expect(sendSignal).toBeDefined());
 		await adapter.stop();
 		expect(sendSignal?.aborted).toBe(true);

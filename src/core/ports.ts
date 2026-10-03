@@ -23,7 +23,9 @@ export interface SessionPort {
 	create(input: {
 		readonly harnessId: AdapterId;
 		readonly cwd: string;
+		readonly name?: string;
 	}): Promise<SessionSummary>;
+	rename(id: SessionId, name?: string): Promise<SessionSummary>;
 	stop(id: SessionId): Promise<void>;
 	resume(id: SessionId): Promise<SessionSummary>;
 }
@@ -52,6 +54,14 @@ export type TransportEvent =
 			readonly kind: "create";
 			readonly harnessId: AdapterId;
 			readonly cwd: string;
+			readonly name?: string;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "rename";
+			readonly sessionId: SessionId;
+			readonly name?: string;
 	  }
 	| {
 			readonly requestId: string;

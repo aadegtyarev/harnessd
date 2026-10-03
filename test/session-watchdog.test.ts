@@ -911,6 +911,7 @@ describe("in-process watchdog", () => {
 			get: base.get.bind(base),
 			delete: base.delete.bind(base),
 			update: base.update.bind(base),
+			setName: base.setName.bind(base),
 			async setStatus(id, status) {
 				if (status === "starting" && ++startingWrites === 2)
 					throw new Error("starting status failed");
@@ -978,6 +979,7 @@ describe("in-process watchdog", () => {
 			get: base.get.bind(base),
 			delete: base.delete.bind(base),
 			update: base.update.bind(base),
+			setName: base.setName.bind(base),
 			async setStatus(id, status) {
 				if (rejectStatusWrites)
 					throw new Error("PRIVATE status persistence failure");
@@ -1051,6 +1053,7 @@ describe("in-process watchdog", () => {
 				get: base.get.bind(base),
 				delete: base.delete.bind(base),
 				update: base.update.bind(base),
+				setName: base.setName.bind(base),
 				async setStatus(id, status) {
 					if (status === "starting" && ++startingWrites === 2) {
 						statusPending.resolve();
@@ -1385,6 +1388,7 @@ describe("in-process watchdog", () => {
 			get: base.get.bind(base),
 			delete: base.delete.bind(base),
 			update: base.update.bind(base),
+			setName: base.setName.bind(base),
 			async setStatus(
 				id: SessionId,
 				status: import("../src/core/types.js").SessionStatus,

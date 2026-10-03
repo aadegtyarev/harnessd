@@ -54,6 +54,10 @@ const safeErrorMessages = new Map([
 	["UNSUPPORTED_CAPABILITY", "Operation is not supported"],
 	["INVALID_WORKING_DIRECTORY", "Working directory is invalid or inaccessible"],
 	["SESSION_NOT_FOUND", "Session was not found"],
+	[
+		"INVALID_SESSION_NAME",
+		"Session name must be a single line of 1–64 characters.",
+	],
 	["SESSION_NOT_STOPPED", "Stop the session before deleting it with /stop."],
 	[
 		"SESSION_NOT_RESUMABLE",
@@ -269,7 +273,14 @@ export class ApplicationRuntime {
 					value = (await this.manager.create({
 						harnessId: request.harnessId,
 						cwd: request.cwd,
+						name: request.name,
 					})) as typeof value;
+					break;
+				case "rename":
+					value = (await this.manager.rename(
+						request.sessionId,
+						request.name,
+					)) as typeof value;
 					break;
 				case "stop":
 					await this.manager.stop(request.sessionId);

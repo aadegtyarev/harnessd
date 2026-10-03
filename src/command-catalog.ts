@@ -54,6 +54,21 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		telegram: { command: "help", description: "Show available commands." },
 	},
 	{
+		visibility: "telegram-only",
+		section: "private-chat",
+		usage: "/menu",
+		telegram: {
+			command: "menu",
+			description: "Open the session control panel.",
+		},
+	},
+	{
+		visibility: "telegram-only",
+		section: "private-chat",
+		usage: "/rename [sessionId] <name|--clear>",
+		telegram: { command: "rename", description: "Name or rename a session." },
+	},
+	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/sessions",
