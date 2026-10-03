@@ -213,6 +213,32 @@ class MockBot {
 		};
 		await this.middleware?.(ctx, async () => this.handler?.(ctx));
 	}
+	async updateDocument(
+		chatId: number,
+		options: {
+			caption?: string;
+			fileId?: string;
+			fileName?: string;
+			fileSize?: number;
+			userId?: number;
+		} = {},
+	) {
+		const ctx: Context = {
+			from: { id: options.userId ?? 42 },
+			chat: { id: chatId, type: "private" },
+			message: {
+				document: {
+					file_id: options.fileId ?? "document-id",
+					file_name: options.fileName ?? "notes.txt",
+					...(options.fileSize === undefined
+						? {}
+						: { file_size: options.fileSize }),
+				},
+				...(options.caption ? { caption: options.caption } : {}),
+			},
+		};
+		await this.middleware?.(ctx, async () => this.photoHandler?.(ctx));
+	}
 	async updatePhoto(chatId: number, caption?: string, userId = 42) {
 		const ctx: Context = {
 			from: { id: userId },
@@ -673,6 +699,7 @@ describe("Telegram transport", () => {
 			"new",
 			"ls",
 			"cd",
+			"send",
 			"use",
 			"resume",
 			"inspect",
@@ -689,6 +716,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("/resume [sessionId]");
 		expect(bot.sent.at(-1)?.text).toContain("/ls [path]");
 		expect(bot.sent.at(-1)?.text).toContain("/cd [path]");
+		expect(bot.sent.at(-1)?.text).toContain("/send <path>");
 		await bot.update(100, "/sessions");
 		expect(requests.at(-1)).toMatchObject({ kind: "list" });
 		const sessionReply = bot.sent.at(-1);
@@ -1204,6 +1232,83 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("downloads selected-session documents and submits their path with the caption", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42, { caption: "summarize this" });
+
+		const submission = requests.find((request) => request.kind === "submit");
+		expect(submission).toMatchObject({
+			kind: "submit",
+			text: expect.stringContaining(
+				"Caption (untrusted user text): summarize this",
+			),
+		});
+		const savedPath =
+			submission?.kind === "submit"
+				? submission.text.match(/saved at (.+)\. Caption/)?.[1]
+				: undefined;
+		expect(savedPath).toBeDefined();
+		if (!savedPath)
+			throw new Error("Document path missing from submitted prompt");
+		expect(await readFile(savedPath, "utf8")).toBe("hello");
+		await adapter.stop();
+	});
+
+	it("does not submit oversized or failed incoming documents", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42, { fileSize: 20 * 1024 * 1024 + 1 });
+		const submissions = () =>
+			requests.filter((request) => request.kind === "submit");
+		expect(submissions()).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain("20 MiB limit");
+
+		bot.api.getFileLink = vi.fn(async () => {
+			throw new Error("secret download failure");
+		});
+		await bot.updateDocument(42);
+		expect(submissions()).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Could not safely download or save",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("secret");
+		await adapter.stop();
+	});
+
+	it("does not submit an incoming document when saving into the session folder fails", async () => {
+		const bot = new MockBot();
+		const root = await temp();
+		const notDirectory = path.join(root, "not-directory");
+		await writeFile(notDirectory, "file");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: notDirectory,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Could not safely download or save",
+		);
+		await adapter.stop();
+	});
+
 	it("allows the model file-send callback only for regular files inside the selected session cwd", async () => {
 		const bot = new MockBot();
 		const dir = await temp();
@@ -1261,6 +1366,34 @@ describe("Telegram transport", () => {
 		expect(
 			await adapter.sendFileFromSession("sid" as SessionId, "folder", "42"),
 		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("sends only selected-session files through /send with paths containing spaces", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const file = path.join(dir, "report file.txt");
+		await writeFile(file, "report");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+
+		await bot.update(100, '/send "report file.txt"');
+		expect(bot.api.sendDocument).not.toHaveBeenCalled();
+		expect(bot.sent.at(-1)?.text).toBe("Select a session first.");
+
+		await bot.update(100, "/use sid");
+		await bot.update(100, '/send "report file.txt"');
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.sent.at(-1)?.text).toBe("File sent.");
+
+		await bot.update(100, "/send ../outside.txt");
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.sent.at(-1)?.text).toContain(
+			"inside the selected session folder",
+		);
 		await adapter.stop();
 	});
 

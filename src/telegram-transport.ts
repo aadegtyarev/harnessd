@@ -1141,6 +1141,25 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				`Created and selected ${sessionLabel(session)}.`,
 			);
 		}
+		const sendCommand = /^\/send(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
+		if (sendCommand) {
+			const parsedPath = parsePathArgument(sendCommand[1]);
+			if (!parsedPath.ok || !parsedPath.path)
+				return this.sendDirect(chatId, "Usage: /send <path>");
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const sent = await this.sendFileFromSession(
+				sessionId,
+				parsedPath.path,
+				String(chatId),
+			);
+			return this.sendDirect(
+				chatId,
+				sent
+					? "File sent."
+					: "Could not send file. Use a regular file inside the selected session folder, no larger than 20 MiB.",
+			);
+		}
 		const pathCommand = /^\/(ls|cd)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (pathCommand) {
 			const parsedPath = parsePathArgument(pathCommand[2]);
