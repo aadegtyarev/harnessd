@@ -1,6 +1,6 @@
 # Feature contract: Telegram event notifications
 
-**Status:** Approved for implementation
+**Status:** Complete; acceptance verified 2026-10-03 (pre-merge)
 
 ## Goal and observable behavior
 
