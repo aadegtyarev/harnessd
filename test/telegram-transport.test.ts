@@ -172,6 +172,9 @@ function result(request: TransportEvent): TransportResult {
 		case "create":
 			value = sessions.get("sid");
 			break;
+		case "resume":
+			value = sessions.get(request.sessionId);
+			break;
 		case "submit":
 			value = "input-1" as never;
 			break;
@@ -326,6 +329,7 @@ describe("Telegram transport", () => {
 			"sessions",
 			"new",
 			"use",
+			"resume",
 			"inspect",
 			"status",
 			"model",
@@ -337,6 +341,7 @@ describe("Telegram transport", () => {
 
 		await bot.update(100, "/help");
 		expect(bot.sent.at(-1)?.text).toContain("/delete <sessionId>");
+		expect(bot.sent.at(-1)?.text).toContain("/resume [sessionId]");
 		await bot.update(100, "/sessions");
 		expect(requests.at(-1)).toMatchObject({ kind: "list" });
 		const sessionReply = bot.sent.at(-1);
@@ -345,16 +350,60 @@ describe("Telegram transport", () => {
 		expect(bot.sendOptions.at(-1)).toEqual({ parse_mode: "HTML" });
 
 		await bot.update(100, "/use other");
+		await bot.update(100, "/resume");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "resume",
+			sessionId: "other",
+		});
+		await bot.update(100, "/resume sid");
+		expect(requests.at(-1)).toMatchObject({ kind: "resume", sessionId: "sid" });
+		await bot.update(100, "still selected other");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "submit",
+			sessionId: "other",
+		});
 		await bot.update(100, "/delete other");
 		expect(requests.at(-1)).toMatchObject({
 			kind: "delete",
 			sessionId: "other",
 		});
 		expect(bot.sent.at(-1)?.text).toContain("Deleted stopped session other");
+		const submitsBeforeDeletedText = requests.filter(
+			({ kind }) => kind === "submit",
+		).length;
 		await bot.update(100, "plain text after deletion");
-		expect(requests.map(({ kind }) => kind)).not.toContain("submit");
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(
+			submitsBeforeDeletedText,
+		);
 		await bot.update(100, "/delete");
 		expect(bot.sent.at(-1)?.text).toBe("Usage: /delete <sessionId>");
+		await adapter.stop();
+	});
+
+	it("keeps chat selection unchanged when an explicit resume fails", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "resume"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "SESSION_NOT_RESUMABLE",
+								message: "Session cannot be resumed safely.",
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/resume other");
+		await bot.update(42, "still targets sid");
+		expect(requests.at(-2)).toMatchObject({
+			kind: "resume",
+			sessionId: "other",
+		});
+		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
+		expect(bot.sent.at(-2)?.text).toBe("Session cannot be resumed safely.");
 		await adapter.stop();
 	});
 

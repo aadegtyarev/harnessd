@@ -7,6 +7,7 @@ import {
 	InvalidWorkingDirectoryError,
 	requireCapability,
 	SessionNotFoundError,
+	SessionNotResumableError,
 	SessionNotStoppedError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
@@ -58,6 +59,7 @@ export class SessionManager {
 	private closing = false;
 	private closePromise: Promise<void> | undefined;
 	private readonly stopping = new Map<SessionId, Promise<void>>();
+	private readonly resuming = new Map<SessionId, Promise<SessionSummary>>();
 	private readonly terminal = new Set<SessionId>();
 	private readonly recovery = new Map<SessionId, Promise<void>>();
 	private readonly attempts = new Map<SessionId, number>();
@@ -322,8 +324,141 @@ export class SessionManager {
 			);
 	}
 
-	async submit(id: SessionId, text: string): Promise<InputId> {
+	resume(id: SessionId): Promise<SessionSummary> {
+		const current = this.resuming.get(id);
+		if (current) return current;
+		if (this.stopping.has(id) || this.closing)
+			return Promise.reject(new SessionNotResumableError(id));
+		const operation = this.resumeSession(id);
+		this.resuming.set(id, operation);
+		this.launching.set(id, operation);
+		this.launchesInProgress.add(operation);
+		void operation
+			.finally(() => {
+				this.launchesInProgress.delete(operation);
+				if (this.resuming.get(id) === operation) this.resuming.delete(id);
+				if (this.launching.get(id) === operation) this.launching.delete(id);
+			})
+			.catch(() => {});
+		return operation;
+	}
+
+	private async resumeSession(id: SessionId): Promise<SessionSummary> {
 		const session = await this.get(id);
+		if (session.status === "running" && this.instances.has(id)) return session;
+		if (
+			this.instances.has(id) ||
+			session.status !== "stopped" ||
+			!session.nativeSessionId
+		)
+			throw new SessionNotResumableError(id);
+		const harness = this.harnesses.get(session.harnessId);
+		if (!harness?.resume) {
+			if (!harness)
+				throw new UnsupportedCapabilityError(
+					"harness.resume",
+					session.harnessId,
+				);
+			throw new UnsupportedCapabilityError(
+				"harness.resume",
+				harness.descriptor.id,
+			);
+		}
+		requireCapability(
+			harness.descriptor.capabilities,
+			"harness.resume",
+			harness.descriptor.id,
+		);
+		if (this.stopping.has(id) || this.closing)
+			throw new SessionNotResumableError(id);
+		this.terminal.delete(id);
+		await this.store.setStatus(id, "starting");
+		if (this.terminal.has(id) || this.stopping.has(id) || this.closing) {
+			await this.store.setStatus(id, "stopped");
+			throw new SessionNotResumableError(id);
+		}
+		let replacement: HarnessInstance;
+		try {
+			replacement = await harness.resume({
+				sessionId: id,
+				cwd: session.cwd,
+				nativeSessionId: session.nativeSessionId,
+			});
+		} catch (error) {
+			try {
+				await this.store.setStatus(id, "stopped");
+			} catch (statusError) {
+				throw new AggregateError(
+					[error, statusError],
+					`Session '${id}' resume failed and its status could not be restored`,
+				);
+			}
+			throw error;
+		}
+		if (replacement.nativeSessionId !== session.nativeSessionId) {
+			this.instances.set(id, replacement);
+			try {
+				await replacement.shutdown();
+				this.instances.delete(id);
+			} catch (error) {
+				throw new AggregateError(
+					[error],
+					`Session '${id}' resumed with a different native session and cleanup failed`,
+				);
+			}
+			await this.store.setStatus(id, "stopped");
+			throw new SessionNotResumableError(id);
+		}
+		this.instances.set(id, replacement);
+		if (this.terminal.has(id) || this.stopping.has(id) || this.closing) {
+			try {
+				await replacement.shutdown();
+				this.instances.delete(id);
+				await this.store.setStatus(id, "stopped");
+			} catch (error) {
+				throw new AggregateError(
+					[error],
+					`Session '${id}' resume raced with stop and cleanup failed`,
+				);
+			}
+			throw new SessionNotResumableError(id);
+		}
+		const running: SessionSummary = { ...session, status: "running" };
+		try {
+			await this.store.update(running);
+		} catch (error) {
+			try {
+				await replacement.shutdown();
+				this.instances.delete(id);
+				await this.store.setStatus(id, "stopped");
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					`Session '${id}' resume persistence failed and cleanup was incomplete`,
+				);
+			}
+			throw error;
+		}
+		if (this.terminal.has(id) || this.stopping.has(id) || this.closing) {
+			try {
+				await replacement.shutdown();
+				this.instances.delete(id);
+				await this.store.setStatus(id, "stopped");
+			} catch (error) {
+				throw new AggregateError(
+					[error],
+					`Session '${id}' resume raced with stop and cleanup failed`,
+				);
+			}
+			throw new SessionNotResumableError(id);
+		}
+		this.startEventPump(id, replacement);
+		this.watchExit(id, replacement);
+		return running;
+	}
+
+	async submit(id: SessionId, text: string): Promise<InputId> {
+		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
 			throw new UnsupportedCapabilityError("input.submit", session.harnessId);
@@ -332,7 +467,16 @@ export class SessionManager {
 			"input.submit",
 			harness.descriptor.id,
 		);
-		const instance = this.instances.get(id);
+		let instance = this.instances.get(id);
+		if (!instance) {
+			const resumeOperation =
+				session.status === "stopped" ? this.resume(id) : this.resuming.get(id);
+			if (resumeOperation) {
+				await resumeOperation;
+				session = await this.get(id);
+				instance = this.instances.get(id);
+			}
+		}
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
 		const input: Input = {

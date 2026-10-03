@@ -28,6 +28,7 @@ import {
 	resolveStateDirectory,
 	SessionManager,
 	SessionNotFoundError,
+	SessionNotResumableError,
 	SessionNotStoppedError,
 	SessionStoreError,
 	SqliteSessionStore,
@@ -65,6 +66,9 @@ const mockSessionPort: SessionPort = {
 	},
 	async stop() {
 		throw new UnsupportedCapabilityError("session.stop", "memory");
+	},
+	async resume() {
+		throw new UnsupportedCapabilityError("session.resume", "memory");
 	},
 };
 const mockTransport: TransportAdapter = {
@@ -162,6 +166,12 @@ describe("core capability contracts", () => {
 				sessionId: "session" as never,
 			},
 			{
+				requestId: "resume",
+				principalId: "operator",
+				kind: "resume",
+				sessionId: "session" as never,
+			},
+			{
 				requestId: "6",
 				principalId: "operator",
 				kind: "submit",
@@ -182,6 +192,7 @@ describe("core capability contracts", () => {
 			"create",
 			"stop",
 			"delete",
+			"resume",
 			"submit",
 			"cancel",
 		]);
@@ -191,6 +202,12 @@ describe("core capability contracts", () => {
 		await expect(
 			mockSessionPort.stop("session" as never),
 		).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+		await expect(
+			mockSessionPort.resume("session" as never),
+		).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+		expect(() =>
+			requireCapability(["session.list"], "session.resume", "mock"),
+		).toThrow(UnsupportedCapabilityError);
 		expect(() =>
 			requireCapability(["session.list"], "session.list", "mock"),
 		).not.toThrow();
@@ -398,6 +415,255 @@ describe("SQLite session management", () => {
 		await manager.stop(session.id);
 		expect((await manager.get(session.id)).status).toBe("stopped");
 		store.close();
+	});
+
+	it("resumes the saved native session before delivering a stopped-session submit once", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const launchRequests: { sessionId: SessionId; cwd: string }[] = [];
+		const resumeRequests: {
+			sessionId: SessionId;
+			cwd: string;
+			nativeSessionId?: string;
+		}[] = [];
+		const submitted: string[] = [];
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "resume-harness" as AdapterId,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"input.submit",
+				],
+			},
+			async launch(request) {
+				launchRequests.push(request);
+				return {
+					processId: "initial-process" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-session-1",
+					events: (async function* () {})(),
+					async send(input) {
+						submitted.push(input.text);
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume(request) {
+				resumeRequests.push(request);
+				return {
+					processId: "resumed-process" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-session-1",
+					events: (async function* () {})(),
+					async send(input) {
+						submitted.push(input.text);
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+			await manager.stop(session.id);
+			const inputId = await manager.submit(session.id, "new prompt");
+			expect(inputId).toMatch(/^[0-9a-f-]{36}$/i);
+			expect(launchRequests).toHaveLength(1);
+			expect(resumeRequests).toEqual([
+				{
+					sessionId: session.id,
+					cwd: session.cwd,
+					nativeSessionId: "native-session-1",
+				},
+			]);
+			expect(submitted).toEqual(["new prompt"]);
+			expect((await manager.get(session.id)).status).toBe("running");
+			await manager.resume(session.id);
+			expect(resumeRequests).toHaveLength(1);
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("leaves the session stopped after resume failure without fresh launch or submission", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let launches = 0;
+		let resumes = 0;
+		let submits = 0;
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "resume-failure-harness" as AdapterId,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"input.submit",
+				],
+			},
+			async launch() {
+				launches++;
+				return {
+					processId: "resume-failure-initial" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-resume-failure",
+					events: (async function* () {})(),
+					async send() {
+						submits++;
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume() {
+				resumes++;
+				throw new Error("private resume detail");
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+			await manager.stop(session.id);
+			await expect(
+				manager.submit(session.id, "must not be delivered"),
+			).rejects.toThrow("private resume detail");
+			expect(launches).toBe(1);
+			expect(resumes).toBe(1);
+			expect(submits).toBe(0);
+			expect((await manager.get(session.id)).status).toBe("stopped");
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("never fresh-launches or submits when a stopped session lacks its native ID", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let launches = 0;
+		let submits = 0;
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "resume-without-native-id" as AdapterId,
+				capabilities: ["harness.launch", "harness.stop", "input.submit"],
+			},
+			async launch() {
+				launches++;
+				return {
+					processId: "without-native-id" as never,
+					exit: new Promise(() => {}),
+					events: (async function* () {})(),
+					async send() {
+						submits++;
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+			await manager.stop(session.id);
+			await expect(manager.resume(session.id)).rejects.toBeInstanceOf(
+				SessionNotResumableError,
+			);
+			await expect(
+				manager.submit(session.id, "must not be delivered"),
+			).rejects.toBeInstanceOf(SessionNotResumableError);
+			expect(launches).toBe(1);
+			expect(submits).toBe(0);
+			expect((await manager.get(session.id)).status).toBe("stopped");
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("coalesces concurrent resumes and lets a racing stop prevent input delivery", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const resumeStarted = deferred<void>();
+		const resumeGate = deferred<void>();
+		let resumeCalls = 0;
+		let shutdowns = 0;
+		let submits = 0;
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "resume-race-harness" as AdapterId,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"input.submit",
+				],
+			},
+			async launch() {
+				return {
+					processId: "race-initial" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-race",
+					events: (async function* () {})(),
+					async send() {
+						submits++;
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume() {
+				resumeCalls++;
+				resumeStarted.resolve();
+				await resumeGate.promise;
+				return {
+					processId: "race-resumed" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-race",
+					events: (async function* () {})(),
+					async send() {
+						submits++;
+					},
+					async cancel() {},
+					async shutdown() {
+						shutdowns++;
+					},
+				};
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+			await manager.stop(session.id);
+			const resume = manager.resume(session.id);
+			const submit = manager.submit(session.id, "must not be delivered");
+			await resumeStarted.promise;
+			const stop = manager.stop(session.id);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			resumeGate.resolve();
+			await expect(resume).rejects.toBeInstanceOf(SessionNotResumableError);
+			await expect(submit).rejects.toBeInstanceOf(SessionNotResumableError);
+			await stop;
+			expect(resumeCalls).toBe(1);
+			expect(shutdowns).toBe(1);
+			expect(submits).toBe(0);
+			expect((await manager.get(session.id)).status).toBe("stopped");
+		} finally {
+			await manager.close();
+			store.close();
+		}
 	});
 
 	it("routes live controls by session and reports partial model changes without persisting them", async () => {

@@ -25,6 +25,7 @@ export interface SessionPort {
 		readonly cwd: string;
 	}): Promise<SessionSummary>;
 	stop(id: SessionId): Promise<void>;
+	resume(id: SessionId): Promise<SessionSummary>;
 }
 
 export interface InputPort {
@@ -56,6 +57,12 @@ export type TransportEvent =
 			readonly requestId: string;
 			readonly principalId: string;
 			readonly kind: "stop";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "resume";
 			readonly sessionId: SessionId;
 	  }
 	| {

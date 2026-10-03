@@ -176,6 +176,72 @@ describe("application runtime", () => {
 		await runtime.close();
 	});
 
+	it("routes explicit resume through the runtime and preserves the saved native ID", async () => {
+		let resumeRequest: unknown;
+		const instance = {
+			processId: "runtime-resume-process" as never,
+			exit: new Promise<{ code: number | null; signal: string | null }>(
+				() => {},
+			),
+			nativeSessionId: "native-runtime-session",
+			events: (async function* () {})(),
+			async send() {},
+			async cancel() {},
+			async shutdown() {},
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [],
+			harnesses: [
+				{
+					descriptor: {
+						id: "runtime-resume" as never,
+						capabilities: ["harness.launch", "harness.stop", "harness.resume"],
+					},
+					async launch() {
+						return instance;
+					},
+					async resume(request) {
+						resumeRequest = request;
+						return instance;
+					},
+				},
+			],
+		});
+		const created = await runtime.dispatch({
+			requestId: "runtime-resume-create",
+			principalId: "test",
+			kind: "create",
+			harnessId: "runtime-resume" as never,
+			cwd: os.tmpdir(),
+		});
+		const session = sessionFrom(created);
+		await runtime.dispatch({
+			requestId: "runtime-resume-stop",
+			principalId: "test",
+			kind: "stop",
+			sessionId: session.id,
+		});
+		const resumed = await runtime.dispatch({
+			requestId: "runtime-resume-request",
+			principalId: "test",
+			kind: "resume",
+			sessionId: session.id,
+		});
+		expect(resumed).toMatchObject({
+			requestId: "runtime-resume-request",
+			ok: true,
+			value: { id: session.id, status: "running" },
+		});
+		expect(resumeRequest).toEqual({
+			sessionId: session.id,
+			cwd: session.cwd,
+			nativeSessionId: "native-runtime-session",
+		});
+		await runtime.close();
+	});
+
 	it("returns actionable Pi startup errors and logs only a safe error code", async () => {
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const launchError = Object.assign(new Error("secret path detail"), {

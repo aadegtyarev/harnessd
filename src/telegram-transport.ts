@@ -36,6 +36,7 @@ const TELEGRAM_COMMANDS = [
 	{ command: "sessions", description: "List saved sessions." },
 	{ command: "new", description: "Create a session, optionally in a folder." },
 	{ command: "use", description: "Select a session by ID." },
+	{ command: "resume", description: "Resume a stopped session." },
 	{ command: "inspect", description: "Show a session's details." },
 	{ command: "status", description: "Show the selected session's status." },
 	{ command: "model", description: "List or select a model." },
@@ -608,7 +609,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (name === "/help" && args.length === 0)
 			return this.sendDirect(
 				chatId,
-				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/delete <sessionId>\n/cancel <inputId>\n/help",
+				"/sessions\n/new [cwd]\n/use <sessionId>\n/resume [sessionId]\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/delete <sessionId>\n/cancel <inputId>\n/help",
 			);
 		if (name === "/status" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
@@ -722,6 +723,24 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			return this.sendDirect(
 				chatId,
 				`Selected ${(result.value as SessionSummary).id}.`,
+			);
+		}
+		if (name === "/resume") {
+			if (args.length > 1)
+				return this.sendDirect(chatId, "Usage: /resume [sessionId]");
+			const sessionId =
+				(args[0] as SessionId | undefined) ?? this.selected.get(chatId);
+			if (!sessionId)
+				return this.sendDirect(
+					chatId,
+					"Provide a session ID or select a session with /use first.",
+				);
+			const result = await this.request(sender, { kind: "resume", sessionId });
+			return this.sendDirect(
+				chatId,
+				result.ok
+					? `Session ${(result.value as SessionSummary).id} is running.`
+					: result.error.message,
 			);
 		}
 		if (name === "/inspect" && args.length <= 1) {
