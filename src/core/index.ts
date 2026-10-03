@@ -6,6 +6,7 @@ export {
 	InvalidWorkingDirectoryError,
 	requireCapability,
 	SessionNotFoundError,
+	SessionNotResumableError,
 	SessionNotStoppedError,
 	SessionStoreError,
 	UnsupportedCapabilityError,

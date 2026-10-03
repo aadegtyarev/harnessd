@@ -11,7 +11,7 @@ flowchart LR
     subgraph SERVICE["harnessd control plane"]
         CLI["CLI<br/>dotenv config, service commands,<br/>signals"] --> RT["ApplicationRuntime<br/>composition and lifecycle"]
         TR["Telegram transport<br/>authorization, chat selection,<br/>bounded message queues"] <--> RT
-        RT <--> CORE["SessionManager<br/>IDs, routing, events,<br/>bounded in-process recovery"]
+        RT <--> CORE["SessionManager<br/>IDs, routing, events,<br/>resume and recovery"]
         CORE <--> DB[("SQLite<br/>supervisor state directory")]
         TR <--> LOCK["Polling lock<br/>token-derived, in state directory"]
         RT --> MODE{"Execution mode"}
@@ -37,7 +37,7 @@ The transport, core, harness, and process provider are separate boundaries. Core
 
 1. The CLI loads an optional `.env` from its current working directory (without overriding existing process variables), validates configuration, opens supervisor state, builds the runtime, and waits for Telegram polling readiness. `--help` does not require or load configuration.
 2. Before a Telegram update reaches the core, middleware requires an allowlisted numeric sender and a private chat. Selection of a session is kept in memory per chat.
-3. A command or text update becomes a typed runtime request. `SessionManager` routes it by supervisor `SessionId` to the matching Pi RPC instance.
+3. A command or text update becomes a typed runtime request. `SessionManager` routes it by supervisor `SessionId` to the matching Pi RPC instance; a submit to a deliberately stopped session first resumes the exact saved native Pi session.
 4. Pi communicates with its adapter using line-delimited JSON over standard input/output. The adapter decodes events and acknowledgements; the runtime returns safe results to Telegram.
 5. Live events are tagged with their supervisor session ID and sent in order to chats that have selected that session, subject to bounded queues. Chat selection and event history are not persisted.
 
@@ -45,7 +45,7 @@ On Linux, `harnessd service install` explicitly installs/enables/starts a per-us
 
 ## Process failure and uncertain input
 
-While harnessd is running, the core watches the process exit separately from RPC stream EOF and drains final events. If a process exits unexpectedly, an unsettled input is surfaced as `uncertain` with its original `InputId`; it is **never automatically resent**. The watchdog may make at most three native-session resume attempts for that supervisor session, after 250 ms, 1 s, and 4 s. Resume uses the exact saved native ID; it never creates a fresh session as fallback. A later operator submission is new work and may duplicate work if the earlier uncertain prompt actually completed.
+While harnessd is running, the core watches the process exit separately from RPC stream EOF and drains final events. If a process exits unexpectedly, an unsettled input is surfaced as `uncertain` with its original `InputId`; it is **never automatically resent**. The watchdog may make at most three native-session resume attempts for that supervisor session, after 250 ms, 1 s, and 4 s. Separately, an operator may use `/resume [sessionId]` to resume a deliberately stopped session, and ordinary text sent to a selected stopped session resumes it before submitting that new text once. Every resume uses the exact saved native ID; it never creates a fresh session as fallback or replays uncertain input. A later operator submission is new work and may duplicate work if the earlier uncertain prompt actually completed.
 
 After harnessd itself exits, existing SQLite rows do not prove that their Pi processes still exist. This CLI does not reattach or restart prior Pi processes. A restarted service may list stale rows, but `/use` cannot restore sessions from the previous service run.
 

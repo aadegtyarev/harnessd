@@ -3,6 +3,7 @@ export type Capability =
 	| "session.get"
 	| "session.create"
 	| "session.stop"
+	| "session.resume"
 	| "input.submit"
 	| "input.cancel"
 	| "transport.poll"
@@ -84,6 +85,15 @@ export class SessionNotStoppedError extends Error {
 	constructor(readonly sessionId: string) {
 		super(`Session '${sessionId}' must be stopped before it can be deleted`);
 		this.name = "SessionNotStoppedError";
+	}
+}
+
+export class SessionNotResumableError extends Error {
+	readonly code = "SESSION_NOT_RESUMABLE";
+
+	constructor(readonly sessionId: string) {
+		super(`Session '${sessionId}' cannot be resumed`);
+		this.name = "SessionNotResumableError";
 	}
 }
 

@@ -7,7 +7,7 @@ It is currently being tested from Git, not published to npm. The manifest and lo
 ## What it does
 
 - Accepts commands and prompts from allowlisted Telegram users in private chats only.
-- Creates, lists, selects, inspects, cancels, and stops independent Pi sessions.
+- Creates, lists, selects, inspects, resumes, cancels, and stops independent Pi sessions.
 - Routes output and status events back to the selected chat.
 - Watches Pi process exits and attempts bounded resume of the same native session while harnessd remains running.
 - Keeps supervisor metadata in SQLite under a private state directory, independently of each session workspace.
@@ -123,6 +123,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/sessions` | List sessions. |
 | `/new [cwd]` | Create a session in `cwd`; defaults to `HARNESSD_DEFAULT_CWD`, or the service's starting directory if unset. |
 | `/use <sessionId>` | Select a session for this private chat. |
+| `/resume [sessionId]` | Resume a stopped session by its saved Pi-native ID; defaults to the selected session. |
 | `/inspect [sessionId]` | Inspect the selected or named session. |
 | `/status` | Show the selected session's folder, model, effort, aggregate tokens, and Pi-estimated cost. |
 | `/model` | List models available to the selected running session. |
@@ -133,13 +134,13 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/delete <sessionId>` | Delete a stopped session record from harnessd. |
 | `/cancel <inputId>` | Cancel an accepted input in the selected session. |
 
-Plain text is sent to the selected session. Chat selection is in memory only. A restarted service does not reattach prior Pi processes; old session rows may appear stale, and `/use` cannot restore those sessions. `/sessions` formats session IDs as code. `/delete <sessionId>` requires an explicitly named stopped session; it removes only the harnessd SQLite record, not Pi-native session files or the working directory. Stop the session first with `/stop <sessionId>`. The bot registers its command menu for private chats through Telegram's `setMyCommands` API; if registration fails, manual command handling remains available. `/status` uses Pi RPC aggregate usage only (no session-file or plugin reads); its cost is an estimate, not provider billing. Live model, effort, tokens, and cost are unavailable when no live Pi instance exists. The supervisor accepts any existing accessible directory as `cwd`, but `cwd` is not a security boundary.
+Plain text is sent to the selected session. If it is deliberately stopped, harnessd resumes the same Pi-native session and submits the new text once; it never creates a fresh session as fallback. `/stop` clears chat selection when it stops the selected session, so use `/use <sessionId>` before `/resume` without an ID or text-driven auto-resume. Chat selection is in memory only. A restarted service does not reattach prior Pi processes; old session rows may appear stale, and `/use` cannot restore those sessions. `/sessions` formats session IDs as code. `/delete <sessionId>` requires an explicitly named stopped session; it removes only the harnessd SQLite record, not Pi-native session files or the working directory. Stop the session first with `/stop <sessionId>`. The bot registers its command menu for private chats through Telegram's `setMyCommands` API; if registration fails, manual command handling remains available. `/status` uses Pi RPC aggregate usage only (no session-file or plugin reads); its cost is an estimate, not provider billing. Live model, effort, tokens, and cost are unavailable when no live Pi instance exists. The supervisor accepts any existing accessible directory as `cwd`, but `cwd` is not a security boundary.
 
 ## Sessions, recovery, and uncertainty
 
 While harnessd is alive, the core watches explicit Pi process exit, drains final events, and may attempt native-session resume up to three times per session after 250 ms, 1 s, and 4 s. It uses the exact saved native session ID and never starts a fresh session as a fallback.
 
-If prompt delivery is uncertain, harnessd reports the original `InputId` and **does not resend the prompt**. A later manual submission is new work and could duplicate an operation if Pi completed the original prompt. After an unclean supervisor exit, stored session rows may be stale; this CLI does not reattach or restart prior Pi processes.
+An operator can resume a deliberately stopped session with `/resume [sessionId]`; it reuses the stored native Pi session ID. If prompt delivery is uncertain, harnessd reports the original `InputId` and **does not resend the prompt**. A later manual submission is new work and could duplicate an operation if Pi completed the original prompt. After an unclean supervisor exit, stored session rows may be stale; this CLI does not reattach or restart prior Pi processes.
 
 ## Trust and limitations
 

@@ -55,6 +55,10 @@ const safeErrorMessages = new Map([
 	["INVALID_WORKING_DIRECTORY", "Working directory is invalid or inaccessible"],
 	["SESSION_NOT_FOUND", "Session was not found"],
 	["SESSION_NOT_STOPPED", "Stop the session before deleting it with /stop."],
+	[
+		"SESSION_NOT_RESUMABLE",
+		"Session cannot be resumed; ensure it is stopped and has a saved Pi session.",
+	],
 	["DUPLICATE_SESSION_ID", "Session already exists"],
 	["SESSION_STORE_ERROR", "Session storage failed"],
 	["INVALID_STATE_DIRECTORY", "Runtime state configuration is invalid"],
@@ -270,6 +274,11 @@ export class ApplicationRuntime {
 				case "stop":
 					await this.manager.stop(request.sessionId);
 					value = undefined as typeof value;
+					break;
+				case "resume":
+					value = (await this.manager.resume(
+						request.sessionId,
+					)) as typeof value;
 					break;
 				case "delete":
 					await this.manager.delete(request.sessionId);
