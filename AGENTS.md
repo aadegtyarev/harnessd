@@ -14,9 +14,10 @@
 ## Git workflow
 - Before code changes, verify the target branch and worktree, then create a task-specific branch from the up-to-date target; do not implement directly on `main`. Keep unrelated existing changes out of the task branch/PR unless approved.
 - Commit meaningful verified increments during implementation.
-- At completion, push the branch and open a PR to `main`; merge when all required checks are green, required review is clear, and no blockers/conflicts remain. Do not wait for a separate merge confirmation.
+- At completion, push the branch and open a PR to `main`; merge only when applicable local validation and all required remote checks are green, required review is clear, and no blockers/conflicts remain. Do not wait for a separate merge confirmation. For runtime changes, run `npm test`, `npm run typecheck`, `npm run build`, `npm run lint`, `npm run format:check`, `npm run version:check`, and `git diff --check` before merge.
 - Do not merge while required checks are pending/failing or blocking review remains. If remote access/checks block delivery, report that and leave the change unmerged.
-- Merge does not authorize deployment or service restart; do those only when explicitly requested.
+- After a successful merge, deploy the merged production version and restart `harnessd.service` by default; this records the operator's standing authorization for routine harnessd deployments after green gates. Use the documented exact-commit local Git install procedure in `README.md`, then verify the service is active. Never inspect or print `.env`, Telegram credentials, or other production secrets during deployment.
+- Ask before deploying changes that require a database/schema migration, destructive production state changes, unavoidable service downtime, or carry material production risk not covered by validation. If the documented safe deployment procedure is unavailable or deployment fails, stop and report the blocker without claiming production was updated or attempting an unapproved rollback.
 
 ## Project-specific commands and conventions
 - Stack and important paths: Node.js 24+, TypeScript strict ESM (`NodeNext`); npm. Core adapter contracts live in `src/core/`, CLI entrypoint in `src/cli.ts`, and tests in `test/`.
