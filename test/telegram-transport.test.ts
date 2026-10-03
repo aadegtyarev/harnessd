@@ -1146,10 +1146,13 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(43, "/use other");
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "status", "harness_restarting"));
 		emit(harnessEvent("sid", "status", "harness_recovered"));
 		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		expect(clearIntervalSpy).toHaveBeenCalled();
+		clearIntervalSpy.mockRestore();
 		emit(harnessEvent("sid", "status", "agent_end"));
 		emit(harnessEvent("sid", "status", "secret-unknown-state"));
 		emit({

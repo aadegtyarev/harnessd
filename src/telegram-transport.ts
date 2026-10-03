@@ -2558,6 +2558,8 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				this.flushTurn(event.sessionId);
 				return;
 			}
+			if (event.text === "harness_recovery_failed")
+				this.stopTyping(event.sessionId);
 			if (
 				event.text === "harness_restarting" ||
 				event.text === "harness_recovered" ||
