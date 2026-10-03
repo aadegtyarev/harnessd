@@ -554,7 +554,10 @@ describe("Telegram transport", () => {
 
 	it("requires confirmation before callback stop and delete operations", async () => {
 		const bot = new MockBot();
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() => expect(bot.api.sendChatAction).toHaveBeenCalled());
 		await bot.update(42, "/menu");
 		const panelMessageId = bot.lastMessageId;
 		await bot.callback(42, "menu:sessions", panelMessageId);
@@ -566,7 +569,10 @@ describe("Telegram transport", () => {
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		await bot.callback(42, "session:delete:sid", panelMessageId);
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		expect(clearIntervalSpy).toHaveBeenCalled();
+		clearIntervalSpy.mockRestore();
 		expect(requests.some((request) => request.kind === "delete")).toBe(true);
 		const requestsAfterDelete = requests.length;
 		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
@@ -1427,6 +1433,10 @@ describe("Telegram transport", () => {
 		expect(bot.api.sendChatAction.mock.calls.map(([chatId]) => chatId)).toEqual(
 			[42, 43, 43],
 		);
+		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+		await bot.update(43, "/delete sid");
+		expect(clearIntervalSpy).toHaveBeenCalled();
+		clearIntervalSpy.mockRestore();
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await adapter.stop();
 	});

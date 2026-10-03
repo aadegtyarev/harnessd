@@ -5,6 +5,7 @@ import {
 	readFile,
 	realpath,
 	rename,
+	stat,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
@@ -315,7 +316,10 @@ function isCode(error: unknown, code: string): boolean {
 	);
 }
 class TelegramAttachmentTooLargeError extends Error {}
-async function readBoundedFile(filePath: string): Promise<Buffer> {
+async function readBoundedFile(
+	rootPath: string,
+	filePath: string,
+): Promise<Buffer> {
 	const handle = await open(
 		filePath,
 		fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
@@ -325,6 +329,18 @@ async function readBoundedFile(filePath: string): Promise<Buffer> {
 		if (!info.isFile()) throw new Error("not a regular file");
 		if (info.size > MAX_TELEGRAM_FILE_BYTES)
 			throw new TelegramAttachmentTooLargeError();
+		const openedPath = await realpath(filePath);
+		const relative = path.relative(rootPath, openedPath);
+		if (
+			!relative ||
+			relative === ".." ||
+			relative.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(relative)
+		)
+			throw new Error("file is outside session cwd");
+		const pathInfo = await stat(openedPath);
+		if (pathInfo.dev !== info.dev || pathInfo.ino !== info.ino)
+			throw new Error("file changed during validation");
 		const chunks: Buffer[] = [];
 		let length = 0;
 		for await (const chunk of handle.createReadStream({ autoClose: false })) {
@@ -989,7 +1005,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				path.isAbsolute(relative)
 			)
 				return false;
-			const data = await readBoundedFile(canonicalFile);
+			const data = await readBoundedFile(canonicalRoot, canonicalFile);
 			if (this.stopping || this.selected.get(chatId) !== sessionId)
 				return false;
 			const sent = await this.telegramCall((signal) =>
@@ -1404,7 +1420,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				this.reportedErrors.delete(sessionId);
 				for (const [selectedChat, selectedId] of this.selected) {
 					if (selectedId === sessionId) {
-						this.selected.delete(selectedChat);
+						this.clearSelected(selectedChat);
 						this.previews.delete(selectedChat);
 					}
 				}
@@ -2517,7 +2533,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			this.reportedErrors.delete(sessionId);
 			for (const [selectedChat, selectedId] of this.selected) {
 				if (selectedId === sessionId) {
-					this.selected.delete(selectedChat);
+					this.clearSelected(selectedChat);
 					this.previews.delete(selectedChat);
 				}
 			}
