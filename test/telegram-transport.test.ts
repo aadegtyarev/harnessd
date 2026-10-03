@@ -36,6 +36,12 @@ class MockBot {
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
 	sent: { chatId: number; text: string }[] = [];
+	sendOptions: unknown[] = [];
+	commandRegistrations: {
+		commands: readonly { command: string; description: string }[];
+		other?: unknown;
+	}[] = [];
+	setMyCommandsBehavior: () => Promise<void> = async () => {};
 	startCalled?: () => void;
 	startResolve?: () => void;
 	startReject?: (error: Error) => void;
@@ -56,6 +62,16 @@ class MockBot {
 				_signal?: AbortSignal,
 			) => {
 				this.sent.push({ chatId, text });
+				this.sendOptions.push(_other);
+			},
+		),
+		setMyCommands: vi.fn(
+			async (
+				commands: readonly { command: string; description: string }[],
+				other?: unknown,
+			) => {
+				this.commandRegistrations.push({ commands, other });
+				await this.setMyCommandsBehavior();
 			},
 		),
 	};
@@ -134,7 +150,7 @@ const sessions = new Map<string, SessionSummary>([
 	],
 ]);
 function result(request: TransportEvent): TransportResult {
-	let value: readonly SessionSummary[] | SessionSummary | string | undefined;
+	let value: Extract<TransportResult, { readonly ok: true }>["value"];
 	switch (request.kind) {
 		case "list":
 			value = [...sessions.values()];
@@ -158,6 +174,52 @@ function result(request: TransportEvent): TransportResult {
 			break;
 		case "submit":
 			value = "input-1" as never;
+			break;
+		case "session_status": {
+			const session = sessions.get(request.sessionId);
+			if (!session)
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: {
+						code: "SESSION_NOT_FOUND",
+						message: "Session was not found",
+					},
+				};
+			value = {
+				session,
+				live: {
+					model: { provider: "openai", id: "gpt-test", name: "Test" },
+					effort: "medium",
+					usage: { totalTokens: 1234, costUsd: 0.125 },
+				},
+			};
+			break;
+		}
+		case "model_list":
+			value = {
+				models: [{ provider: "openai", id: "gpt-test", name: "Test" }],
+				current: { provider: "openai", id: "gpt-test", name: "Test" },
+			};
+			break;
+		case "model_set":
+			value = {
+				model: {
+					provider: request.provider,
+					id: request.modelId,
+					name: request.modelId,
+				},
+				...(request.effort !== undefined
+					? { effort: request.effort, effortConfirmed: true }
+					: {}),
+			};
+			break;
+		case "effort_list":
+			value = { levels: ["low", "medium", "high"], current: "medium" };
+			break;
+		case "effort_set":
+		case "delete":
+			value = undefined;
 			break;
 		default:
 			value = undefined;
@@ -226,6 +288,7 @@ describe("Telegram transport", () => {
 		const dir = await temp();
 		const { adapter, requests } = await startAdapter(bot, dir);
 		await bot.update(42, "/sessions", { userId: 7 });
+		await bot.update(42, "/delete sid", { userId: 7 });
 		await bot.update(42, "/sessions", { missingSender: true });
 		await bot.update(42, "/sessions", { userId: 0 });
 		await bot.update(42, "/sessions", { userId: 42.2 });
@@ -234,6 +297,210 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/sessions", { userId: 42, chatType: "channel" });
 		expect(requests).toEqual([]);
 		expect(bot.sent).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("registers commands and formats IDs as safely escaped code", async () => {
+		const bot = new MockBot();
+		const sid = sessions.get("sid");
+		if (!sid) throw new Error("Missing session fixture");
+		const unsafeSession = { ...sid, cwd: "/work<&" };
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: [unsafeSession],
+						}
+					: result(request),
+		});
+		expect(bot.api.setMyCommands).toHaveBeenCalledOnce();
+		expect(bot.commandRegistrations[0]).toMatchObject({
+			other: { scope: { type: "all_private_chats" } },
+		});
+		expect(
+			bot.commandRegistrations[0]?.commands.map(({ command }) => command),
+		).toEqual([
+			"help",
+			"sessions",
+			"new",
+			"use",
+			"inspect",
+			"status",
+			"model",
+			"effort",
+			"stop",
+			"delete",
+			"cancel",
+		]);
+
+		await bot.update(100, "/help");
+		expect(bot.sent.at(-1)?.text).toContain("/delete <sessionId>");
+		await bot.update(100, "/sessions");
+		expect(requests.at(-1)).toMatchObject({ kind: "list" });
+		const sessionReply = bot.sent.at(-1);
+		expect(sessionReply?.text).toContain("<code>sid</code>");
+		expect(sessionReply?.text).toContain("/work&lt;&amp;");
+		expect(bot.sendOptions.at(-1)).toEqual({ parse_mode: "HTML" });
+
+		await bot.update(100, "/use other");
+		await bot.update(100, "/delete other");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "delete",
+			sessionId: "other",
+		});
+		expect(bot.sent.at(-1)?.text).toContain("Deleted stopped session other");
+		await bot.update(100, "plain text after deletion");
+		expect(requests.map(({ kind }) => kind)).not.toContain("submit");
+		await bot.update(100, "/delete");
+		expect(bot.sent.at(-1)?.text).toBe("Usage: /delete <sessionId>");
+		await adapter.stop();
+	});
+
+	it("keeps polling if Telegram command registration fails without logging raw errors", async () => {
+		const bot = new MockBot();
+		bot.setMyCommandsBehavior = async () => {
+			throw new Error("PRIVATE Telegram API failure");
+		};
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		expect(bot.api.setMyCommands).toHaveBeenCalledOnce();
+		expect(log).toHaveBeenCalledWith(
+			"harnessd: Telegram command menu registration failed",
+		);
+		expect(log.mock.calls.flat().join(" ")).not.toContain("PRIVATE");
+		await adapter.stop();
+	});
+
+	it("routes model, effort, and status commands to each chat's selected session", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use other");
+		await bot.update(100, "/status");
+		await bot.update(100, "/model");
+		await bot.update(101, "/model openai/gpt-next high");
+		await bot.update(100, "/effort");
+		await bot.update(101, "/effort high");
+		await bot.update(101, "/status");
+		await bot.update(101, "prompt for other");
+		expect(requests.map(({ kind }) => kind)).toEqual([
+			"inspect",
+			"inspect",
+			"session_status",
+			"model_list",
+			"model_set",
+			"effort_list",
+			"effort_set",
+			"session_status",
+			"submit",
+		]);
+		expect(requests[2]).toMatchObject({
+			kind: "session_status",
+			sessionId: "sid",
+		});
+		expect(requests[3]).toMatchObject({ kind: "model_list", sessionId: "sid" });
+		expect(requests[4]).toMatchObject({
+			kind: "model_set",
+			sessionId: "other",
+			provider: "openai",
+			modelId: "gpt-next",
+			effort: "high",
+		});
+		expect(requests[5]).toMatchObject({
+			kind: "effort_list",
+			sessionId: "sid",
+		});
+		expect(requests[6]).toMatchObject({
+			kind: "effort_set",
+			sessionId: "other",
+			effort: "high",
+		});
+		expect(requests[8]).toMatchObject({ kind: "submit", sessionId: "other" });
+		expect(
+			bot.sent.some(
+				({ chatId, text }) => chatId === 100 && text.includes("Tokens: 1,234"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 100 && text.includes("openai/gpt-test"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 100 &&
+					text.includes("Effort levels (current: medium): low, medium, high"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 101 &&
+					text.includes("Switched to openai/gpt-next; effort set to high."),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("reports partial model selection and saved status when live fields are unavailable", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "model_set")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: {
+							model: {
+								provider: request.provider,
+								id: request.modelId,
+								name: request.modelId,
+							},
+							effort: request.effort,
+							effortConfirmed: false,
+						},
+					};
+				if (request.kind === "session_status") {
+					const session = sessions.get(request.sessionId);
+					if (!session)
+						return {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "SESSION_NOT_FOUND",
+								message: "Session was not found",
+							},
+						};
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: { session: { ...session, status: "stopped" } },
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/model openai/gpt-next high");
+		await bot.update(42, "/status");
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Pi did not confirm effort high"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ text }) =>
+					text.includes("Folder: /work") &&
+					text.includes("Session: stopped") &&
+					text.includes("Model: unavailable") &&
+					text.includes("Live Pi data: unavailable"),
+			),
+		).toBe(true);
 		await adapter.stop();
 	});
 
@@ -297,6 +564,36 @@ describe("Telegram transport", () => {
 		expect(bot.sent).toHaveLength(sentCount);
 	});
 
+	it("accepts unquoted and matching quoted cwd paths without shell parsing", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/new /tmp/project with spaces");
+		await bot.update(42, '/new "/tmp/project with spaces"');
+		await bot.update(42, "/new '/tmp/project with spaces'");
+		await bot.update(42, '/new "/tmp/project with spaces');
+		expect(
+			requests
+				.filter((request) => request.kind === "create")
+				.map((request) => request.cwd),
+		).toEqual([
+			"/tmp/project with spaces",
+			"/tmp/project with spaces",
+			"/tmp/project with spaces",
+		]);
+		expect(bot.sent.at(-1)?.text).toBe(
+			"Use matching quotes around the entire path, or remove the quotes.",
+		);
+		await adapter.stop();
+	});
+
+	it("uses the configured default cwd when /new has no explicit path", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/new");
+		expect(requests[0]).toMatchObject({ kind: "create", cwd: "/work" });
+		await adapter.stop();
+	});
+
 	it("contains dispatch rejections with a safe message and no prompt echo", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp(), {
@@ -308,9 +605,13 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "private prompt text");
-		expect(bot.sent.some(({ text }) => text === "Operation failed.")).toBe(
-			true,
-		);
+		expect(
+			bot.sent.some(
+				({ text }) =>
+					text ===
+					"Request failed unexpectedly. Check the harnessd service journal.",
+			),
+		).toBe(true);
 		expect(
 			bot.sent.some(({ text }) => text.includes("private dispatch detail")),
 		).toBe(false);

@@ -10,6 +10,11 @@ export type Capability =
 	| "harness.stop"
 	| "harness.resume"
 	| "harness.cancel"
+	| "harness.session.status"
+	| "harness.model.list"
+	| "harness.model.set"
+	| "harness.effort.list"
+	| "harness.effort.set"
 	| "process.launch"
 	| "process.signal"
 	| "process.isolation"
@@ -70,6 +75,15 @@ export class SessionNotFoundError extends Error {
 	constructor(readonly sessionId: string) {
 		super(`Session '${sessionId}' does not exist`);
 		this.name = "SessionNotFoundError";
+	}
+}
+
+export class SessionNotStoppedError extends Error {
+	readonly code = "SESSION_NOT_STOPPED";
+
+	constructor(readonly sessionId: string) {
+		super(`Session '${sessionId}' must be stopped before it can be deleted`);
+		this.name = "SessionNotStoppedError";
 	}
 }
 

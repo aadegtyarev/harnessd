@@ -27,6 +27,8 @@ import {
 	requireCapability,
 	resolveStateDirectory,
 	SessionManager,
+	SessionNotFoundError,
+	SessionNotStoppedError,
 	SessionStoreError,
 	SqliteSessionStore,
 	UnsupportedCapabilityError,
@@ -41,6 +43,7 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
+	vi.useRealTimers();
 	vi.restoreAllMocks();
 	await Promise.all(
 		tempDirectories
@@ -155,12 +158,18 @@ describe("core capability contracts", () => {
 			{
 				requestId: "5",
 				principalId: "operator",
+				kind: "delete",
+				sessionId: "session" as never,
+			},
+			{
+				requestId: "6",
+				principalId: "operator",
 				kind: "submit",
 				sessionId: "session" as never,
 				text: "hello",
 			},
 			{
-				requestId: "6",
+				requestId: "7",
 				principalId: "operator",
 				kind: "cancel",
 				sessionId: "session" as never,
@@ -172,6 +181,7 @@ describe("core capability contracts", () => {
 			"inspect",
 			"create",
 			"stop",
+			"delete",
 			"submit",
 			"cancel",
 		]);
@@ -228,6 +238,152 @@ describe("SQLite session management", () => {
 		reopened.close();
 	});
 
+	it("deletes only stopped session metadata and leaves its workspace intact", async () => {
+		const state = await temporaryDirectory();
+		const workspace = await temporaryDirectory();
+		const store = await SqliteSessionStore.open(state);
+		const { harness } = harnessPort();
+		const manager = new SessionManager(store, [harness]);
+		await expect(manager.delete("missing" as SessionId)).rejects.toBeInstanceOf(
+			SessionNotFoundError,
+		);
+		const session = await manager.create({
+			harnessId: harness.descriptor.id,
+			cwd: workspace,
+		});
+
+		await expect(manager.delete(session.id)).rejects.toBeInstanceOf(
+			SessionNotStoppedError,
+		);
+		expect(await store.get(session.id)).toEqual(session);
+
+		await manager.stop(session.id);
+		await manager.delete(session.id);
+		expect(await store.get(session.id)).toBeUndefined();
+		expect(await store.list()).toEqual([]);
+		const { stat } = await import("node:fs/promises");
+		expect((await stat(workspace)).isDirectory()).toBe(true);
+		await manager.close();
+		store.close();
+	});
+
+	it("resets terminal lifecycle state when a stopped ID is deleted and reused", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const firstExit = deferred<{
+			code: number | null;
+			signal: string | null;
+		}>();
+		const secondExit = deferred<{
+			code: number | null;
+			signal: string | null;
+		}>();
+		let launches = 0;
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "reusable-harness" as AdapterId,
+				capabilities: ["harness.launch", "harness.stop"],
+			},
+			async launch(request) {
+				const exit = launches++ === 0 ? firstExit.promise : secondExit.promise;
+				return {
+					processId: `process-${request.sessionId}` as never,
+					exit,
+					events: (async function* () {})(),
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		const session = await manager.create({
+			id: "reusable-session",
+			harnessId: harness.descriptor.id,
+			cwd: os.tmpdir(),
+		});
+		await manager.stop(session.id);
+		await manager.delete(session.id);
+		await manager.create({
+			id: session.id,
+			harnessId: harness.descriptor.id,
+			cwd: os.tmpdir(),
+		});
+
+		secondExit.resolve({ code: 1, signal: null });
+		await vi.waitFor(async () => {
+			expect((await store.get(session.id))?.status).toBe("failed");
+		});
+		await manager.close();
+		store.close();
+	});
+
+	it("preserves the resume-attempt budget across deletion and same-ID reuse", async () => {
+		vi.useFakeTimers();
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const firstExit = deferred<{
+			code: number | null;
+			signal: string | null;
+		}>();
+		const secondExit = deferred<{
+			code: number | null;
+			signal: string | null;
+		}>();
+		let launches = 0;
+		let resumes = 0;
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "budget-harness" as AdapterId,
+				capabilities: ["harness.launch", "harness.stop", "harness.resume"],
+			},
+			async launch(request) {
+				const exit = launches++ === 0 ? firstExit.promise : secondExit.promise;
+				return {
+					processId: `budget-process-${request.sessionId}` as never,
+					exit,
+					nativeSessionId: "native-session",
+					events: (async function* () {})(),
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume() {
+				resumes++;
+				throw new Error("resume failure");
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				id: "budget-session",
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+			firstExit.resolve({ code: 1, signal: null });
+			await vi.advanceTimersByTimeAsync(250);
+			expect(resumes).toBe(1);
+			await manager.stop(session.id);
+			await manager.delete(session.id);
+			await manager.create({
+				id: session.id,
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+
+			secondExit.resolve({ code: 1, signal: null });
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(resumes).toBe(2);
+			await vi.advanceTimersByTimeAsync(4000);
+			expect(resumes).toBe(3);
+			await vi.waitFor(async () => {
+				expect((await store.get(session.id))?.status).toBe("failed");
+			});
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
 	it("addresses submit and stop to the selected session and returns persisted status", async () => {
 		const store = await SqliteSessionStore.open(await temporaryDirectory());
 		const { harness, submitted } = harnessPort();
@@ -242,6 +398,189 @@ describe("SQLite session management", () => {
 		await manager.stop(session.id);
 		expect((await manager.get(session.id)).status).toBe("stopped");
 		store.close();
+	});
+
+	it("routes live controls by session and reports partial model changes without persisting them", async () => {
+		const state = await temporaryDirectory();
+		const calls: string[] = [];
+		const harness = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.session.status",
+				"harness.model.list",
+				"harness.model.set",
+				"harness.effort.list",
+				"harness.effort.set",
+			],
+			launch: async (request) => ({
+				processId: `control-${request.sessionId}` as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				control: {
+					async getSelection() {
+						return {
+							model: { provider: "openai", id: "gpt-test", name: "Test" },
+							effort: "medium",
+						};
+					},
+					async getStatus() {
+						calls.push(`status:${request.sessionId}`);
+						return {
+							model: { provider: "openai", id: "gpt-test", name: "Test" },
+							effort: "medium",
+							usage: { totalTokens: 123, costUsd: 0.01 },
+						};
+					},
+					async listModels() {
+						calls.push(`models:${request.sessionId}`);
+						return [{ provider: "openai", id: "gpt-test", name: "Test" }];
+					},
+					async listEfforts() {
+						calls.push(`efforts:${request.sessionId}`);
+						return ["low", "medium", "high"];
+					},
+					async setModel(provider, modelId) {
+						calls.push(`model:${request.sessionId}:${provider}/${modelId}`);
+						return { provider, id: modelId, name: modelId };
+					},
+					async setEffort(level) {
+						calls.push(`effort:${request.sessionId}:${level}`);
+						throw new Error("private Pi detail");
+					},
+				},
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		}).harness;
+		const store = await SqliteSessionStore.open(state);
+		const manager = new SessionManager(store, [harness]);
+		const sessionA = await manager.create({
+			id: "control-a",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const sessionB = await manager.create({
+			id: "control-b",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		const change = await manager.setModel(
+			sessionA.id,
+			"openai",
+			"gpt-next",
+			"high",
+		);
+		expect(change).toEqual({
+			model: { provider: "openai", id: "gpt-next", name: "gpt-next" },
+			effort: "high",
+			effortConfirmed: false,
+		});
+		expect(calls).toEqual([
+			"model:control-a:openai/gpt-next",
+			"effort:control-a:high",
+		]);
+		const status = await manager.getSessionStatus(sessionA.id);
+		expect(status.live?.usage).toEqual({ totalTokens: 123, costUsd: 0.01 });
+		expect((await manager.get(sessionA.id)).cwd).toBe(os.homedir());
+		await manager.stop(sessionA.id);
+		const stopped = await manager.getSessionStatus(sessionA.id);
+		expect(stopped.live).toBeUndefined();
+		expect(stopped.session).not.toHaveProperty("model");
+		await manager.stop(sessionB.id);
+		store.close();
+	});
+
+	it("enforces each declared model and effort capability before calling controls", async () => {
+		const controlCapabilities = [
+			"harness.model.list",
+			"harness.model.set",
+			"harness.effort.list",
+			"harness.effort.set",
+		] as const;
+		const cases: {
+			missing: (typeof controlCapabilities)[number];
+			run(manager: SessionManager, id: SessionId): Promise<unknown>;
+		}[] = [
+			{
+				missing: "harness.model.list",
+				run: (manager, id) => manager.listModels(id),
+			},
+			{
+				missing: "harness.model.set",
+				run: (manager, id) => manager.setModel(id, "openai", "gpt-next"),
+			},
+			{
+				missing: "harness.effort.list",
+				run: (manager, id) => manager.listEfforts(id),
+			},
+			{
+				missing: "harness.effort.set",
+				run: (manager, id) => manager.setEffort(id, "high"),
+			},
+		];
+		for (const [index, testCase] of cases.entries()) {
+			const calls: string[] = [];
+			const capabilities = [
+				"harness.launch",
+				"harness.stop",
+				...controlCapabilities.filter(
+					(capability) => capability !== testCase.missing,
+				),
+			] as HarnessAdapter["descriptor"]["capabilities"];
+			const harness = harnessPort({
+				capabilities,
+				launch: async () => ({
+					processId: "capability-test" as never,
+					exit: new Promise(() => {}),
+					events: (async function* () {})(),
+					control: {
+						async getSelection() {
+							calls.push("getSelection");
+							return {};
+						},
+						async getStatus() {
+							calls.push("getStatus");
+							return {};
+						},
+						async listModels() {
+							calls.push("listModels");
+							return [];
+						},
+						async listEfforts() {
+							calls.push("listEfforts");
+							return [];
+						},
+						async setModel(provider, id) {
+							calls.push("setModel");
+							return { provider, id, name: id };
+						},
+						async setEffort() {
+							calls.push("setEffort");
+						},
+					},
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				}),
+			}).harness;
+			const store = await SqliteSessionStore.open(await temporaryDirectory());
+			const manager = new SessionManager(store, [harness]);
+			const session = await manager.create({
+				id: `missing-control-${index}`,
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			expect((await manager.getSessionStatus(session.id)).live).toBeUndefined();
+			await expect(testCase.run(manager, session.id)).rejects.toMatchObject({
+				code: "UNSUPPORTED_CAPABILITY",
+				capability: testCase.missing,
+			});
+			expect(calls).toEqual([]);
+			await manager.stop(session.id);
+			store.close();
+		}
 	});
 
 	it("routes cancellation by session and accepted input ID", async () => {

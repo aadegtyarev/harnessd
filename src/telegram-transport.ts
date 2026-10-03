@@ -3,6 +3,11 @@ import { open, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { Bot } from "grammy";
 import type {
+	HarnessEffortCatalog,
+	HarnessModelCatalog,
+	HarnessModelChangeResult,
+	HarnessModelInfo,
+	HarnessSessionStatus,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventSubscription,
@@ -26,6 +31,22 @@ const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
+const TELEGRAM_COMMANDS = [
+	{ command: "help", description: "Show available commands." },
+	{ command: "sessions", description: "List saved sessions." },
+	{ command: "new", description: "Create a session, optionally in a folder." },
+	{ command: "use", description: "Select a session by ID." },
+	{ command: "inspect", description: "Show a session's details." },
+	{ command: "status", description: "Show the selected session's status." },
+	{ command: "model", description: "List or select a model." },
+	{ command: "effort", description: "List or set model effort." },
+	{ command: "stop", description: "Stop a session." },
+	{ command: "delete", description: "Delete a stopped session record." },
+	{
+		command: "cancel",
+		description: "Cancel an input in the selected session.",
+	},
+] as const;
 
 type UpdateContext = {
 	from?: { id: number };
@@ -38,6 +59,14 @@ type TelegramBot = {
 			chatId: number,
 			text: string,
 			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
+		setMyCommands(
+			commands: readonly {
+				readonly command: string;
+				readonly description: string;
+			}[],
+			other?: { readonly scope?: { readonly type: "all_private_chats" } },
 			signal?: AbortSignal,
 		): Promise<unknown>;
 	};
@@ -192,8 +221,59 @@ function isCode(error: unknown, code: string): boolean {
 		error.code === code
 	);
 }
+function escapeHtml(value: string): string {
+	return value.replace(/[&<>"']/g, (character) => {
+		switch (character) {
+			case "&":
+				return "&amp;";
+			case "<":
+				return "&lt;";
+			case ">":
+				return "&gt;";
+			case '"':
+				return "&quot;";
+			default:
+				return "&#39;";
+		}
+	});
+}
 function formatSession(session: SessionSummary): string {
-	return `${session.id} · ${session.status} · ${session.cwd}`;
+	const cwd = [...oneLine(session.cwd)];
+	const displayCwd =
+		cwd.length > 600 ? `${cwd.slice(0, 599).join("")}…` : cwd.join("");
+	return `<code>${escapeHtml(session.id)}</code> · ${escapeHtml(session.status)}\n${escapeHtml(displayCwd)}`;
+}
+function oneLine(value: string): string {
+	return [...value]
+		.map((character) => {
+			const code = character.codePointAt(0) ?? 0;
+			return code < 32 || code === 127 ? " " : character;
+		})
+		.join("")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+function modelId(model: HarnessModelInfo): string {
+	return `${oneLine(model.provider)}/${oneLine(model.id)}`;
+}
+function formatCount(value: number): string {
+	return Math.round(value).toLocaleString("en-US");
+}
+function formatStatus(status: HarnessSessionStatus): string {
+	const { session, live } = status;
+	const lines = [
+		`Folder: ${oneLine(session.cwd)}`,
+		`Session: ${session.status}`,
+		`Model: ${live?.model ? modelId(live.model) : "unavailable"}`,
+		`Effort: ${live?.effort ? oneLine(live.effort) : "unavailable"}`,
+	];
+	const usage = live?.usage;
+	lines.push(
+		`Tokens: ${usage?.totalTokens !== undefined ? formatCount(usage.totalTokens) : "unavailable"}`,
+		`Estimated cost: ${usage?.costUsd !== undefined ? `~$${usage.costUsd.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}` : "unavailable"}`,
+	);
+	if (!live) lines.push("Live Pi data: unavailable for this session.");
+	return lines.join("\n");
 }
 function chunks(text: string): string[] {
 	return splitChunks(text, TELEGRAM_LIMIT);
@@ -252,6 +332,30 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 			},
 		);
 	});
+}
+
+function parseNewWorkingDirectory(
+	value: string | undefined,
+	defaultCwd: string,
+):
+	| { readonly ok: true; readonly cwd: string }
+	| { readonly ok: false; readonly error: string } {
+	const candidate = value?.trim();
+	if (!candidate) return { ok: true, cwd: defaultCwd };
+	const quote = candidate[0];
+	if (quote === '"' || quote === "'") {
+		if (candidate.length < 2 || candidate.at(-1) !== quote)
+			return {
+				ok: false,
+				error:
+					"Use matching quotes around the entire path, or remove the quotes.",
+			};
+		const cwd = candidate.slice(1, -1);
+		if (!cwd)
+			return { ok: false, error: "Working directory path cannot be empty." };
+		return { ok: true, cwd };
+	}
+	return { ok: true, cwd: candidate };
 }
 
 export class TelegramTransportAdapter implements TransportAdapter {
@@ -327,6 +431,18 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					);
 				const initialized = await this.initializationPromise;
 				if (!initialized.ok) throw new Error("Telegram initialization failed");
+				try {
+					await withDeadline(
+						this.bot.api.setMyCommands(
+							TELEGRAM_COMMANDS,
+							{ scope: { type: "all_private_chats" } },
+							this.initializationAbort.signal,
+						),
+						SEND_TIMEOUT_MS,
+					);
+				} catch {
+					console.error("harnessd: Telegram command menu registration failed");
+				}
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortInitialization);
 			}
@@ -458,7 +574,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				);
 			}
 		} catch {
-			await this.sendDirect(chatId, "Operation failed.");
+			await this.sendDirect(
+				chatId,
+				"Request failed unexpectedly. Check the harnessd service journal.",
+			);
 		}
 	}
 
@@ -469,11 +588,15 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	): Promise<void> {
 		const newCommand = /^\/new(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (newCommand) {
-			const cwd = newCommand[1]?.trim() || this.options.defaultCwd;
+			const parsedCwd = parseNewWorkingDirectory(
+				newCommand[1],
+				this.options.defaultCwd,
+			);
+			if (!parsedCwd.ok) return this.sendDirect(chatId, parsedCwd.error);
 			const result = await this.request(sender, {
 				kind: "create",
 				harnessId: "pi-rpc" as never,
-				cwd,
+				cwd: parsedCwd.cwd,
 			});
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
@@ -485,17 +608,108 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (name === "/help" && args.length === 0)
 			return this.sendDirect(
 				chatId,
-				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/stop [sessionId]\n/cancel <inputId>\n/help",
+				"/sessions\n/new [cwd]\n/use <sessionId>\n/inspect [sessionId]\n/status\n/model [provider/modelId [effort]]\n/effort [level]\n/stop [sessionId]\n/delete <sessionId>\n/cancel <inputId>\n/help",
 			);
+		if (name === "/status" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "session_status",
+				sessionId,
+			});
+			return this.sendDirect(
+				chatId,
+				result.ok
+					? formatStatus(result.value as HarnessSessionStatus)
+					: result.error.message,
+			);
+		}
+		if (name === "/model" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "model_list",
+				sessionId,
+			});
+			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			const catalog = result.value as HarnessModelCatalog;
+			const choices = catalog.models.map((model) => {
+				const label = modelId(model);
+				const name = oneLine(model.name);
+				return `• ${label}${name && name !== model.id ? ` — ${name}` : ""}${catalog.current && model.provider === catalog.current.provider && model.id === catalog.current.id ? " (current)" : ""}`;
+			});
+			return this.sendDirect(
+				chatId,
+				choices.length ? choices.join("\n") : "No models available.",
+			);
+		}
+		if (name === "/model" && args.length >= 1 && args.length <= 2) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const slash = args[0].indexOf("/");
+			if (slash <= 0 || slash === args[0].length - 1)
+				return this.sendDirect(
+					chatId,
+					"Usage: /model <provider/modelId> [effort]",
+				);
+			const effort = args[1];
+			const result = await this.request(sender, {
+				kind: "model_set",
+				sessionId,
+				provider: args[0].slice(0, slash),
+				modelId: args[0].slice(slash + 1),
+				...(effort !== undefined ? { effort } : {}),
+			});
+			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			const change = result.value as HarnessModelChangeResult;
+			if (change.effortConfirmed === false)
+				return this.sendDirect(
+					chatId,
+					`Switched to ${modelId(change.model)}, but Pi did not confirm effort ${oneLine(effort ?? "")}. Check /status before retrying.`,
+				);
+			return this.sendDirect(
+				chatId,
+				effort === undefined
+					? `Switched to ${modelId(change.model)}.`
+					: `Switched to ${modelId(change.model)}; effort set to ${oneLine(effort)}.`,
+			);
+		}
+		if (name === "/effort" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "effort_list",
+				sessionId,
+			});
+			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			const catalog = result.value as HarnessEffortCatalog;
+			return this.sendDirect(
+				chatId,
+				`Effort levels${catalog.current ? ` (current: ${oneLine(catalog.current)})` : ""}: ${catalog.levels.map(oneLine).join(", ") || "unavailable"}`,
+			);
+		}
+		if (name === "/effort" && args.length === 1) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			const result = await this.request(sender, {
+				kind: "effort_set",
+				sessionId,
+				effort: args[0],
+			});
+			return this.sendDirect(
+				chatId,
+				result.ok ? `Effort set to ${oneLine(args[0])}.` : result.error.message,
+			);
+		}
 		if (name === "/sessions" && args.length === 0) {
 			const result = await this.request(sender, { kind: "list" });
-			return this.sendDirect(
+			return this.sendDirectHtml(
 				chatId,
 				result.ok
 					? (result.value as readonly SessionSummary[])
 							.map(formatSession)
-							.join("\n") || "No sessions."
-					: result.error.message,
+							.join("\n\n") || "No sessions."
+					: escapeHtml(result.error.message),
 			);
 		}
 		if (name === "/use" && args.length === 1) {
@@ -519,11 +733,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 					"Provide a session ID or select a session first.",
 				);
 			const result = await this.request(sender, { kind: "inspect", sessionId });
-			return this.sendDirect(
+			return this.sendDirectHtml(
 				chatId,
 				result.ok
 					? formatSession(result.value as SessionSummary)
-					: result.error.message,
+					: escapeHtml(result.error.message),
 			);
 		}
 		if (name === "/stop" && args.length <= 1) {
@@ -540,6 +754,23 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			return this.sendDirect(
 				chatId,
 				result.ok ? `Session ${sessionId} stopped.` : result.error.message,
+			);
+		}
+		if (name === "/delete") {
+			if (args.length !== 1)
+				return this.sendDirect(chatId, "Usage: /delete <sessionId>");
+			const sessionId = args[0] as SessionId;
+			const result = await this.request(sender, { kind: "delete", sessionId });
+			if (result.ok) {
+				for (const [selectedChat, selectedId] of this.selected) {
+					if (selectedId === sessionId) this.selected.delete(selectedChat);
+				}
+			}
+			return this.sendDirect(
+				chatId,
+				result.ok
+					? `Deleted stopped session ${sessionId} from harnessd.`
+					: result.error.message,
 			);
 		}
 		if (name === "/cancel" && args.length === 1) {
@@ -575,6 +806,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	private async sendDirect(chatId: number, text: string): Promise<void> {
 		for (const chunk of chunks(text || " "))
 			await this.sendWithDeadline(chatId, chunk);
+	}
+
+	private async sendDirectHtml(chatId: number, text: string): Promise<void> {
+		for (const chunk of chunks(text || " "))
+			await this.sendWithDeadline(chatId, chunk, { parse_mode: "HTML" });
 	}
 
 	private onEvent(event: HarnessEvent): void {
@@ -770,20 +1006,28 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 	}
 
-	private sendWithDeadline(chatId: number, text: string): Promise<boolean> {
+	private sendWithDeadline(
+		chatId: number,
+		text: string,
+		other?: unknown,
+	): Promise<boolean> {
 		if (this.stopping) return Promise.resolve(false);
-		const sending = this.performSend(chatId, text);
+		const sending = this.performSend(chatId, text, other);
 		this.activeSends.add(sending);
 		void sending.finally(() => this.activeSends.delete(sending));
 		return sending;
 	}
 
-	private async performSend(chatId: number, text: string): Promise<boolean> {
+	private async performSend(
+		chatId: number,
+		text: string,
+		other?: unknown,
+	): Promise<boolean> {
 		const controller = new AbortController();
 		this.pendingSends.add(controller);
 		try {
 			await withDeadline(
-				this.bot.api.sendMessage(chatId, text, undefined, controller.signal),
+				this.bot.api.sendMessage(chatId, text, other, controller.signal),
 				SEND_TIMEOUT_MS,
 			);
 			return true;

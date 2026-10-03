@@ -20,7 +20,10 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
-import { UncertainInputDeliveryError } from "../src/harness/pi-rpc-harness.js";
+import {
+	PiControlError,
+	UncertainInputDeliveryError,
+} from "../src/harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "../src/process/node-process-provider.js";
 
 const dirs: string[] = [];
@@ -100,6 +103,114 @@ describe("application runtime", () => {
 			await runtime.close();
 		},
 	);
+
+	it("routes delete through the runtime and returns safe stopped-session errors", async () => {
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [],
+			harnesses: [
+				{
+					descriptor: {
+						id: "delete-test" as never,
+						capabilities: ["harness.launch", "harness.stop"],
+					},
+					async launch() {
+						return {
+							processId: "delete-test-process" as never,
+							exit: new Promise(() => {}),
+							events: (async function* () {})(),
+							async send() {},
+							async cancel() {},
+							async shutdown() {},
+						};
+					},
+				},
+			],
+		});
+		const created = await runtime.dispatch({
+			requestId: "create-before-delete",
+			principalId: "test",
+			kind: "create",
+			harnessId: "delete-test" as never,
+			cwd: os.tmpdir(),
+		});
+		const session = sessionFrom(created);
+		const activeDelete = await runtime.dispatch({
+			requestId: "delete-active",
+			principalId: "test",
+			kind: "delete",
+			sessionId: session.id,
+		});
+		expect(activeDelete).toMatchObject({
+			ok: false,
+			error: {
+				code: "SESSION_NOT_STOPPED",
+				message: "Stop the session before deleting it with /stop.",
+			},
+		});
+		await runtime.dispatch({
+			requestId: "stop-before-delete",
+			principalId: "test",
+			kind: "stop",
+			sessionId: session.id,
+		});
+		expect(
+			await runtime.dispatch({
+				requestId: "delete-stopped",
+				principalId: "test",
+				kind: "delete",
+				sessionId: session.id,
+			}),
+		).toMatchObject({
+			requestId: "delete-stopped",
+			ok: true,
+			value: undefined,
+		});
+		const listed = await runtime.dispatch({
+			requestId: "list-after-delete",
+			principalId: "test",
+			kind: "list",
+		});
+		expect(listed).toMatchObject({ ok: true, value: [] });
+		await runtime.close();
+	});
+
+	it("returns actionable Pi startup errors and logs only a safe error code", async () => {
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const launchError = Object.assign(new Error("secret path detail"), {
+			code: "ENOENT",
+		});
+		vi.spyOn(NodeProcessProvider.prototype, "launch").mockRejectedValue(
+			launchError,
+		);
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/private/pi",
+			stateDirectory: await state(),
+			transports: [],
+		});
+		const result = await runtime.dispatch({
+			requestId: "create-pi-startup-failure",
+			principalId: "test",
+			kind: "create",
+			harnessId: "pi-rpc" as never,
+			cwd: os.tmpdir(),
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			error: {
+				code: "PI_EXECUTABLE_NOT_FOUND",
+				message: "Pi CLI was not found; check HARNESSD_PI_EXECUTABLE.",
+			},
+		});
+		expect(journal).toHaveBeenCalledWith(
+			"harnessd: Pi startup failed (PI_EXECUTABLE_NOT_FOUND)",
+		);
+		expect(journal).not.toHaveBeenCalledWith(
+			expect.stringContaining("secret path detail"),
+		);
+		await runtime.close();
+	});
 
 	it("routes an injected provider to the default Pi harness", async () => {
 		const store = await SqliteSessionStore.open(await state());
@@ -243,16 +354,55 @@ describe("application runtime", () => {
 	it("returns correlated typed results and rejects dispatch once closing starts", async () => {
 		let dispatch!: RuntimeDispatch;
 		const sent: string[] = [];
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const harness: HarnessAdapter = {
 			descriptor: {
 				id: "mock" as never,
-				capabilities: ["harness.launch", "harness.stop", "input.submit"],
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.session.status",
+					"harness.model.list",
+					"harness.model.set",
+					"harness.effort.list",
+					"harness.effort.set",
+					"input.submit",
+				],
 			},
 			async launch() {
 				return {
 					processId: "proc" as never,
 					exit: new Promise(() => {}),
 					events: (async function* () {})(),
+					control: {
+						async getSelection() {
+							return {
+								model: { provider: "openai", id: "gpt-test", name: "Test" },
+								effort: "medium",
+							};
+						},
+						async getStatus() {
+							return {
+								model: { provider: "openai", id: "gpt-test", name: "Test" },
+								effort: "medium",
+								usage: { totalTokens: 321, costUsd: 0.125 },
+							};
+						},
+						async listModels() {
+							return [{ provider: "openai", id: "gpt-test", name: "Test" }];
+						},
+						async listEfforts() {
+							return ["low", "medium", "high"];
+						},
+						async setModel(provider, modelId) {
+							return { provider, id: modelId, name: modelId };
+						},
+						async setEffort() {
+							throw new PiControlError("EFFORT_NOT_SUPPORTED", {
+								cause: new Error("sensitive provider response"),
+							});
+						},
+					},
 					async send(input) {
 						if (input.text === "uncertain private prompt")
 							throw new UncertainInputDeliveryError(input.id);
@@ -327,6 +477,87 @@ describe("application runtime", () => {
 			ok: true,
 			value: created.value,
 		});
+		const liveStatus = await dispatch({
+			requestId: "request-status",
+			principalId: "operator",
+			kind: "session_status",
+			sessionId: created.value.id,
+		});
+		expect(liveStatus).toMatchObject({
+			ok: true,
+			value: {
+				session: { id: created.value.id },
+				live: {
+					model: { provider: "openai", id: "gpt-test" },
+					effort: "medium",
+					usage: { totalTokens: 321, costUsd: 0.125 },
+				},
+			},
+		});
+		const models = await dispatch({
+			requestId: "request-model-list",
+			principalId: "operator",
+			kind: "model_list",
+			sessionId: created.value.id,
+		});
+		expect(models).toMatchObject({
+			ok: true,
+			value: {
+				current: { provider: "openai", id: "gpt-test" },
+				models: [{ provider: "openai", id: "gpt-test" }],
+			},
+		});
+		const modelChange = await dispatch({
+			requestId: "request-model-set",
+			principalId: "operator",
+			kind: "model_set",
+			sessionId: created.value.id,
+			provider: "openai",
+			modelId: "gpt-next",
+			effort: "high",
+		});
+		expect(modelChange).toMatchObject({
+			ok: true,
+			value: {
+				model: { id: "gpt-next" },
+				effort: "high",
+				effortConfirmed: false,
+			},
+		});
+		const effortLevels = await dispatch({
+			requestId: "request-effort-list",
+			principalId: "operator",
+			kind: "effort_list",
+			sessionId: created.value.id,
+		});
+		expect(effortLevels).toMatchObject({
+			ok: true,
+			value: { current: "medium", levels: ["low", "medium", "high"] },
+		});
+		const effortFailure = await dispatch({
+			requestId: "request-effort-set",
+			principalId: "operator",
+			kind: "effort_set",
+			sessionId: created.value.id,
+			effort: "xhigh",
+		});
+		expect(effortFailure).toMatchObject({
+			ok: false,
+			error: {
+				code: "EFFORT_NOT_SUPPORTED",
+				message:
+					"Effort is not supported by this model; use /effort to see valid levels.",
+			},
+		});
+		expect(JSON.stringify(effortFailure)).not.toContain(
+			"sensitive provider response",
+		);
+		expect(journal).toHaveBeenCalledWith(
+			"harnessd: Pi control failed (EFFORT_NOT_SUPPORTED)",
+		);
+		expect(journal.mock.calls.flat().join(" ")).not.toContain(
+			"sensitive provider response",
+		);
 		const input = await dispatch({
 			requestId: "request-submit",
 			principalId: "operator",

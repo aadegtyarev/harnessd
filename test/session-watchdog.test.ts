@@ -909,6 +909,7 @@ describe("in-process watchdog", () => {
 			create: base.create.bind(base),
 			list: base.list.bind(base),
 			get: base.get.bind(base),
+			delete: base.delete.bind(base),
 			update: base.update.bind(base),
 			async setStatus(id, status) {
 				if (status === "starting" && ++startingWrites === 2)
@@ -975,6 +976,7 @@ describe("in-process watchdog", () => {
 			create: base.create.bind(base),
 			list: base.list.bind(base),
 			get: base.get.bind(base),
+			delete: base.delete.bind(base),
 			update: base.update.bind(base),
 			async setStatus(id, status) {
 				if (rejectStatusWrites)
@@ -1047,6 +1049,7 @@ describe("in-process watchdog", () => {
 				create: base.create.bind(base),
 				list: base.list.bind(base),
 				get: base.get.bind(base),
+				delete: base.delete.bind(base),
 				update: base.update.bind(base),
 				async setStatus(id, status) {
 					if (status === "starting" && ++startingWrites === 2) {
@@ -1380,6 +1383,7 @@ describe("in-process watchdog", () => {
 			create: base.create.bind(base),
 			list: base.list.bind(base),
 			get: base.get.bind(base),
+			delete: base.delete.bind(base),
 			update: base.update.bind(base),
 			async setStatus(
 				id: SessionId,

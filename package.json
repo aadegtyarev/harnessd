@@ -9,14 +9,24 @@
 	"bin": {
 		"harnessd": "./dist/src/cli.js"
 	},
+	"files": [
+		"dist/src/**",
+		"README.md",
+		"CHANGELOG.md",
+		"LICENSE",
+		"docs/architecture.md",
+		"docs/contracts/surfaces/*.md"
+	],
 	"scripts": {
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc --noEmit -p tsconfig.json",
 		"test": "vitest run --exclude \"**/dist/**\"",
 		"test:watch": "vitest --exclude \"**/dist/**\"",
-		"lint": "biome check src test package.json tsconfig.json",
-		"format": "biome format --write src test package.json tsconfig.json",
-		"format:check": "biome format src test package.json tsconfig.json"
+		"lint": "biome check src test scripts package.json tsconfig.json",
+		"format": "biome format --write src test scripts package.json tsconfig.json",
+		"format:check": "biome format src test scripts package.json tsconfig.json",
+		"version:check": "node scripts/check-version.mjs",
+		"prepare": "npm run build"
 	},
 	"dependencies": {
 		"better-sqlite3": "^12.4.1",

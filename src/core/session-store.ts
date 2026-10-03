@@ -14,6 +14,7 @@ export interface SessionStore {
 	create(session: SessionSummary): Promise<void>;
 	list(): Promise<readonly SessionSummary[]>;
 	get(id: SessionId): Promise<SessionSummary | undefined>;
+	delete(id: SessionId): Promise<boolean>;
 	setStatus(id: SessionId, status: SessionStatus): Promise<void>;
 	update(session: SessionSummary): Promise<void>;
 }
@@ -174,6 +175,19 @@ export class SqliteSessionStore implements SessionStore {
 			return row ? fromRow(row) : undefined;
 		} catch (error) {
 			throw new SessionStoreError(`Could not load session '${id}'`, {
+				cause: error,
+			});
+		}
+	}
+
+	async delete(id: SessionId): Promise<boolean> {
+		try {
+			const result = this.database
+				.prepare("DELETE FROM sessions WHERE id = ?")
+				.run(id);
+			return result.changes === 1;
+		} catch (error) {
+			throw new SessionStoreError(`Could not delete session '${id}'`, {
 				cause: error,
 			});
 		}

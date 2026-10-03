@@ -1,14 +1,39 @@
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { HELP, main } from "../src/cli.js";
+import { HELP, isDirectInvocation, main } from "../src/cli.js";
+
+const EMPTY_CWD = path.join(os.tmpdir(), `harnessd-cli-${randomUUID()}`);
+
+function runMain(options: Parameters<typeof main>[0] = {}): Promise<void> {
+	return main({ cwd: EMPTY_CWD, ...options });
+}
 
 function transportOptions(options: unknown): {
 	signal: AbortSignal;
 	token: string;
+	defaultCwd: string;
 	onFatal: () => void;
 } {
 	const transport = (options as { transports: readonly unknown[] })
 		.transports[0] as {
-		options: { signal: AbortSignal; token: string; onFatal: () => void };
+		options: {
+			signal: AbortSignal;
+			token: string;
+			defaultCwd: string;
+			onFatal: () => void;
+		};
 	};
 	return transport.options;
 }
@@ -16,20 +41,198 @@ function transportOptions(options: unknown): {
 describe("CLI", () => {
 	it("shows trusted direct and isolated availability in help", async () => {
 		const write = vi.fn();
-		await main({ argv: ["--help"], env: {}, write });
+		await runMain({ argv: ["--help"], env: {}, write });
 		expect(write).toHaveBeenCalledWith(HELP);
 		expect(HELP).toContain("HARNESSD_EXECUTION_MODE");
 		expect(HELP).toContain("direct (default, trusted; cwd is not a sandbox)");
 		expect(HELP).toContain("isolated (unavailable in this CLI");
+		expect(HELP).toContain("HARNESSD_DEFAULT_CWD");
+		expect(HELP).toContain("harnessd service install");
+	});
+
+	it("recognizes direct invocation through an npm-style symlink", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-bin-"));
+		const entryPath = path.join(cwd, "dist", "cli.js");
+		const binPath = path.join(cwd, "node_modules", ".bin", "harnessd");
+		await mkdir(path.dirname(binPath), { recursive: true });
+		await mkdir(path.dirname(entryPath), { recursive: true });
+		await writeFile(entryPath, "");
+		await symlink(entryPath, binPath);
+		try {
+			expect(isDirectInvocation(pathToFileURL(entryPath).href, binPath)).toBe(
+				true,
+			);
+			expect(isDirectInvocation(pathToFileURL(entryPath).href, undefined)).toBe(
+				false,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("prints help through both direct and npm-style symlink invocations", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-smoke-"));
+		try {
+			const root = process.cwd();
+			const outputDir = path.join(cwd, "dist");
+			const compiledCli = path.join(outputDir, "src", "cli.js");
+			const binDir = path.join(cwd, "consumer", "node_modules", ".bin");
+			const binPath = path.join(binDir, "harnessd");
+			await mkdir(binDir, { recursive: true });
+			await writeFile(path.join(cwd, "package.json"), '{"type":"module"}');
+			await symlink(
+				path.join(root, "node_modules"),
+				path.join(cwd, "node_modules"),
+				"dir",
+			);
+			const compile = spawnSync(
+				process.execPath,
+				[
+					path.join(root, "node_modules", "typescript", "bin", "tsc"),
+					"--target",
+					"ES2023",
+					"--module",
+					"NodeNext",
+					"--moduleResolution",
+					"NodeNext",
+					"--rootDir",
+					".",
+					"--outDir",
+					outputDir,
+					"--strict",
+					"--esModuleInterop",
+					"--skipLibCheck",
+					"src/cli.ts",
+				],
+				{ cwd: root, encoding: "utf8" },
+			);
+			expect(compile.status, compile.stderr).toBe(0);
+			await chmod(compiledCli, 0o755);
+			await symlink(compiledCli, binPath);
+			const nodeHelp = spawnSync(process.execPath, [compiledCli, "--help"], {
+				cwd,
+				encoding: "utf8",
+				env: {},
+			});
+			const symlinkHelp = spawnSync(binPath, ["--help"], {
+				cwd,
+				encoding: "utf8",
+				env: {
+					PATH: [path.dirname(process.execPath), "/usr/bin", "/bin"].join(
+						path.delimiter,
+					),
+				},
+			});
+			for (const result of [nodeHelp, symlinkHelp]) {
+				expect(result.status, result.stderr).toBe(0);
+				expect(result.stdout).toContain(
+					"harnessd - locally supervised Pi sessions",
+				);
+			}
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("loads .env before validating config and uses its default cwd", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-env-"));
+		const close = vi.fn(async () => {});
+		let runtimeOptions: unknown;
+		const runtimeStart = vi.fn(async (options: unknown) => {
+			runtimeOptions = options;
+			return { close } as never;
+		});
+		await writeFile(
+			path.join(cwd, ".env"),
+			"HARNESSD_TELEGRAM_BOT_TOKEN=file-token\nHARNESSD_TELEGRAM_ALLOWED_USER_IDS=42\nHARNESSD_DEFAULT_CWD=/workspace\n",
+		);
+		try {
+			const running = runMain({
+				argv: [],
+				cwd,
+				env: { HARNESSD_TELEGRAM_BOT_TOKEN: "shell-token" },
+				runtimeStart: runtimeStart as never,
+			});
+			await vi.waitFor(() => expect(runtimeStart).toHaveBeenCalledOnce());
+			expect(transportOptions(runtimeOptions).token).toBe("shell-token");
+			expect(transportOptions(runtimeOptions).defaultCwd).toBe("/workspace");
+			process.emit("SIGINT");
+			await running;
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("dispatches service commands with configuration from the install directory", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-service-cli-"));
+		await writeFile(
+			path.join(cwd, ".env"),
+			"HARNESSD_TELEGRAM_BOT_TOKEN=service-token\nHARNESSD_TELEGRAM_ALLOWED_USER_IDS=42\nHOME=/file-home\nXDG_CONFIG_HOME=/file-config\n",
+		);
+		const serviceManager = vi.fn(async () => {});
+		const env: NodeJS.ProcessEnv = {};
+		try {
+			await runMain({
+				argv: ["service", "install"],
+				cwd,
+				env,
+				serviceManager: serviceManager as never,
+			});
+			expect(serviceManager).toHaveBeenCalledWith(
+				"install",
+				expect.objectContaining({
+					cwd,
+					env,
+				}),
+			);
+			expect(env).toEqual({});
+			await runMain({
+				argv: ["service", "uninstall"],
+				cwd,
+				env: {},
+				serviceManager: serviceManager as never,
+			});
+			expect(serviceManager).toHaveBeenNthCalledWith(
+				2,
+				"uninstall",
+				expect.anything(),
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("requires Telegram settings in .env before installing a user service", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-service-cli-"));
+		const serviceManager = vi.fn(async () => {});
+		try {
+			await expect(
+				runMain({
+					argv: ["service", "install"],
+					cwd,
+					env: {
+						HARNESSD_TELEGRAM_BOT_TOKEN: "shell-token",
+						HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+					},
+					serviceManager: serviceManager as never,
+				}),
+			).rejects.toThrow(
+				"HARNESSD_SERVICE_DOTENV_MUST_CONTAIN_TELEGRAM_CONFIGURATION",
+			);
+			expect(serviceManager).not.toHaveBeenCalled();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it.each([undefined, "direct"] as const)(
 		"selects direct execution by default or explicitly (%s)",
+
 		async (mode) => {
 			const runtimeStart = vi.fn(
 				async () => ({ close: async () => {} }) as never,
 			);
-			const running = main({
+			const running = runMain({
 				argv: [],
 				env: {
 					HARNESSD_TELEGRAM_BOT_TOKEN: "token",
@@ -53,7 +256,7 @@ describe("CLI", () => {
 		for (const mode of ["isolated", "invalid-secret-value"]) {
 			const writeError = vi.fn();
 			await expect(
-				main({
+				runMain({
 					argv: [],
 					env: {
 						HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
@@ -75,10 +278,10 @@ describe("CLI", () => {
 
 	it("validates required environment without exposing credentials", async () => {
 		await expect(
-			main({ argv: [], env: { HARNESSD_TELEGRAM_BOT_TOKEN: "secret" } }),
+			runMain({ argv: [], env: { HARNESSD_TELEGRAM_BOT_TOKEN: "secret" } }),
 		).rejects.toThrow("HARNESSD_TELEGRAM_ALLOWED_USER_IDS");
 		await expect(
-			main({
+			runMain({
 				argv: [],
 				env: {
 					HARNESSD_TELEGRAM_BOT_TOKEN: "secret",
@@ -97,7 +300,7 @@ describe("CLI", () => {
 				runtimeOptions = options;
 				return { close } as never;
 			});
-			const running = main({
+			const running = runMain({
 				argv: [],
 				env: {
 					HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
@@ -120,6 +323,7 @@ describe("CLI", () => {
 			});
 			expect(runtimeOptions).not.toHaveProperty("piOptions");
 			expect(transportOptions(runtimeOptions).token).toBe("secret-token");
+			expect(transportOptions(runtimeOptions).defaultCwd).toBe("/work");
 			expect(
 				JSON.stringify({
 					piExecutable: (runtimeOptions as { piExecutable: string })
@@ -145,7 +349,7 @@ describe("CLI", () => {
 			).transports[0];
 			return { close } as never;
 		});
-		const running = main({
+		const running = runMain({
 			argv: [],
 			env: {
 				HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
@@ -175,7 +379,7 @@ describe("CLI", () => {
 				);
 			});
 		});
-		const running = main({
+		const running = runMain({
 			argv: [],
 			env: {
 				HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
