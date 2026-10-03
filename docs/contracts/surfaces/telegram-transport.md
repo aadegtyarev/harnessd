@@ -40,7 +40,7 @@
 ## Incoming files and typing
 
 - Authorized private-chat documents and photos are downloaded with a 20 MiB bound, written using collision-resistant names and private file permissions to the selected session's canonical working directory, and submitted with a local path and any caption as untrusted prompt text. Photos are also passed to Pi as image content. Incomplete temporary files are removed; unsupported, missing-selection, oversized, download, and write failures receive fixed actionable replies without submitting partial content.
-- While Pi reports an agent turn active, the transport refreshes the Telegram `typing` action for authorized chats currently selecting that session. It stops on settlement, error, selection change, or transport shutdown.
+- While Pi reports an agent turn active, the transport refreshes the Telegram `typing` action for authorized chats currently selecting that session. It stops for chats on deselection and on turn settlement, error, or transport shutdown. If a chat reselects a session while its turn remains active, typing resumes for that chat.
 
 ## Non-goals and related contracts
 

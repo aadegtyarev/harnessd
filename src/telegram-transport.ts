@@ -659,6 +659,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		ReturnType<typeof setInterval>
 	>();
 	private readonly typingChats = new Map<SessionId, Set<number>>();
+	private readonly activeTypingSessions = new Set<SessionId>();
 	private readonly sessionCwds = new Map<SessionId, string>();
 	private panelStore?: TelegramPanelStore;
 	private readonly pendingSends = new Set<AbortController>();
@@ -824,6 +825,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		for (const timer of this.typingTimers.values()) clearInterval(timer);
 		this.typingTimers.clear();
 		this.typingChats.clear();
+		this.activeTypingSessions.clear();
 		for (const queue of this.queues.values()) {
 			if (queue.drainTimer) clearTimeout(queue.drainTimer);
 			queue.messages.length = 0;
@@ -862,7 +864,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		this.selected.set(chatId, sessionId);
 		if (previous && previous !== sessionId && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
-		if (this.typingTimers.has(sessionId)) this.refreshTyping(sessionId);
+		if (this.activeTypingSessions.has(sessionId)) this.startTyping(sessionId);
 	}
 
 	private clearSelected(chatId: number): void {
@@ -2497,10 +2499,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	}
 
 	private startTyping(sessionId: SessionId): void {
+		this.activeTypingSessions.add(sessionId);
 		if (![...this.selected.values()].includes(sessionId)) return;
-		this.stopTyping(sessionId);
-		const send = () => this.refreshTyping(sessionId);
-		this.typingTimers.set(sessionId, setInterval(send, TYPING_REFRESH_MS));
+		if (!this.typingTimers.has(sessionId)) {
+			const send = () => this.refreshTyping(sessionId);
+			this.typingTimers.set(sessionId, setInterval(send, TYPING_REFRESH_MS));
+		}
 		this.refreshTyping(sessionId);
 	}
 
@@ -2516,10 +2520,15 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			void this.telegramCall((signal) =>
 				this.bot.api.sendChatAction(chatId, "typing", {}, signal),
 			);
-		if (!chats.size) this.stopTyping(sessionId);
+		if (!chats.size) this.clearTypingTimer(sessionId);
 	}
 
 	private stopTyping(sessionId: SessionId): void {
+		this.activeTypingSessions.delete(sessionId);
+		this.clearTypingTimer(sessionId);
+	}
+
+	private clearTypingTimer(sessionId: SessionId): void {
 		const timer = this.typingTimers.get(sessionId);
 		if (timer) clearInterval(timer);
 		this.typingTimers.delete(sessionId);

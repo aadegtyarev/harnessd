@@ -1413,6 +1413,26 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("restarts typing when a chat reselects a session with an active turn", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1),
+		);
+
+		await bot.update(42, "/use other");
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(2),
+		);
+
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+	});
+
 	it("sends one accepted-input confirmation and marks only the footer ID monospace", async () => {
 		const bot = new MockBot();
 		let emitEvent!: (event: HarnessEvent) => void;
