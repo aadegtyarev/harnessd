@@ -7,6 +7,7 @@ export type ProcessId = Brand<string, "ProcessId">;
 
 export interface SessionSummary {
 	readonly id: SessionId;
+	readonly name?: string;
 	readonly harnessId: AdapterId;
 	readonly cwd: string;
 	readonly nativeSessionId?: string;

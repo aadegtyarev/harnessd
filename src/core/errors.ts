@@ -2,6 +2,7 @@ export type Capability =
 	| "session.list"
 	| "session.get"
 	| "session.create"
+	| "session.rename"
 	| "session.stop"
 	| "session.resume"
 	| "input.submit"
@@ -67,6 +68,17 @@ export class InvalidWorkingDirectoryError extends Error {
 			options,
 		);
 		this.name = "InvalidWorkingDirectoryError";
+	}
+}
+
+export class InvalidSessionNameError extends Error {
+	readonly code = "INVALID_SESSION_NAME";
+
+	constructor(
+		message = "Session name must be a nonempty single line of at most 64 characters",
+	) {
+		super(message);
+		this.name = "InvalidSessionNameError";
 	}
 }
 

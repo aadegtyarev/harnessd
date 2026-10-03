@@ -4,6 +4,7 @@ import { access, realpath, stat } from "node:fs/promises";
 import {
 	DuplicateAdapterIdError,
 	DuplicateSessionIdError,
+	InvalidSessionNameError,
 	InvalidWorkingDirectoryError,
 	requireCapability,
 	SessionNotFoundError,
@@ -34,6 +35,7 @@ import type {
 export interface CreateSessionRequest {
 	readonly harnessId: AdapterId;
 	readonly cwd: string;
+	readonly name?: string;
 	readonly id?: string;
 }
 
@@ -95,6 +97,13 @@ export class SessionManager {
 		return session;
 	}
 
+	async rename(id: SessionId, name?: string): Promise<SessionSummary> {
+		await this.get(id);
+		const normalizedName = normalizeSessionName(name);
+		await this.store.setName(id, normalizedName);
+		return this.get(id);
+	}
+
 	async delete(id: SessionId): Promise<void> {
 		const session = await this.get(id);
 		if (
@@ -129,6 +138,7 @@ export class SessionManager {
 	private async createSession(
 		request: CreateSessionRequest,
 	): Promise<SessionSummary> {
+		const name = normalizeSessionName(request.name);
 		const id = parseSessionId(request.id ?? randomUUID());
 		if (this.creating.has(id)) throw new DuplicateSessionIdError(id);
 		this.creating.add(id);
@@ -148,6 +158,7 @@ export class SessionManager {
 			const cwd = await validateWorkingDirectory(request.cwd);
 			const starting: SessionSummary = {
 				id,
+				...(name ? { name } : {}),
 				harnessId: request.harnessId,
 				cwd,
 				status: "starting",
@@ -964,6 +975,24 @@ function isUncertainDelivery(error: unknown, inputId: InputId): boolean {
 		candidate.code === "UNCERTAIN_INPUT_DELIVERY" &&
 		candidate.inputId === inputId
 	);
+}
+
+function normalizeSessionName(name?: string): string | undefined {
+	if (name === undefined) return undefined;
+	for (const character of name) {
+		const codePoint = character.codePointAt(0) ?? 0;
+		if (
+			codePoint <= 0x1f ||
+			(codePoint >= 0x7f && codePoint <= 0x9f) ||
+			codePoint === 0x2028 ||
+			codePoint === 0x2029
+		)
+			throw new InvalidSessionNameError();
+	}
+	const normalized = name.trim().replace(/\s+/gu, " ");
+	if (!normalized || [...normalized].length > 64)
+		throw new InvalidSessionNameError();
+	return normalized;
 }
 
 function parseSessionId(value: string): SessionId {

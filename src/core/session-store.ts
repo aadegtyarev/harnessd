@@ -16,6 +16,7 @@ export interface SessionStore {
 	get(id: SessionId): Promise<SessionSummary | undefined>;
 	delete(id: SessionId): Promise<boolean>;
 	setStatus(id: SessionId, status: SessionStatus): Promise<void>;
+	setName(id: SessionId, name?: string): Promise<void>;
 	update(session: SessionSummary): Promise<void>;
 }
 
@@ -116,8 +117,14 @@ export class SqliteSessionStore implements SessionStore {
 				cwd TEXT NOT NULL,
 				native_session_id TEXT,
 				status TEXT NOT NULL CHECK (status IN ('starting', 'running', 'stopped', 'failed', 'uncertain')),
+				name TEXT,
 				created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 			)`);
+			const columns = database.pragma("table_info(sessions)") as {
+				name: string;
+			}[];
+			if (!columns.some((column) => column.name === "name"))
+				database.exec("ALTER TABLE sessions ADD COLUMN name TEXT");
 			return new SqliteSessionStore(stateDirectory, database);
 		} catch (error) {
 			try {
@@ -136,14 +143,15 @@ export class SqliteSessionStore implements SessionStore {
 	async create(session: SessionSummary): Promise<void> {
 		try {
 			this.database
-				.prepare(`INSERT INTO sessions (id, harness_id, cwd, native_session_id, status)
-				VALUES (?, ?, ?, ?, ?)`)
+				.prepare(`INSERT INTO sessions (id, harness_id, cwd, native_session_id, status, name)
+				VALUES (?, ?, ?, ?, ?, ?)`)
 				.run(
 					session.id,
 					session.harnessId,
 					session.cwd,
 					session.nativeSessionId ?? null,
 					session.status,
+					session.name ?? null,
 				);
 		} catch (error) {
 			throw new SessionStoreError(`Could not persist session '${session.id}'`, {
@@ -156,7 +164,7 @@ export class SqliteSessionStore implements SessionStore {
 		try {
 			const rows = this.database
 				.prepare(
-					"SELECT id, harness_id, cwd, native_session_id, status FROM sessions ORDER BY created_at, id",
+					"SELECT id, harness_id, cwd, native_session_id, status, name FROM sessions ORDER BY created_at, id",
 				)
 				.all() as SessionRow[];
 			return rows.map(fromRow);
@@ -169,7 +177,7 @@ export class SqliteSessionStore implements SessionStore {
 		try {
 			const row = this.database
 				.prepare(
-					"SELECT id, harness_id, cwd, native_session_id, status FROM sessions WHERE id = ?",
+					"SELECT id, harness_id, cwd, native_session_id, status, name FROM sessions WHERE id = ?",
 				)
 				.get(id) as SessionRow | undefined;
 			return row ? fromRow(row) : undefined;
@@ -188,6 +196,20 @@ export class SqliteSessionStore implements SessionStore {
 			return result.changes === 1;
 		} catch (error) {
 			throw new SessionStoreError(`Could not delete session '${id}'`, {
+				cause: error,
+			});
+		}
+	}
+
+	async setName(id: SessionId, name?: string): Promise<void> {
+		try {
+			const result = this.database
+				.prepare("UPDATE sessions SET name = ? WHERE id = ?")
+				.run(name ?? null, id);
+			if (result.changes !== 1)
+				throw new Error("session record does not exist");
+		} catch (error) {
+			throw new SessionStoreError(`Could not rename session '${id}'`, {
 				cause: error,
 			});
 		}
@@ -240,11 +262,13 @@ interface SessionRow {
 	cwd: string;
 	native_session_id: string | null;
 	status: SessionStatus;
+	name: string | null;
 }
 
 function fromRow(row: SessionRow): SessionSummary {
 	return {
 		id: row.id as SessionId,
+		...(row.name === null ? {} : { name: row.name }),
 		harnessId: row.harness_id as AdapterId,
 		cwd: row.cwd,
 		...(row.native_session_id === null

@@ -6,7 +6,7 @@ The core owns stable session identity, working-directory validation, session met
 
 ## Observable operations
 
-- Create a session for a declared harness and existing local working directory; return its supervisor ID and current state.
+- Create a session for a declared harness and existing local working directory; return its supervisor ID, optional human-readable name, and current state. Rename or clear the name without changing the stable supervisor ID, native Pi session, lifecycle, or `cwd`; duplicate names are valid.
 - List and inspect sessions using supervisor IDs, independently of their workspace paths.
 - Stop a session explicitly; an operator-requested stop is terminal and must not be restarted by automatic recovery. The adapter's `harness.stop` capability is checked independently; unsupported shutdown fails explicitly.
 - Explicitly resume a deliberately stopped session, reusing its exact saved native session ID. Resume checks the declared and implemented `harness.resume` capability and does not use the automatic-recovery retry budget. Concurrent resume calls for one supervisor session share one launch; a running live session is returned idempotently. A non-stopped, missing-native-ID, or unsupported session fails explicitly; resume never falls back to fresh launch.
@@ -28,13 +28,13 @@ The core owns stable session identity, working-directory validation, session met
 
 ## Interfaces and compatibility
 
-- Session, input, and adapter identities are stable opaque IDs; consumers must not infer identity from `cwd` or native harness IDs. Harness events include output, status, error, and input-delivery variants. The ephemeral session-status result combines persisted session cwd/lifecycle data with optional live model, effort, and aggregate usage; absence of a live instance never adds these fields to session storage. Input-delivery events carry the existing `InputEvent` input ID, state, and optional detail; states are pending, accepted, completed, uncertain, or failed. Core forwards live events only; it does not persist an input/event history.
+- Session, input, and adapter identities are stable opaque IDs; consumers must not infer identity from `cwd` or native harness IDs. `SessionSummary.name` is optional metadata stored with the supervisor record, normalized to one line, and limited to 64 Unicode code points. Harness events include output, status, error, and input-delivery variants. The ephemeral session-status result combines persisted session cwd/lifecycle data with optional live model, effort, and aggregate usage; absence of a live instance never adds these fields to session storage. Input-delivery events carry the existing `InputEvent` input ID, state, and optional detail; states are pending, accepted, completed, uncertain, or failed. Core forwards live events only; it does not persist an input/event history.
 - Core ports declare capabilities. Adapters may provide fewer capabilities; calls to unsupported operations return an explicit error. Harness launch, stop, resume, input submission, and cancellation are checked independently.
 - Harness-native session IDs are optional adapter-owned metadata, separate from supervisor IDs.
 
 ## Failure, security, and limits
 
-- Invalid paths, missing adapters, unsupported capabilities, duplicate/malformed IDs, non-stopped deletion, missing IDs, and persistence failures produce explicit errors. Invalid paths fail before launch; failed startup is not reported as running. An unexpected harness event-stream failure is surfaced as a generic session-scoped error event without exposing the underlying exception.
+- Invalid paths, invalid session names, missing adapters, unsupported capabilities, duplicate/malformed IDs, non-stopped deletion, missing IDs, and persistence failures produce explicit errors. Invalid paths fail before launch; failed startup is not reported as running. An unexpected harness event-stream failure is surfaced as a generic session-scoped error event without exposing the underlying exception.
 - State is never intentionally written under a selected workspace merely because it is the session `cwd`. POSIX state-directory ownership and mode are checked before opening SQLite; Windows ACLs are platform-managed and are not verified by core.
 - Direct harness execution is trusted and runs with the supervisor user's operating-system permissions; `cwd` is not a sandbox or security boundary.
 - Supervisor-managed credential values are not stored in session metadata or intentionally passed by core to harnesses. This does not guarantee that a same-user harness cannot read ambient credentials or write secret material into its workspace/output/network traffic.
