@@ -882,6 +882,42 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("logs a safe diagnostic when final assistant output cannot be delivered", async () => {
+		const bot = new MockBot();
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		bot.sendMessageBehavior = async () => {
+			if (
+				bot.api.sendMessage.mock.calls.at(-1)?.[1] === "Visible answer\n\nsid"
+			)
+				throw new Error("Telegram rejected the message");
+		};
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "Visible answer"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ответ не удалось доставить"),
+		);
+		expect(journal.mock.calls.flat().join(" ")).toContain(
+			"Telegram message delivery failed",
+		);
+		expect(journal.mock.calls.flat().join(" ")).toContain(
+			"Telegram rejected the message",
+		);
+		journal.mockRestore();
+		await adapter.stop();
+	});
+
 	it("does not retry an activity edit after an uncertain Telegram outcome", async () => {
 		const bot = new MockBot();
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -2309,6 +2345,68 @@ describe("Telegram transport", () => {
 		);
 
 		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+	});
+
+	it("filters internal status widgets without dropping surrounding assistant text", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const messagesBeforeTurn = bot.sent.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "Here is the result.\nPI_SUBAGENT_"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot"}\nAnother useful detail.',
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Another useful detail.")),
+			).toBe(true),
+		);
+		const answer = bot.sent.at(-1)?.text ?? "";
+		expect(answer).toContain("Here is the result.");
+		expect(answer).toContain("Another useful detail.");
+		expect(answer).not.toContain("PI_SUBAGENT_ASYNC_JSON:");
+		expect(bot.sent).toHaveLength(messagesBeforeTurn + 1);
+		await adapter.stop();
+	});
+
+	it("does not send a Telegram answer when a turn contains only an internal widget", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const messagesBeforeTurn = bot.sent.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot"}',
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.sent).toHaveLength(messagesBeforeTurn);
+		await adapter.stop();
+	});
+
+	it("does not send an overflow notice when the buffered output is only internal widgets", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const messagesBeforeTurn = bot.sent.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const snapshot =
+			'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot"}\n';
+		emit(harnessEvent("sid", "output", snapshot.repeat(500)));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.sent).toHaveLength(messagesBeforeTurn);
 		await adapter.stop();
 	});
 
