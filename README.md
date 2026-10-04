@@ -127,7 +127,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/ls [path]` | List immediate files and folders in the current chat folder or the supplied path. Dotfiles are hidden; output is bounded. |
 | `/cd [path]` | Change this chat's folder; relative paths work, and `/cd` without a path goes to the OS user's home. Does not change running sessions. |
 | `/send <path>` | Send a regular file from the selected session's working directory (up to 20 MiB). |
-| `/use <sessionId>` | Select a session for this private chat. |
+| `/use [sessionId]` | Select a session, or confirm this chat's remembered selection without an ID. |
 | `/resume [sessionId]` | Resume a stopped session by its saved Pi-native ID; defaults to the selected session. |
 | `/inspect [sessionId]` | Inspect the selected or named session. |
 | `/status` | Show the selected session's folder, model, effort, aggregate tokens, and Pi-estimated cost. |
@@ -139,7 +139,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | `/delete <sessionId>` | Delete a stopped session record from harnessd. |
 | `/cancel <inputId>` | Cancel an accepted input in the selected session. |
 
-`/menu` previews sessions with previous/next; only **Choose** changes selection. Selection and folder navigation remain in memory. After service restart, select again; harnessd does not reattach prior Pi processes, so old rows may be stale and `/use` cannot restore them. Completed assistant turns are sent whole when possible, with a searchable `Name · <full SessionId>` footer (or just the ID when unnamed); the ID is monospace and has no leading `#`. Longer turns are split into numbered parts.
+`/menu` previews sessions with previous/next; only **Choose** changes selection. The per-chat selected session and panel message ID are stored in the bot-token-scoped private state file; folder navigation and previews remain in memory. After a graceful service restart, Telegram restores each chat's selection but does not launch Pi until a new message or explicit `/resume`. New input resumes a deliberately stopped session by its saved Pi-native ID and submits only that new input. After an unclean supervisor exit, stale `running` rows are not reattached or restarted. Completed assistant turns are sent whole when possible, with a searchable `Name · <full SessionId>` footer (or just the ID when unnamed); the ID is monospace and has no leading `#`. Longer turns are split into numbered parts.
 
 Session names are optional, limited to 64 Unicode code points, and persisted in harnessd metadata—not Pi-native session data. `/sessions` and `/inspect` show the optional name and a plain searchable `#<full SessionId>` tag. All allowlisted operators share access to these names and sessions.
 
@@ -158,9 +158,9 @@ An operator can resume a deliberately stopped session with `/resume [sessionId]`
 - `direct` runs Pi with the supervisor user's operating-system permissions. There is no sandbox: Pi may access files outside `cwd` that the user can access. `/send` and the agent's `send_file` tool are narrower: they only upload regular files inside the selected session's canonical `cwd` and at most 20 MiB. Incoming attachments are stored separately under the state directory with per-session quotas and a seven-day TTL.
 - `isolated` is not implemented in this CLI and is rejected before runtime startup; it never silently falls back to direct mode.
 - Telegram operators share access to local sessions. Output may include sensitive workspace data and is not universally redacted; a full output queue can cause additional notifications to be omitted.
-- Session metadata is stored, but chat selection and event/input history are not persisted.
+- Session metadata and each private chat's selected session are persisted. Event/input history and prompt bodies are not persisted.
 - The polling lock coordinates harnessd processes that share the same state directory; it cannot prevent an unrelated application from polling the same bot token.
-- There is no secret wallet or recovery after supervisor restart.
+- There is no secret wallet or automatic reattachment/restart after an unclean supervisor exit.
 
 ## Versioning and release
 
