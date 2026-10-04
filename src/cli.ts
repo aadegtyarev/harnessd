@@ -10,6 +10,7 @@ import {
 import { getCliCommandUsages } from "./command-catalog.js";
 import { resolveStateDirectory } from "./core/session-store.js";
 import { loadDotEnv } from "./dotenv.js";
+import { describeError } from "./error-diagnostics.js";
 import { resolveInitialDirectory } from "./telegram-filesystem.js";
 import { TelegramTransportAdapter } from "./telegram-transport.js";
 import {
@@ -230,8 +231,11 @@ if (isDirectInvocation(import.meta.url, process.argv[1])) {
 		const message =
 			error instanceof Error && error.message.startsWith("HARNESSD_")
 				? error.message
-				: "harnessd could not start or shut down cleanly; check configuration and runtime availability";
-		process.stderr.write(`${message}\n`);
+				: "harnessd could not start or shut down cleanly";
+		const detail = describeError(error, [
+			process.env.HARNESSD_TELEGRAM_BOT_TOKEN,
+		]);
+		process.stderr.write(`${message}\n${detail}\n`);
 		process.exitCode = 1;
 	});
 }

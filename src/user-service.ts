@@ -189,7 +189,7 @@ function runSystemctl(args: readonly string[]): Promise<void> {
 				if (error) {
 					reject(
 						new Error(
-							`HARNESSD_SERVICE_SYSTEMCTL_FAILED:${args[0] ?? "unknown"}`,
+							`HARNESSD_SERVICE_SYSTEMCTL_FAILED:${args[0] ?? "unknown"}:${error.code ?? "UNKNOWN"}`,
 						),
 					);
 					return;

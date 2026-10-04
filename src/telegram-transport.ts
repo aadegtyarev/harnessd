@@ -29,6 +29,7 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "./core/types.js";
+import { describeError, redactDiagnosticText } from "./error-diagnostics.js";
 import {
 	listDirectoryEntries,
 	parsePathArgument,
@@ -740,14 +741,21 @@ export class TelegramTransportAdapter
 			try {
 				if (this.options.signal?.aborted)
 					throw new Error("Telegram startup aborted");
+				let initializationError: unknown;
 				this.initializationPromise = this.bot
 					.init(this.initializationAbort.signal)
 					.then(
 						() => ({ ok: true }),
-						() => ({ ok: false }),
+						(error: unknown) => {
+							initializationError = error;
+							return { ok: false };
+						},
 					);
 				const initialized = await this.initializationPromise;
-				if (!initialized.ok) throw new Error("Telegram initialization failed");
+				if (!initialized.ok)
+					throw new Error("Telegram initialization failed", {
+						cause: initializationError,
+					});
 				try {
 					await withDeadline(
 						this.bot.api.setMyCommands(
@@ -757,8 +765,8 @@ export class TelegramTransportAdapter
 						),
 						SEND_TIMEOUT_MS,
 					);
-				} catch {
-					console.error("harnessd: Telegram command menu registration failed");
+				} catch (error) {
+					this.reportError("Telegram command menu registration failed", error);
 				}
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortInitialization);
@@ -779,8 +787,11 @@ export class TelegramTransportAdapter
 							failReady,
 							new Error("Telegram polling stopped unexpectedly"),
 						),
-					() =>
-						this.pollingEnded(failReady, new Error("Telegram polling failed")),
+					(error: unknown) =>
+						this.pollingEnded(
+							failReady,
+							new Error("Telegram polling failed", { cause: error }),
+						),
 				);
 				await readiness;
 				if (this.options.signal?.aborted)
@@ -790,17 +801,23 @@ export class TelegramTransportAdapter
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortPolling);
 			}
-		} catch {
+		} catch (error) {
+			this.reportError("Telegram transport startup failed", error);
 			try {
 				await this.stop();
-			} catch {
+			} catch (cleanupError) {
+				this.reportError(
+					"Telegram transport startup cleanup failed",
+					cleanupError,
+				);
 				/* lock is retained if shutdown cannot be confirmed */
 			}
-			throw new Error("Telegram transport could not start");
+			throw new Error("Telegram transport could not start", { cause: error });
 		}
 	}
 
 	private pollingEnded(failReady: (error: Error) => void, error: Error): void {
+		this.reportError("Telegram polling ended", error);
 		this.resolvePollingFinished();
 		if (this.stopping) return;
 		if (!this.ready) failReady(error);
@@ -819,8 +836,8 @@ export class TelegramTransportAdapter
 			const task = this.sweepSessionInboxes();
 			this.inboxSweepPromise = task;
 			void task
-				.catch(() => {
-					console.error("harnessd: Telegram inbox cleanup failed");
+				.catch((error: unknown) => {
+					this.reportError("Telegram inbox cleanup failed", error);
 				})
 				.finally(() => {
 					if (this.inboxSweepPromise === task)
@@ -857,8 +874,8 @@ export class TelegramTransportAdapter
 			try {
 				await inbox.removeSessionUnderLock(sessionId);
 				return { result, cleanupPending: false };
-			} catch {
-				console.error("harnessd: Telegram session inbox cleanup failed");
+			} catch (error) {
+				this.reportError("Telegram session inbox cleanup failed", error);
 				return { result, cleanupPending: true };
 			}
 		});
@@ -909,8 +926,10 @@ export class TelegramTransportAdapter
 				await withDeadline(this.pollingPromise, STOP_TIMEOUT_MS);
 				await withDeadline(this.pollingFinished, STOP_TIMEOUT_MS);
 			}
-		} catch {
-			throw new Error("Telegram shutdown incomplete; polling lock retained");
+		} catch (error) {
+			throw new Error("Telegram shutdown incomplete; polling lock retained", {
+				cause: error,
+			});
 		}
 		if (this.releaseLock) {
 			await this.releaseLock();
@@ -984,10 +1003,15 @@ export class TelegramTransportAdapter
 						: safeResultError(result.error),
 				);
 			}
-		} catch {
-			await this.sendDirect(
+		} catch (error) {
+			const reference = this.reportError(
+				"Telegram update handler failed",
+				error,
+				[text],
+			);
+			await this.sendDiagnostic(
 				chatId,
-				"Request failed unexpectedly. Check the harnessd service journal.",
+				`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}`,
 			);
 		}
 	}
@@ -1063,8 +1087,19 @@ export class TelegramTransportAdapter
 					signal,
 				),
 			);
-			return sent.ok;
-		} catch {
+			if (!sent.ok) {
+				this.reportError("Telegram agent file delivery failed", sent.error, [
+					filePath,
+					caption,
+				]);
+				return false;
+			}
+			return true;
+		} catch (error) {
+			this.reportError("Telegram agent file preparation failed", error, [
+				filePath,
+				caption,
+			]);
 			return false;
 		}
 	}
@@ -1823,7 +1858,10 @@ export class TelegramTransportAdapter
 			this.bot.api.pinChatMessage(chatId, createdMessageId, {}, signal),
 		);
 		if (!pinned.ok || pinned.value === false) {
-			console.error("harnessd: Telegram control panel could not be pinned");
+			this.reportError(
+				"Telegram control panel could not be pinned",
+				pinned.ok ? new Error("Telegram returned false") : pinned.error,
+			);
 			await this.sendDirect(
 				chatId,
 				"Панель открыта, но Telegram не закрепил её. Её можно обновить командой /menu.",
@@ -1839,8 +1877,8 @@ export class TelegramTransportAdapter
 		this.panelMessageIds.set(chatId, messageId);
 		try {
 			await this.panelStore?.set(chatId, messageId);
-		} catch {
-			console.error("harnessd: Telegram panel reference could not be saved");
+		} catch (error) {
+			this.reportError("Telegram panel reference could not be saved", error);
 		}
 	}
 
@@ -1864,10 +1902,14 @@ export class TelegramTransportAdapter
 		if (!callback.data || callback.data.length > 64) return;
 		try {
 			await this.dispatchCallback(chatId, sender, callback.data, messageId);
-		} catch {
-			await this.sendDirect(
+		} catch (error) {
+			const reference = this.reportError(
+				"Telegram callback action failed",
+				error,
+			);
+			await this.sendDiagnostic(
 				chatId,
-				"Не удалось выполнить действие. Откройте /menu и попробуйте снова.",
+				`Не удалось выполнить действие (ref ${reference}). Попробуйте открыть /menu ещё раз.\n\n${describeError(error, [this.options.token])}`,
 			);
 		}
 	}
@@ -2034,8 +2076,61 @@ export class TelegramTransportAdapter
 	}
 
 	private async sendDirect(chatId: number, text: string): Promise<void> {
+		const errorPrefixes = [
+			"Invalid ",
+			"Unsupported ",
+			"Could not ",
+			"Cannot ",
+			"Failed ",
+			"Request failed",
+			"Operation failed",
+			"No authorized ",
+			"Select a session",
+			"The session ",
+			"This reply ",
+			"Directory is ",
+			"Attachment ",
+			"Session is ",
+			"Input delivery is ",
+			"Usage:",
+			"Не удалось",
+			"Недоступно",
+			"Некорректно",
+			"Неподдерживаемая",
+		];
+		if (
+			text.includes("\n\nError:") ||
+			errorPrefixes.some((prefix) => text.startsWith(prefix))
+		)
+			return this.sendDiagnostic(chatId, text);
 		for (const chunk of chunks(text || " "))
 			await this.sendWithDeadline(chatId, chunk);
+	}
+
+	private async sendDiagnostic(chatId: number, text: string): Promise<void> {
+		let body = "";
+		for (const character of redactDiagnosticText(text, [this.options.token])) {
+			const escaped = escapeHtml(character);
+			if (body.length + escaped.length > 3900) {
+				body += "\n… [trace truncated]";
+				break;
+			}
+			body += escaped;
+		}
+		await this.sendWithDeadline(chatId, `<pre><code>${body}</code></pre>`, {
+			parse_mode: "HTML",
+		});
+	}
+
+	private reportError(
+		context: string,
+		error: unknown,
+		redactions: readonly (string | undefined)[] = [],
+	): string {
+		const reference = randomUUID().slice(0, 8);
+		const details = describeError(error, [this.options.token, ...redactions]);
+		console.error(`harnessd: ${context} (ref ${reference})\n${details}`);
+		return reference;
 	}
 
 	private async browseSessions(
