@@ -16,6 +16,7 @@ import {
 	SqliteSessionStore,
 } from "./core/session-store.js";
 import type { HarnessEvent } from "./core/types.js";
+import { describeError } from "./error-diagnostics.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
 	PiControlError,
@@ -421,18 +422,24 @@ export class ApplicationRuntime {
 				code === "OPERATION_FAILED"
 					? requestReference(request.requestId)
 					: undefined;
-			if (code === "OPERATION_FAILED") {
-				const origin = safeErrorOrigin(error);
-				const diagnostic = {
-					reference: reference ?? "unavailable",
-					kind: safeOperationKind(request.kind),
-					errorType: safeErrorType(error),
-					...(origin ? { origin } : {}),
-				};
-				console.error(
-					`harnessd: unclassified request failure ${JSON.stringify(diagnostic)}`,
-				);
-			}
+			const origin = safeErrorOrigin(error);
+			const diagnostic = {
+				reference: reference ?? "unavailable",
+				kind: safeOperationKind(request.kind),
+				errorType: safeErrorType(error),
+				...(origin ? { origin } : {}),
+			};
+			const detail = describeError(
+				error,
+				[
+					process.env.HARNESSD_TELEGRAM_BOT_TOKEN,
+					request.kind === "submit" ? request.text : undefined,
+				],
+				!(error instanceof PiStartupError || error instanceof PiControlError),
+			);
+			console.error(
+				`harnessd: request failure ${JSON.stringify(diagnostic)}\n${detail}`,
+			);
 			const inputId =
 				error instanceof UncertainInputDeliveryError
 					? error.inputId
@@ -442,11 +449,7 @@ export class ApplicationRuntime {
 				ok: false,
 				error: {
 					code,
-					message:
-						safeErrorMessages.get(code) ??
-						(reference
-							? `Operation failed (ref ${reference})`
-							: "Operation failed"),
+					message: `${safeErrorMessages.get(code) ?? (reference ? `Operation failed (ref ${reference})` : "Operation failed")}\n\n${detail}`,
 					...(code === "UNCERTAIN_INPUT_DELIVERY" && inputId
 						? { inputId }
 						: {}),

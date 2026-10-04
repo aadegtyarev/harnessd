@@ -461,14 +461,22 @@ describe("Telegram transport", () => {
 							ok: false,
 							error: {
 								code: "OPERATION_FAILED",
-								message: "Operation failed (ref deadbeef)",
+								message:
+									"Operation failed (ref deadbeef)\n\nError: unsafe <detail> secret-token Authorization: Bearer abc123-private\n    at test.ts:1:1",
 							},
 						}
 					: result(request),
 		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "hello");
-		expect(bot.sent.at(-1)?.text).toBe("Operation failed (ref deadbeef)");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"<pre><code>Operation failed (ref deadbeef)",
+		);
+		expect(bot.sent.at(-1)?.text).toContain("unsafe &lt;detail&gt;");
+		expect(bot.sent.at(-1)?.text).not.toContain("secret-token");
+		expect(bot.sent.at(-1)?.text).not.toContain("abc123-private");
+		expect(bot.sent.at(-1)?.text).not.toContain("Bearer");
+		expect(bot.sendOptions.at(-1)).toEqual({ parse_mode: "HTML" });
 		await adapter.stop();
 	});
 
@@ -777,7 +785,9 @@ describe("Telegram transport", () => {
 			submitsBeforeDeletedText,
 		);
 		await bot.update(100, "/delete");
-		expect(bot.sent.at(-1)?.text).toBe("Usage: /delete <sessionId>");
+		expect(bot.sent.at(-1)?.text).toBe(
+			"<pre><code>Usage: /delete &lt;sessionId&gt;</code></pre>",
+		);
 		await adapter.stop();
 	});
 
@@ -808,7 +818,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("keeps polling if Telegram command registration fails without logging raw errors", async () => {
+	it("keeps polling and logs a trace if Telegram command registration fails", async () => {
 		const bot = new MockBot();
 		bot.setMyCommandsBehavior = async () => {
 			throw new Error("PRIVATE Telegram API failure");
@@ -817,9 +827,13 @@ describe("Telegram transport", () => {
 		const { adapter } = await startAdapter(bot, await temp());
 		expect(bot.api.setMyCommands).toHaveBeenCalledOnce();
 		expect(log).toHaveBeenCalledWith(
-			"harnessd: Telegram command menu registration failed",
+			expect.stringContaining(
+				"harnessd: Telegram command menu registration failed (ref ",
+			),
 		);
-		expect(log.mock.calls.flat().join(" ")).not.toContain("PRIVATE");
+		expect(log.mock.calls.flat().join(" ")).toContain(
+			"PRIVATE Telegram API failure",
+		);
 		await adapter.stop();
 	});
 
@@ -1111,7 +1125,24 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("contains dispatch rejections with a safe message and no prompt echo", async () => {
+	it("bounds escaped long Unicode diagnostics to Telegram's message limit", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") throw new Error("<>&😀".repeat(2000));
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "trigger");
+		const diagnostic = bot.sent.at(-1)?.text ?? "";
+		expect(diagnostic.length).toBeLessThanOrEqual(4096);
+		expect(diagnostic).toContain("[trace truncated]");
+		expect(bot.sendOptions.at(-1)).toEqual({ parse_mode: "HTML" });
+		await adapter.stop();
+	});
+
+	it("shows traced dispatch failures without echoing submitted prompts", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp(), {
 			dispatch: async (request) => {
@@ -1123,15 +1154,13 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "private prompt text");
 		expect(
-			bot.sent.some(
-				({ text }) =>
-					text ===
-					"Request failed unexpectedly. Check the harnessd service journal.",
+			bot.sent.some(({ text }) =>
+				text.includes("<pre><code>Request failed (ref "),
 			),
 		).toBe(true);
 		expect(
 			bot.sent.some(({ text }) => text.includes("private dispatch detail")),
-		).toBe(false);
+		).toBe(true);
 		expect(
 			bot.sent.some(({ text }) => text.includes("private prompt text")),
 		).toBe(false);
@@ -1163,8 +1192,9 @@ describe("Telegram transport", () => {
 		expect(
 			bot.sent.some(
 				({ text }) =>
-					text ===
-					`Input delivery is uncertain (InputId ${inputId}; not resent)`,
+					text.includes(
+						`Input delivery is uncertain (InputId ${inputId}; not resent)`,
+					) && text.startsWith("<pre><code>"),
 			),
 		).toBe(true);
 		expect(bot.sent.some(({ text }) => text.includes("private prompt"))).toBe(
@@ -1483,7 +1513,9 @@ describe("Telegram transport", () => {
 
 		await bot.update(100, '/send "report file.txt"');
 		expect(bot.api.sendDocument).not.toHaveBeenCalled();
-		expect(bot.sent.at(-1)?.text).toBe("Select a session first.");
+		expect(bot.sent.at(-1)?.text).toBe(
+			"<pre><code>Select a session first.</code></pre>",
+		);
 
 		await bot.update(100, "/use sid");
 		await bot.update(100, '/send "report file.txt"');

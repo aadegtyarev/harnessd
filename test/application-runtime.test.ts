@@ -198,7 +198,9 @@ describe("application runtime", () => {
 			ok: false,
 			error: {
 				code: "SESSION_NOT_STOPPED",
-				message: "Stop the session before deleting it with /stop.",
+				message: expect.stringContaining(
+					"Stop the session before deleting it with /stop.\n\nError:",
+				),
 			},
 		});
 		await runtime.dispatch({
@@ -294,7 +296,7 @@ describe("application runtime", () => {
 		await runtime.close();
 	});
 
-	it("returns actionable Pi startup errors and logs only a safe error code", async () => {
+	it("returns actionable Pi startup errors and logs a useful redacted trace", async () => {
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const launchError = Object.assign(new Error("secret path detail"), {
 			code: "ENOENT",
@@ -318,11 +320,13 @@ describe("application runtime", () => {
 			ok: false,
 			error: {
 				code: "PI_EXECUTABLE_NOT_FOUND",
-				message: "Pi CLI was not found; check HARNESSD_PI_EXECUTABLE.",
+				message: expect.stringContaining(
+					"Pi CLI was not found; check HARNESSD_PI_EXECUTABLE.\n\nError:",
+				),
 			},
 		});
 		expect(journal).toHaveBeenCalledWith(
-			"harnessd: Pi startup failed (PI_EXECUTABLE_NOT_FOUND)",
+			expect.stringContaining("harnessd: request failure"),
 		);
 		expect(journal).not.toHaveBeenCalledWith(
 			expect.stringContaining("secret path detail"),
@@ -525,10 +529,15 @@ describe("application runtime", () => {
 						if (input.text === "uncertain private prompt")
 							throw new UncertainInputDeliveryError(input.id);
 						if (input.text === "sensitive failure")
-							throw Object.assign(new Error("private detail"), {
-								code: "SECRET_PRIVATE_DETAIL",
-								name: "SECRET_NAME_MARKER",
-							});
+							throw Object.assign(
+								new Error(
+									"private detail; Authorization: Bearer abc123-private",
+								),
+								{
+									code: "SECRET_PRIVATE_DETAIL",
+									name: "SECRET_NAME_MARKER",
+								},
+							);
 						sent.push(input.text);
 					},
 					async cancel() {},
@@ -567,7 +576,9 @@ describe("application runtime", () => {
 			ok: false,
 			error: {
 				code: "INVALID_WORKING_DIRECTORY",
-				message: "Working directory is invalid or inaccessible",
+				message: expect.stringContaining(
+					"Working directory is invalid or inaccessible\n\nError:",
+				),
 			},
 		});
 		const created = await dispatch({
@@ -664,8 +675,9 @@ describe("application runtime", () => {
 			ok: false,
 			error: {
 				code: "EFFORT_NOT_SUPPORTED",
-				message:
-					"Effort is not supported by this model; use /effort to see valid levels.",
+				message: expect.stringContaining(
+					"Effort is not supported by this model; use /effort to see valid levels.\n\nError:",
+				),
 			},
 		});
 		expect(JSON.stringify(effortFailure)).not.toContain(
@@ -695,26 +707,30 @@ describe("application runtime", () => {
 			sessionId: created.value.id,
 			text: "sensitive failure",
 		});
-		expect(safeFailure).toEqual({
+		expect(safeFailure).toMatchObject({
 			requestId: "deadbeef-cafe-4000-8000-000000000000",
 			ok: false,
 			error: {
 				code: "OPERATION_FAILED",
-				message: "Operation failed (ref deadbeef)",
+				message: expect.stringContaining(
+					"Operation failed (ref deadbeef)\n\nError:",
+				),
 			},
 		});
-		expect(JSON.stringify(safeFailure)).not.toContain("private detail");
+		expect(JSON.stringify(safeFailure)).toContain("private detail");
+		expect(JSON.stringify(safeFailure)).not.toContain("abc123-private");
+		expect(JSON.stringify(safeFailure)).not.toContain("Bearer");
 		const diagnostic = journal.mock.calls.flat().join(" ");
 		expect(diagnostic).toContain('"reference":"deadbeef"');
 		expect(diagnostic).toContain('"kind":"submit"');
 		expect(diagnostic).toContain('"errorType":"Error"');
 		expect(diagnostic).toMatch(/"origin":"[^"]+\.ts:\d+"/);
-		expect(diagnostic).not.toContain("private detail");
+		expect(diagnostic).toContain("private detail");
 		expect(diagnostic).not.toContain("SECRET_PRIVATE_DETAIL");
 		expect(diagnostic).not.toContain("SECRET_NAME_MARKER");
+		expect(diagnostic).not.toContain("abc123-private");
+		expect(diagnostic).not.toContain("Bearer");
 		expect(diagnostic).not.toContain("sensitive failure");
-		expect(diagnostic).not.toContain(process.cwd());
-		expect(diagnostic).not.toContain("at Object.send");
 		const uncertain = await dispatch({
 			requestId: "request-uncertain",
 			principalId: "operator",
@@ -727,7 +743,9 @@ describe("application runtime", () => {
 			ok: false,
 			error: {
 				code: "UNCERTAIN_INPUT_DELIVERY",
-				message: "Input delivery is uncertain",
+				message: expect.stringContaining(
+					"Input delivery is uncertain\n\nError:",
+				),
 			},
 		});
 		if (uncertain.ok) throw new Error("Expected uncertain input result");

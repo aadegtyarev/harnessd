@@ -34,7 +34,7 @@ The core owns stable session identity, working-directory validation, session met
 
 ## Failure, security, and limits
 
-- Invalid paths, invalid session names, missing adapters, unsupported capabilities, duplicate/malformed IDs, non-stopped deletion, missing IDs, and persistence failures produce explicit errors. Invalid paths fail before launch; failed startup is not reported as running. An unexpected harness event-stream failure is surfaced as a generic session-scoped error event without exposing the underlying exception.
+- Invalid paths, invalid session names, missing adapters, unsupported capabilities, duplicate/malformed IDs, non-stopped deletion, missing IDs, and persistence failures produce explicit errors. Invalid paths fail before launch; failed startup is not reported as running. An unexpected harness event-stream failure is surfaced as a generic session-scoped error event without exposing the underlying exception in the event; if it reaches the application request boundary, the runtime journals and returns a redacted, correlated traceback without changing core recovery behavior.
 - State is never intentionally written under a selected workspace merely because it is the session `cwd`. POSIX state-directory ownership and mode are checked before opening SQLite; Windows ACLs are platform-managed and are not verified by core.
 - Direct harness execution is trusted and runs with the supervisor user's operating-system permissions; `cwd` is not a sandbox or security boundary.
 - Supervisor-managed credential values are not stored in session metadata or intentionally passed by core to harnesses. This does not guarantee that a same-user harness cannot read ambient credentials or write secret material into its workspace/output/network traffic.
