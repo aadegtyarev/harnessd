@@ -29,7 +29,7 @@ This surface defines the package identity, version compatibility promise, local 
 
 ## Current status and limits
 
-The package is `0.1.0`, `private: true`, and intended for local Git-based owner testing. It is not currently published to npm. No automatic tag, GitHub Release, or publish workflow exists. Publication visibility, credentials, ownership, and release approval must be decided before any future npm release.
+The package is `0.1.0`, `private: true`, and intended for local Git-based owner testing. It is not currently published to npm. GitHub Actions CI validates pull requests targeting `main` and pushes to `main`; it does not create tags, GitHub Releases, deployments, or npm publications. Publication visibility, credentials, ownership, and release approval must be decided before any future npm release.
 
 ## Related contracts
 
