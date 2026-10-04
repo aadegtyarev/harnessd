@@ -1221,6 +1221,7 @@ describe("SQLite session management", () => {
 			sessionId: session.id,
 			kind: "error",
 			text: "Harness event stream failed",
+			fatal: true,
 		});
 		await manager.stop(session.id);
 	});

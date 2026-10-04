@@ -372,6 +372,11 @@ describe("PiRpcHarnessAdapter", () => {
 					data: {
 						tokens: { total: 42, input: 20, output: 22, cacheRead: 4 },
 						cost: 0.123456,
+						contextUsage: {
+							tokens: 60_000,
+							contextWindow: 272_000,
+							percent: 22.1,
+						},
 						sessionFile: "/must/not/be/exposed/session.jsonl",
 					},
 				},
@@ -405,6 +410,9 @@ describe("PiRpcHarnessAdapter", () => {
 				outputTokens: 22,
 				cacheReadTokens: 4,
 				costUsd: 0.123456,
+				contextTokens: 60_000,
+				contextWindow: 272_000,
+				contextPercent: 22.1,
 			},
 		});
 		expect(JSON.stringify(status)).not.toContain("session.jsonl");
@@ -442,6 +450,35 @@ describe("PiRpcHarnessAdapter", () => {
 				expect.objectContaining({ type: "set_thinking_level", level: "high" }),
 			]),
 		);
+		await instance.shutdown();
+	});
+
+	it("preserves unknown context usage after compaction instead of deriving it from session totals", async () => {
+		const fake = fakeProvider({
+			rpcResponses: {
+				get_session_stats: {
+					data: {
+						tokens: { total: 105_000 },
+						contextUsage: {
+							tokens: null,
+							contextWindow: 272_000,
+							percent: null,
+						},
+					},
+				},
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "/bin/pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const status = await instance.control?.getStatus();
+		expect(status?.usage).toEqual({
+			totalTokens: 105_000,
+			contextTokens: null,
+			contextWindow: 272_000,
+			contextPercent: null,
+		});
 		await instance.shutdown();
 	});
 
@@ -782,6 +819,112 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("forwards tool activity and non-fatal extension diagnostics but never raw thinking text", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "/bin/pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		fake.stdout.write(
+			`${[
+				{
+					type: "message_update",
+					assistantMessageEvent: { type: "thinking_start" },
+				},
+				{
+					type: "message_update",
+					assistantMessageEvent: {
+						type: "thinking_delta",
+						delta: "private reasoning",
+					},
+				},
+				{
+					type: "message_update",
+					assistantMessageEvent: {
+						type: "thinking_end",
+						content: "private reasoning",
+					},
+				},
+				{
+					type: "tool_execution_start",
+					toolCallId: "tool-1",
+					toolName: "grep",
+					args: { pattern: "contextUsage", path: "src" },
+				},
+				{
+					type: "tool_execution_end",
+					toolCallId: "tool-1",
+					toolName: "grep",
+					isError: false,
+				},
+				{
+					type: "extension_ui_request",
+					id: "notify-1",
+					method: "notify",
+					message: "Extension initialized",
+					notifyType: "info",
+				},
+				{
+					type: "extension_error",
+					extensionPath: "/home/user/ext.ts",
+					event: "session_start",
+					error: "Unable to initialize",
+				},
+			]
+				.map((event) => JSON.stringify(event))
+				.join("\n")}\n`,
+		);
+		const events = await collectEvents(instance, 5);
+		expect(events.filter((event) => event?.kind === "activity")).toEqual([
+			{
+				sessionId: "supervisor",
+				kind: "activity",
+				activityEvent: { type: "thinking", active: true },
+			},
+			{
+				sessionId: "supervisor",
+				kind: "activity",
+				activityEvent: { type: "thinking", active: false },
+			},
+			{
+				sessionId: "supervisor",
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: "tool-1",
+					summary: "grep: contextUsage — src",
+				},
+			},
+			{
+				sessionId: "supervisor",
+				kind: "activity",
+				activityEvent: {
+					type: "tool_end",
+					toolCallId: "tool-1",
+					failed: false,
+				},
+			},
+			{
+				sessionId: "supervisor",
+				kind: "activity",
+				activityEvent: {
+					type: "notification",
+					text: "Extension initialized",
+					level: "info",
+				},
+			},
+		]);
+		const error = await collectEvents(instance, 1);
+		expect(error[0]).toMatchObject({
+			kind: "error",
+			text: "Pi extension ext.ts (session_start): Unable to initialize",
+		});
+		expect(JSON.stringify([...events, ...error])).not.toContain(
+			"private reasoning",
+		);
+		await instance.shutdown();
+	});
+
 	it("handles agent_settled before prompt acknowledgement", async () => {
 		let sentSettled = false;
 		const fake = fakeProvider({
@@ -815,7 +958,7 @@ describe("PiRpcHarnessAdapter", () => {
 		const sending = instance.send(input("DO NOT LEAK", "reject"));
 		await expect(sending).rejects.toThrow("rejected");
 		fake.stdout.write(
-			'{"type":"extension_ui_request","id":"dialog-1","method":"confirm"}\n',
+			'{"type":"extension_ui_request","id":"dialog-1","method":"confirm","title":"Confirm operation"}\n',
 		);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(fake.commands.at(-1)).toMatchObject({
@@ -831,6 +974,11 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(
 			events.some((event) => event?.text?.includes("PRIVATE STDERR")),
 		).toBe(false);
+		expect(
+			events.some((event) =>
+				event?.text?.includes("unsupported confirm dialog: Confirm operation"),
+			),
+		).toBe(true);
 		await instance.shutdown();
 	});
 

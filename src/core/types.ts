@@ -45,9 +45,29 @@ export interface InputEvent {
 	readonly detail?: string;
 }
 
+export type HarnessActivityEvent =
+	| { readonly type: "thinking"; readonly active: boolean }
+	| {
+			readonly type: "tool_start";
+			readonly toolCallId: string;
+			readonly summary: string;
+	  }
+	| {
+			readonly type: "tool_end";
+			readonly toolCallId: string;
+			readonly failed: boolean;
+	  }
+	| {
+			readonly type: "notification";
+			readonly text: string;
+			readonly level?: string;
+	  };
+
 export interface HarnessEvent {
 	readonly sessionId: SessionId;
-	readonly kind: "output" | "status" | "error" | "input";
+	readonly kind: "output" | "status" | "error" | "input" | "activity";
 	readonly text?: string;
+	readonly fatal?: boolean;
 	readonly inputEvent?: InputEvent;
+	readonly activityEvent?: HarnessActivityEvent;
 }

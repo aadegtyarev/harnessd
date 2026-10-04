@@ -890,6 +890,7 @@ export class SessionManager {
 					sessionId: id,
 					kind: "error",
 					text: "Harness event stream failed",
+					fatal: true,
 				});
 			}
 		}

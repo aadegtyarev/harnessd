@@ -25,11 +25,16 @@ import type {
 } from "./core/ports.js";
 import type {
 	AdapterId,
+	HarnessActivityEvent,
 	HarnessEvent,
 	SessionId,
 	SessionSummary,
 } from "./core/types.js";
-import { describeError, redactDiagnosticText } from "./error-diagnostics.js";
+import {
+	describeError,
+	redactDiagnosticText,
+	truncateDiagnostic,
+} from "./error-diagnostics.js";
 import {
 	listDirectoryEntries,
 	parsePathArgument,
@@ -41,6 +46,8 @@ import { TelegramInbox, TelegramInboxQuotaError } from "./telegram-inbox.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
 
 const TELEGRAM_LIMIT = 4096;
+const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
+const ACTIVITY_OVERFLOW_INPUT_LIMIT = 128;
 const SEND_TIMEOUT_MS = 5000;
 const STOP_TIMEOUT_MS = 6000;
 const MAX_QUEUED_MESSAGES = 32;
@@ -98,6 +105,11 @@ type TelegramBot = {
 			messageId: number,
 			text: string,
 			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
+		deleteMessage(
+			chatId: number,
+			messageId: number,
 			signal?: AbortSignal,
 		): Promise<unknown>;
 		pinChatMessage(
@@ -199,11 +211,44 @@ type ChatQueue = {
 	drainTimer?: NodeJS.Timeout;
 	failed: boolean;
 	overflowQueued: boolean;
+	readonly idleWaiters: (() => void)[];
 };
 type TurnBuffer = {
 	readonly chunks: string[];
 	characters: number;
 	overflow: boolean;
+};
+type ActivityTool = {
+	readonly id: string;
+	readonly summary: string;
+	status: "running" | "done" | "failed";
+	history: ("running" | "done" | "failed")[];
+};
+type LiveActivity = {
+	readonly chatId: number;
+	readonly sessionId: SessionId;
+	readonly sourceMessageId?: number;
+	readonly queuedInputs: { readonly inputId: string; state: string }[];
+	readonly overflowInputIds: Set<string>;
+	readonly failedOverflowInputIds: Set<string>;
+	untrackedInputOverflow: boolean;
+	untrackedFailureOverflow: boolean;
+	readonly tools: ActivityTool[];
+	readonly notices: string[];
+	status: string;
+	submittedWhileRunning: boolean;
+	thinking: boolean;
+	messageId?: number;
+	lastText?: string;
+	unavailable: boolean;
+	liveStatus?: HarnessSessionStatus["live"];
+	renderQueue: Promise<void>;
+	statsTimer?: NodeJS.Timeout;
+	statsInFlight: boolean;
+	pendingSubmissions: number;
+	turnGeneration: number;
+	finishTimer?: ReturnType<typeof setTimeout>;
+	finishing: boolean;
 };
 
 export interface TelegramTransportOptions {
@@ -454,6 +499,9 @@ function oneLine(value: string): string {
 		.replace(/\s+/g, " ")
 		.trim();
 }
+function activityKey(chatId: number, sessionId: SessionId): string {
+	return JSON.stringify([chatId, sessionId]);
+}
 function modelId(model: HarnessModelInfo): string {
 	return `${oneLine(model.provider)}/${oneLine(model.id)}`;
 }
@@ -529,6 +577,31 @@ function cacheHitRate(usage: HarnessUsageStats | undefined): string {
 		? `${((usage.cacheReadTokens / prompt) * 100).toFixed(1)}%`
 		: "—";
 }
+function truncateActivityText(value: string): string {
+	return truncateDiagnostic(value, TELEGRAM_LIMIT - 100);
+}
+function hasContextUsage(
+	usage: HarnessUsageStats | undefined,
+): usage is HarnessUsageStats {
+	return (
+		usage?.contextTokens !== undefined ||
+		usage?.contextWindow !== undefined ||
+		usage?.contextPercent !== undefined
+	);
+}
+function compactContextUsage(usage: HarnessUsageStats): string {
+	const percent =
+		usage.contextPercent === undefined || usage.contextPercent === null
+			? "?"
+			: `${usage.contextPercent.toFixed(1)}%`;
+	const tokens =
+		usage.contextTokens === null ? "?" : compactCount(usage.contextTokens);
+	const window =
+		usage.contextWindow === undefined
+			? ""
+			: `/${compactCount(usage.contextWindow)} (auto)`;
+	return `${percent}/${tokens}${window}`;
+}
 function compactUsage(usage: HarnessUsageStats | undefined): string {
 	return [
 		`↑${compactCount(usage?.inputTokens)}`,
@@ -536,6 +609,7 @@ function compactUsage(usage: HarnessUsageStats | undefined): string {
 		`R${compactCount(usage?.cacheReadTokens)}`,
 		`CH${cacheHitRate(usage)}`,
 		compactCost(usage?.costUsd),
+		...(hasContextUsage(usage) ? [compactContextUsage(usage)] : []),
 	].join(" ");
 }
 function formatStatus(status: HarnessSessionStatus): string {
@@ -551,6 +625,8 @@ function formatStatus(status: HarnessSessionStatus): string {
 		`Tokens: ${usage?.totalTokens !== undefined ? formatCount(usage.totalTokens) : "unavailable"}`,
 		`Estimated cost: ${usage?.costUsd !== undefined ? `~$${usage.costUsd.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}` : "unavailable"}`,
 	);
+	if (hasContextUsage(usage))
+		lines.push(`Context: ${compactContextUsage(usage)}`);
 	if (!live) lines.push("Live Pi data: unavailable for this session.");
 	return lines.join("\n");
 }
@@ -678,7 +754,9 @@ export class TelegramTransportAdapter
 	private readonly selected = new Map<number, SessionId>();
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
-	private readonly reportedErrors = new Set<SessionId>();
+	private readonly reportedErrors = new Map<SessionId, Set<string>>();
+	private readonly liveActivities = new Map<string, LiveActivity>();
+	private readonly runningSessions = new Set<SessionId>();
 	private readonly previews = new Map<number, SessionId>();
 	private readonly pendingNames = new Map<
 		number,
@@ -952,7 +1030,13 @@ export class TelegramTransportAdapter
 			if (queue.drainTimer) clearTimeout(queue.drainTimer);
 			queue.messages.length = 0;
 			queue.pendingCharacters = 0;
+			for (const resolve of queue.idleWaiters.splice(0)) resolve();
 		}
+		for (const activity of this.liveActivities.values()) {
+			if (activity.statsTimer) clearInterval(activity.statsTimer);
+			if (activity.finishTimer) clearTimeout(activity.finishTimer);
+		}
+		this.liveActivities.clear();
 		try {
 			if (this.initializationPromise)
 				await withDeadline(this.initializationPromise, STOP_TIMEOUT_MS);
@@ -1062,6 +1146,8 @@ export class TelegramTransportAdapter
 		const text = ctx.message?.text;
 		if (chatId === undefined || sender === undefined || text === undefined)
 			return;
+		let activity: LiveActivity | undefined;
+		let submissionPending = false;
 		try {
 			const replyTo = ctx.message?.reply_to_message?.message_id;
 			const pending =
@@ -1082,32 +1168,59 @@ export class TelegramTransportAdapter
 				const sessionId = this.selected.get(chatId);
 				if (!sessionId)
 					return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+				activity = this.beginLiveActivity(
+					chatId,
+					sessionId,
+					ctx.message?.message_id,
+				);
+				submissionPending = true;
 				const result = await this.request(sender, {
 					kind: "submit",
 					sessionId,
 					text,
 				});
-				if (result.ok)
+				if (result.ok) {
+					submissionPending = false;
 					await this.confirmInputAccepted(
 						chatId,
 						ctx.message?.message_id,
 						result.value as string,
-						`Input accepted: ${result.value as string}`,
+						activity,
 					);
-				else
+				} else {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					this.stopLiveActivityStats(activity);
+					this.updateLiveActivity(activity, {
+						status: "Pi не принял сообщение",
+						notice: `${redactDiagnosticText(result.error.message, [this.options.token])}${result.error.inputId ? ` · InputId ${result.error.inputId}` : ""}`,
+					});
 					await this.presentSubmitFailure(
 						chatId,
 						sender,
 						sessionId,
 						result.error,
+						text,
 					);
+				}
 			}
 		} catch (error) {
+			if (activity && submissionPending) {
+				submissionPending = false;
+				this.finishActivitySubmission(activity);
+			}
 			const reference = this.reportError(
 				"Telegram update handler failed",
 				error,
 				[text],
 			);
+			if (activity) {
+				this.stopLiveActivityStats(activity);
+				this.updateLiveActivity(activity, {
+					status: "Ошибка запроса",
+					notice: `Request failed (ref ${reference})`,
+				});
+			}
 			await this.sendDiagnostic(
 				chatId,
 				`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}`,
@@ -1249,6 +1362,8 @@ export class TelegramTransportAdapter
 			}
 			const session = inspected.value as SessionSummary;
 			this.rememberSession(session);
+			let activity: LiveActivity | undefined;
+			let submissionPending = false;
 			try {
 				const file = await this.bot.api.getFile(fileId);
 				if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
@@ -1275,26 +1390,54 @@ export class TelegramTransportAdapter
 				const image = photo
 					? [{ mimeType: "image/jpeg", data: data.toString("base64") }]
 					: undefined;
+				activity = this.beginLiveActivity(
+					chatId,
+					sessionId,
+					message.message_id,
+				);
+				submissionPending = true;
 				const submitted = await this.dispatchRequest(sender, {
 					kind: "submit",
 					sessionId,
 					text,
 					...(image ? { images: image } : {}),
 				});
-				if (!submitted.ok)
+				if (!submitted.ok) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					this.stopLiveActivityStats(activity);
+					this.updateLiveActivity(activity, {
+						status: "Pi не принял вложение",
+						notice: redactDiagnosticText(submitted.error.message, [
+							this.options.token,
+						]),
+					});
 					return this.presentSubmitFailure(
 						chatId,
 						sender,
 						sessionId,
 						submitted.error,
+						caption ?? document?.file_name ?? "photo",
 					);
+				}
+				submissionPending = false;
 				return this.confirmInputAccepted(
 					chatId,
 					message.message_id,
 					submitted.value as string,
+					activity,
 					`Attachment saved and submitted: ${saved.path}`,
 				);
 			} catch (error) {
+				if (activity && submissionPending) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					this.stopLiveActivityStats(activity);
+					this.updateLiveActivity(activity, {
+						status: "Вложение не удалось отправить",
+						notice: "Pi не получил вложение.",
+					});
+				}
 				if (error instanceof TelegramAttachmentTooLargeError)
 					return this.sendDirect(
 						chatId,
@@ -1823,11 +1966,18 @@ export class TelegramTransportAdapter
 			readonly message: string;
 			readonly inputId?: string;
 		},
+		inputText?: string,
 	): Promise<void> {
+		const withInput = (message: string) =>
+			inputText
+				? `${message}\n\nСообщение:\n${truncateDiagnostic(inputText, 1200)}`
+				: message;
 		if (error.code === "SESSION_NOT_RESUMABLE")
 			return this.sendDirect(
 				chatId,
-				`${error.message}. This message was not submitted, and harnessd did not create a replacement. Choose another with /sessions or /menu.`,
+				withInput(
+					`${error.message}. This message was not submitted, and harnessd did not create a replacement. Choose another with /sessions or /menu.`,
+				),
 			);
 		if (error.code === "SESSION_NOT_FOUND") {
 			const inspected = await this.request(sender, {
@@ -1842,7 +1992,9 @@ export class TelegramTransportAdapter
 						: "The session is not currently available to Pi.";
 				return this.sendDirect(
 					chatId,
-					`${detail} This message was not sent. Choose a session with /sessions or /menu; harnessd did not create a replacement.`,
+					withInput(
+						`${detail} This message was not sent. Choose a session with /sessions or /menu; harnessd did not create a replacement.`,
+					),
 				);
 			}
 			if (inspected.error.code === "SESSION_NOT_FOUND") {
@@ -1851,11 +2003,13 @@ export class TelegramTransportAdapter
 					(await this.clearSelected(chatId));
 				return this.sendDirect(
 					chatId,
-					`The remembered session no longer exists. This message was not sent. Choose another with /sessions or /menu.${selectionCleared ? "" : " The stale selection could not be cleared from saved state."}`,
+					withInput(
+						`The remembered session no longer exists. This message was not sent. Choose another with /sessions or /menu.${selectionCleared ? "" : " The stale selection could not be cleared from saved state."}`,
+					),
 				);
 			}
 		}
-		return this.sendDirect(chatId, safeResultError(error));
+		return this.sendDirect(chatId, withInput(safeResultError(error)));
 	}
 
 	private request(
@@ -2272,15 +2426,440 @@ export class TelegramTransportAdapter
 			await this.sendWithDeadline(chatId, chunk);
 	}
 
+	private beginLiveActivity(
+		chatId: number,
+		sessionId: SessionId,
+		sourceMessageId: number | undefined,
+	): LiveActivity {
+		let activity = this.liveActivities.get(activityKey(chatId, sessionId));
+		if (activity && activity.sessionId === sessionId) {
+			const current = activity;
+			const startsIndependentTurn =
+				!this.runningSessions.has(sessionId) &&
+				current.pendingSubmissions === 0;
+			current.turnGeneration++;
+			current.pendingSubmissions++;
+			if (current.finishTimer) clearTimeout(current.finishTimer);
+			current.finishTimer = undefined;
+			current.submittedWhileRunning = this.runningSessions.has(sessionId);
+			if (startsIndependentTurn) {
+				current.queuedInputs.splice(0, current.queuedInputs.length);
+				current.overflowInputIds.clear();
+				current.failedOverflowInputIds.clear();
+				current.untrackedInputOverflow = false;
+				current.untrackedFailureOverflow = false;
+			}
+			if (!current.statsTimer) {
+				current.statsTimer = setInterval(
+					() => void this.refreshLiveActivityStats(current),
+					2500,
+				);
+				current.statsTimer.unref();
+			}
+			current.status = current.submittedWhileRunning
+				? "В очереди Pi"
+				: "Отправляю в Pi";
+			current.notices.push("Новое сообщение добавлено в очередь");
+			this.renderLiveActivity(current);
+			return current;
+		}
+		activity = {
+			chatId,
+			sessionId,
+			...(sourceMessageId !== undefined ? { sourceMessageId } : {}),
+			queuedInputs: [],
+			overflowInputIds: new Set(),
+			failedOverflowInputIds: new Set(),
+			untrackedInputOverflow: false,
+			untrackedFailureOverflow: false,
+			tools: [],
+			notices: [],
+			status: this.runningSessions.has(sessionId)
+				? "В очереди Pi"
+				: "Отправляю в Pi",
+			submittedWhileRunning: this.runningSessions.has(sessionId),
+			thinking: false,
+			unavailable: false,
+			renderQueue: Promise.resolve(),
+			statsInFlight: false,
+			pendingSubmissions: 1,
+			turnGeneration: 1,
+			finishing: false,
+		};
+		this.liveActivities.set(activityKey(chatId, sessionId), activity);
+		this.renderLiveActivity(activity);
+		activity.statsTimer = setInterval(
+			() => void this.refreshLiveActivityStats(activity),
+			2500,
+		);
+		activity.statsTimer.unref();
+		return activity;
+	}
+
+	private liveActivityText(activity: LiveActivity): string {
+		const lines = ["🔧 Pi activity:"];
+		if (activity.thinking) lines.push("• Думаю…");
+		for (const notice of activity.notices.slice(-4))
+			lines.push(`• ${truncateDiagnostic(notice, 180)}`);
+		for (const tool of activity.tools.slice(-10))
+			for (const state of tool.history)
+				lines.push(
+					`• ${truncateDiagnostic(tool.summary, 120)} ${state === "running" ? "…" : state === "failed" ? "❌" : "✓"}`,
+				);
+		const visibleInputs = activity.queuedInputs.slice(-5);
+		const olderUnresolved = activity.queuedInputs
+			.slice(0, -visibleInputs.length)
+			.filter((input) => input.state !== "completed").length;
+		const overflowUnresolved =
+			activity.overflowInputIds.size + activity.failedOverflowInputIds.size;
+		if (olderUnresolved || overflowUnresolved)
+			lines.push(
+				`• ${olderUnresolved + overflowUnresolved} earlier input(s) remain unresolved`,
+			);
+		if (activity.untrackedInputOverflow)
+			lines.push("• Additional input status is unresolved.");
+		if (activity.untrackedFailureOverflow)
+			lines.push("• Additional failed/uncertain input status is retained.");
+		for (const input of visibleInputs)
+			lines.push(`• Input ${input.inputId}: ${input.state}`);
+		const live = activity.liveStatus;
+		const model = live?.model
+			? truncateDiagnostic(modelId(live.model), 120)
+			: "model unavailable";
+		const effort = live?.effort
+			? truncateDiagnostic(oneLine(live.effort), 60)
+			: "effort unavailable";
+		lines.push(
+			`⏳ ${activity.status} · ${compactUsage(live?.usage)} · ${model} · ${effort}`,
+		);
+		return truncateActivityText(lines.join("\n"));
+	}
+
+	private renderLiveActivity(activity: LiveActivity): void {
+		activity.renderQueue = activity.renderQueue
+			.then(async () => {
+				if (
+					this.stopping ||
+					activity.unavailable ||
+					this.liveActivities.get(
+						activityKey(activity.chatId, activity.sessionId),
+					) !== activity
+				)
+					return;
+				const text = this.liveActivityText(activity);
+				if (activity.messageId === undefined) {
+					const sent = await this.telegramCall((signal) =>
+						this.bot.api.sendMessage(
+							activity.chatId,
+							text,
+							activity.sourceMessageId === undefined
+								? {}
+								: {
+										reply_parameters: { message_id: activity.sourceMessageId },
+									},
+							signal,
+						),
+					);
+					if (!sent.ok) {
+						activity.unavailable = true;
+						this.reportError(
+							"Telegram activity bubble could not be sent",
+							sent.error,
+						);
+						return;
+					}
+					activity.messageId = messageIdFrom(sent.value);
+					activity.lastText = text;
+					return;
+				}
+				if (activity.lastText === text) return;
+				const edited = await this.telegramCall((signal) =>
+					this.bot.api.editMessageText(
+						activity.chatId,
+						activity.messageId as number,
+						text,
+						{},
+						signal,
+					),
+				);
+				if (!edited.ok) {
+					if (isMessageNotFound(edited.error)) {
+						activity.messageId = undefined;
+						activity.lastText = undefined;
+						this.renderLiveActivity(activity);
+					} else {
+						activity.unavailable = true;
+						this.reportError(
+							"Telegram activity bubble could not be updated",
+							edited.error,
+						);
+					}
+					return;
+				}
+				activity.lastText = text;
+			})
+			.catch((error) => {
+				this.reportError("Telegram activity update failed", error);
+			});
+	}
+
+	private async refreshLiveActivityStats(
+		activity: LiveActivity,
+	): Promise<void> {
+		if (activity.statsInFlight || this.stopping) return;
+		const sender = this.authorizedChatPrincipals.get(activity.chatId);
+		if (sender === undefined) return;
+		activity.statsInFlight = true;
+		try {
+			const result = await this.request(sender, {
+				kind: "session_status",
+				sessionId: activity.sessionId,
+			});
+			if (
+				result.ok &&
+				this.liveActivities.get(
+					activityKey(activity.chatId, activity.sessionId),
+				) === activity
+			) {
+				activity.liveStatus = (result.value as HarnessSessionStatus).live;
+				this.renderLiveActivity(activity);
+			}
+		} catch {
+			// Activity reporting is best-effort and must not affect input delivery.
+		} finally {
+			activity.statsInFlight = false;
+		}
+	}
+
+	private finishActivitySubmission(activity: LiveActivity): void {
+		if (activity.pendingSubmissions > 0) activity.pendingSubmissions--;
+	}
+
+	private updateLiveActivity(
+		activity: LiveActivity,
+		update: { readonly status?: string; readonly notice?: string },
+	): void {
+		if (update.status !== undefined) activity.status = update.status;
+		if (update.notice) activity.notices.push(update.notice);
+		if (activity.notices.length > 12) activity.notices.shift();
+		this.renderLiveActivity(activity);
+	}
+
+	private updateActivityInput(
+		activity: LiveActivity,
+		inputId: string,
+		state: string,
+	): void {
+		const existing = activity.queuedInputs.find(
+			(input) => input.inputId === inputId,
+		);
+		const previousState = existing?.state;
+		const terminalStates = new Set(["completed", "failed", "uncertain"]);
+		if (
+			existing &&
+			terminalStates.has(existing.state) &&
+			!terminalStates.has(state)
+		)
+			return;
+		if (existing) existing.state = state;
+		else {
+			const completed = activity.queuedInputs.findIndex(
+				(input) => input.state === "completed",
+			);
+			if (completed >= 0) activity.queuedInputs.splice(completed, 1);
+			if (activity.queuedInputs.length < ACTIVITY_INPUT_HISTORY_LIMIT)
+				activity.queuedInputs.push({ inputId, state });
+			else if (state !== "completed") {
+				if (activity.overflowInputIds.size < ACTIVITY_OVERFLOW_INPUT_LIMIT)
+					activity.overflowInputIds.add(inputId);
+				else activity.untrackedInputOverflow = true;
+			}
+		}
+		if (state === "completed") {
+			activity.overflowInputIds.delete(inputId);
+			activity.failedOverflowInputIds.delete(inputId);
+		} else if (state === "failed" || state === "uncertain") {
+			if (activity.overflowInputIds.delete(inputId)) {
+				if (
+					activity.failedOverflowInputIds.size < ACTIVITY_OVERFLOW_INPUT_LIMIT
+				)
+					activity.failedOverflowInputIds.add(inputId);
+				else {
+					activity.overflowInputIds.add(inputId);
+					activity.untrackedFailureOverflow = true;
+				}
+			} else if (
+				!activity.queuedInputs.some((input) => input.inputId === inputId) &&
+				activity.untrackedInputOverflow
+			)
+				activity.untrackedFailureOverflow = true;
+		}
+		if (
+			(state === "failed" || state === "uncertain") &&
+			previousState !== state
+		)
+			activity.notices.push(
+				`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`,
+			);
+		if (activity.notices.length > 12) activity.notices.shift();
+		if (state === "pending")
+			activity.status = activity.submittedWhileRunning
+				? "В очереди Pi"
+				: "Отправляю в Pi";
+		if (state === "uncertain" || state === "failed") {
+			this.stopLiveActivityStats(activity);
+			activity.status =
+				state === "uncertain"
+					? "Статус доставки неизвестен"
+					: "Ошибка отправки";
+		}
+		this.renderLiveActivity(activity);
+	}
+
+	private stopLiveActivityStats(activity: LiveActivity): void {
+		if (activity.statsTimer) clearInterval(activity.statsTimer);
+		activity.statsTimer = undefined;
+	}
+
+	private async waitForEventQueue(chatId: number): Promise<boolean> {
+		const queue = this.queues.get(chatId);
+		if (!queue) return true;
+		if (!queue.messages.length && !queue.draining && !queue.drainTimer)
+			return !queue.failed;
+		await new Promise<void>((resolve) => queue.idleWaiters.push(resolve));
+		return !queue.failed;
+	}
+
+	private hasUnsettledActivityInputs(activity: LiveActivity): boolean {
+		return (
+			activity.untrackedInputOverflow ||
+			activity.untrackedFailureOverflow ||
+			activity.overflowInputIds.size > 0 ||
+			activity.failedOverflowInputIds.size > 0 ||
+			activity.queuedInputs.some((input) => input.state !== "completed")
+		);
+	}
+
+	private reconcileOverflowAtRunSettlement(sessionId: SessionId): void {
+		for (const activity of this.activitiesForSession(sessionId)) {
+			activity.overflowInputIds.clear();
+			if (!activity.untrackedFailureOverflow)
+				activity.untrackedInputOverflow = false;
+			this.renderLiveActivity(activity);
+		}
+	}
+
+	private scheduleLiveActivityFinish(
+		sessionId: SessionId,
+		settledByRun = false,
+	): void {
+		for (const activity of this.activitiesForSession(sessionId)) {
+			if (
+				!settledByRun &&
+				!activity.queuedInputs.some((input) => input.state === "completed") &&
+				activity.overflowInputIds.size === 0
+			)
+				continue;
+			if (this.hasUnsettledActivityInputs(activity)) continue;
+			if (activity.finishTimer) continue;
+			activity.finishTimer = setTimeout(() => {
+				activity.finishTimer = undefined;
+				if (
+					activity.pendingSubmissions === 0 &&
+					!this.runningSessions.has(sessionId)
+				)
+					void this.finishLiveActivities(sessionId);
+			}, 0);
+		}
+	}
+
+	private async finishLiveActivities(sessionId: SessionId): Promise<void> {
+		const activities = [...this.liveActivities.values()].filter(
+			(activity) => activity.sessionId === sessionId,
+		);
+		for (const activity of activities) {
+			if (activity.pendingSubmissions > 0 || activity.finishing) continue;
+			if (this.hasUnsettledActivityInputs(activity)) {
+				const hasFailedInput =
+					activity.untrackedFailureOverflow ||
+					activity.failedOverflowInputIds.size > 0 ||
+					activity.queuedInputs.some((input) =>
+						["failed", "uncertain"].includes(input.state),
+					);
+				if (!hasFailedInput) activity.status = "Ожидаю подтверждения Pi";
+				this.renderLiveActivity(activity);
+				continue;
+			}
+			activity.finishing = true;
+			const generation = activity.turnGeneration;
+			activity.status = "Готово";
+			activity.thinking = false;
+			this.renderLiveActivity(activity);
+			const delivered = await this.waitForEventQueue(activity.chatId);
+			await activity.renderQueue;
+			if (
+				activity.turnGeneration !== generation ||
+				activity.pendingSubmissions > 0 ||
+				this.hasUnsettledActivityInputs(activity)
+			) {
+				activity.finishing = false;
+				continue;
+			}
+			if (!delivered) {
+				activity.finishing = false;
+				activity.status = "Ответ не удалось доставить";
+				activity.notices.push("Telegram не подтвердил доставку ответа.");
+				this.renderLiveActivity(activity);
+				continue;
+			}
+			await this.deleteLiveActivity(activity);
+		}
+	}
+
+	private async deleteLiveActivity(activity: LiveActivity): Promise<void> {
+		await activity.renderQueue;
+		if (activity.statsTimer) clearInterval(activity.statsTimer);
+		activity.statsTimer = undefined;
+		if (activity.finishTimer) clearTimeout(activity.finishTimer);
+		activity.finishTimer = undefined;
+		const key = activityKey(activity.chatId, activity.sessionId);
+		if (this.liveActivities.get(key) === activity)
+			this.liveActivities.delete(key);
+		if (activity.messageId !== undefined) {
+			const deleted = await this.telegramCall((signal) =>
+				this.bot.api.deleteMessage(
+					activity.chatId,
+					activity.messageId as number,
+					signal,
+				),
+			);
+			if (!deleted.ok)
+				this.reportError(
+					"Telegram activity bubble could not be deleted",
+					deleted.error,
+				);
+		}
+	}
+
 	private async confirmInputAccepted(
 		chatId: number,
 		messageId: number | undefined,
 		inputId: string,
-		acknowledgement: string,
+		activity: LiveActivity,
+		acknowledgement?: string,
 	): Promise<void> {
+		this.finishActivitySubmission(activity);
 		if (messageId !== undefined)
 			void this.reactToAcceptedInput(chatId, messageId, inputId);
-		await this.sendDirect(chatId, acknowledgement);
+		this.updateActivityInput(
+			activity,
+			inputId,
+			activity.submittedWhileRunning ? "queued" : "accepted",
+		);
+		if (acknowledgement && !acknowledgement.startsWith("Input accepted:"))
+			activity.notices.push(acknowledgement);
+		this.renderLiveActivity(activity);
+		this.scheduleLiveActivityFinish(activity.sessionId);
 	}
 
 	private async reactToAcceptedInput(
@@ -2981,22 +3560,44 @@ export class TelegramTransportAdapter
 			this.appendTurnOutput(event.sessionId, event.text);
 			return;
 		}
+		if (event.kind === "activity" && event.activityEvent) {
+			this.updateLiveActivityFromEvent(event.sessionId, event.activityEvent);
+			return;
+		}
 		if (event.kind === "status") {
 			if (event.text === "harness_recovered")
 				this.reportedErrors.delete(event.sessionId);
+			if (
+				event.text === "harness_restarting" ||
+				event.text === "harness_recovered" ||
+				event.text === "harness_recovery_failed"
+			) {
+				this.runningSessions.delete(event.sessionId);
+				this.stopTyping(event.sessionId);
+			}
 			if (event.text === "agent_start") {
+				this.runningSessions.add(event.sessionId);
 				this.startTyping(event.sessionId);
 				this.turnBuffers.set(event.sessionId, {
 					chunks: [],
 					characters: 0,
 					overflow: false,
 				});
+				for (const activity of this.activitiesForSession(event.sessionId)) {
+					activity.status = "Pi выполняет ход сессии";
+					activity.thinking = false;
+					this.renderLiveActivity(activity);
+					void this.refreshLiveActivityStats(activity);
+				}
 				return;
 			}
 			if (event.text === "agent_end") return;
 			if (event.text === "agent_settled") {
+				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
 				this.flushTurn(event.sessionId);
+				this.reconcileOverflowAtRunSettlement(event.sessionId);
+				this.scheduleLiveActivityFinish(event.sessionId, true);
 				return;
 			}
 			if (event.text === "harness_recovery_failed")
@@ -3011,11 +3612,30 @@ export class TelegramTransportAdapter
 			return;
 		}
 		if (event.kind === "error") {
-			this.stopTyping(event.sessionId);
-			this.flushTurn(event.sessionId, true);
-			if (this.reportedErrors.has(event.sessionId)) return;
-			this.reportedErrors.add(event.sessionId);
-			this.enqueueForSelected(event.sessionId, "Session reported an error.");
+			const detail = redactDiagnosticText(
+				event.text?.trim() || "Pi reported an unspecified session error.",
+				[this.options.token],
+			);
+			const fingerprint = detail;
+			let seen = this.reportedErrors.get(event.sessionId);
+			if (!seen) {
+				seen = new Set();
+				this.reportedErrors.set(event.sessionId, seen);
+			}
+			if (seen.has(fingerprint)) return;
+			seen.add(fingerprint);
+			if (event.fatal) {
+				this.runningSessions.delete(event.sessionId);
+				this.stopTyping(event.sessionId);
+				this.flushTurn(event.sessionId, true);
+			}
+			for (const activity of this.activitiesForSession(event.sessionId)) {
+				activity.notices.push(`⚠️ ${detail}`);
+				if (event.fatal) this.stopLiveActivityStats(activity);
+				activity.status = event.fatal ? "Ошибка сессии" : activity.status;
+				this.renderLiveActivity(activity);
+			}
+			this.enqueueForSelected(event.sessionId, `Pi error: ${detail}`);
 			return;
 		}
 		if (event.kind === "input" && event.inputEvent) {
@@ -3023,11 +3643,97 @@ export class TelegramTransportAdapter
 			if (state === "failed" || state === "uncertain")
 				this.stopTyping(event.sessionId);
 			if (state === "accepted") return;
+			const activities = this.activitiesForSession(event.sessionId);
+			if (activities.length) {
+				for (const activity of activities) {
+					this.updateActivityInput(activity, inputId, state);
+					if (state === "completed")
+						this.scheduleLiveActivityFinish(event.sessionId, true);
+				}
+				if (state === "failed" || state === "uncertain")
+					this.enqueueForSelected(
+						event.sessionId,
+						`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}${event.inputEvent.detail ? ` · ${redactDiagnosticText(event.inputEvent.detail, [this.options.token])}` : ""}`,
+						{ inputId, state },
+					);
+				return;
+			}
 			this.enqueueForSelected(
 				event.sessionId,
 				`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`,
 				{ inputId, state },
 			);
+		}
+	}
+
+	private activitiesForSession(sessionId: SessionId): LiveActivity[] {
+		return [...this.liveActivities.values()].filter(
+			(activity) => activity.sessionId === sessionId,
+		);
+	}
+
+	private updateLiveActivityFromEvent(
+		sessionId: SessionId,
+		event: HarnessActivityEvent,
+	): void {
+		const activities = this.activitiesForSession(sessionId);
+		if (activities.length === 0) {
+			if (event.type === "notification")
+				this.enqueueForSelected(
+					sessionId,
+					`Pi: ${redactDiagnosticText(event.text, [this.options.token])}`,
+				);
+			return;
+		}
+		for (const activity of activities) {
+			switch (event.type) {
+				case "thinking":
+					activity.thinking = event.active;
+					break;
+				case "tool_start": {
+					const existing = activity.tools.find(
+						(tool) => tool.id === event.toolCallId,
+					);
+					if (existing) {
+						existing.status = "running";
+						existing.history.push("running");
+						if (existing.history.length > 4) existing.history.shift();
+					} else
+						activity.tools.push({
+							id: event.toolCallId,
+							summary: truncateDiagnostic(
+								redactDiagnosticText(event.summary, [this.options.token]),
+								700,
+							),
+							status: "running",
+							history: ["running"],
+						});
+					if (activity.tools.length > 40) activity.tools.shift();
+					activity.status = "Вызов инструмента";
+					void this.refreshLiveActivityStats(activity);
+					break;
+				}
+				case "tool_end": {
+					const tool = activity.tools.find(
+						(item) => item.id === event.toolCallId,
+					);
+					if (tool) {
+						tool.status = event.failed ? "failed" : "done";
+						tool.history.push(tool.status);
+						if (tool.history.length > 4) tool.history.shift();
+					}
+					activity.status = "Pi выполняет ход сессии";
+					void this.refreshLiveActivityStats(activity);
+					break;
+				}
+				case "notification":
+					activity.notices.push(
+						redactDiagnosticText(event.text, [this.options.token]),
+					);
+					if (activity.notices.length > 12) activity.notices.shift();
+					break;
+			}
+			this.renderLiveActivity(activity);
 		}
 	}
 
@@ -3119,6 +3825,7 @@ export class TelegramTransportAdapter
 				pendingCharacters: 0,
 				failed: false,
 				overflowQueued: false,
+				idleWaiters: [],
 			};
 			this.queues.set(chatId, queue);
 		}
@@ -3215,7 +3922,11 @@ export class TelegramTransportAdapter
 	}
 
 	private scheduleDrain(chatId: number, queue: ChatQueue): void {
-		if (queue.draining || queue.drainTimer || !queue.messages.length) return;
+		if (queue.draining || queue.drainTimer) return;
+		if (!queue.messages.length) {
+			for (const resolve of queue.idleWaiters.splice(0)) resolve();
+			return;
+		}
 		queue.drainTimer = setTimeout(() => {
 			queue.drainTimer = undefined;
 			const draining = Promise.resolve().then(() => this.drain(chatId, queue));
