@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
 	ManagedProcess,
 	ProcessLaunchRequest,
@@ -16,6 +16,10 @@ import type {
 	ProcessId,
 	SessionId,
 } from "../src/core/types.js";
+import {
+	AGENT_FILE_SEND_TOKEN_ENV,
+	AGENT_FILE_SEND_URL_ENV,
+} from "../src/harness/agent-file-send-protocol.js";
 import {
 	PiControlError,
 	PiRpcHarnessAdapter,
@@ -305,6 +309,52 @@ describe("PiRpcHarnessAdapter", () => {
 			stdio: "pipe",
 		});
 		expect(instance.nativeSessionId).toBe("native-exact");
+		await instance.shutdown();
+	});
+
+	it("loads an explicit send_file extension with a session-scoped local bridge", async () => {
+		const fake = fakeProvider();
+		const sendAgentFile = vi.fn(async () => ({
+			fileName: "report.txt",
+			delivered: 1,
+			recipients: 1,
+		}));
+		const adapter = new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			agentFileSend: sendAgentFile,
+			startupTimeoutMs: 100,
+		});
+		expect(adapter.descriptor.capabilities).toContain("harness.file.send");
+		const instance = await adapter.launch(request);
+		const launchRequest = fake.launchRequest;
+		expect(launchRequest?.args).toContain("--extension");
+		const extensionIndex = launchRequest?.args.indexOf("--extension") ?? -1;
+		expect(launchRequest?.args[extensionIndex + 1]).toMatch(
+			/agent-file-send-extension\.(?:ts|js)$/,
+		);
+		const env = launchRequest?.env ?? {};
+		const url = env[AGENT_FILE_SEND_URL_ENV];
+		const token = env[AGENT_FILE_SEND_TOKEN_ENV];
+		expect(Object.keys(env).sort()).toEqual(
+			[AGENT_FILE_SEND_TOKEN_ENV, AGENT_FILE_SEND_URL_ENV].sort(),
+		);
+		const response = await fetch(url as string, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({ path: "report.txt", caption: "Sent" }),
+		});
+		expect(await response.json()).toEqual({
+			ok: true,
+			result: { fileName: "report.txt", delivered: 1, recipients: 1 },
+		});
+		expect(sendAgentFile).toHaveBeenCalledWith({
+			sessionId: request.sessionId,
+			path: "report.txt",
+			caption: "Sent",
+		});
 		await instance.shutdown();
 	});
 

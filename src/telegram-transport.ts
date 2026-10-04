@@ -1,14 +1,6 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import {
-	open,
-	readFile,
-	realpath,
-	rename,
-	stat,
-	unlink,
-	writeFile,
-} from "node:fs/promises";
+import { open, readFile, realpath, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Bot, InputFile } from "grammy";
@@ -17,6 +9,9 @@ import {
 	getTelegramHelpUsages,
 } from "./command-catalog.js";
 import type {
+	AgentFileSendRequest,
+	AgentFileSendResult,
+	AgentFileSendTransport,
 	HarnessEffortCatalog,
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
@@ -39,7 +34,9 @@ import {
 	parsePathArgument,
 	resolveExistingDirectory,
 	resolvePathFrom,
+	safeAttachmentName,
 } from "./telegram-filesystem.js";
+import { TelegramInbox, TelegramInboxQuotaError } from "./telegram-inbox.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
 
 const TELEGRAM_LIMIT = 4096;
@@ -52,6 +49,8 @@ const MAX_QUEUED_CHARACTERS = 32_768;
 const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
 const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_TELEGRAM_DOWNLOAD_BYTES = 20_000_000;
+const INBOX_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
@@ -354,7 +353,10 @@ async function readBoundedFile(
 		await handle.close();
 	}
 }
-async function readBoundedResponse(response: Response): Promise<Buffer> {
+async function readBoundedResponse(
+	response: Response,
+	maxBytes = MAX_TELEGRAM_FILE_BYTES,
+): Promise<Buffer> {
 	if (!response.body) throw new Error("empty response");
 	const reader = response.body.getReader();
 	const chunks: Uint8Array[] = [];
@@ -363,23 +365,13 @@ async function readBoundedResponse(response: Response): Promise<Buffer> {
 		const { done, value } = await reader.read();
 		if (done) break;
 		length += value.byteLength;
-		if (length > MAX_TELEGRAM_FILE_BYTES) {
+		if (length > maxBytes) {
 			await reader.cancel();
 			throw new TelegramAttachmentTooLargeError();
 		}
 		chunks.push(value);
 	}
 	return Buffer.concat(chunks, length);
-}
-function safeAttachmentName(value: string): string {
-	const basename = path
-		.basename(value)
-		.replace(/[\\/\\\\]/g, "_")
-		.replace(/[^A-Za-z0-9._-]/g, "_")
-		.slice(0, 100);
-	return basename && basename !== "." && basename !== ".."
-		? basename
-		: "attachment";
 }
 function escapeHtml(value: string): string {
 	return value.replace(/[&<>"']/g, (character) => {
@@ -630,7 +622,9 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 	});
 }
 
-export class TelegramTransportAdapter implements TransportAdapter {
+export class TelegramTransportAdapter
+	implements TransportAdapter, AgentFileSendTransport
+{
 	readonly descriptor = {
 		id: "telegram" as AdapterId,
 		capabilities: ["transport.poll"] as const,
@@ -668,6 +662,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	private readonly authorized: Set<number>;
 	private readonly authorizedChatPrincipals = new Map<number, number>();
 	private dispatch?: (event: TransportEvent) => Promise<TransportResult>;
+	private listSessions?: () => Promise<readonly SessionSummary[]>;
+	private inbox?: TelegramInbox;
+	private inboxSweepTimer?: NodeJS.Timeout;
+	private inboxSweepPromise?: Promise<void>;
 	private unsubscribe?: () => void;
 	private releaseLock?: () => Promise<void>;
 	private stopPromise?: Promise<void>;
@@ -693,8 +691,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	async start(
 		dispatch: (event: TransportEvent) => Promise<TransportResult>,
 		subscribe: TransportEventSubscription,
+		listSessions?: () => Promise<readonly SessionSummary[]>,
 	): Promise<void> {
 		this.dispatch = dispatch;
+		this.listSessions = listSessions;
 		this.releaseLock = await acquireTelegramPollingLock(
 			this.options.token,
 			this.options.stateDirectory,
@@ -704,6 +704,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				this.options.stateDirectory,
 				this.options.token,
 			);
+			this.inbox = new TelegramInbox(this.options.stateDirectory);
 			if (this.options.signal?.aborted)
 				throw new Error("Telegram startup aborted");
 			this.unsubscribe = subscribe((event) => this.onEvent(event));
@@ -785,6 +786,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				if (this.options.signal?.aborted)
 					throw new Error("Telegram startup aborted");
 				this.ready = true;
+				this.scheduleInboxSweep();
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortPolling);
 			}
@@ -811,6 +813,57 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 	}
 
+	private scheduleInboxSweep(): void {
+		const run = () => {
+			if (this.stopping || this.inboxSweepPromise) return;
+			const task = this.sweepSessionInboxes();
+			this.inboxSweepPromise = task;
+			void task
+				.catch(() => {
+					console.error("harnessd: Telegram inbox cleanup failed");
+				})
+				.finally(() => {
+					if (this.inboxSweepPromise === task)
+						this.inboxSweepPromise = undefined;
+				});
+		};
+		setTimeout(run, 0);
+		this.inboxSweepTimer = setInterval(run, INBOX_SWEEP_INTERVAL_MS);
+	}
+
+	private async sweepSessionInboxes(): Promise<void> {
+		const listSessions = this.listSessions;
+		if (!listSessions || !this.inbox || this.stopping) return;
+		const sessions = await listSessions();
+		await this.inbox.sweep(sessions, listSessions);
+	}
+
+	private async deleteSessionAndInbox(
+		sender: number,
+		sessionId: SessionId,
+	): Promise<{
+		readonly result: TransportResult;
+		readonly cleanupPending: boolean;
+	}> {
+		const inbox = this.inbox;
+		if (!inbox)
+			return {
+				result: await this.request(sender, { kind: "delete", sessionId }),
+				cleanupPending: false,
+			};
+		return inbox.withSessionLock(sessionId, async () => {
+			const result = await this.request(sender, { kind: "delete", sessionId });
+			if (!result.ok) return { result, cleanupPending: false };
+			try {
+				await inbox.removeSessionUnderLock(sessionId);
+				return { result, cleanupPending: false };
+			} catch {
+				console.error("harnessd: Telegram session inbox cleanup failed");
+				return { result, cleanupPending: true };
+			}
+		});
+	}
+
 	stop(): Promise<void> {
 		if (!this.stopPromise) this.stopPromise = this.stopPolling();
 		return this.stopPromise;
@@ -818,6 +871,12 @@ export class TelegramTransportAdapter implements TransportAdapter {
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		if (this.inboxSweepTimer) clearInterval(this.inboxSweepTimer);
+		this.inboxSweepTimer = undefined;
+		if (this.inboxSweepPromise)
+			await withDeadline(this.inboxSweepPromise, STOP_TIMEOUT_MS).catch(
+				() => {},
+			);
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.initializationAbort?.abort();
@@ -933,10 +992,45 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		}
 	}
 
+	async sendAgentFile(
+		request: AgentFileSendRequest,
+	): Promise<AgentFileSendResult> {
+		if (this.stopping) throw new Error("Telegram transport is stopping");
+		if (request.caption !== undefined && [...request.caption].length > 1024)
+			throw new Error("Invalid file caption");
+		const recipients = [...this.selected].flatMap(([chatId, sessionId]) =>
+			sessionId === request.sessionId &&
+			Number.isSafeInteger(chatId) &&
+			this.authorized.has(this.authorizedChatPrincipals.get(chatId) ?? -1)
+				? [chatId]
+				: [],
+		);
+		if (recipients.length === 0)
+			throw new Error("No authorized chat currently selects this session");
+		let delivered = 0;
+		for (const chatId of recipients) {
+			if (
+				await this.sendFileToChat(
+					request.sessionId,
+					request.path,
+					chatId,
+					request.caption,
+				)
+			)
+				delivered += 1;
+		}
+		return {
+			fileName: safeAttachmentName(path.basename(request.path)),
+			delivered,
+			recipients: recipients.length,
+		};
+	}
+
 	private async sendFileToChat(
 		sessionId: SessionId,
 		filePath: string,
 		chatId: number,
+		caption?: string,
 	): Promise<boolean> {
 		const cwd = this.sessionCwds.get(sessionId);
 		if (!cwd) return false;
@@ -965,7 +1059,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 				this.bot.api.sendDocument(
 					chatId,
 					new InputFile(data, path.basename(canonicalFile)),
-					{},
+					caption === undefined ? {} : { caption },
 					signal,
 				),
 			);
@@ -1003,71 +1097,83 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		if (!fileId)
 			return this.sendDirect(chatId, "Could not identify the attachment.");
 		const declaredSize = document?.file_size ?? photo?.file_size;
-		if (declaredSize !== undefined && declaredSize > MAX_TELEGRAM_FILE_BYTES)
-			return this.sendDirect(chatId, "Attachment exceeds the 20 MiB limit.");
-		const inspected = await this.request(sender, {
-			kind: "inspect",
-			sessionId,
-		});
-		if (!inspected.ok) return this.sendDirect(chatId, inspected.error.message);
-		const session = inspected.value as SessionSummary;
-		this.rememberSession(session);
-		try {
-			const file = await this.bot.api.getFile(fileId);
-			if ((file.file_size ?? 0) > MAX_TELEGRAM_FILE_BYTES)
-				throw new TelegramAttachmentTooLargeError();
-			if (!file.file_path) throw new Error("file unavailable");
-			const url = await this.bot.api.getFileLink(fileId);
-			const response = await fetch(url);
-			if (!response.ok) throw new Error("download failed");
-			const data = await readBoundedResponse(response);
-			if (!data.length || data.length > MAX_TELEGRAM_FILE_BYTES)
-				throw new Error("file size invalid");
-			const safeName = safeAttachmentName(
-				document?.file_name ?? (photo ? "photo.jpg" : "attachment"),
+		if (
+			declaredSize !== undefined &&
+			declaredSize > MAX_TELEGRAM_DOWNLOAD_BYTES
+		)
+			return this.sendDirect(
+				chatId,
+				"Attachment exceeds Telegram's 20 MB download limit.",
 			);
-			const target = path.join(
-				session.cwd,
-				`${Date.now()}-${randomBytes(6).toString("hex")}-${safeName}`,
-			);
-			const temporary = `${target}.part`;
-			try {
-				await writeFile(temporary, data, { flag: "wx", mode: 0o600 });
-				await rename(temporary, target);
-			} catch (error) {
-				await unlink(temporary).catch(() => {});
-				throw error;
-			}
-			const canonical = await realpath(target);
-			if (path.dirname(canonical) !== (await realpath(session.cwd))) {
-				await unlink(target).catch(() => {});
-				throw new Error("attachment path invalid");
-			}
-			const caption = message.caption?.trim();
-			const text = `The user sent an attachment saved at ${canonical}.${caption ? ` Caption (untrusted user text): ${caption}` : ""}`;
-			const image = photo
-				? [{ mimeType: "image/jpeg", data: data.toString("base64") }]
-				: undefined;
-			const submitted = await this.request(sender, {
-				kind: "submit",
+		const inbox = this.inbox;
+		if (!inbox)
+			return this.sendDirect(chatId, "The session inbox is unavailable.");
+		await inbox.withSessionLock(sessionId, async () => {
+			const inspected = await this.request(sender, {
+				kind: "inspect",
 				sessionId,
-				text,
-				...(image ? { images: image } : {}),
 			});
-			if (!submitted.ok)
-				return this.sendDirect(chatId, submitted.error.message);
-			return this.sendDirect(
-				chatId,
-				`Attachment saved and submitted: ${canonical}`,
-			);
-		} catch (error) {
-			if (error instanceof TelegramAttachmentTooLargeError)
-				return this.sendDirect(chatId, "Attachment exceeds the 20 MiB limit.");
-			return this.sendDirect(
-				chatId,
-				"Could not safely download or save this attachment. Check that the selected session folder is writable and try a smaller file.",
-			);
-		}
+			if (!inspected.ok) {
+				await this.sendDirect(chatId, inspected.error.message);
+				return;
+			}
+			const session = inspected.value as SessionSummary;
+			this.rememberSession(session);
+			try {
+				const file = await this.bot.api.getFile(fileId);
+				if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
+					throw new TelegramAttachmentTooLargeError();
+				if (!file.file_path) throw new Error("file unavailable");
+				const url = await this.bot.api.getFileLink(fileId);
+				const response = await fetch(url);
+				if (!response.ok) throw new Error("download failed");
+				const data = await readBoundedResponse(
+					response,
+					MAX_TELEGRAM_DOWNLOAD_BYTES,
+				);
+				if (!data.length || data.length > MAX_TELEGRAM_DOWNLOAD_BYTES)
+					throw new Error("file size invalid");
+				const saved = await inbox.saveUnderLock(
+					session.id,
+					document?.file_name ?? (photo ? "photo.jpg" : "attachment"),
+					data,
+					session.status === "stopped" || session.status === "failed",
+					session.cwd,
+				);
+				const caption = message.caption?.trim();
+				const text = `The user sent an attachment saved in the harnessd inbox at ${saved.path}.${caption ? ` Caption (untrusted user text): ${caption}` : ""}`;
+				const image = photo
+					? [{ mimeType: "image/jpeg", data: data.toString("base64") }]
+					: undefined;
+				const submitted = await this.dispatchRequest(sender, {
+					kind: "submit",
+					sessionId,
+					text,
+					...(image ? { images: image } : {}),
+				});
+				if (!submitted.ok)
+					return this.sendDirect(chatId, submitted.error.message);
+				return this.sendDirect(
+					chatId,
+					`Attachment saved and submitted: ${saved.path}`,
+				);
+			} catch (error) {
+				if (error instanceof TelegramAttachmentTooLargeError)
+					return this.sendDirect(
+						chatId,
+						"Attachment exceeds Telegram's 20 MB download limit.",
+					);
+				if (error instanceof TelegramInboxQuotaError)
+					return this.sendDirect(
+						chatId,
+						"Session inbox quota reached (10 files or 100 MiB). Remove files or wait for expired files to be cleaned.",
+					);
+				return this.sendDirect(
+					chatId,
+					"Could not safely download or save this attachment in the session inbox. Try again with a smaller file.",
+				);
+			}
+		});
 	}
 
 	private async command(
@@ -1365,7 +1471,10 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			if (args.length !== 1)
 				return this.sendDirect(chatId, "Usage: /delete <sessionId>");
 			const sessionId = args[0] as SessionId;
-			const result = await this.request(sender, { kind: "delete", sessionId });
+			const { result, cleanupPending } = await this.deleteSessionAndInbox(
+				sender,
+				sessionId,
+			);
 			if (result.ok) {
 				this.sessionNames.delete(sessionId);
 				this.knownSessions.delete(sessionId);
@@ -1381,7 +1490,7 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			return this.sendDirect(
 				chatId,
 				result.ok
-					? `Deleted stopped session ${this.sessionFooter(sessionId)} from harnessd.`
+					? `Deleted stopped session ${this.sessionFooter(sessionId)} from harnessd.${cleanupPending ? " Inbox cleanup is pending." : ""}`
 					: result.error.message,
 			);
 		}
@@ -1555,6 +1664,16 @@ export class TelegramTransportAdapter implements TransportAdapter {
 	}
 
 	private request(
+		sender: number,
+		request: TelegramRequest,
+	): Promise<TransportResult> {
+		const operation = () => this.dispatchRequest(sender, request);
+		if (this.inbox && (request.kind === "resume" || request.kind === "submit"))
+			return this.inbox.withSessionLock(request.sessionId, operation);
+		return operation();
+	}
+
+	private dispatchRequest(
 		sender: number,
 		request: TelegramRequest,
 	): Promise<TransportResult> {
@@ -2466,10 +2585,16 @@ export class TelegramTransportAdapter implements TransportAdapter {
 		sessionId: SessionId,
 		messageId: number,
 	): Promise<void> {
-		const result = await this.request(sender, {
-			kind: action,
-			sessionId,
-		} as TelegramRequest);
+		const { result, cleanupPending } =
+			action === "delete"
+				? await this.deleteSessionAndInbox(sender, sessionId)
+				: {
+						result: await this.request(sender, {
+							kind: action,
+							sessionId,
+						} as TelegramRequest),
+						cleanupPending: false,
+					};
 		if (!result.ok) {
 			await this.sendDirect(chatId, result.error.message);
 			return this.renderPanel(chatId, sender, messageId);
@@ -2483,6 +2608,11 @@ export class TelegramTransportAdapter implements TransportAdapter {
 			this.sessionNames.delete(sessionId);
 			this.knownSessions.delete(sessionId);
 			this.reportedErrors.delete(sessionId);
+			if (cleanupPending)
+				await this.sendDirect(
+					chatId,
+					"Session deleted; inbox cleanup is pending.",
+				);
 			for (const [selectedChat, selectedId] of this.selected) {
 				if (selectedId === sessionId) {
 					this.clearSelected(selectedChat);

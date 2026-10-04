@@ -3,8 +3,11 @@ import { constants as fsConstants } from "node:fs";
 import { access, open, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
+import type { Capability } from "../core/errors.js";
 import { requireCapability } from "../core/errors.js";
 import type {
+	AgentFileSendHandler,
 	HarnessAdapter as HarnessAdapterPort,
 	HarnessControl,
 	HarnessInstance,
@@ -24,11 +27,20 @@ import type {
 	InputId,
 	SessionId,
 } from "../core/types.js";
+import {
+	type AgentFileSendBridge,
+	startAgentFileSendBridge,
+} from "./agent-file-send-bridge.js";
+import {
+	AGENT_FILE_SEND_TOKEN_ENV,
+	AGENT_FILE_SEND_URL_ENV,
+} from "./agent-file-send-protocol.js";
 
 export interface PiRpcHarnessOptions {
 	readonly executable: string;
 	readonly args?: readonly string[];
 	readonly env?: Readonly<Record<string, string>>;
+	readonly agentFileSend?: AgentFileSendHandler;
 	readonly startupTimeoutMs?: number;
 	readonly commandTimeoutMs?: number;
 	readonly shutdownTimeoutMs?: number;
@@ -210,9 +222,8 @@ const controlledFlags = [
 ];
 
 export class PiRpcHarnessAdapter implements HarnessAdapterPort {
-	readonly descriptor = {
-		id: "pi-rpc" as AdapterId,
-		capabilities: [
+	get descriptor(): HarnessAdapterPort["descriptor"] {
+		const capabilities: Capability[] = [
 			"harness.launch",
 			"harness.stop",
 			"harness.resume",
@@ -223,8 +234,10 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			"harness.effort.list",
 			"harness.effort.set",
 			"input.submit",
-		] as const,
-	};
+		];
+		if (this.options.agentFileSend) capabilities.push("harness.file.send");
+		return { id: "pi-rpc" as AdapterId, capabilities };
+	}
 	constructor(
 		private readonly processes: ProcessProvider,
 		private readonly options: PiRpcHarnessOptions,
@@ -298,23 +311,53 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			request.cwd,
 			this.options.env,
 		);
+		let fileSendBridge:
+			| Awaited<ReturnType<typeof startAgentFileSendBridge>>
+			| undefined;
 		let child: ManagedProcess;
 		try {
+			if (this.options.agentFileSend) {
+				fileSendBridge = await startAgentFileSendBridge(
+					request.sessionId,
+					this.options.agentFileSend,
+				);
+				const adapterPath = fileURLToPath(import.meta.url);
+				args.push(
+					"--extension",
+					path.join(
+						path.dirname(adapterPath),
+						`agent-file-send-extension${path.extname(adapterPath)}`,
+					),
+				);
+			}
 			child = await this.processes.launch({
 				executable: launch?.executable ?? this.options.executable,
 				args: [...(launch?.argsPrefix ?? []), ...args],
 				cwd: request.cwd,
-				env: this.options.env,
+				env: fileSendBridge
+					? {
+							...(this.options.env ?? {}),
+							[AGENT_FILE_SEND_URL_ENV]: fileSendBridge.url,
+							[AGENT_FILE_SEND_TOKEN_ENV]: fileSendBridge.token,
+						}
+					: this.options.env,
 				stdio: "pipe",
 			});
 		} catch (error) {
+			await fileSendBridge?.close().catch(() => {});
 			throw toPiStartupError(error, "launch");
 		}
 		if (!child.stdin || !child.stdout || !child.stderr) {
 			await terminateChild(child, this.options.shutdownTimeoutMs ?? 1000);
+			await fileSendBridge?.close().catch(() => {});
 			throw new PiStartupError("PI_STARTUP_FAILED");
 		}
-		const instance = new PiRpcInstance(child, request.sessionId, this.options);
+		const instance = new PiRpcInstance(
+			child,
+			request.sessionId,
+			this.options,
+			fileSendBridge,
+		);
 		try {
 			await instance.ready(resume ? request.nativeSessionId : undefined);
 			return instance;
@@ -445,6 +488,7 @@ class PiRpcInstance implements HarnessInstance {
 		private readonly child: ManagedProcess,
 		private readonly sessionId: SessionId,
 		private readonly options: PiRpcHarnessOptions,
+		private readonly fileSendBridge?: AgentFileSendBridge,
 	) {
 		this.processId = child.id;
 		this.exit = child.exit;
@@ -469,6 +513,7 @@ class PiRpcInstance implements HarnessInstance {
 		stderr.on("error", () => this.failProcess("Pi stderr failed"));
 		void child.exit.then((exit) => {
 			this.childExited = true;
+			void this.fileSendBridge?.close().catch(() => {});
 			if (this.eventsClosed) return;
 			this.exitDetail = `Pi process exited (${exit.code ?? exit.signal ?? "unknown"})`;
 			if (this.stdoutEnded) queueMicrotask(() => this.finalizeChildExit(false));
@@ -971,6 +1016,7 @@ class PiRpcInstance implements HarnessInstance {
 				}
 			}
 			this.closeEvents("Pi harness shut down");
+			await this.fileSendBridge?.close();
 		})();
 		return this.cleanup;
 	}

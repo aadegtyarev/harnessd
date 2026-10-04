@@ -1,4 +1,6 @@
 import type {
+	AgentFileSendHandler,
+	AgentFileSendTransport,
 	HarnessAdapter,
 	ProcessProvider,
 	TransportAdapter,
@@ -147,7 +149,10 @@ export interface ApplicationRuntimeOptions {
 	readonly piExecutable: string;
 	readonly executionMode?: ExecutionMode;
 	readonly processProvider?: ProcessProvider;
-	readonly piOptions?: Omit<PiRpcHarnessOptions, "executable">;
+	readonly piOptions?: Omit<
+		PiRpcHarnessOptions,
+		"agentFileSend" | "executable"
+	>;
 	readonly transports: readonly TransportAdapter[];
 	readonly harnesses?: readonly HarnessAdapter[];
 	readonly stateDirectory?: string;
@@ -202,6 +207,16 @@ export class ApplicationRuntime {
 				throw new IsolationUnavailableError();
 		}
 		if (!options.piExecutable) throw new TypeError("Pi executable is required");
+		const agentFileSenders = options.transports.filter(
+			(transport): transport is TransportAdapter & AgentFileSendTransport =>
+				typeof (transport as Partial<AgentFileSendTransport>).sendAgentFile ===
+				"function",
+		);
+		if (agentFileSenders.length > 1)
+			throw new TypeError("Only one agent file-send transport is supported");
+		const agentFileSend: AgentFileSendHandler | undefined = agentFileSenders[0]
+			? (request) => agentFileSenders[0].sendAgentFile(request)
+			: undefined;
 		let store: (SessionStore & { close(): void }) | undefined;
 		let manager: SessionManager | undefined;
 		let runtimeToClose: ApplicationRuntime | undefined;
@@ -212,7 +227,7 @@ export class ApplicationRuntime {
 				(await SqliteSessionStore.open(
 					resolveStateDirectory(options.stateDirectory),
 				));
-			manager = new SessionManager(
+			const sessionManager = new SessionManager(
 				store,
 				options.harnesses ?? [
 					new PiRpcHarnessAdapter(
@@ -220,13 +235,15 @@ export class ApplicationRuntime {
 						{
 							...options.piOptions,
 							executable: options.piExecutable,
+							...(agentFileSend ? { agentFileSend } : {}),
 						},
 					),
 				],
 			);
+			manager = sessionManager;
 			const runtime = new ApplicationRuntime(
 				store,
-				manager,
+				sessionManager,
 				options.transports,
 			);
 			runtimeToClose = runtime;
@@ -234,7 +251,9 @@ export class ApplicationRuntime {
 				runtime.subscribe(listener);
 			for (const transport of options.transports) {
 				started.push(transport);
-				await transport.start(runtime.dispatch, subscribeEvents);
+				await transport.start(runtime.dispatch, subscribeEvents, () =>
+					sessionManager.list(),
+				);
 			}
 			runtime.state = "running";
 			return runtime;

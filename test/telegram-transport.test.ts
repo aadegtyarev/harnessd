@@ -1,6 +1,7 @@
 import {
 	mkdir,
 	mkdtemp,
+	readdir,
 	readFile,
 	rm,
 	stat,
@@ -126,7 +127,14 @@ class MockBot {
 			return true;
 		}),
 		sendChatAction: vi.fn(async (_chatId: number) => true),
-		sendDocument: vi.fn(async () => true),
+		sendDocument: vi.fn(
+			async (
+				_chatId: number,
+				_document: unknown,
+				_other?: unknown,
+				_signal?: AbortSignal,
+			) => true,
+		),
 		answerCallbackQuery: vi.fn(async () => true),
 		getFile: vi.fn(async () => ({ file_path: "photo.jpg", file_size: 5 })),
 		getFileLink: vi.fn(async () => new URL("data:image/jpeg;base64,aGVsbG8=")),
@@ -429,6 +437,7 @@ async function startAdapter(
 				subscribed = false;
 			};
 		},
+		async () => [...sessions.values()],
 	);
 	await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
 	bot.ready();
@@ -1080,7 +1089,9 @@ describe("Telegram transport", () => {
 		expect(
 			bot.sent.some(({ text }) => text === `Working folder: ${outside}`),
 		).toBe(true);
-		expect(requests.filter(({ kind }) => kind !== "create")).toEqual([]);
+		expect(
+			requests.filter(({ kind }) => kind !== "create" && kind !== "list"),
+		).toEqual([]);
 		await adapter.stop();
 	});
 
@@ -1231,7 +1242,8 @@ describe("Telegram transport", () => {
 			...(sessions.get("sid") as SessionSummary),
 			cwd: dir,
 		});
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const stateDirectory = await temp();
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updatePhoto(42, "describe this");
 		const submission = requests.find((request) => request.kind === "submit");
@@ -1244,11 +1256,15 @@ describe("Telegram transport", () => {
 		});
 		const savedPath =
 			submission?.kind === "submit"
-				? submission.text.match(/saved at (.+)\. Caption/)?.[1]
+				? submission.text.match(
+						/saved in the harnessd inbox at (.+)\. Caption/,
+					)?.[1]
 				: undefined;
 		expect(savedPath).toBeDefined();
 		if (!savedPath) throw new Error("Photo path missing from submitted prompt");
+		expect(savedPath).toContain(path.join(stateDirectory, "inbox", "sid"));
 		expect(await readFile(savedPath, "utf8")).toBe("hello");
+		expect(await readdir(dir)).toEqual([]);
 		await adapter.stop();
 	});
 
@@ -1259,7 +1275,8 @@ describe("Telegram transport", () => {
 			...(sessions.get("sid") as SessionSummary),
 			cwd: dir,
 		});
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const stateDirectory = await temp();
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42, { caption: "summarize this" });
 
@@ -1272,12 +1289,16 @@ describe("Telegram transport", () => {
 		});
 		const savedPath =
 			submission?.kind === "submit"
-				? submission.text.match(/saved at (.+)\. Caption/)?.[1]
+				? submission.text.match(
+						/saved in the harnessd inbox at (.+)\. Caption/,
+					)?.[1]
 				: undefined;
 		expect(savedPath).toBeDefined();
 		if (!savedPath)
 			throw new Error("Document path missing from submitted prompt");
+		expect(savedPath).toContain(path.join(stateDirectory, "inbox", "sid"));
 		expect(await readFile(savedPath, "utf8")).toBe("hello");
+		expect(await readdir(dir)).toEqual([]);
 		await adapter.stop();
 	});
 
@@ -1290,11 +1311,11 @@ describe("Telegram transport", () => {
 		});
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
-		await bot.updateDocument(42, { fileSize: 20 * 1024 * 1024 + 1 });
+		await bot.updateDocument(42, { fileSize: 20_000_001 });
 		const submissions = () =>
 			requests.filter((request) => request.kind === "submit");
 		expect(submissions()).toHaveLength(0);
-		expect(bot.sent.at(-1)?.text).toContain("20 MiB limit");
+		expect(bot.sent.at(-1)?.text).toContain("20 MB download limit");
 
 		bot.api.getFileLink = vi.fn(async () => {
 			throw new Error("secret download failure");
@@ -1308,16 +1329,30 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("does not submit an incoming document when saving into the session folder fails", async () => {
+	it("rejects incoming files when the configured inbox lies inside the workspace", async () => {
 		const bot = new MockBot();
-		const root = await temp();
-		const notDirectory = path.join(root, "not-directory");
-		await writeFile(notDirectory, "file");
+		const workspace = await temp();
 		sessions.set("sid", {
 			...(sessions.get("sid") as SessionSummary),
-			cwd: notDirectory,
+			cwd: workspace,
 		});
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const { adapter, requests } = await startAdapter(bot, workspace);
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+		await expect(readdir(path.join(workspace, "inbox"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await adapter.stop();
+	});
+
+	it("does not submit an incoming document when saving into the inbox fails", async () => {
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		await writeFile(path.join(stateDirectory, "inbox"), "not a directory");
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42);
 		expect(
@@ -1326,6 +1361,70 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain(
 			"Could not safely download or save",
 		);
+		await adapter.stop();
+	});
+
+	it("removes a deleted stopped session inbox without touching its workspace", async () => {
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		const inboxDirectory = path.join(stateDirectory, "inbox", "sid");
+		await mkdir(inboxDirectory, { recursive: true, mode: 0o700 });
+		const inboxFile = path.join(
+			inboxDirectory,
+			`${Date.now()}-aaaaaaaaaaaaaaaa-upload.txt`,
+		);
+		await writeFile(inboxFile, "incoming");
+		const workspace = await temp();
+		const workspaceFile = path.join(workspace, "keep.txt");
+		await writeFile(workspaceFile, "keep");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: workspace,
+			status: "stopped",
+		});
+		const { adapter } = await startAdapter(bot, stateDirectory);
+		await bot.update(42, "/delete sid");
+		await expect(readFile(inboxFile)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readFile(workspaceFile, "utf8")).toBe("keep");
+		await adapter.stop();
+	});
+
+	it("sends agent-requested files only to authorized chats selecting the session", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		const file = path.join(directory, "report.txt");
+		await writeFile(file, "report");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: directory,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		const sent = await adapter.sendAgentFile({
+			sessionId: "sid" as SessionId,
+			path: "report.txt",
+			caption: "Requested file",
+		});
+		expect(sent).toEqual({
+			fileName: "report.txt",
+			delivered: 2,
+			recipients: 2,
+		});
+		expect(bot.api.sendDocument).toHaveBeenCalledTimes(2);
+		for (const call of bot.api.sendDocument.mock.calls) {
+			expect(call[1]).toMatchObject({ filename: "report.txt" });
+			expect(call[2]).toEqual({ caption: "Requested file" });
+		}
+		const beforeOutside = bot.api.sendDocument.mock.calls.length;
+		const outside = await temp();
+		await writeFile(path.join(outside, "private.txt"), "private");
+		const result = await adapter.sendAgentFile({
+			sessionId: "sid" as SessionId,
+			path: path.join(outside, "private.txt"),
+		});
+		expect(result).toMatchObject({ delivered: 0, recipients: 2 });
+		expect(bot.api.sendDocument).toHaveBeenCalledTimes(beforeOutside);
 		await adapter.stop();
 	});
 
