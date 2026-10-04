@@ -98,6 +98,51 @@ const safeErrorMessages = new Map([
 	],
 ]);
 
+function requestReference(requestId: string): string | undefined {
+	const reference = requestId.replace(/[^a-f0-9]/gi, "").slice(0, 8);
+	return /^[a-f0-9]{8}$/i.test(reference) ? reference.toLowerCase() : undefined;
+}
+
+const safeErrorTypes = new Set([
+	"Error",
+	"TypeError",
+	"RangeError",
+	"ReferenceError",
+	"SyntaxError",
+	"URIError",
+	"EvalError",
+	"AggregateError",
+]);
+
+function safeErrorType(error: unknown): string {
+	try {
+		if (!(error instanceof Error)) return "NonError";
+		return safeErrorTypes.has(error.name) ? error.name : "Error";
+	} catch {
+		return "Error";
+	}
+}
+
+function safeErrorOrigin(error: unknown): string | undefined {
+	try {
+		if (!(error instanceof Error)) return undefined;
+		const frame = error.stack
+			?.split("\n")
+			.slice(1)
+			.find((line) => line.includes(":"));
+		const match = frame?.match(
+			/\/([A-Za-z0-9_.-]+\.(?:[cm]?js|ts)):(\d+):\d+\)?\s*$/,
+		);
+		return match ? `${match[1]}:${match[2]}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function safeOperationKind(value: string): string {
+	return /^[a-z_]{1,32}$/.test(value) ? value : "unknown";
+}
+
 export interface ApplicationRuntimeOptions {
 	readonly piExecutable: string;
 	readonly executionMode?: ExecutionMode;
@@ -353,6 +398,22 @@ export class ApplicationRuntime {
 				typeof candidate === "string" && safeErrorMessages.has(candidate)
 					? candidate
 					: "OPERATION_FAILED";
+			const reference =
+				code === "OPERATION_FAILED"
+					? requestReference(request.requestId)
+					: undefined;
+			if (code === "OPERATION_FAILED") {
+				const origin = safeErrorOrigin(error);
+				const diagnostic = {
+					reference: reference ?? "unavailable",
+					kind: safeOperationKind(request.kind),
+					errorType: safeErrorType(error),
+					...(origin ? { origin } : {}),
+				};
+				console.error(
+					`harnessd: unclassified request failure ${JSON.stringify(diagnostic)}`,
+				);
+			}
 			const inputId =
 				error instanceof UncertainInputDeliveryError
 					? error.inputId
@@ -362,7 +423,11 @@ export class ApplicationRuntime {
 				ok: false,
 				error: {
 					code,
-					message: safeErrorMessages.get(code) ?? "Operation failed",
+					message:
+						safeErrorMessages.get(code) ??
+						(reference
+							? `Operation failed (ref ${reference})`
+							: "Operation failed"),
 					...(code === "UNCERTAIN_INPUT_DELIVERY" && inputId
 						? { inputId }
 						: {}),

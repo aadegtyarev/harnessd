@@ -527,6 +527,7 @@ describe("application runtime", () => {
 						if (input.text === "sensitive failure")
 							throw Object.assign(new Error("private detail"), {
 								code: "SECRET_PRIVATE_DETAIL",
+								name: "SECRET_NAME_MARKER",
 							});
 						sent.push(input.text);
 					},
@@ -688,18 +689,32 @@ describe("application runtime", () => {
 			throw new Error("submit result missing input ID");
 		expect(sent).toEqual(["hello"]);
 		const safeFailure = await dispatch({
-			requestId: "request-sensitive",
+			requestId: "deadbeef-cafe-4000-8000-000000000000",
 			principalId: "operator",
 			kind: "submit",
 			sessionId: created.value.id,
 			text: "sensitive failure",
 		});
 		expect(safeFailure).toEqual({
-			requestId: "request-sensitive",
+			requestId: "deadbeef-cafe-4000-8000-000000000000",
 			ok: false,
-			error: { code: "OPERATION_FAILED", message: "Operation failed" },
+			error: {
+				code: "OPERATION_FAILED",
+				message: "Operation failed (ref deadbeef)",
+			},
 		});
 		expect(JSON.stringify(safeFailure)).not.toContain("private detail");
+		const diagnostic = journal.mock.calls.flat().join(" ");
+		expect(diagnostic).toContain('"reference":"deadbeef"');
+		expect(diagnostic).toContain('"kind":"submit"');
+		expect(diagnostic).toContain('"errorType":"Error"');
+		expect(diagnostic).toMatch(/"origin":"[^"]+\.ts:\d+"/);
+		expect(diagnostic).not.toContain("private detail");
+		expect(diagnostic).not.toContain("SECRET_PRIVATE_DETAIL");
+		expect(diagnostic).not.toContain("SECRET_NAME_MARKER");
+		expect(diagnostic).not.toContain("sensitive failure");
+		expect(diagnostic).not.toContain(process.cwd());
+		expect(diagnostic).not.toContain("at Object.send");
 		const uncertain = await dispatch({
 			requestId: "request-uncertain",
 			principalId: "operator",
