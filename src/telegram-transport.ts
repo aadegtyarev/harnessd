@@ -62,6 +62,7 @@ const INBOX_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
+const INTERNAL_WIDGET_PREFIX = "PI_SUBAGENT_ASYNC_JSON:";
 type UpdateContext = {
 	from?: { id: number };
 	chat?: { id: number; type: string };
@@ -3765,6 +3766,11 @@ export class TelegramTransportAdapter
 		this.turnBuffers.delete(sessionId);
 		if (!buffer || (buffer.characters === 0 && !buffer.overflow)) return;
 		let text = buffer.chunks.join("");
+		text = text
+			.split(/\r?\n/)
+			.filter((line) => !line.trimStart().startsWith(INTERNAL_WIDGET_PREFIX))
+			.join("\n");
+		if (!text.trim()) return;
 		if (interrupted) text += "\n\n[Response interrupted before completion.]";
 		if (buffer.overflow)
 			text +=
@@ -3972,7 +3978,13 @@ export class TelegramTransportAdapter
 	): Promise<boolean> {
 		return this.telegramCall((signal) =>
 			this.bot.api.sendMessage(chatId, text, other, signal),
-		).then((result) => result.ok);
+		).then((result) => {
+			if (!result.ok) {
+				this.reportError("Telegram message delivery failed", result.error);
+				return false;
+			}
+			return true;
+		});
 	}
 
 	private async telegramCall<T>(
