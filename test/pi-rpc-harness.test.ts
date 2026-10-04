@@ -834,31 +834,68 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
-	it("excludes parallel inputs, aborts active work, and reports uncertain after written response loss", async () => {
-		const fake = fakeProvider({ holdPrompt: true });
+	it("reports every accepted queued input uncertain if Pi exits before settlement", async () => {
+		const fake = fakeProvider();
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
 			executable: "pi",
 			startupTimeoutMs: 100,
-			commandTimeoutMs: 15,
 		}).launch(request);
-		const sending = instance.send(input("private prompt", "one"));
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		await expect(instance.send(input("second", "two"))).rejects.toThrow(
-			"already active",
+		await instance.send(input("first", "exit-one"));
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await instance.send(input("second", "exit-two"));
+		const exit = fake.child.sendSignal("SIGKILL");
+		await exit;
+		await instance.exit;
+		const events = await collectEvents(instance, 8);
+		expect(
+			events
+				.filter((event) => event?.inputEvent)
+				.map((event) => [event.inputEvent?.inputId, event.inputEvent?.state]),
+		).toEqual([
+			["exit-one", "pending"],
+			["exit-one", "accepted"],
+			["exit-two", "pending"],
+			["exit-two", "accepted"],
+			["exit-one", "uncertain"],
+			["exit-two", "uncertain"],
+		]);
+		await instance.shutdown();
+	});
+
+	it("queues parallel inputs through Pi steering and tracks each input until settlement", async () => {
+		const fake = fakeProvider({ promptDisposition: "queued" });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await instance.send(input("first", "one"));
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await instance.send(input("second", "two"));
+		const prompts = fake.commands.filter(
+			(command) => command.type === "prompt",
 		);
-		await expect(sending).rejects.toBeInstanceOf(UncertainInputDeliveryError);
+		expect(prompts).toHaveLength(2);
+		expect(prompts[0]).not.toHaveProperty("streamingBehavior");
+		expect(prompts[1]).toMatchObject({ streamingBehavior: "steer" });
+		await expect(instance.cancel("two" as InputId)).rejects.toThrow(
+			"no input was canceled",
+		);
 		expect(
-			fake.commands.filter((command) => command.type === "prompt"),
-		).toHaveLength(1);
-		const events = await collectEvents(instance, 2);
-		expect(
-			events.some((event) => event?.inputEvent?.state === "uncertain"),
-		).toBe(true);
-		await expect(
-			instance.send(input("new explicit input", "blocked-after-uncertain")),
-		).rejects.toThrow("already active");
+			fake.commands.filter((command) => command.type === "abort"),
+		).toHaveLength(0);
 		fake.stdout.write('{"type":"agent_settled"}\n');
-		await new Promise((resolve) => setTimeout(resolve, 0));
+		const events = await collectEvents(instance, 8);
+		const inputEvents = events.flatMap((event) =>
+			event?.inputEvent ? [event.inputEvent] : [],
+		);
+		expect(inputEvents).toEqual([
+			{ inputId: "one", state: "pending" },
+			{ inputId: "one", state: "accepted" },
+			{ inputId: "two", state: "pending" },
+			{ inputId: "two", state: "accepted" },
+			{ inputId: "one", state: "completed" },
+			{ inputId: "two", state: "completed" },
+		]);
 		await instance.shutdown();
 	});
 
@@ -930,9 +967,13 @@ describe("PiRpcHarnessAdapter", () => {
 			})}\n`,
 		);
 		await new Promise<void>((resolve) => setImmediate(resolve));
-		await expect(
-			instance.send(input("blocked", "during-cancel-b")),
-		).rejects.toThrow("already active");
+		const queuedDuringCancel = instance.send(
+			input("queue during cancellation", "during-cancel-b"),
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(2);
 		fake.stdout.write(
 			`{"type":"agent_settled"}\n${JSON.stringify({
 				type: "response",
@@ -942,8 +983,14 @@ describe("PiRpcHarnessAdapter", () => {
 			})}\n`,
 		);
 		await expect(secondCancel).resolves.toBeUndefined();
+		await expect(queuedDuringCancel).resolves.toBeUndefined();
+		const prompts = fake.commands.filter(
+			(command) => command.type === "prompt",
+		);
+		expect(prompts[2]?.streamingBehavior).toBeUndefined();
+		fake.stdout.write('{"type":"agent_start"}\n{"type":"agent_settled"}\n');
 
-		const events = await collectEvents(instance, 7);
+		const events = await collectEvents(instance, 12);
 		expect(
 			events
 				.filter((event) => event?.inputEvent)
@@ -955,6 +1002,9 @@ describe("PiRpcHarnessAdapter", () => {
 			"pending",
 			"accepted",
 			"failed",
+			"pending",
+			"accepted",
+			"completed",
 		]);
 		await instance.shutdown();
 	});
@@ -1009,6 +1059,43 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(
 			fake.commands.filter((command) => command.type === "prompt"),
 		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it("holds new submissions after uncertain abort until Pi settles", async () => {
+		const fake = fakeProvider({ holdAbort: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 10,
+		}).launch(request);
+		await instance.send(input("cancel uncertainty", "abort-uncertain-pending"));
+		await expect(
+			instance.cancel("abort-uncertain-pending" as InputId),
+		).rejects.toThrow("timed out");
+		const waitingSend = instance.send(
+			input("after settle", "after-uncertain-abort"),
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		fake.stdout.write('{"type":"agent_settled"}\n');
+		await expect(waitingSend).resolves.toBeUndefined();
+		fake.stdout.write('{"type":"agent_start"}\n{"type":"agent_settled"}\n');
+		const events = await collectEvents(instance, 9);
+		expect(
+			events
+				.filter((event) => event?.inputEvent)
+				.map((event) => [event.inputEvent?.inputId, event.inputEvent?.state]),
+		).toEqual([
+			["abort-uncertain-pending", "pending"],
+			["abort-uncertain-pending", "accepted"],
+			["abort-uncertain-pending", "uncertain"],
+			["after-uncertain-abort", "pending"],
+			["after-uncertain-abort", "accepted"],
+			["after-uncertain-abort", "completed"],
+		]);
 		await instance.shutdown();
 	});
 

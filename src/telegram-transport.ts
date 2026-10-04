@@ -127,6 +127,13 @@ type TelegramBot = {
 			other?: unknown,
 			signal?: AbortSignal,
 		): Promise<unknown>;
+		setMessageReaction(
+			chatId: number,
+			messageId: number,
+			reaction: readonly { readonly type: "emoji"; readonly emoji: string }[],
+			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
 		setMyCommands(
 			commands: readonly {
 				readonly command: string;
@@ -1029,12 +1036,14 @@ export class TelegramTransportAdapter
 					sessionId,
 					text,
 				});
-				await this.sendDirect(
-					chatId,
-					result.ok
-						? `Input accepted: ${result.value as string}`
-						: safeResultError(result.error),
-				);
+				if (result.ok)
+					await this.confirmInputAccepted(
+						chatId,
+						ctx.message?.message_id,
+						result.value as string,
+						`Input accepted: ${result.value as string}`,
+					);
+				else await this.sendDirect(chatId, safeResultError(result.error));
 			}
 		} catch (error) {
 			const reference = this.reportError(
@@ -1221,8 +1230,10 @@ export class TelegramTransportAdapter
 				});
 				if (!submitted.ok)
 					return this.sendDirect(chatId, submitted.error.message);
-				return this.sendDirect(
+				return this.confirmInputAccepted(
 					chatId,
+					message.message_id,
+					submitted.value as string,
 					`Attachment saved and submitted: ${saved.path}`,
 				);
 			} catch (error) {
@@ -2138,6 +2149,45 @@ export class TelegramTransportAdapter
 			return this.sendDiagnostic(chatId, text);
 		for (const chunk of chunks(text || " "))
 			await this.sendWithDeadline(chatId, chunk);
+	}
+
+	private async confirmInputAccepted(
+		chatId: number,
+		messageId: number | undefined,
+		inputId: string,
+		acknowledgement: string,
+	): Promise<void> {
+		if (messageId !== undefined)
+			void this.reactToAcceptedInput(chatId, messageId, inputId);
+		await this.sendDirect(chatId, acknowledgement);
+	}
+
+	private async reactToAcceptedInput(
+		chatId: number,
+		messageId: number,
+		inputId: string,
+	): Promise<void> {
+		try {
+			const reaction = await this.telegramCall((signal) =>
+				this.bot.api.setMessageReaction(
+					chatId,
+					messageId,
+					[{ type: "emoji", emoji: "👀" }],
+					{},
+					signal,
+				),
+			);
+			if (!reaction.ok)
+				this.reportError(
+					"Telegram input acceptance reaction failed",
+					reaction.error,
+					[inputId],
+				);
+		} catch (error) {
+			this.reportError("Telegram input acceptance reaction failed", error, [
+				inputId,
+			]);
+		}
 	}
 
 	private async sendDiagnostic(chatId: number, text: string): Promise<void> {
