@@ -71,8 +71,8 @@ type UpdateContext = {
 		photo?: readonly {
 			file_id: string;
 			file_size?: number;
-			width?: number;
-			height?: number;
+			width: number;
+			height: number;
 		}[];
 		reply_to_message?: { message_id?: number };
 	};
@@ -82,6 +82,9 @@ type UpdateContext = {
 		message?: { message_id: number };
 	};
 };
+type TelegramPhotoSize = NonNullable<
+	NonNullable<UpdateContext["message"]>["photo"]
+>[number];
 type TelegramBot = {
 	api: {
 		sendMessage(
@@ -107,7 +110,6 @@ type TelegramBot = {
 			fileId: string,
 			signal?: AbortSignal,
 		): Promise<{ file_path?: string; file_size?: number }>;
-		getFileLink(fileId: string): Promise<URL>;
 		sendChatAction(
 			chatId: number,
 			action: string,
@@ -304,6 +306,37 @@ async function removeOwnedLock(lockPath: string, pid: number): Promise<void> {
 	if (current.trim() !== String(pid))
 		throw new Error("Telegram polling lock ownership changed");
 	await unlink(lockPath);
+}
+
+function telegramFileDownloadUrl(token: string, filePath: string): URL {
+	const segments = filePath.split("/");
+	if (
+		!filePath ||
+		filePath.startsWith("/") ||
+		segments.some((segment) => !segment || segment === "." || segment === "..")
+	)
+		throw new Error("Invalid Telegram file path");
+	return new URL(
+		`/file/bot${token}/${segments.map(encodeURIComponent).join("/")}`,
+		"https://api.telegram.org",
+	);
+}
+
+function largestPhoto(
+	photos: readonly TelegramPhotoSize[] | undefined,
+): TelegramPhotoSize | undefined {
+	let largest = photos?.[0];
+	for (const photo of photos?.slice(1) ?? []) {
+		const photoArea = photo.width * photo.height;
+		const largestArea = (largest?.width ?? 0) * (largest?.height ?? 0);
+		if (
+			photoArea > largestArea ||
+			(photoArea === largestArea &&
+				(photo.file_size ?? 0) > (largest?.file_size ?? 0))
+		)
+			largest = photo;
+	}
+	return largest;
 }
 
 function isCode(error: unknown, code: string): boolean {
@@ -1125,7 +1158,7 @@ export class TelegramTransportAdapter
 				"Select a session with /use before sending files.",
 			);
 		const document = message.document;
-		const photo = message.photo?.at(-1);
+		const photo = largestPhoto(message.photo);
 		if (!document && !photo)
 			return this.sendDirect(chatId, "Unsupported attachment type.");
 		const fileId = document?.file_id ?? photo?.file_id;
@@ -1159,7 +1192,7 @@ export class TelegramTransportAdapter
 				if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
 					throw new TelegramAttachmentTooLargeError();
 				if (!file.file_path) throw new Error("file unavailable");
-				const url = await this.bot.api.getFileLink(fileId);
+				const url = telegramFileDownloadUrl(this.options.token, file.file_path);
 				const response = await fetch(url);
 				if (!response.ok) throw new Error("download failed");
 				const data = await readBoundedResponse(
@@ -1205,7 +1238,7 @@ export class TelegramTransportAdapter
 					);
 				return this.sendDirect(
 					chatId,
-					"Could not safely download or save this attachment in the session inbox. Try again with a smaller file.",
+					"Could not safely download or save this attachment. Please try again later.",
 				);
 			}
 		});

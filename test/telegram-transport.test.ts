@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Bot } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TransportEvent, TransportResult } from "../src/core/ports.js";
 import type {
@@ -40,8 +41,14 @@ async function temp() {
 	roots.push(dir);
 	return dir;
 }
+function stubFileDownload() {
+	const mock = vi.fn(async (_url: URL) => new Response(Buffer.from("hello")));
+	vi.stubGlobal("fetch", mock);
+	return mock;
+}
 afterEach(async () => {
 	vi.useRealTimers();
+	vi.unstubAllGlobals();
 	await Promise.all(
 		roots.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
 	);
@@ -54,7 +61,12 @@ type Context = {
 		text?: string;
 		caption?: string;
 		document?: { file_id: string; file_name?: string; file_size?: number };
-		photo?: readonly { file_id: string; file_size?: number }[];
+		photo?: readonly {
+			file_id: string;
+			file_size?: number;
+			width: number;
+			height: number;
+		}[];
 		message_id?: number;
 		reply_to_message?: { message_id: number };
 	};
@@ -136,8 +148,14 @@ class MockBot {
 			) => true,
 		),
 		answerCallbackQuery: vi.fn(async () => true),
-		getFile: vi.fn(async () => ({ file_path: "photo.jpg", file_size: 5 })),
-		getFileLink: vi.fn(async () => new URL("data:image/jpeg;base64,aGVsbG8=")),
+		getFile: vi.fn(
+			async (
+				fileId: string,
+			): Promise<{ file_path?: string; file_size?: number }> => ({
+				file_path: `photos/${fileId}.jpg`,
+				file_size: 5,
+			}),
+		),
 		setMyCommands: vi.fn(
 			async (
 				commands: readonly { command: string; description: string }[],
@@ -242,7 +260,20 @@ class MockBot {
 			from: { id: userId },
 			chat: { id: chatId, type: "private" },
 			message: {
-				photo: [{ file_id: "photo-id", file_size: 5 }],
+				photo: [
+					{
+						file_id: "largest-photo-id",
+						file_size: 5,
+						width: 1600,
+						height: 1200,
+					},
+					{
+						file_id: "smaller-photo-id",
+						file_size: 2,
+						width: 320,
+						height: 240,
+					},
+				],
 				...(caption ? { caption } : {}),
 			},
 		};
@@ -1265,7 +1296,13 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("downloads selected-session photos and submits image content with the caption", async () => {
+	it("uses grammY's supported getFile API instead of a nonexistent getFileLink", () => {
+		const bot = new Bot("123456:FAKE_TEST_TOKEN");
+		expect(Reflect.get(bot.api, "getFileLink")).toBeUndefined();
+	});
+
+	it("downloads the largest selected-session photo and submits image content with the caption", async () => {
+		const fetchFile = stubFileDownload();
 		const bot = new MockBot();
 		const dir = await temp();
 		sessions.set("sid", {
@@ -1284,6 +1321,16 @@ describe("Telegram transport", () => {
 			),
 			images: [{ mimeType: "image/jpeg", data: "aGVsbG8=" }],
 		});
+		expect(bot.api.getFile).toHaveBeenCalledWith("largest-photo-id");
+		expect(fetchFile).toHaveBeenCalledTimes(1);
+		const downloadUrl = fetchFile.mock.calls[0]?.[0];
+		expect(downloadUrl).toBeInstanceOf(URL);
+		expect(downloadUrl?.href).toBe(
+			"https://api.telegram.org/file/botsecret-token/photos/largest-photo-id.jpg",
+		);
+		expect(bot.sent.every(({ text }) => !text.includes("secret-token"))).toBe(
+			true,
+		);
 		const savedPath =
 			submission?.kind === "submit"
 				? submission.text.match(
@@ -1299,6 +1346,7 @@ describe("Telegram transport", () => {
 	});
 
 	it("downloads selected-session documents and submits their path with the caption", async () => {
+		const fetchFile = stubFileDownload();
 		const bot = new MockBot();
 		const dir = await temp();
 		sessions.set("sid", {
@@ -1317,6 +1365,9 @@ describe("Telegram transport", () => {
 				"Caption (untrusted user text): summarize this",
 			),
 		});
+		expect(fetchFile.mock.calls[0]?.[0]?.href).toBe(
+			"https://api.telegram.org/file/botsecret-token/photos/document-id.jpg",
+		);
 		const savedPath =
 			submission?.kind === "submit"
 				? submission.text.match(
@@ -1347,7 +1398,7 @@ describe("Telegram transport", () => {
 		expect(submissions()).toHaveLength(0);
 		expect(bot.sent.at(-1)?.text).toContain("20 MB download limit");
 
-		bot.api.getFileLink = vi.fn(async () => {
+		bot.api.getFile = vi.fn(async () => {
 			throw new Error("secret download failure");
 		});
 		await bot.updateDocument(42);
@@ -1355,11 +1406,57 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain(
 			"Could not safely download or save",
 		);
+		expect(bot.sent.at(-1)?.text).not.toContain("smaller file");
 		expect(bot.sent.at(-1)?.text).not.toContain("secret");
 		await adapter.stop();
 	});
 
+	it("does not submit when Telegram omits file_path or the download fails", async () => {
+		const bot = new MockBot();
+		const workspace = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: workspace,
+		});
+		const stateDirectory = await temp();
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
+		await bot.update(42, "/use sid");
+		bot.api.getFile = vi.fn(async () => ({ file_size: 5 }));
+		await bot.updateDocument(42);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Could not safely download or save",
+		);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+
+		const fetchFile = vi.fn(
+			async () => new Response("failure", { status: 503 }),
+		);
+		vi.stubGlobal("fetch", fetchFile);
+		bot.api.getFile = vi.fn(async (fileId: string) => ({
+			file_path: `photos/${fileId}.jpg`,
+			file_size: 5,
+		}));
+		await bot.updateDocument(42);
+		expect(fetchFile).toHaveBeenCalledTimes(1);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Could not safely download or save",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("secret-token");
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+		await expect(
+			readdir(path.join(stateDirectory, "inbox")),
+		).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await adapter.stop();
+	});
+
 	it("rejects incoming files when the configured inbox lies inside the workspace", async () => {
+		stubFileDownload();
 		const bot = new MockBot();
 		const workspace = await temp();
 		sessions.set("sid", {
@@ -1379,6 +1476,7 @@ describe("Telegram transport", () => {
 	});
 
 	it("does not submit an incoming document when saving into the inbox fails", async () => {
+		stubFileDownload();
 		const bot = new MockBot();
 		const stateDirectory = await temp();
 		await writeFile(path.join(stateDirectory, "inbox"), "not a directory");
