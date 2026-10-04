@@ -85,6 +85,9 @@ class MockBot {
 	sent: { chatId: number; text: string }[] = [];
 	reactions: { chatId: number; messageId: number; reaction: unknown }[] = [];
 	setMessageReactionBehavior: () => Promise<unknown> = async () => true;
+	sendMessageBehavior: () => Promise<void> = async () => {};
+	editMessageBehavior: () => Promise<void> = async () => {};
+	deleteMessageBehavior: () => Promise<void> = async () => {};
 	nextMessageId = 1000;
 	lastMessageId?: number;
 	edited: {
@@ -119,6 +122,7 @@ class MockBot {
 				_other?: unknown,
 				_signal?: AbortSignal,
 			): Promise<unknown> => {
+				await this.sendMessageBehavior();
 				this.sent.push({ chatId, text });
 				this.sendOptions.push(_other);
 				const message_id = this.nextMessageId++;
@@ -133,10 +137,15 @@ class MockBot {
 				text: string,
 				options?: unknown,
 			) => {
+				await this.editMessageBehavior();
 				this.edited.push({ chatId, messageId, text, options });
 				return { message_id: messageId };
 			},
 		),
+		deleteMessage: vi.fn(async (_chatId: number, _messageId: number) => {
+			await this.deleteMessageBehavior();
+			return true;
+		}),
 		pinChatMessage: vi.fn(async (chatId: number, messageId: number) => {
 			this.pinned.push({ chatId, messageId });
 			return true;
@@ -400,7 +409,13 @@ function result(request: TransportEvent): TransportResult {
 				live: {
 					model: { provider: "openai", id: "gpt-test", name: "Test" },
 					effort: "medium",
-					usage: { totalTokens: 1234, costUsd: 0.125 },
+					usage: {
+						totalTokens: 1234,
+						costUsd: 0.125,
+						contextTokens: 145_000,
+						contextWindow: 272_000,
+						contextPercent: 53.3,
+					},
 				},
 			};
 			break;
@@ -497,6 +512,39 @@ async function startAdapter(
 }
 
 describe("Telegram transport", () => {
+	it("shows Pi-reported context usage in session status without deriving it", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/status");
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Context: 53.3%/145k/272k (auto)"),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("labels an input sent during an active run as queued rather than started", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(42, "queue this input");
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("Input input-1: queued")),
+			).toBe(true),
+		);
+		expect(bot.edited.some(({ text }) => text.includes("В очереди Pi"))).toBe(
+			true,
+		);
+		expect(
+			bot.edited.some(({ text }) => text.includes("Pi выполняет ход сессии")),
+		).toBe(false);
+		await adapter.stop();
+	});
+
 	it("reacts to the source message only after Pi accepts the input", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
@@ -511,7 +559,109 @@ describe("Telegram transport", () => {
 				reaction: [{ type: "emoji", emoji: "👀" }],
 			},
 		]);
-		expect(bot.sent.at(-1)?.text).toBe("Input accepted: input-1");
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Input input-1: accepted"),
+		);
+		await adapter.stop();
+	});
+
+	it("deletes activity after Pi reports a handled input complete without an agent_settled event", async () => {
+		const bot = new MockBot();
+		let emitInput: ((event: HarnessEvent) => void) | undefined;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") {
+					emitInput?.({
+						sessionId: request.sessionId,
+						kind: "input",
+						inputEvent: {
+							inputId: "input-1" as never,
+							state: "accepted",
+						},
+					});
+					emitInput?.({
+						sessionId: request.sessionId,
+						kind: "input",
+						inputEvent: {
+							inputId: "input-1" as never,
+							state: "completed",
+						},
+					});
+				}
+				return result(request);
+			},
+		});
+		emitInput = emit;
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Handle this command");
+		await vi.waitFor(() =>
+			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+		);
+		expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
+			true,
+		);
+		await adapter.stop();
+	});
+
+	it("retains an uncertain InputId when later completed inputs exceed the display history", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Do not resend this");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "uncertain" },
+		});
+		for (let index = 2; index <= 10; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: {
+					inputId: `input-${index}` as never,
+					state: "completed",
+				},
+			});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
+		expect(
+			bot.edited.some(({ text }) =>
+				text.includes("Input input-1: uncertain (not resent)"),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("retains an untracked uncertain input after a large run settles", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "large queued batch");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		for (let index = 2; index <= 180; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: {
+					inputId: `input-${index}` as never,
+					state: "pending",
+				},
+			});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-180" as never, state: "uncertain" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
+		expect(
+			bot.edited.some(({ text }) =>
+				text.includes("Input input-180: uncertain (not resent)"),
+			),
+		).toBe(true);
 		await adapter.stop();
 	});
 
@@ -524,11 +674,265 @@ describe("Telegram transport", () => {
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "do the task");
-		expect(bot.sent.at(-1)?.text).toBe("Input accepted: input-1");
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Input input-1: accepted"),
+		);
 		await vi.waitFor(() => expect(journal).toHaveBeenCalled());
 		expect(journal.mock.calls.flat().join(" ")).toContain(
 			"Telegram input acceptance reaction failed",
 		);
+		await adapter.stop();
+	});
+
+	it("edits one reply bubble with Pi tool activity, sends the final answer separately, then deletes the bubble", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const sourceMessageId = bot.nextMessageId;
+		await bot.update(42, "Run the requested checks");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const bubbleId = bot.lastMessageId;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "tool-1",
+				summary: "bash: npm test",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("bash: npm test …")),
+			).toBe(true),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "tool_end", toolCallId: "tool-1", failed: false },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "tool-2",
+				summary: "grep: secret token",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("grep: secret token …")),
+			).toBe(true),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "tool_end", toolCallId: "tool-2", failed: true },
+		});
+		emit(harnessEvent("sid", "output", "All checks passed."));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+		);
+		expect(bot.api.sendMessage).toHaveBeenCalledWith(
+			42,
+			expect.stringContaining("Pi activity"),
+			expect.objectContaining({
+				reply_parameters: { message_id: sourceMessageId },
+			}),
+			expect.anything(),
+		);
+		expect(
+			bot.edited.some(({ text }) => text.includes("bash: npm test ✓")),
+		).toBe(true);
+		expect(
+			bot.edited.some(({ text }) => text.includes("grep: secret token ❌")),
+		).toBe(true);
+		expect(
+			bot.edited.some(({ text }) => text.includes("53.3%/145k/272k (auto)")),
+		).toBe(true);
+		expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+			42,
+			bubbleId,
+			expect.anything(),
+		);
+		const answer = bot.sent.find(({ text }) =>
+			text.includes("All checks passed."),
+		);
+		expect(answer?.text).toContain("All checks passed.");
+		expect(answer?.text).not.toContain("Pi activity");
+		await adapter.stop();
+	});
+
+	it("bounds input history and reconciles overflow at run settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "process a large queued batch");
+		for (let index = 1; index <= 180; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: {
+					inputId: `input-${index}` as never,
+					state: "pending",
+				},
+			});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		for (let index = 1; index <= 180; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: {
+					inputId: `input-${index}` as never,
+					state: "completed",
+				},
+			});
+		await vi.waitFor(() =>
+			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+		);
+		expect((bot.edited.at(-1)?.text.length ?? 0) < 4096).toBe(true);
+		await adapter.stop();
+	});
+
+	it("keeps activity tracking for an older session while a chat works in another session", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "first session task");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const firstBubble = bot.lastMessageId;
+		await bot.update(42, "/use other");
+		await bot.update(42, "second session task");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const secondBubble = bot.lastMessageId;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: "first session still active",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(
+					({ messageId, text }) =>
+						messageId === firstBubble &&
+						text.includes("first session still active"),
+				),
+			).toBe(true),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+				42,
+				firstBubble,
+				expect.anything(),
+			),
+		);
+		expect(bot.api.deleteMessage).not.toHaveBeenCalledWith(
+			42,
+			secondBubble,
+			expect.anything(),
+		);
+		await adapter.stop();
+	});
+
+	it("does not retry an activity-bubble send after an uncertain Telegram outcome", async () => {
+		const bot = new MockBot();
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sendMessageBehavior = async () => {
+			throw new Error("Telegram send timed out");
+		};
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() => expect(journal).toHaveBeenCalled());
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "notification", text: "still working" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(
+			bot.api.sendMessage.mock.calls.filter(([, text]) =>
+				String(text).includes("Pi activity"),
+			),
+		).toHaveLength(1);
+		journal.mockRestore();
+		await adapter.stop();
+	});
+
+	it("does not retry an activity edit after an uncertain Telegram outcome", async () => {
+		const bot = new MockBot();
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.editMessageBehavior = async () => {
+			throw new Error("Telegram edit timed out");
+		};
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() => expect(journal).toHaveBeenCalled());
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		expect(
+			bot.api.sendMessage.mock.calls.filter(([, text]) =>
+				String(text).includes("Pi activity"),
+			),
+		).toHaveLength(1);
+		journal.mockRestore();
+		await adapter.stop();
+	});
+
+	it("keeps a failed deletion from resending the final answer", async () => {
+		const bot = new MockBot();
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		bot.deleteMessageBehavior = async () => {
+			throw new Error("Telegram delete timed out");
+		};
+		emit(harnessEvent("sid", "output", "Only once"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Only once")),
+		).toHaveLength(1);
+		expect(journal).toHaveBeenCalled();
+		journal.mockRestore();
 		await adapter.stop();
 	});
 
@@ -848,7 +1252,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("no live Pi process is attached");
 		expect(bot.sent.at(-1)?.text).toContain("This message was not sent");
 		expect(bot.sent.at(-1)?.text).toContain("/menu");
-		expect(bot.sent.at(-1)?.text).not.toContain("do not replay this text");
+		expect(bot.sent.at(-1)?.text).toContain("do not replay this text");
 		expect(bot.reactions).toEqual([]);
 		await adapter.stop();
 	});
@@ -1378,8 +1782,9 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("shows traced dispatch failures without echoing submitted prompts", async () => {
+	it("shows traced dispatch failures and the submitted text in the private Telegram diagnostic", async () => {
 		const bot = new MockBot();
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const { adapter } = await startAdapter(bot, await temp(), {
 			dispatch: async (request) => {
 				if (request.kind === "submit")
@@ -1399,7 +1804,11 @@ describe("Telegram transport", () => {
 		).toBe(true);
 		expect(
 			bot.sent.some(({ text }) => text.includes("private prompt text")),
-		).toBe(false);
+		).toBe(true);
+		expect(journal.mock.calls.flat().join(" ")).not.toContain(
+			"private prompt text",
+		);
+		journal.mockRestore();
 		await adapter.stop();
 	});
 
@@ -1434,7 +1843,7 @@ describe("Telegram transport", () => {
 			),
 		).toBe(true);
 		expect(bot.sent.some(({ text }) => text.includes("private prompt"))).toBe(
-			false,
+			true,
 		);
 		await adapter.stop();
 	});
@@ -1488,7 +1897,7 @@ describe("Telegram transport", () => {
 		expect(recoveryMessages).toContain("Session status changed.");
 		expect(
 			sidMessages.some(({ text }) => text.includes("raw-secret-error")),
-		).toBe(false);
+		).toBe(true);
 		expect(
 			sidMessages.some(({ text }) =>
 				text.includes("input-uncertain: uncertain (not resent)"),
@@ -1921,18 +2330,28 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "send this");
 		emit(harnessEvent("sid", "output", "literal <b>markup</b> & text"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(({ text }) => text.includes("literal <b>markup</b>")),
 			).toBe(true),
 		);
-		const acceptanceMessages = bot.sent.filter(({ text }) =>
+		const acceptanceUpdates = bot.edited.filter(({ text }) =>
 			text.includes("input-1"),
 		);
-		expect(acceptanceMessages.map(({ text }) => text)).toEqual([
-			"Input accepted: input-1",
-		]);
+		expect(
+			acceptanceUpdates.some(({ text }) =>
+				text.includes("Input input-1: accepted"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(({ text }) => text === "Input accepted: input-1"),
+		).toBe(false);
 		const outputIndex = bot.sent.findIndex(({ text }) =>
 			text.includes("literal <b>markup</b>"),
 		);
@@ -1961,22 +2380,27 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		for (let index = 0; index < 3; index++)
-			emit(harnessEvent("sid", "error", `failure ${index}`));
+			emit(harnessEvent("sid", "error", "RPC event stream failed"));
+		emit(harnessEvent("sid", "error", "different extension error"));
 		emit(harnessEvent("sid", "status", "harness_recovered"));
 		for (let index = 0; index < 2; index++)
-			emit(harnessEvent("sid", "error", `failure after recovery ${index}`));
+			emit(harnessEvent("sid", "error", "RPC event stream failed"));
 		await vi.waitFor(() =>
 			expect(
-				bot.sent.filter(
-					({ text }) => telegramBody(text) === "Session reported an error.",
-				).length,
-			).toBe(2),
+				bot.sent.filter(({ text }) =>
+					telegramBody(text).startsWith("Pi error:"),
+				),
+			).toHaveLength(3),
 		);
 		expect(
-			bot.sent.filter(
-				({ text }) => telegramBody(text) === "Session reported an error.",
-			),
-		).toHaveLength(2);
+			bot.sent
+				.map(({ text }) => telegramBody(text))
+				.filter((text) => text.startsWith("Pi error:")),
+		).toEqual([
+			"Pi error: RPC event stream failed",
+			"Pi error: different extension error",
+			"Pi error: RPC event stream failed",
+		]);
 		await adapter.stop();
 	});
 

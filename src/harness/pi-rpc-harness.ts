@@ -28,6 +28,10 @@ import type {
 	SessionId,
 } from "../core/types.js";
 import {
+	redactDiagnosticText,
+	truncateDiagnostic,
+} from "../error-diagnostics.js";
+import {
 	type AgentFileSendBridge,
 	startAgentFileSendBridge,
 } from "./agent-file-send-bridge.js";
@@ -451,6 +455,20 @@ function usageStats(value: unknown): HarnessUsageStats | undefined {
 	const cacheReadTokens = safeCount(tokens?.cacheRead);
 	const cacheWriteTokens = safeCount(tokens?.cacheWrite);
 	const costUsd = safeCount(stats.cost);
+	const context = recordValue(stats.contextUsage);
+	const contextTokens =
+		context && "tokens" in context
+			? context.tokens === null
+				? null
+				: safeCount(context.tokens)
+			: undefined;
+	const contextWindow = safeCount(context?.contextWindow);
+	const contextPercent =
+		context && "percent" in context
+			? context.percent === null
+				? null
+				: safeCount(context.percent)
+			: undefined;
 	const usage: HarnessUsageStats = {
 		...(totalTokens !== undefined ? { totalTokens } : {}),
 		...(inputTokens !== undefined ? { inputTokens } : {}),
@@ -458,8 +476,45 @@ function usageStats(value: unknown): HarnessUsageStats | undefined {
 		...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
 		...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
 		...(costUsd !== undefined ? { costUsd } : {}),
+		...(contextTokens !== undefined ? { contextTokens } : {}),
+		...(contextWindow !== undefined ? { contextWindow } : {}),
+		...(contextPercent !== undefined ? { contextPercent } : {}),
 	};
 	return Object.keys(usage).length ? usage : undefined;
+}
+function toolActivitySummary(name: string, value: unknown): string {
+	const args = recordValue(value);
+	if (!args) return name;
+	const pathValue =
+		typeof args.path === "string"
+			? args.path
+			: typeof args.file_path === "string"
+				? args.file_path
+				: undefined;
+	const lines =
+		typeof args.start_line === "number"
+			? args.start_line
+			: typeof args.offset === "number"
+				? args.offset
+				: undefined;
+	const range = lines === undefined ? "" : ` (line ${lines})`;
+	let summary = name;
+	if (name === "bash" && typeof args.command === "string")
+		summary = `bash: ${args.command}`;
+	else if (["read", "write", "edit"].includes(name))
+		summary = `${name}: ${pathValue ?? "file"}${range}`;
+	else if (["grep", "find"].includes(name)) {
+		const pattern = args.pattern ?? args.query;
+		summary = `${name}: ${typeof pattern === "string" ? pattern : ""}${pathValue ? ` — ${pathValue}` : ""}`;
+	} else if (name === "subagent") {
+		const agent = typeof args.agent === "string" ? args.agent : "workflow";
+		const task =
+			typeof args.task === "string"
+				? args.task.replace(/\s+/g, " ").trim()
+				: "";
+		summary = `subagent · ${agent}${task ? ` · ${task}` : ""}`;
+	}
+	return truncateDiagnostic(redactDiagnosticText(summary), 700);
 }
 class PiRpcInstance implements HarnessInstance {
 	readonly processId: ManagedProcess["id"];
@@ -712,6 +767,7 @@ class PiRpcInstance implements HarnessInstance {
 			sessionId: this.sessionId,
 			kind: "error",
 			text: "Malformed or oversized Pi RPC stdout record",
+			fatal: true,
 		});
 		this.failProcess("Malformed Pi RPC protocol");
 	}
@@ -745,30 +801,104 @@ class PiRpcInstance implements HarnessInstance {
 			item.resolve(record);
 			return;
 		}
+		if (record.type === "extension_error") {
+			const extensionPath =
+				typeof record.extensionPath === "string"
+					? path.basename(record.extensionPath)
+					: undefined;
+			const eventName =
+				typeof record.event === "string" ? record.event : undefined;
+			const detail =
+				typeof record.error === "string"
+					? record.error
+					: record.error === undefined
+						? "Unknown extension error"
+						: JSON.stringify(record.error);
+			this.emit({
+				sessionId: this.sessionId,
+				kind: "error",
+				text: redactDiagnosticText(
+					`Pi extension${extensionPath ? ` ${extensionPath}` : ""}${eventName ? ` (${eventName})` : ""}: ${detail}`,
+				),
+			});
+			return;
+		}
 		if (record.type === "extension_ui_request") {
+			const method =
+				typeof record.method === "string" ? record.method : "unknown";
+			if (method === "notify") {
+				if (typeof record.message === "string")
+					this.emit({
+						sessionId: this.sessionId,
+						kind: "activity",
+						activityEvent: {
+							type: "notification",
+							text: redactDiagnosticText(record.message),
+							...(typeof record.notifyType === "string"
+								? { level: record.notifyType }
+								: {}),
+						},
+					});
+				return;
+			}
+			if (method === "setStatus") {
+				if (typeof record.statusText === "string")
+					this.emit({
+						sessionId: this.sessionId,
+						kind: "activity",
+						activityEvent: {
+							type: "notification",
+							text: redactDiagnosticText(record.statusText),
+							level: "status",
+						},
+					});
+				return;
+			}
+			if (method === "setTitle") return;
+			if (method === "setWidget") {
+				const lines = Array.isArray(record.widgetLines)
+					? record.widgetLines.filter(
+							(line): line is string => typeof line === "string",
+						)
+					: [];
+				if (lines.length)
+					this.emit({
+						sessionId: this.sessionId,
+						kind: "activity",
+						activityEvent: {
+							type: "notification",
+							text: redactDiagnosticText(lines.join("\n")),
+							level: "status",
+						},
+					});
+				return;
+			}
 			const dialogMethods = ["select", "confirm", "input", "editor"];
-			if (!dialogMethods.includes(String(record.method))) {
+			const title = typeof record.title === "string" ? record.title : undefined;
+			const message =
+				typeof record.message === "string" ? record.message : undefined;
+			if (dialogMethods.includes(method) && typeof record.id === "string") {
 				this.emit({
 					sessionId: this.sessionId,
 					kind: "error",
-					text: "Unsupported Pi extension UI request",
+					text: redactDiagnosticText(
+						`Pi extension requested unsupported ${method} dialog${title ? `: ${title}` : ""}${message ? ` — ${message}` : ""}. The dialog was cancelled because Telegram dialog forwarding is not available.`,
+					),
 				});
-				return;
-			}
-			if (typeof record.id !== "string") {
-				this.protocolFailure();
+				void this.write({
+					type: "extension_ui_response",
+					id: record.id,
+					cancelled: true,
+				}).catch(() => {});
 				return;
 			}
 			this.emit({
 				sessionId: this.sessionId,
 				kind: "error",
-				text: "Unsupported Pi extension UI dialog cancelled",
+				text: redactDiagnosticText(
+					`Unsupported Pi extension UI request: ${method}`,
+				),
 			});
-			void this.write({
-				type: "extension_ui_response",
-				id: record.id,
-				cancelled: true,
-			}).catch(() => {});
 			return;
 		}
 		if (record.type === "message_update") {
@@ -780,6 +910,47 @@ class PiRpcInstance implements HarnessInstance {
 					sessionId: this.sessionId,
 					kind: "output",
 					text: update.delta,
+				});
+			else if (
+				update?.type === "thinking_start" ||
+				update?.type === "thinking_end"
+			)
+				this.emit({
+					sessionId: this.sessionId,
+					kind: "activity",
+					activityEvent: {
+						type: "thinking",
+						active: update.type === "thinking_start",
+					},
+				});
+			return;
+		}
+		if (record.type === "tool_execution_start") {
+			if (
+				typeof record.toolCallId === "string" &&
+				typeof record.toolName === "string"
+			)
+				this.emit({
+					sessionId: this.sessionId,
+					kind: "activity",
+					activityEvent: {
+						type: "tool_start",
+						toolCallId: record.toolCallId,
+						summary: toolActivitySummary(record.toolName, record.args),
+					},
+				});
+			return;
+		}
+		if (record.type === "tool_execution_end") {
+			if (typeof record.toolCallId === "string")
+				this.emit({
+					sessionId: this.sessionId,
+					kind: "activity",
+					activityEvent: {
+						type: "tool_end",
+						toolCallId: record.toolCallId,
+						failed: record.isError === true,
+					},
 				});
 			return;
 		}
@@ -1098,7 +1269,12 @@ class PiRpcInstance implements HarnessInstance {
 		}
 		if (!this.failureReported && detail !== "Pi harness shut down") {
 			this.failureReported = true;
-			this.emit({ sessionId: this.sessionId, kind: "error", text: detail });
+			this.emit({
+				sessionId: this.sessionId,
+				kind: "error",
+				text: redactDiagnosticText(detail),
+				fatal: true,
+			});
 		}
 		for (const waiter of this.waiters.splice(0))
 			waiter({ value: undefined, done: true });

@@ -212,6 +212,9 @@ export interface HarnessUsageStats {
 	readonly cacheReadTokens?: number;
 	readonly cacheWriteTokens?: number;
 	readonly costUsd?: number;
+	readonly contextTokens?: number | null;
+	readonly contextWindow?: number;
+	readonly contextPercent?: number | null;
 }
 
 export interface HarnessSelection {
