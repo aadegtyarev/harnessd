@@ -635,6 +635,11 @@ function safeResultError(error: {
 		return `${error.message} (InputId ${error.inputId}; not resent)`;
 	return error.message;
 }
+const NO_SESSION_SELECTED_MESSAGE =
+	"No session is selected. Use /sessions to find one and /use <sessionId>, or open /menu.";
+const SELECTION_NOT_SAVED_WARNING =
+	" The selection works now, but could not be saved for the next restart.";
+
 function statusMessage(value: string | undefined): string {
 	switch (value) {
 		case "harness_restarting":
@@ -745,6 +750,7 @@ export class TelegramTransportAdapter
 				this.options.stateDirectory,
 				this.options.token,
 			);
+			await this.restoreSelectedSessions();
 			this.inbox = new TelegramInbox(this.options.stateDirectory);
 			if (this.options.signal?.aborted)
 				throw new Error("Telegram startup aborted");
@@ -977,19 +983,64 @@ export class TelegramTransportAdapter
 		}
 	}
 
-	private setSelected(chatId: number, sessionId: SessionId): void {
+	private async restoreSelectedSessions(): Promise<void> {
+		const store = this.panelStore;
+		if (!store) return;
+		for (const [chatId, sessionId] of store.selections())
+			this.selected.set(chatId, sessionId as SessionId);
+		if (!this.listSessions) return;
+		try {
+			const sessions = await this.listSessions();
+			this.rememberSessions(sessions);
+			const existing = new Set(sessions.map((session) => session.id));
+			for (const [chatId, sessionId] of store.selections()) {
+				if (!existing.has(sessionId as SessionId))
+					await this.clearSelected(chatId);
+			}
+		} catch (error) {
+			this.reportError(
+				"Telegram saved session selections could not be checked",
+				error,
+			);
+		}
+	}
+
+	private async setSelected(
+		chatId: number,
+		sessionId: SessionId,
+	): Promise<boolean> {
 		const previous = this.selected.get(chatId);
 		this.selected.set(chatId, sessionId);
 		if (previous && previous !== sessionId && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
 		if (this.activeTypingSessions.has(sessionId)) this.startTyping(sessionId);
+		try {
+			await this.panelStore?.setSelected(chatId, sessionId);
+			return true;
+		} catch (error) {
+			this.reportError("Telegram session selection could not be saved", error, [
+				sessionId,
+			]);
+			return false;
+		}
 	}
 
-	private clearSelected(chatId: number): void {
+	private async clearSelected(chatId: number): Promise<boolean> {
 		const previous = this.selected.get(chatId);
 		this.selected.delete(chatId);
 		if (previous && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
+		try {
+			await this.panelStore?.clearSelected(chatId);
+			return true;
+		} catch (error) {
+			this.reportError(
+				"Telegram session selection could not be cleared",
+				error,
+				[previous ?? ""],
+			);
+			return false;
+		}
 	}
 
 	private isAuthorized(ctx: UpdateContext): boolean {
@@ -1030,7 +1081,7 @@ export class TelegramTransportAdapter
 			else {
 				const sessionId = this.selected.get(chatId);
 				if (!sessionId)
-					return this.sendDirect(chatId, "Select a session with /use first.");
+					return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 				const result = await this.request(sender, {
 					kind: "submit",
 					sessionId,
@@ -1043,7 +1094,13 @@ export class TelegramTransportAdapter
 						result.value as string,
 						`Input accepted: ${result.value as string}`,
 					);
-				else await this.sendDirect(chatId, safeResultError(result.error));
+				else
+					await this.presentSubmitFailure(
+						chatId,
+						sender,
+						sessionId,
+						result.error,
+					);
 			}
 		} catch (error) {
 			const reference = this.reportError(
@@ -1161,11 +1218,7 @@ export class TelegramTransportAdapter
 		const message = ctx.message;
 		if (chatId === undefined || sender === undefined || !message) return;
 		const sessionId = this.selected.get(chatId);
-		if (!sessionId)
-			return this.sendDirect(
-				chatId,
-				"Select a session with /use before sending files.",
-			);
+		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 		const document = message.document;
 		const photo = largestPhoto(message.photo);
 		if (!document && !photo)
@@ -1229,7 +1282,12 @@ export class TelegramTransportAdapter
 					...(image ? { images: image } : {}),
 				});
 				if (!submitted.ok)
-					return this.sendDirect(chatId, submitted.error.message);
+					return this.presentSubmitFailure(
+						chatId,
+						sender,
+						sessionId,
+						submitted.error,
+					);
 				return this.confirmInputAccepted(
 					chatId,
 					message.message_id,
@@ -1286,12 +1344,12 @@ export class TelegramTransportAdapter
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
-			this.setSelected(chatId, session.id);
+			const selectionSaved = await this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
 				chatId,
-				`Created and selected ${sessionLabel(session)}.`,
+				`Created and selected ${sessionLabel(session)}.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
 			);
 		}
 		const sendCommand = /^\/send(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
@@ -1300,7 +1358,8 @@ export class TelegramTransportAdapter
 			if (!parsedPath.ok || !parsedPath.path)
 				return this.sendDirect(chatId, "Usage: /send <path>");
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const sent = await this.sendFileToChat(
 				sessionId,
 				parsedPath.path,
@@ -1371,7 +1430,8 @@ export class TelegramTransportAdapter
 			return this.sendDirect(chatId, getTelegramHelpUsages().join("\n"));
 		if (name === "/status" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, {
 				kind: "session_status",
 				sessionId,
@@ -1385,7 +1445,8 @@ export class TelegramTransportAdapter
 		}
 		if (name === "/model" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, {
 				kind: "model_list",
 				sessionId,
@@ -1404,7 +1465,8 @@ export class TelegramTransportAdapter
 		}
 		if (name === "/model" && args.length >= 1 && args.length <= 2) {
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const slash = args[0].indexOf("/");
 			if (slash <= 0 || slash === args[0].length - 1)
 				return this.sendDirect(
@@ -1435,7 +1497,8 @@ export class TelegramTransportAdapter
 		}
 		if (name === "/effort" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, {
 				kind: "effort_list",
 				sessionId,
@@ -1449,7 +1512,8 @@ export class TelegramTransportAdapter
 		}
 		if (name === "/effort" && args.length === 1) {
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, {
 				kind: "effort_set",
 				sessionId,
@@ -1473,18 +1537,31 @@ export class TelegramTransportAdapter
 					: escapeHtml(result.error.message),
 			);
 		}
-		if (name === "/use" && args.length === 1) {
-			const result = await this.request(sender, {
-				kind: "inspect",
-				sessionId: args[0] as SessionId,
-			});
-			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+		if (name === "/use") {
+			if (args.length > 1)
+				return this.sendDirect(chatId, "Usage: /use [sessionId]");
+			const sessionId =
+				(args[0] as SessionId | undefined) ?? this.selected.get(chatId);
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const result = await this.request(sender, { kind: "inspect", sessionId });
+			if (!result.ok) {
+				if (args.length === 0 && result.error.code === "SESSION_NOT_FOUND")
+					await this.clearSelected(chatId);
+				return this.sendDirect(
+					chatId,
+					`${result.error.message} Choose another session with /sessions or /menu.`,
+				);
+			}
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
-			this.setSelected(chatId, session.id);
+			const selectionSaved = await this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
-			return this.sendDirect(chatId, `Selected ${sessionLabel(session)}.`);
+			return this.sendDirect(
+				chatId,
+				`Selected ${sessionLabel(session)}.${args.length === 0 && session.status === "stopped" ? " A new message will resume it." : ""}${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+			);
 		}
 		if (name === "/resume") {
 			if (args.length > 1)
@@ -1492,10 +1569,7 @@ export class TelegramTransportAdapter
 			const sessionId =
 				(args[0] as SessionId | undefined) ?? this.selected.get(chatId);
 			if (!sessionId)
-				return this.sendDirect(
-					chatId,
-					"Provide a session ID or select a session with /use first.",
-				);
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "resume", sessionId });
 			if (result.ok) {
 				this.rememberSession(result.value as SessionSummary);
@@ -1505,17 +1579,14 @@ export class TelegramTransportAdapter
 				chatId,
 				result.ok
 					? `Session ${this.sessionFooter(sessionId)} is running.`
-					: result.error.message,
+					: `${result.error.message} Choose another session with /sessions or /menu.`,
 			);
 		}
 		if (name === "/inspect" && args.length <= 1) {
 			const sessionId =
 				(args[0] as SessionId | undefined) ?? this.selected.get(chatId);
 			if (!sessionId)
-				return this.sendDirect(
-					chatId,
-					"Provide a session ID or select a session first.",
-				);
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "inspect", sessionId });
 			if (result.ok) this.rememberSession(result.value as SessionSummary);
 			return this.sendDirectHtml(
@@ -1529,20 +1600,18 @@ export class TelegramTransportAdapter
 			const sessionId =
 				(args[0] as SessionId | undefined) ?? this.selected.get(chatId);
 			if (!sessionId)
-				return this.sendDirect(
-					chatId,
-					"Provide a session ID or select a session first.",
-				);
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "stop", sessionId });
+			let selectionCleared = true;
 			if (result.ok && this.selected.get(chatId) === sessionId) {
-				this.clearSelected(chatId);
+				selectionCleared = await this.clearSelected(chatId);
 				this.previews.delete(chatId);
 			}
 			if (result.ok) await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
 				chatId,
 				result.ok
-					? `Session ${this.sessionFooter(sessionId)} stopped.`
+					? `Session ${this.sessionFooter(sessionId)} stopped.${selectionCleared ? "" : " The saved chat selection could not be cleared and may return after restart."}`
 					: result.error.message,
 			);
 		}
@@ -1554,13 +1623,15 @@ export class TelegramTransportAdapter
 				sender,
 				sessionId,
 			);
+			let selectionsCleared = true;
 			if (result.ok) {
 				this.sessionNames.delete(sessionId);
 				this.knownSessions.delete(sessionId);
 				this.reportedErrors.delete(sessionId);
 				for (const [selectedChat, selectedId] of this.selected) {
 					if (selectedId === sessionId) {
-						this.clearSelected(selectedChat);
+						selectionsCleared =
+							(await this.clearSelected(selectedChat)) && selectionsCleared;
 						this.previews.delete(selectedChat);
 					}
 				}
@@ -1569,13 +1640,14 @@ export class TelegramTransportAdapter
 			return this.sendDirect(
 				chatId,
 				result.ok
-					? `Deleted stopped session ${this.sessionFooter(sessionId)} from harnessd.${cleanupPending ? " Inbox cleanup is pending." : ""}`
+					? `Deleted stopped session ${this.sessionFooter(sessionId)} from harnessd.${cleanupPending ? " Inbox cleanup is pending." : ""}${selectionsCleared ? "" : " Saved chat selection cleanup may be retried after restart."}`
 					: result.error.message,
 			);
 		}
 		if (name === "/cancel" && args.length === 1) {
 			const sessionId = this.selected.get(chatId);
-			if (!sessionId) return this.sendDirect(chatId, "Select a session first.");
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, {
 				kind: "cancel",
 				sessionId,
@@ -1719,12 +1791,12 @@ export class TelegramTransportAdapter
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
-			this.setSelected(chatId, session.id);
+			const selectionSaved = await this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
 				chatId,
-				`Created and selected ${sessionLabel(session)}.`,
+				`Created and selected ${sessionLabel(session)}.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
 			);
 		}
 		const result = await this.request(sender, {
@@ -1740,6 +1812,50 @@ export class TelegramTransportAdapter
 			chatId,
 			`Session name updated: ${sessionLabel(session)}.`,
 		);
+	}
+
+	private async presentSubmitFailure(
+		chatId: number,
+		sender: number,
+		sessionId: SessionId,
+		error: {
+			readonly code: string;
+			readonly message: string;
+			readonly inputId?: string;
+		},
+	): Promise<void> {
+		if (error.code === "SESSION_NOT_RESUMABLE")
+			return this.sendDirect(
+				chatId,
+				`${error.message}. This message was not submitted, and harnessd did not create a replacement. Choose another with /sessions or /menu.`,
+			);
+		if (error.code === "SESSION_NOT_FOUND") {
+			const inspected = await this.request(sender, {
+				kind: "inspect",
+				sessionId,
+			});
+			if (inspected.ok) {
+				const session = inspected.value as SessionSummary;
+				const detail =
+					session.status === "running"
+						? "Its saved status is running, but no live Pi process is attached; this can happen after an unclean shutdown."
+						: "The session is not currently available to Pi.";
+				return this.sendDirect(
+					chatId,
+					`${detail} This message was not sent. Choose a session with /sessions or /menu; harnessd did not create a replacement.`,
+				);
+			}
+			if (inspected.error.code === "SESSION_NOT_FOUND") {
+				const selectionCleared =
+					this.selected.get(chatId) !== sessionId ||
+					(await this.clearSelected(chatId));
+				return this.sendDirect(
+					chatId,
+					`The remembered session no longer exists. This message was not sent. Choose another with /sessions or /menu.${selectionCleared ? "" : " The stale selection could not be cleared from saved state."}`,
+				);
+			}
+		}
+		return this.sendDirect(chatId, safeResultError(error));
 	}
 
 	private request(
@@ -1775,8 +1891,9 @@ export class TelegramTransportAdapter
 			: [];
 		if (listed.ok) this.rememberSessions(sessions);
 		const selectedId = this.selected.get(chatId);
+		let selectionClearFailed = false;
 		if (selectedId && !sessions.some((session) => session.id === selectedId)) {
-			this.clearSelected(chatId);
+			selectionClearFailed = !(await this.clearSelected(chatId));
 			this.previews.delete(chatId);
 		}
 		let previewId = this.previews.get(chatId);
@@ -1808,6 +1925,10 @@ export class TelegramTransportAdapter
 			"📌 Текущая сессия",
 			`Выбрана: ${current ? sessionLabel(current) : "не выбрана"}`,
 		];
+		if (selectionClearFailed)
+			lines.push(
+				"Не удалось сохранить очистку выбора; он может вернуться после перезапуска.",
+			);
 		if (preview && preview.id !== current?.id)
 			lines.push(`Просмотр: ${sessionLabel(preview)}`);
 		const display = status?.session ?? preview ?? current;
@@ -2255,9 +2376,11 @@ export class TelegramTransportAdapter
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
-		this.setSelected(chatId, session.id);
+		const selectionSaved = await this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
 		await this.renderPanel(chatId, sender, messageId);
+		if (!selectionSaved)
+			await this.sendDirect(chatId, SELECTION_NOT_SAVED_WARNING.trim());
 	}
 
 	private async selectSession(
@@ -2273,9 +2396,11 @@ export class TelegramTransportAdapter
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
-		this.setSelected(chatId, session.id);
+		const selectionSaved = await this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
 		await this.renderPanel(chatId, sender, messageId);
+		if (!selectionSaved)
+			await this.sendDirect(chatId, SELECTION_NOT_SAVED_WARNING.trim());
 	}
 
 	private async renderSessions(
@@ -2777,9 +2902,10 @@ export class TelegramTransportAdapter
 			await this.sendDirect(chatId, result.error.message);
 			return this.renderPanel(chatId, sender, messageId);
 		}
+		let selectionPersistenceWarning = false;
 		if (action === "stop") {
 			if (this.selected.get(chatId) === sessionId) {
-				this.clearSelected(chatId);
+				selectionPersistenceWarning = !(await this.clearSelected(chatId));
 				this.previews.delete(chatId);
 			}
 		} else {
@@ -2793,11 +2919,18 @@ export class TelegramTransportAdapter
 				);
 			for (const [selectedChat, selectedId] of this.selected) {
 				if (selectedId === sessionId) {
-					this.clearSelected(selectedChat);
+					selectionPersistenceWarning =
+						!(await this.clearSelected(selectedChat)) ||
+						selectionPersistenceWarning;
 					this.previews.delete(selectedChat);
 				}
 			}
 		}
+		if (selectionPersistenceWarning)
+			await this.sendDirect(
+				chatId,
+				"The session action succeeded, but a saved chat selection could not be cleared and may return after restart.",
+			);
 		await this.renderPanel(chatId, sender, messageId);
 	}
 

@@ -104,8 +104,11 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 	{
 		visibility: "both",
 		section: "private-chat",
-		usage: "/use <sessionId>",
-		telegram: { command: "use", description: "Select a session by ID." },
+		usage: "/use [sessionId]",
+		telegram: {
+			command: "use",
+			description: "Select a session or reuse this chat's remembered one.",
+		},
 	},
 	{
 		visibility: "both",
