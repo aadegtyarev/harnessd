@@ -82,6 +82,8 @@ class MockBot {
 	photoHandler?: (ctx: Context) => Promise<void>;
 	callbackHandler?: (ctx: Context) => Promise<void>;
 	sent: { chatId: number; text: string }[] = [];
+	reactions: { chatId: number; messageId: number; reaction: unknown }[] = [];
+	setMessageReactionBehavior: () => Promise<unknown> = async () => true;
 	nextMessageId = 1000;
 	lastMessageId?: number;
 	edited: {
@@ -146,6 +148,16 @@ class MockBot {
 				_other?: unknown,
 				_signal?: AbortSignal,
 			) => true,
+		),
+		setMessageReaction: vi.fn(
+			async (
+				chatId: number,
+				messageId: number,
+				reaction: readonly { type: "emoji"; emoji: string }[],
+			) => {
+				this.reactions.push({ chatId, messageId, reaction });
+				return this.setMessageReactionBehavior();
+			},
 		),
 		answerCallbackQuery: vi.fn(async () => true),
 		getFile: vi.fn(
@@ -243,6 +255,7 @@ class MockBot {
 			from: { id: options.userId ?? 42 },
 			chat: { id: chatId, type: "private" },
 			message: {
+				message_id: this.nextMessageId++,
 				document: {
 					file_id: options.fileId ?? "document-id",
 					file_name: options.fileName ?? "notes.txt",
@@ -260,6 +273,7 @@ class MockBot {
 			from: { id: userId },
 			chat: { id: chatId, type: "private" },
 			message: {
+				message_id: this.nextMessageId++,
 				photo: [
 					{
 						file_id: "largest-photo-id",
@@ -482,6 +496,41 @@ async function startAdapter(
 }
 
 describe("Telegram transport", () => {
+	it("reacts to the source message only after Pi accepts the input", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const sourceMessageId = bot.nextMessageId;
+		await bot.update(42, "do the task");
+		await vi.waitFor(() => expect(bot.reactions).toHaveLength(1));
+		expect(bot.reactions).toEqual([
+			{
+				chatId: 42,
+				messageId: sourceMessageId,
+				reaction: [{ type: "emoji", emoji: "👀" }],
+			},
+		]);
+		expect(bot.sent.at(-1)?.text).toBe("Input accepted: input-1");
+		await adapter.stop();
+	});
+
+	it("keeps the acceptance reply if Telegram cannot add the eye reaction", async () => {
+		const bot = new MockBot();
+		bot.setMessageReactionBehavior = async () => {
+			throw new Error("reaction API unavailable");
+		};
+		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "do the task");
+		expect(bot.sent.at(-1)?.text).toBe("Input accepted: input-1");
+		await vi.waitFor(() => expect(journal).toHaveBeenCalled());
+		expect(journal.mock.calls.flat().join(" ")).toContain(
+			"Telegram input acceptance reaction failed",
+		);
+		await adapter.stop();
+	});
+
 	it("shows the runtime's safe operation reference in Telegram", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp(), {
@@ -504,6 +553,7 @@ describe("Telegram transport", () => {
 			"<pre><code>Operation failed (ref deadbeef)",
 		);
 		expect(bot.sent.at(-1)?.text).toContain("unsafe &lt;detail&gt;");
+		expect(bot.reactions).toEqual([]);
 		expect(bot.sent.at(-1)?.text).not.toContain("secret-token");
 		expect(bot.sent.at(-1)?.text).not.toContain("abc123-private");
 		expect(bot.sent.at(-1)?.text).not.toContain("Bearer");
@@ -1313,6 +1363,7 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updatePhoto(42, "describe this");
+		await vi.waitFor(() => expect(bot.reactions).toHaveLength(1));
 		const submission = requests.find((request) => request.kind === "submit");
 		expect(submission).toMatchObject({
 			kind: "submit",
@@ -1322,6 +1373,11 @@ describe("Telegram transport", () => {
 			images: [{ mimeType: "image/jpeg", data: "aGVsbG8=" }],
 		});
 		expect(bot.api.getFile).toHaveBeenCalledWith("largest-photo-id");
+		expect(bot.reactions).toContainEqual({
+			chatId: 42,
+			messageId: 1002,
+			reaction: [{ type: "emoji", emoji: "👀" }],
+		});
 		expect(fetchFile).toHaveBeenCalledTimes(1);
 		const downloadUrl = fetchFile.mock.calls[0]?.[0];
 		expect(downloadUrl).toBeInstanceOf(URL);
@@ -1357,6 +1413,7 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42, { caption: "summarize this" });
+		await vi.waitFor(() => expect(bot.reactions).toHaveLength(1));
 
 		const submission = requests.find((request) => request.kind === "submit");
 		expect(submission).toMatchObject({
@@ -1364,6 +1421,11 @@ describe("Telegram transport", () => {
 			text: expect.stringContaining(
 				"Caption (untrusted user text): summarize this",
 			),
+		});
+		expect(bot.reactions).toContainEqual({
+			chatId: 42,
+			messageId: 1002,
+			reaction: [{ type: "emoji", emoji: "👀" }],
 		});
 		expect(fetchFile.mock.calls[0]?.[0]?.href).toBe(
 			"https://api.telegram.org/file/botsecret-token/photos/document-id.jpg",

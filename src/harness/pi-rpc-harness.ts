@@ -404,8 +404,13 @@ interface PendingCommand {
 	reject(error: Error): void;
 	timer?: ReturnType<typeof setTimeout>;
 }
+interface AbortGate {
+	promise: Promise<void>;
+	release: () => void;
+}
 interface ActiveInput {
 	id: InputId;
+	sentAsSteer: boolean;
 	accepted: boolean;
 	settled: boolean;
 	uncertain: boolean;
@@ -471,8 +476,11 @@ class PiRpcInstance implements HarnessInstance {
 	private readonly waiters: ((result: IteratorResult<HarnessEvent>) => void)[] =
 		[];
 	private readonly pending = new Map<string, PendingCommand>();
+	private readonly activeInputs = new Map<InputId, ActiveInput>();
+	private abortInFlight?: AbortGate;
+	private abortOutcomeUncertain = false;
 	private nativeId?: string;
-	private active?: ActiveInput;
+	private agentRunning = false;
 	private eventsClosed = false;
 	private childExited = false;
 	private stdoutEnded = false;
@@ -781,11 +789,17 @@ class PiRpcInstance implements HarnessInstance {
 				kind: "status",
 				text: record.type,
 			});
-			if (record.type === "agent_settled" && this.active) {
-				this.active.settled = true;
-				if (this.active.uncertain) this.active = undefined;
-				else if (this.active.accepted && !this.active.canceling)
-					this.completeActive();
+			if (record.type === "agent_start") this.agentRunning = true;
+			if (record.type === "agent_settled") {
+				this.agentRunning = false;
+				// Pi settles the whole queued run, without identifying individual inputs.
+				for (const input of this.activeInputs.values()) {
+					if (input.accepted || !input.sentAsSteer) input.settled = true;
+					if (input.uncertain) this.activeInputs.delete(input.id);
+					else if (input.accepted && input.settled && !input.canceling)
+						this.completeActive(input.id);
+				}
+				if (this.abortOutcomeUncertain) this.releaseAbortGate();
 			}
 		}
 	}
@@ -793,10 +807,11 @@ class PiRpcInstance implements HarnessInstance {
 		response: Record<string, unknown>,
 		inputId?: InputId,
 	): void {
-		const active = this.active;
-		if (!active || active.id !== inputId) return;
+		if (inputId === undefined) return;
+		const active = this.activeInputs.get(inputId);
+		if (!active) return;
 		if (response.success !== true) {
-			this.active = undefined;
+			this.activeInputs.delete(active.id);
 			this.delivery(active.id, "failed", "Pi rejected the prompt");
 			return;
 		}
@@ -805,21 +820,22 @@ class PiRpcInstance implements HarnessInstance {
 		const disposition = (response.data as Record<string, unknown> | undefined)
 			?.disposition;
 		if (disposition === "handled") active.settled = true;
-		if (active.settled) this.completeActive();
+		if (active.settled && !active.canceling) this.completeActive(active.id);
 	}
 	private applyAbortResponse(
 		response: Record<string, unknown>,
 		inputId?: InputId,
 	): void {
-		const active = this.active;
-		if (!active || active.id !== inputId || !active.canceling) return;
+		if (inputId === undefined) return;
+		const active = this.activeInputs.get(inputId);
+		if (!active?.canceling) return;
 		if (response.success === true) {
-			this.active = undefined;
+			this.activeInputs.delete(active.id);
 			this.delivery(active.id, "failed", "Input canceled");
 			return;
 		}
 		active.canceling = false;
-		if (active.settled) this.completeActive();
+		if (active.settled) this.completeActive(active.id);
 	}
 	private write(value: Record<string, unknown>): Promise<void> {
 		const line = `${JSON.stringify(value)}\n`;
@@ -902,16 +918,19 @@ class PiRpcInstance implements HarnessInstance {
 		return sessionId;
 	}
 	async send(input: Input): Promise<void> {
+		while (this.abortInFlight) await this.abortInFlight.promise;
 		if (this.eventsClosed) throw new Error("Pi harness is closed");
-		if (this.active) throw new Error("An input is already active");
-		this.active = {
+		const sendAsSteer = this.agentRunning || this.activeInputs.size > 0;
+		const active: ActiveInput = {
 			id: input.id,
+			sentAsSteer: sendAsSteer,
 			accepted: false,
 			settled: false,
 			uncertain: false,
 			uncertainReported: false,
 			canceling: false,
 		};
+		this.activeInputs.set(input.id, active);
 		this.delivery(input.id, "pending");
 		let response: Record<string, unknown>;
 		try {
@@ -919,6 +938,7 @@ class PiRpcInstance implements HarnessInstance {
 				"prompt",
 				{
 					message: input.text,
+					...(sendAsSteer ? { streamingBehavior: "steer" } : {}),
 					...(input.images?.length
 						? {
 								images: input.images.map((image) => ({
@@ -932,66 +952,93 @@ class PiRpcInstance implements HarnessInstance {
 				input.id,
 			);
 		} catch (error) {
-			if (this.active?.id === input.id) {
-				this.active.uncertain = true;
-				this.active.uncertainReported = true;
+			const pendingInput = this.activeInputs.get(input.id);
+			if (pendingInput) {
+				pendingInput.uncertain = true;
+				pendingInput.uncertainReported = true;
 				this.delivery(
 					input.id,
 					"uncertain",
 					"Pi prompt response was not received",
 				);
-				if (this.active.settled) this.active = undefined;
+				if (pendingInput.settled) this.activeInputs.delete(input.id);
 			}
 			throw new UncertainInputDeliveryError(input.id, { cause: error });
 		}
-		if (response.success !== true) {
-			if (this.active?.id === input.id) {
-				this.active = undefined;
-				this.delivery(input.id, "failed", "Pi rejected the prompt");
-			}
-			throw new Error("Pi rejected the prompt");
-		}
+		if (response.success !== true) throw new Error("Pi rejected the prompt");
 	}
-	private completeActive(): void {
-		const active = this.active;
+	private completeActive(inputId: InputId): void {
+		const active = this.activeInputs.get(inputId);
 		if (!active) return;
-		this.active = undefined;
+		this.activeInputs.delete(inputId);
 		this.delivery(active.id, "completed");
 	}
 	async cancel(inputId: InputId): Promise<void> {
-		if (this.active?.id !== inputId) throw new Error("Input is not active");
-		if (!this.active.accepted || this.active.uncertain)
+		const active = this.activeInputs.get(inputId);
+		if (!active) throw new Error("Input is not active");
+		if (this.activeInputs.size > 1)
+			throw new Error(
+				"Pi cannot cancel one input while others are queued; no input was canceled",
+			);
+		if (!active.accepted || active.uncertain)
 			throw new Error("Input cannot be canceled before acknowledged delivery");
-		if (this.active.canceling)
+		if (active.canceling)
 			throw new Error("Input cancellation is already in progress");
-		this.active.canceling = true;
-		let response: Record<string, unknown>;
+		active.canceling = true;
+		let releaseAbort!: () => void;
+		const abortGate: AbortGate = {
+			promise: new Promise<void>((resolve) => {
+				releaseAbort = resolve;
+			}),
+			release: () => releaseAbort(),
+		};
+		this.abortInFlight = abortGate;
+		this.abortOutcomeUncertain = false;
+		let holdAbortGate = false;
 		try {
-			response = await this.command("abort", {}, inputId);
-		} catch (error) {
-			if (this.active?.id === inputId) {
-				this.active.uncertain = true;
-				this.active.uncertainReported = true;
-				this.delivery(
-					inputId,
-					"uncertain",
-					"Pi abort response was not received",
-				);
-				if (this.active.settled) this.active = undefined;
+			let response: Record<string, unknown>;
+			try {
+				response = await this.command("abort", {}, inputId);
+			} catch (error) {
+				const current = this.activeInputs.get(inputId);
+				if (current) {
+					current.uncertain = true;
+					current.uncertainReported = true;
+					if (!current.settled && !this.eventsClosed) {
+						this.abortOutcomeUncertain = true;
+						holdAbortGate = true;
+					}
+					this.delivery(
+						inputId,
+						"uncertain",
+						"Pi abort response was not received",
+					);
+					if (current.settled) this.activeInputs.delete(inputId);
+				}
+				throw error;
 			}
-			throw error;
-		}
-		if (response.success !== true) {
-			if (this.active?.id === inputId) {
-				this.active.canceling = false;
-				if (this.active.settled) this.completeActive();
+			if (response.success !== true) {
+				const current = this.activeInputs.get(inputId);
+				if (current) {
+					current.canceling = false;
+					if (current.settled) this.completeActive(inputId);
+				}
+				throw new Error("Pi rejected the abort command");
 			}
-			throw new Error("Pi rejected the abort command");
+			if (this.activeInputs.has(inputId)) {
+				this.activeInputs.delete(inputId);
+				this.delivery(inputId, "failed", "Input canceled");
+			}
+		} finally {
+			if (!holdAbortGate) this.releaseAbortGate(abortGate);
 		}
-		if (this.active?.id === inputId) {
-			this.active = undefined;
-			this.delivery(inputId, "failed", "Input canceled");
-		}
+	}
+	private releaseAbortGate(expected?: AbortGate): void {
+		const gate = this.abortInFlight;
+		if (!gate || (expected && gate !== expected)) return;
+		this.abortInFlight = undefined;
+		this.abortOutcomeUncertain = false;
+		gate.release();
 	}
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
@@ -1036,14 +1083,14 @@ class PiRpcInstance implements HarnessInstance {
 	private closeEvents(detail: string): void {
 		if (this.eventsClosed) return;
 		this.eventsClosed = true;
+		this.releaseAbortGate();
 		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
 		this.exitDrainTimer = undefined;
-		if (this.active) {
-			const active = this.active;
-			this.active = undefined;
+		for (const active of this.activeInputs.values()) {
 			if (!active.uncertainReported)
 				this.delivery(active.id, "uncertain", detail);
 		}
+		this.activeInputs.clear();
 		for (const [id, item] of this.pending) {
 			if (item.timer) clearTimeout(item.timer);
 			item.reject(new Error(detail));
