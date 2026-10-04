@@ -84,6 +84,17 @@ export interface ListedDirectory {
 	readonly truncated: boolean;
 }
 
+export function safeAttachmentName(value: string): string {
+	const basename = path
+		.basename(value)
+		.replace(/[\\/\\\\]/g, "_")
+		.replace(/[^A-Za-z0-9._-]/g, "_")
+		.slice(0, 100);
+	return basename && basename !== "." && basename !== ".."
+		? basename
+		: "attachment";
+}
+
 export async function listDirectoryEntries(
 	candidate: string,
 ): Promise<ListedDirectory> {

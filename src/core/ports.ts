@@ -163,11 +163,32 @@ export type TransportEventSubscription = (
 	listener: TransportEventListener,
 ) => () => void;
 
+export interface AgentFileSendRequest {
+	readonly sessionId: SessionId;
+	readonly path: string;
+	readonly caption?: string;
+}
+
+export interface AgentFileSendResult {
+	readonly fileName: string;
+	readonly delivered: number;
+	readonly recipients: number;
+}
+
+export type AgentFileSendHandler = (
+	request: AgentFileSendRequest,
+) => Promise<AgentFileSendResult>;
+
+export interface AgentFileSendTransport {
+	sendAgentFile(request: AgentFileSendRequest): Promise<AgentFileSendResult>;
+}
+
 export interface TransportAdapter {
 	readonly descriptor: PortDescriptor;
 	start(
 		dispatch: (event: TransportEvent) => Promise<TransportResult>,
 		subscribeEvents: TransportEventSubscription,
+		listSessions?: () => Promise<readonly SessionSummary[]>,
 	): Promise<void>;
 	stop(): Promise<void>;
 }
