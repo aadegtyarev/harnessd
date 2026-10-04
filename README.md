@@ -151,7 +151,7 @@ Plain text goes to the selected session. Telegram shows a typing indicator while
 
 While harnessd is alive, the core watches explicit Pi process exit, drains final events, and may attempt native-session resume up to three times per session after 250 ms, 1 s, and 4 s. It uses the exact saved native session ID and never starts a fresh session as a fallback.
 
-An operator can resume a deliberately stopped session with `/resume [sessionId]`; it reuses the stored native Pi session ID. If prompt delivery is uncertain, harnessd reports the original `InputId` and **does not resend the prompt**. A later manual submission is new work and could duplicate an operation if Pi completed the original prompt. After an unclean supervisor exit, stored session rows may be stale; this CLI does not reattach or restart prior Pi processes.
+An operator can resume a deliberately stopped session with `/resume [sessionId]`; it reuses the stored native Pi session ID. If prompt delivery is uncertain, harnessd reports the original `InputId` and **does not resend the prompt**. A later manual submission is new work and could duplicate an operation if Pi completed the original prompt. After an unclean supervisor exit, stored session rows may be stale; this CLI does not reattach or restart prior Pi processes. An unclassified request failure includes a short reference; use it to locate the matching `harnessd.service` journal entry. The entry records the request kind, an allowlisted error type, and source filename/line, but not the raw exception message, full stack, prompt, or secret values.
 
 ## Trust and limitations
 

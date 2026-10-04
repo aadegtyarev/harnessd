@@ -442,6 +442,27 @@ async function startAdapter(
 }
 
 describe("Telegram transport", () => {
+	it("shows the runtime's safe operation reference in Telegram", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "OPERATION_FAILED",
+								message: "Operation failed (ref deadbeef)",
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "hello");
+		expect(bot.sent.at(-1)?.text).toBe("Operation failed (ref deadbeef)");
+		await adapter.stop();
+	});
+
 	it("creates one pinned panel, browses sessions, selects explicitly, and guards callbacks", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
