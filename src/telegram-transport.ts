@@ -1223,7 +1223,7 @@ export class TelegramTransportAdapter
 			}
 			await this.sendDiagnostic(
 				chatId,
-				`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}${text.startsWith("/") ? "" : `\n\nСообщение:\n${truncateDiagnostic(text, 1200)}`}`,
+				`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}`,
 			);
 		}
 	}

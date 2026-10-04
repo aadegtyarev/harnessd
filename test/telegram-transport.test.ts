@@ -1782,7 +1782,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("shows traced dispatch failures and the submitted text in the private Telegram diagnostic", async () => {
+	it("shows traced dispatch failures without echoing uncorrelated submitted text", async () => {
 		const bot = new MockBot();
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const { adapter } = await startAdapter(bot, await temp(), {
@@ -1804,7 +1804,7 @@ describe("Telegram transport", () => {
 		).toBe(true);
 		expect(
 			bot.sent.some(({ text }) => text.includes("private prompt text")),
-		).toBe(true);
+		).toBe(false);
 		expect(journal.mock.calls.flat().join(" ")).not.toContain(
 			"private prompt text",
 		);
