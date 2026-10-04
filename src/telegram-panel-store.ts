@@ -3,14 +3,16 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 interface StoredPanels {
-	readonly version: 1;
+	readonly version: 2;
 	readonly messages: Readonly<Record<string, number>>;
+	readonly selectedSessions: Readonly<Record<string, string>>;
 }
 
-/** Persists only Telegram chat/message identifiers, never session selection or prompt data. */
+/** Persists per-bot Telegram panel IDs and chat selections, never prompt data. */
 export class TelegramPanelStore {
 	readonly filePath: string;
 	private readonly messages = new Map<number, number>();
+	private readonly selectedSessions = new Map<number, string>();
 	private writes: Promise<void> = Promise.resolve();
 
 	private constructor(stateDirectory: string, token: string) {
@@ -35,9 +37,29 @@ export class TelegramPanelStore {
 		return this.messages.get(chatId);
 	}
 
+	getSelected(chatId: number): string | undefined {
+		return this.selectedSessions.get(chatId);
+	}
+
+	selections(): readonly (readonly [number, string])[] {
+		return [...this.selectedSessions.entries()];
+	}
+
+	async setSelected(chatId: number, sessionId: string): Promise<void> {
+		validateChatId(chatId);
+		if (!isSessionId(sessionId)) throw new TypeError("Invalid session ID");
+		this.selectedSessions.set(chatId, sessionId);
+		await this.persist();
+	}
+
+	async clearSelected(chatId: number): Promise<void> {
+		validateChatId(chatId);
+		if (!this.selectedSessions.delete(chatId)) return;
+		await this.persist();
+	}
+
 	async set(chatId: number, messageId: number): Promise<void> {
-		if (!Number.isSafeInteger(chatId) || chatId <= 0)
-			throw new TypeError("Invalid private Telegram chat ID");
+		validateChatId(chatId);
 		if (!Number.isSafeInteger(messageId) || messageId <= 0)
 			throw new TypeError("Invalid Telegram message ID");
 		this.messages.set(chatId, messageId);
@@ -63,7 +85,11 @@ export class TelegramPanelStore {
 		} catch {
 			return;
 		}
-		if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.messages))
+		if (
+			!isRecord(parsed) ||
+			(parsed.version !== 1 && parsed.version !== 2) ||
+			!isRecord(parsed.messages)
+		)
 			return;
 		for (const [rawChatId, rawMessageId] of Object.entries(parsed.messages)) {
 			const chatId = Number(rawChatId);
@@ -74,6 +100,19 @@ export class TelegramPanelStore {
 				Number(rawMessageId) > 0
 			)
 				this.messages.set(chatId, Number(rawMessageId));
+		}
+		if (parsed.version === 2 && isRecord(parsed.selectedSessions)) {
+			for (const [rawChatId, sessionId] of Object.entries(
+				parsed.selectedSessions,
+			)) {
+				const chatId = Number(rawChatId);
+				if (
+					Number.isSafeInteger(chatId) &&
+					chatId > 0 &&
+					isSessionId(sessionId)
+				)
+					this.selectedSessions.set(chatId, sessionId);
+			}
 		}
 	}
 
@@ -86,11 +125,17 @@ export class TelegramPanelStore {
 	private async writeSnapshot(): Promise<void> {
 		const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
 		const contents: StoredPanels = {
-			version: 1,
+			version: 2,
 			messages: Object.fromEntries(
 				[...this.messages.entries()].map(([chatId, messageId]) => [
 					String(chatId),
 					messageId,
+				]),
+			),
+			selectedSessions: Object.fromEntries(
+				[...this.selectedSessions.entries()].map(([chatId, sessionId]) => [
+					String(chatId),
+					sessionId,
 				]),
 			),
 		};
@@ -106,6 +151,20 @@ export class TelegramPanelStore {
 			throw new Error("Could not persist Telegram panel state");
 		}
 	}
+}
+
+function validateChatId(chatId: number): void {
+	if (!Number.isSafeInteger(chatId) || chatId <= 0)
+		throw new TypeError("Invalid private Telegram chat ID");
+}
+
+function isSessionId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= 256 &&
+		!/\p{Cc}/u.test(value)
+	);
 }
 
 function isCode(error: unknown, code: string): boolean {

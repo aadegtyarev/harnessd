@@ -2,7 +2,7 @@
 
 ## Boundary and ownership
 
-The core owns stable session identity, working-directory validation, session metadata and lifecycle decisions. It consumes harness/process functionality through adapter ports and does not import transport or harness implementations. The application runtime composes core with process, harness, and transport adapters; transports request core operations but do not own session state. Runtime process selection defaults to trusted direct execution. Explicit isolated selection requires an injected provider declaring `process.isolation`, `process.launch`, and `process.signal`, and is checked before storage or transport startup. The runtime rejects caller-supplied harness arrays in isolated mode because it cannot guarantee they use the checked provider.
+The core owns stable supervisor-session identity, working-directory validation, session metadata and lifecycle decisions. It consumes harness/process functionality through adapter ports and does not import transport or harness implementations. The application runtime composes core with process, harness, and transport adapters; transports request core operations but do not own supervisor records, native Pi state, or lifecycle. A transport may persist its own routing choice (for example, Telegram's per-chat selected session) without changing core lifecycle policy. Runtime process selection defaults to trusted direct execution. Explicit isolated selection requires an injected provider declaring `process.isolation`, `process.launch`, and `process.signal`, and is checked before storage or transport startup. The runtime rejects caller-supplied harness arrays in isolated mode because it cannot guarantee they use the checked provider.
 
 ## Observable operations
 

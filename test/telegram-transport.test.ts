@@ -19,6 +19,7 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
+import { TelegramPanelStore } from "../src/telegram-panel-store.js";
 import {
 	acquireTelegramPollingLock,
 	TelegramTransportAdapter,
@@ -743,6 +744,158 @@ describe("Telegram transport", () => {
 		await second.adapter.stop();
 	});
 
+	it("restores each chat's selected stopped session after a transport restart", async () => {
+		const directory = await temp();
+		const sessionCwd = await temp();
+		const sid = sessions.get("sid");
+		if (!sid) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...sid, cwd: sessionCwd });
+		const fetchFile = stubFileDownload();
+		const firstBot = new MockBot();
+		const first = await startAdapter(firstBot, directory);
+		await firstBot.update(42, "/use sid");
+		await firstBot.update(43, "/use other");
+		await first.adapter.stop();
+
+		const sidAfterStop = sessions.get("sid");
+		const other = sessions.get("other");
+		if (!sidAfterStop || !other) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...sidAfterStop, status: "stopped" });
+		sessions.set("other", { ...other, status: "stopped" });
+
+		const secondBot = new MockBot();
+		const second = await startAdapter(secondBot, directory);
+		expect(second.requests).toEqual([]);
+		await secondBot.update(42, "/use");
+		expect(secondBot.sent.at(-1)?.text).toContain("Selected");
+		expect(secondBot.sent.at(-1)?.text).toContain(
+			"A new message will resume it",
+		);
+		await secondBot.update(42, "continue sid");
+		await secondBot.update(43, "continue other");
+		await secondBot.updatePhoto(42, "describe image");
+		await secondBot.updateDocument(42, { caption: "review document" });
+		expect(
+			second.requests.filter((request) => request.kind === "submit"),
+		).toMatchObject([
+			{ kind: "submit", sessionId: "sid", text: "continue sid" },
+			{ kind: "submit", sessionId: "other", text: "continue other" },
+			{
+				kind: "submit",
+				sessionId: "sid",
+				text: expect.stringContaining("describe image"),
+			},
+			{
+				kind: "submit",
+				sessionId: "sid",
+				text: expect.stringContaining("review document"),
+			},
+		]);
+		expect(fetchFile).toHaveBeenCalledTimes(2);
+		await second.adapter.stop();
+	});
+
+	it("reports an unresumable selected session without creating a replacement", async () => {
+		const stopped = sessions.get("sid");
+		if (!stopped) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...stopped, status: "stopped" });
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "SESSION_NOT_RESUMABLE",
+								message: "Session cannot be resumed",
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "new work");
+		expect(requests.map(({ kind }) => kind)).toEqual(["inspect", "submit"]);
+		expect(bot.sent.at(-1)?.text).toContain("This message was not submitted");
+		expect(bot.sent.at(-1)?.text).toContain("did not create a replacement");
+		expect(bot.sent.at(-1)?.text).toContain("/sessions or /menu");
+		expect(bot.reactions).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("reports an unavailable saved Pi session without resending or creating a replacement", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "SESSION_NOT_FOUND",
+								message: "Session was not found",
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "do not replay this text");
+		expect(requests.map(({ kind }) => kind)).toEqual([
+			"inspect",
+			"submit",
+			"inspect",
+		]);
+		expect(bot.sent.at(-1)?.text).toContain("no live Pi process is attached");
+		expect(bot.sent.at(-1)?.text).toContain("This message was not sent");
+		expect(bot.sent.at(-1)?.text).toContain("/menu");
+		expect(bot.sent.at(-1)?.text).not.toContain("do not replay this text");
+		expect(bot.reactions).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("clears stale saved selections and guides the chat to choose a session", async () => {
+		const directory = await temp();
+		const store = await TelegramPanelStore.open(directory, "secret-token");
+		await store.setSelected(42, "deleted-session");
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, directory);
+		await bot.update(42, "do not submit");
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		expect(bot.sent.at(-1)?.text).toContain("/sessions");
+		expect(bot.sent.at(-1)?.text).toContain("/menu");
+		expect(
+			(await TelegramPanelStore.open(directory, "secret-token")).getSelected(
+				42,
+			),
+		).toBeUndefined();
+		await adapter.stop();
+	});
+
+	it("persists selection clearing after stop and deletion", async () => {
+		const directory = await temp();
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, directory);
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use other");
+		await bot.update(42, "/stop");
+		await bot.update(43, "/delete other");
+		await adapter.stop();
+		const store = await TelegramPanelStore.open(directory, "secret-token");
+		expect(store.getSelected(42)).toBeUndefined();
+		expect(store.getSelected(43)).toBeUndefined();
+	});
+
+	it("makes bare /use explain how to select a session when none is remembered", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use");
+		expect(requests).toEqual([]);
+		expect(bot.sent.at(-1)?.text).toContain("/sessions");
+		expect(bot.sent.at(-1)?.text).toContain("/menu");
+		expect(bot.sent.at(-1)?.text).not.toContain("Invalid command");
+		await adapter.stop();
+	});
+
 	it("uses ForceReply to create named sessions and consumes only replies to its prompt", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
@@ -895,7 +1048,9 @@ describe("Telegram transport", () => {
 			sessionId: "other",
 		});
 		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
-		expect(bot.sent.at(-2)?.text).toBe("Session cannot be resumed safely.");
+		expect(bot.sent.at(-2)?.text).toBe(
+			"Session cannot be resumed safely. Choose another session with /sessions or /menu.",
+		);
 		await adapter.stop();
 	});
 
@@ -1091,9 +1246,9 @@ describe("Telegram transport", () => {
 				inputId: "input-1",
 			},
 		);
-		expect(bot.sent.some(({ text }) => text === "Session was not found")).toBe(
-			true,
-		);
+		expect(
+			bot.sent.some(({ text }) => text.includes("Session was not found")),
+		).toBe(true);
 		expect(
 			requests.every(
 				(request) => request.principalId === "42" && request.requestId,
@@ -1674,7 +1829,7 @@ describe("Telegram transport", () => {
 		await bot.update(100, '/send "report file.txt"');
 		expect(bot.api.sendDocument).not.toHaveBeenCalled();
 		expect(bot.sent.at(-1)?.text).toBe(
-			"<pre><code>Select a session first.</code></pre>",
+			"No session is selected. Use /sessions to find one and /use <sessionId>, or open /menu.",
 		);
 
 		await bot.update(100, "/use sid");

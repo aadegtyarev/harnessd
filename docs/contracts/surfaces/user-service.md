@@ -18,7 +18,7 @@ The CLI service commands in `src/user-service.ts` install or remove one harnessd
 - Install refuses to replace an existing unit that is not marked as harnessd-managed. Uninstall refuses to remove an unmanaged unit. Failed systemd commands are explicit errors; uninstall does not remove the unit if stopping/disabling fails. A failed install may leave the generated unit in place for inspection/retry.
 - Commands are supported only on Linux with a working user systemd manager. Unsupported platforms, relative XDG config paths, Node executable paths containing systemd-unsafe characters (control characters, quotes, or backslash), and unavailable systemd operations fail explicitly; there is no `sudo` or fallback to a system-wide service.
 - Unit installation/removal never deletes `.env`, SQLite state, workspaces, packages, or other unit files. Service tests use temporary directories and mocked systemctl calls; they never modify the real user manager.
-- The service does not add supervisor-restart recovery: existing session rows may be stale after a process restart, and uncertain inputs are never resent. OS service management does not change the transport, harness, process-provider, or isolation contracts.
+- Graceful shutdown persists selected session metadata; the Telegram transport restores each chat's selection after service restart and resumes a deliberately stopped Pi session only when a new message arrives (or `/resume` is invoked), never at startup. Abrupt supervisor-crash recovery remains out of scope: a session row may be stale and marked `running`; uncertain inputs are never resent. OS service management does not change the transport, harness, process-provider, or isolation contracts.
 
 ## Non-goals and related contracts
 
