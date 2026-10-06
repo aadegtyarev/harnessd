@@ -1134,6 +1134,9 @@ describe("Telegram transport", () => {
 		await bot.callback(42, "action:cancel", panelMessageId);
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		await bot.callback(42, "session:delete:sid", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toBe(
+			"Удалить запись #sid? Будут удалены запись harnessd и полученные вложения во входящих; файлы в рабочей папке и файлы Pi останутся.",
+		);
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
 		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
@@ -1890,13 +1893,59 @@ describe("Telegram transport", () => {
 			bot.sent.some(
 				({ text }) =>
 					text.includes(
-						`Input delivery is uncertain (InputId ${inputId}; not resent)`,
+						`Input delivery is uncertain (Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred; InputId ${inputId})`,
 					) && text.startsWith("<pre><code>"),
 			),
 		).toBe(true);
 		expect(bot.sent.some(({ text }) => text.includes("private prompt"))).toBe(
 			true,
 		);
+		await adapter.stop();
+	});
+
+	it("presents definite input rejection distinctly from uncertain delivery", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: { code: "INPUT_REJECTED", message: "Pi rejected input" },
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "rejected text");
+		const failure = bot.edited.find(({ text }) =>
+			text.includes("Pi rejected input"),
+		);
+		expect(failure?.text).toContain("Pi не принял сообщение");
+		expect(failure?.text).not.toContain("acknowledgement was lost");
+		await adapter.stop();
+	});
+
+	it("presents user cancellation as canceled by user, not as a send error", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "cancel me");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "cancelled-input" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("canceled by user")),
+			).toBe(true),
+		);
+		expect(bot.edited.at(-1)?.text).toContain("Отменено пользователем");
+		expect(bot.edited.at(-1)?.text).not.toContain("Ошибка отправки");
 		await adapter.stop();
 	});
 
@@ -1965,6 +2014,44 @@ describe("Telegram transport", () => {
 	it("uses grammY's supported getFile API instead of a nonexistent getFileLink", () => {
 		const bot = new Bot("123456:FAKE_TEST_TOKEN");
 		expect(Reflect.get(bot.api, "getFileLink")).toBeUndefined();
+	});
+
+	it("explains uncertain media delivery without resending the attachment", async () => {
+		const fetchFile = stubFileDownload();
+		const bot = new MockBot();
+		const dir = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "UNCERTAIN_INPUT_DELIVERY",
+								message: "Input delivery is uncertain",
+								inputId: "media-input" as never,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.updatePhoto(42, "caption");
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(1);
+		expect(fetchFile).toHaveBeenCalledTimes(1);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes(
+					"Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred",
+				),
+			),
+		).toBe(true);
+		await adapter.stop();
 	});
 
 	it("downloads the largest selected-session photo and submits image content with the caption", async () => {
