@@ -1903,6 +1903,58 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it.each(["text", "media"] as const)(
+		"keeps uncertainty ahead of long diagnostics for %s submissions",
+		async (kind) => {
+			const fetchFile = kind === "media" ? stubFileDownload() : undefined;
+			const bot = new MockBot();
+			const dir = await temp();
+			sessions.set("sid", {
+				...(sessions.get("sid") as SessionSummary),
+				cwd: dir,
+			});
+			const inputId = `long-${kind}-uncertain-input`;
+			const traceback = `Input delivery is uncertain\n\nUncertainInputDeliveryError: lost acknowledgement\n${"    at prompt (runtime.js:1:1)\n".repeat(60)}`;
+			const { adapter } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) =>
+					request.kind === "submit"
+						? {
+								requestId: request.requestId,
+								ok: false,
+								error: {
+									code: "UNCERTAIN_INPUT_DELIVERY",
+									message: traceback,
+									inputId: inputId as never,
+								},
+							}
+						: result(request),
+			});
+			await bot.update(42, "/use sid");
+			if (kind === "media") await bot.updatePhoto(42, "caption");
+			else await bot.update(42, "submit text");
+
+			const explanation =
+				"Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred";
+			expect(
+				bot.sent.some(
+					({ text }) =>
+						text.startsWith("<pre><code>") &&
+						text.includes(explanation) &&
+						text.includes(`InputId ${inputId}`) &&
+						text.includes("UncertainInputDeliveryError"),
+				),
+			).toBe(true);
+			expect(
+				bot.edited.some(
+					({ text }) =>
+						text.includes(explanation) && text.includes(`InputId ${inputId}`),
+				),
+			).toBe(true);
+			if (kind === "media") expect(fetchFile).toHaveBeenCalledTimes(1);
+			await adapter.stop();
+		},
+	);
+
 	it("presents definite input rejection distinctly from uncertain delivery", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp(), {

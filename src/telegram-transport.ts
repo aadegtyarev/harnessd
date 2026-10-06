@@ -824,13 +824,16 @@ function splitChunks(text: string, limit: number): string[] {
 	if (remaining) result.push(remaining);
 	return result;
 }
+function uncertainDeliveryNotice(inputId?: string): string {
+	return `Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred${inputId ? `; InputId ${inputId}` : ""}`;
+}
 function safeResultError(error: {
 	readonly code: string;
 	readonly message: string;
 	readonly inputId?: string;
 }): string {
 	if (error.code === "UNCERTAIN_INPUT_DELIVERY")
-		return `${error.message} (Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred${error.inputId ? `; InputId ${error.inputId}` : ""})`;
+		return `Input delivery is uncertain (${uncertainDeliveryNotice(error.inputId)})${error.message ? `\n${error.message}` : ""}`;
 	return error.message;
 }
 const NO_SESSION_SELECTED_MESSAGE =
@@ -1318,9 +1321,15 @@ export class TelegramTransportAdapter
 							result.error.code === "UNCERTAIN_INPUT_DELIVERY"
 								? "Статус доставки неизвестен"
 								: "Pi не принял сообщение",
-						notice: redactDiagnosticText(safeResultError(result.error), [
-							this.options.token,
-						]),
+						notice:
+							result.error.code === "UNCERTAIN_INPUT_DELIVERY"
+								? redactDiagnosticText(
+										uncertainDeliveryNotice(result.error.inputId),
+										[this.options.token],
+									)
+								: redactDiagnosticText(safeResultError(result.error), [
+										this.options.token,
+									]),
 					});
 					await this.presentSubmitFailure(
 						chatId,
@@ -1538,9 +1547,15 @@ export class TelegramTransportAdapter
 							submitted.error.code === "UNCERTAIN_INPUT_DELIVERY"
 								? "Статус доставки неизвестен"
 								: "Pi не принял вложение",
-						notice: redactDiagnosticText(safeResultError(submitted.error), [
-							this.options.token,
-						]),
+						notice:
+							submitted.error.code === "UNCERTAIN_INPUT_DELIVERY"
+								? redactDiagnosticText(
+										uncertainDeliveryNotice(submitted.error.inputId),
+										[this.options.token],
+									)
+								: redactDiagnosticText(safeResultError(submitted.error), [
+										this.options.token,
+									]),
 					});
 					return this.presentSubmitFailure(
 						chatId,
