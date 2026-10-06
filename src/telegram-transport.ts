@@ -824,13 +824,16 @@ function splitChunks(text: string, limit: number): string[] {
 	if (remaining) result.push(remaining);
 	return result;
 }
+function uncertainDeliveryNotice(inputId?: string): string {
+	return `Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred${inputId ? `; InputId ${inputId}` : ""}`;
+}
 function safeResultError(error: {
 	readonly code: string;
 	readonly message: string;
 	readonly inputId?: string;
 }): string {
-	if (error.code === "UNCERTAIN_INPUT_DELIVERY" && error.inputId)
-		return `${error.message} (InputId ${error.inputId}; not resent)`;
+	if (error.code === "UNCERTAIN_INPUT_DELIVERY")
+		return `Input delivery is uncertain (${uncertainDeliveryNotice(error.inputId)})${error.message ? `\n${error.message}` : ""}`;
 	return error.message;
 }
 const NO_SESSION_SELECTED_MESSAGE =
@@ -1314,8 +1317,19 @@ export class TelegramTransportAdapter
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
-						status: "Pi не принял сообщение",
-						notice: `${redactDiagnosticText(result.error.message, [this.options.token])}${result.error.inputId ? ` · InputId ${result.error.inputId}` : ""}`,
+						status:
+							result.error.code === "UNCERTAIN_INPUT_DELIVERY"
+								? "Статус доставки неизвестен"
+								: "Pi не принял сообщение",
+						notice:
+							result.error.code === "UNCERTAIN_INPUT_DELIVERY"
+								? redactDiagnosticText(
+										uncertainDeliveryNotice(result.error.inputId),
+										[this.options.token],
+									)
+								: redactDiagnosticText(safeResultError(result.error), [
+										this.options.token,
+									]),
 					});
 					await this.presentSubmitFailure(
 						chatId,
@@ -1529,10 +1543,19 @@ export class TelegramTransportAdapter
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
-						status: "Pi не принял вложение",
-						notice: redactDiagnosticText(submitted.error.message, [
-							this.options.token,
-						]),
+						status:
+							submitted.error.code === "UNCERTAIN_INPUT_DELIVERY"
+								? "Статус доставки неизвестен"
+								: "Pi не принял вложение",
+						notice:
+							submitted.error.code === "UNCERTAIN_INPUT_DELIVERY"
+								? redactDiagnosticText(
+										uncertainDeliveryNotice(submitted.error.inputId),
+										[this.options.token],
+									)
+								: redactDiagnosticText(safeResultError(submitted.error), [
+										this.options.token,
+									]),
 					});
 					return this.presentSubmitFailure(
 						chatId,
@@ -2771,6 +2794,7 @@ export class TelegramTransportAdapter
 		activity: LiveActivity,
 		inputId: string,
 		state: string,
+		detail?: string,
 	): void {
 		const existing = activity.queuedInputs.find(
 			(input) => input.inputId === inputId,
@@ -2816,12 +2840,16 @@ export class TelegramTransportAdapter
 			)
 				activity.untrackedFailureOverflow = true;
 		}
+		const canceledByUser =
+			state === "failed" && detail?.toLowerCase() === "input canceled";
 		if (
 			(state === "failed" || state === "uncertain") &&
 			previousState !== state
 		)
 			activity.notices.push(
-				`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`,
+				canceledByUser
+					? `Input ${inputId}: canceled by user`
+					: `Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`,
 			);
 		if (activity.notices.length > 12) activity.notices.shift();
 		if (state === "pending")
@@ -2833,7 +2861,9 @@ export class TelegramTransportAdapter
 			activity.status =
 				state === "uncertain"
 					? "Статус доставки неизвестен"
-					: "Ошибка отправки";
+					: canceledByUser
+						? "Отменено пользователем"
+						: "Ошибка отправки";
 		}
 		this.renderLiveActivity(activity);
 	}
@@ -3564,7 +3594,7 @@ export class TelegramTransportAdapter
 		const prompt =
 			action === "stop"
 				? `Остановить ${sessionLabel(session)}?`
-				: `Удалить запись ${sessionLabel(session)}? Будут удалены только метаданные harnessd; файлы Pi и папка проекта останутся.`;
+				: `Удалить запись ${sessionLabel(session)}? Будут удалены запись harnessd и полученные вложения во входящих; файлы в рабочей папке и файлы Pi останутся.`;
 		const confirmData =
 			action === "stop"
 				? `action:confirm-stop:${sessionId}`
@@ -3761,30 +3791,34 @@ export class TelegramTransportAdapter
 			return;
 		}
 		if (event.kind === "input" && event.inputEvent) {
-			const { inputId, state } = event.inputEvent;
+			const { inputId, state, detail } = event.inputEvent;
+			const canceledByUser =
+				state === "failed" && detail?.toLowerCase() === "input canceled";
+			const inputPresentation = canceledByUser
+				? `Input ${inputId}: canceled by user`
+				: `Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`;
 			if (state === "failed" || state === "uncertain")
 				this.stopTyping(event.sessionId);
 			if (state === "accepted") return;
 			const activities = this.activitiesForSession(event.sessionId);
 			if (activities.length) {
 				for (const activity of activities) {
-					this.updateActivityInput(activity, inputId, state);
+					this.updateActivityInput(activity, inputId, state, detail);
 					if (state === "completed")
 						this.scheduleLiveActivityFinish(event.sessionId, true);
 				}
 				if (state === "failed" || state === "uncertain")
 					this.enqueueForSelected(
 						event.sessionId,
-						`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}${event.inputEvent.detail ? ` · ${redactDiagnosticText(event.inputEvent.detail, [this.options.token])}` : ""}`,
+						`${inputPresentation}${!canceledByUser && detail ? ` · ${redactDiagnosticText(detail, [this.options.token])}` : ""}`,
 						{ inputId, state },
 					);
 				return;
 			}
-			this.enqueueForSelected(
-				event.sessionId,
-				`Input ${inputId}: ${state}${state === "uncertain" ? " (not resent)" : ""}`,
-				{ inputId, state },
-			);
+			this.enqueueForSelected(event.sessionId, inputPresentation, {
+				inputId,
+				state,
+			});
 		}
 	}
 
