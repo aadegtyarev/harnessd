@@ -2448,7 +2448,7 @@ describe("Telegram transport", () => {
 			"```ts",
 			'const value = "<tag>";',
 			"```",
-			"raw <b>HTML</b> & text [unsafe](javascript:alert(1)) [safe](https://example.com/?x=1&y=2) [mail](mailto:user@example.com) *crossed ~~markup* stays~~ readable* unclosed **formatting",
+			'raw <b>HTML</b> & text [unsafe](javascript:alert(1)) [safe](https://example.com/?x=1&y=2) [mail](mailto:user@example.com) [\u0060x\u0060](https://example.com) [code](https://example.com/\u0060x\u0060) **\u0060x\u0060** [malformed](https://example.com/" onload="x) *crossed ~~markup* stays~~ readable* unclosed **formatting',
 		].join("\n");
 		emit(harnessEvent("sid", "output", assistantOutput));
 		emit({
@@ -2497,7 +2497,12 @@ describe("Telegram transport", () => {
 		expect(output?.text).toContain(
 			'<a href="mailto:user@example.com">mail</a>',
 		);
-		expect(output?.text).not.toContain("javascript:");
+		expect(output?.text).not.toContain('<a href="javascript:');
+		expect(output?.text).not.toContain("HARNESSDMD");
+		expect(output?.text).not.toContain("<b><code>");
+		expect(output?.text).not.toContain(
+			'<a href="https://example.com/" onload=',
+		);
 		expect(telegramBody(output?.text ?? "")).toContain("unsafe");
 		expect(telegramBody(output?.text ?? "")).toContain("unclosed");
 		expect(output?.text).not.toContain("<i>crossed");
@@ -2665,6 +2670,31 @@ describe("Telegram transport", () => {
 					index++;
 				} else expect(codePoint < 0xdc00 || codePoint > 0xdfff).toBe(true);
 			}
+		}
+		const fenced =
+			"```ts\n" +
+			"z".repeat(8500) +
+			"\n``` [link](https://example.com/" +
+			"q".repeat(800) +
+			")";
+		const beforeFence = bot.sent.length;
+		emit(harnessEvent("other", "output", fenced));
+		emit(harnessEvent("other", "status", "agent_settled"));
+		let fenceParts: typeof bot.sent = [];
+		await vi.waitFor(() => {
+			fenceParts = bot.sent
+				.slice(beforeFence)
+				.filter(({ text }) => text.includes("<pre>"));
+			expect(fenceParts.length).toBeGreaterThan(1);
+		});
+		expect(fenceParts.map(({ text }) => telegramBody(text)).join("")).toBe(
+			`${"z".repeat(8500)}\n link`,
+		);
+		for (const { text } of fenceParts) {
+			expect(telegramVisibleText(text).length).toBeLessThanOrEqual(4096);
+			expect((text.match(/<pre>/g) ?? []).length).toBe(1);
+			expect((text.match(/<\/pre>/g) ?? []).length).toBe(1);
+			expect(text).not.toContain("HARNESSDMD");
 		}
 		await adapter.stop();
 	});
