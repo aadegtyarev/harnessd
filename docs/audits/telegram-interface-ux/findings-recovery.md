@@ -4,7 +4,7 @@
 
 **Evidence:** structural inbox-inside-workspace rejection (`src/telegram-inbox.ts:213–235`) becomes “Please try again later” (`src/telegram-transport.ts:1573–1578`); test `test/telegram-transport.test.ts:2136–2154`. Quota says delete files or wait (`1567–1572`), but cleanup skips running sessions (`src/telegram-inbox.ts:183–197`) and Telegram has no inbox cleanup command. `/send` collapses absent file/path restriction/delivery failure into one regular-file/cwd/size hint (`src/telegram-transport.ts:1390–1431,1630–1638`).
 
-**Impact / flow:** configuration rejection → retry later → same failure; quota in running session → wait but cleanup cannot occur; successful `/send` followed by Telegram timeout → user is told to fix file.
+**Impact / flow:** configuration rejection → retry later → same failure; quota in running session → wait but cleanup cannot occur; valid `/send` followed by Telegram timeout → user is told to fix file.
 
 **Recommended behavior:** safe reason codes and distinct messages: unavailable file, outside workspace, size, inbox configuration, quota, uncertain delivery. For quota explain actual cleanup condition and available route (another session/operator); inbox-management capability needs separate scope.
 
@@ -12,7 +12,7 @@
 
 ## F15 — P2: successful cancellation appears as send error
 
-**Evidence:** Pi RPC emits `failed` with detail `Input canceled` (`src/harness/pi-rpc-harness.ts:1204–1206`). Activity updater receives only ID/state (`src/telegram-transport.ts:3764–3777`); maps failed to `Ошибка отправки` (`2828–2835`). Separate detail and slash response say cancellation requested (`1924`).
+**Evidence:** Pi RPC emits `failed` with detail `Input canceled` (`src/harness/pi-rpc-harness.ts:1204–1206`). Activity updater receives only ID/state (`src/telegram-transport.ts:3764–3777`); maps failed to `Ошибка отправки` (`2828–2835`). Separate input detail says `Input canceled`, while slash feedback says `Cancellation requested` (`1924`).
 
 **Impact / flow:** accepted request → `/cancel inputId` → abort succeeds → bubble says send error while separate reply says cancel.
 
