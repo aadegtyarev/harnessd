@@ -176,6 +176,7 @@ type TelegramRequest = TransportEvent extends infer Event
 type QueuedMessage = {
 	readonly sessionId: SessionId;
 	readonly text: string;
+	readonly output?: true;
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
@@ -475,6 +476,126 @@ function escapeHtml(value: string): string {
 				return "&#39;";
 		}
 	});
+}
+function markdownToTelegramHtml(message: string, sessionId: SessionId): string {
+	const footerStart = message.lastIndexOf("\n\n");
+	const body = footerStart < 0 ? message : message.slice(0, footerStart);
+	let text = "";
+	for (let offset = 0; offset < body.length; ) {
+		const remaining = body.slice(offset);
+		const fence = remaining.match(/^```[^\n]*\n([\s\S]*?)```/);
+		if (fence) {
+			text += `<pre>${escapeHtml(fence[1] ?? "")}</pre>`;
+			offset += fence[0].length;
+			continue;
+		}
+		const inlineCode = remaining.match(/^`([^`\n]+)`/);
+		if (inlineCode) {
+			text += `<code>${escapeHtml(inlineCode[1] ?? "")}</code>`;
+			offset += inlineCode[0].length;
+			continue;
+		}
+		const link = remaining.match(/^\[([^\]\n]+)\]\(([^()\n]+)\)/);
+		if (link) {
+			const href = (link[2] ?? "").trim();
+			let safe = false;
+			try {
+				const url = new URL(href);
+				safe = ["http:", "https:", "mailto:"].includes(url.protocol);
+			} catch {
+				/* Malformed destinations remain readable, non-clickable text. */
+			}
+			text += safe
+				? `<a href="${escapeHtml(href)}">${escapeHtml(link[1] ?? "")}</a>`
+				: escapeHtml(link[1] ?? link[0]);
+			offset += link[0].length;
+			continue;
+		}
+		const emphasis = remaining.match(/^(\*\*|__|~~|\*|_)([^*_~\n]+?)\1/);
+		if (emphasis) {
+			const marker = emphasis[1];
+			const tag = marker === "~~" ? "s" : marker.length === 2 ? "b" : "i";
+			text += `<${tag}>${escapeHtml(emphasis[2] ?? "")}</${tag}>`;
+			offset += emphasis[0].length;
+			continue;
+		}
+		const point = String.fromCodePoint(body.codePointAt(offset) ?? 0);
+		text += escapeHtml(point);
+		offset += point.length;
+	}
+	if (footerStart < 0) return text;
+	const escapedFooter = escapeHtml(message.slice(footerStart + 2));
+	const escapedSessionId = escapeHtml(sessionId);
+	const sessionOffset = escapedFooter.lastIndexOf(escapedSessionId);
+	const footer =
+		sessionOffset < 0
+			? escapedFooter
+			: `${escapedFooter.slice(0, sessionOffset)}<code>${escapedSessionId}</code>${escapedFooter.slice(sessionOffset + escapedSessionId.length)}`;
+	return `${text}\n\n${footer}`;
+}
+function splitAssistantHtml(
+	message: string,
+	footer: string,
+	sessionId: SessionId,
+): string[] {
+	const rendered = markdownToTelegramHtml(`${message}\n\n${footer}`, sessionId);
+	const footerHtml = markdownToTelegramHtml(`\n\n${footer}`, sessionId);
+	const body = rendered.slice(0, rendered.lastIndexOf("\n\n"));
+	const footerVisible = footer.length + 2;
+	let total = 1;
+	for (let attempt = 0; attempt < 16; attempt++) {
+		const markerBudget = total > 1 ? ` · ${total}/${total}`.length : 0;
+		const result = splitHtmlBody(
+			body,
+			TELEGRAM_LIMIT - footerVisible - markerBudget,
+		);
+		if (result.length === total) {
+			return result.map(
+				(part, index) =>
+					`${part}${footerHtml}${total > 1 ? ` · ${index + 1}/${total}` : ""}`,
+			);
+		}
+		total = result.length;
+	}
+	throw new Error("Could not split rendered Telegram assistant output");
+}
+function splitHtmlBody(html: string, limit: number): string[] {
+	const tokens =
+		html.match(
+			/<[^>]*>|&(?:#\d+|#x[\da-f]+|[a-z]+);|[\uD800-\uDBFF][\uDC00-\uDFFF]|[\s\S]/gi,
+		) ?? [];
+	const parts: string[] = [];
+	let part = "";
+	let visible = 0;
+	const stack: { name: string; open: string }[] = [];
+	const closeTags = () =>
+		stack
+			.slice()
+			.reverse()
+			.map(({ name }) => `</${name}>`)
+			.join("");
+	const startPart = () => stack.map(({ open }) => open).join("");
+	for (const token of tokens) {
+		const isTag = token.startsWith("<");
+		const closing = isTag && /^<\//.test(token);
+		const tagName = isTag
+			? token.match(/^<\/?([a-z]+)/i)?.[1]?.toLowerCase()
+			: undefined;
+		const visibleCount = isTag ? 0 : token.startsWith("&") ? 1 : token.length;
+		if (visibleCount && visible + visibleCount > limit && part) {
+			parts.push(part + closeTags());
+			part = startPart();
+			visible = 0;
+		}
+		part += token;
+		visible += visibleCount;
+		if (tagName && ["b", "i", "s", "a", "code", "pre"].includes(tagName)) {
+			if (closing) stack.pop();
+			else if (!/\/>$/.test(token)) stack.push({ name: tagName, open: token });
+		}
+	}
+	if (part || parts.length === 0) parts.push(part + closeTags());
+	return parts;
 }
 function sessionLabel(session: Pick<SessionSummary, "id" | "name">): string {
 	return `${session.name ? `${oneLine(session.name)} · ` : ""}#${session.id}`;
@@ -3775,17 +3896,18 @@ export class TelegramTransportAdapter
 		if (buffer.overflow)
 			text +=
 				"\n\n[Additional output omitted because the response reached the queue limit.]";
-		this.enqueueForSelected(sessionId, text);
+		this.enqueueForSelected(sessionId, text, undefined, true);
 	}
 
 	private enqueueForSelected(
 		sessionId: SessionId,
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
+		output = false,
 	): void {
 		for (const [chatId, selectedId] of this.selected) {
 			if (selectedId === sessionId)
-				this.enqueue(chatId, sessionId, text, input);
+				this.enqueue(chatId, sessionId, text, input, output);
 		}
 	}
 
@@ -3823,6 +3945,7 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
+		output = false,
 	): void {
 		let queue = this.queues.get(chatId);
 		if (!queue) {
@@ -3836,7 +3959,9 @@ export class TelegramTransportAdapter
 			this.queues.set(chatId, queue);
 		}
 		if (queue.failed || this.stopping) return;
-		const parts = splitMessageWithFooter(text, this.eventFooter(sessionId));
+		const parts = output
+			? splitAssistantHtml(text, this.eventFooter(sessionId), sessionId)
+			: splitMessageWithFooter(text, this.eventFooter(sessionId));
 		if (input) {
 			this.enqueueInput(queue, sessionId, parts[0] ?? text, input);
 			this.scheduleDrain(chatId, queue);
@@ -3855,7 +3980,11 @@ export class TelegramTransportAdapter
 				this.queueOverflow(queue, sessionId);
 				break;
 			}
-			queue.messages.push({ sessionId, text: part });
+			queue.messages.push({
+				sessionId,
+				text: part,
+				...(output ? { output: true as const } : {}),
+			});
 			queue.pendingCharacters += part.length;
 		}
 		this.scheduleDrain(chatId, queue);
@@ -3961,7 +4090,9 @@ export class TelegramTransportAdapter
 			const delivered = await this.sendWithDeadline(
 				chatId,
 				message.text,
-				sessionIdEntity(message.text, message.sessionId),
+				message.output
+					? { parse_mode: "HTML" }
+					: sessionIdEntity(message.text, message.sessionId),
 			);
 			if (!delivered) {
 				queue.failed = true;
