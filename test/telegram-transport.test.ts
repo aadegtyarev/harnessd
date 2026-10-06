@@ -27,14 +27,28 @@ import {
 } from "../src/telegram-transport.js";
 
 const roots: string[] = [];
+function telegramVisibleText(text: string): string {
+	return text
+		.replace(/<[^>]+>/g, "")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;/g, "'")
+		.replace(/&amp;/g, "&");
+}
 function telegramBody(text: string): string {
 	const footerStart = text.lastIndexOf("\n\n");
-	return footerStart < 0 ? text : text.slice(0, footerStart);
+	return telegramVisibleText(
+		footerStart < 0 ? text : text.slice(0, footerStart),
+	);
 }
 function hasSessionFooter(text: string, sessionId: string): boolean {
 	const footerStart = text.lastIndexOf("\n\n");
 	if (footerStart < 0) return false;
-	const footer = text.slice(footerStart + 2).replace(/ · \d+\/\d+$/, "");
+	const footer = text
+		.slice(footerStart + 2)
+		.replace(/<\/?code>/g, "")
+		.replace(/ · \d+\/\d+$/, "");
 	return footer === sessionId || footer.endsWith(` · ${sessionId}`);
 }
 async function temp() {
@@ -893,7 +907,9 @@ describe("Telegram transport", () => {
 		);
 		bot.sendMessageBehavior = async () => {
 			if (
-				bot.api.sendMessage.mock.calls.at(-1)?.[1] === "Visible answer\n\nsid"
+				String(bot.api.sendMessage.mock.calls.at(-1)?.[1]).includes(
+					"Visible answer",
+				)
 			)
 				throw new Error("Telegram rejected the message");
 		};
@@ -2410,7 +2426,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("sends one accepted-input confirmation and marks only the footer ID monospace", async () => {
+	it("formats assistant Markdown safely and keeps input acknowledgements literal", async () => {
 		const bot = new MockBot();
 		let emitEvent!: (event: HarnessEvent) => void;
 		const { adapter, emit } = await startAdapter(bot, await temp(), {
@@ -2427,7 +2443,14 @@ describe("Telegram transport", () => {
 		emitEvent = emit;
 		await bot.update(42, "/use sid");
 		await bot.update(42, "send this");
-		emit(harnessEvent("sid", "output", "literal <b>markup</b> & text"));
+		const assistantOutput = [
+			"**bold** *italic* ~~strike~~ `inline <code>`",
+			"```ts",
+			'const value = "<tag>";',
+			"```",
+			"raw <b>HTML</b> & text [unsafe](javascript:alert(1)) [safe](https://example.com/?x=1&y=2) [mail](mailto:user@example.com) *crossed ~~markup* stays~~ readable* unclosed **formatting",
+		].join("\n");
+		emit(harnessEvent("sid", "output", assistantOutput));
 		emit({
 			sessionId: "sid" as SessionId,
 			kind: "input",
@@ -2435,9 +2458,9 @@ describe("Telegram transport", () => {
 		});
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
-			expect(
-				bot.sent.some(({ text }) => text.includes("literal <b>markup</b>")),
-			).toBe(true),
+			expect(bot.sent.some(({ text }) => text.includes("<b>bold</b>"))).toBe(
+				true,
+			),
 		);
 		const acceptanceUpdates = bot.edited.filter(({ text }) =>
 			text.includes("input-1"),
@@ -2447,28 +2470,40 @@ describe("Telegram transport", () => {
 				text.includes("Input input-1: accepted"),
 			),
 		).toBe(true);
-		expect(
-			bot.sent.some(({ text }) => text === "Input accepted: input-1"),
-		).toBe(false);
+		const commandReplyIndex = bot.sent.findIndex(({ text }) =>
+			text.startsWith("Selected"),
+		);
+		expect(commandReplyIndex).toBeGreaterThanOrEqual(0);
+		expect(bot.sendOptions[commandReplyIndex]).not.toMatchObject({
+			parse_mode: "HTML",
+		});
 		const outputIndex = bot.sent.findIndex(({ text }) =>
-			text.includes("literal <b>markup</b>"),
+			text.includes("<b>bold</b>"),
 		);
 		const output = bot.sent[outputIndex];
 		const options = bot.sendOptions[outputIndex] as {
 			entities?: readonly { type: string; offset: number; length: number }[];
 			parse_mode?: string;
 		};
-		expect(output?.text).toContain("literal <b>markup</b> & text");
-		expect(options.parse_mode).toBeUndefined();
-		expect(options.entities).toHaveLength(1);
-		const entity = options.entities?.[0];
-		expect(entity?.type).toBe("code");
-		expect(
-			output?.text.slice(
-				entity?.offset,
-				(entity?.offset ?? 0) + (entity?.length ?? 0),
-			),
-		).toBe("sid");
+		expect(output?.text).toContain("<b>bold</b> <i>italic</i> <s>strike</s>");
+		expect(output?.text).toContain("<code>inline &lt;code&gt;</code>");
+		expect(output?.text).toContain(
+			"<pre>const value = &quot;&lt;tag&gt;&quot;;\n</pre>",
+		);
+		expect(output?.text).toContain("raw &lt;b&gt;HTML&lt;/b&gt; &amp; text");
+		expect(output?.text).toContain(
+			'<a href="https://example.com/?x=1&amp;y=2">safe</a>',
+		);
+		expect(output?.text).toContain(
+			'<a href="mailto:user@example.com">mail</a>',
+		);
+		expect(output?.text).not.toContain("javascript:");
+		expect(telegramBody(output?.text ?? "")).toContain("unsafe");
+		expect(telegramBody(output?.text ?? "")).toContain("unclosed");
+		expect(output?.text).not.toContain("<i>crossed");
+		expect(output?.text).not.toContain("<s>markup");
+		expect(options.parse_mode).toBe("HTML");
+		expect(options.entities).toBeUndefined();
 		expect(hasSessionFooter(output?.text ?? "", "sid")).toBe(true);
 		await adapter.stop();
 	});
@@ -2586,20 +2621,17 @@ describe("Telegram transport", () => {
 		);
 		expect(
 			chunks.every(
-				({ text }) => text.length <= 4096 && hasSessionFooter(text, "other"),
+				({ text }) =>
+					telegramVisibleText(text).length <= 4096 &&
+					hasSessionFooter(text, "other"),
 			),
 		).toBe(true);
 		for (const message of chunks) {
 			const options = bot.sendOptions[bot.sent.indexOf(message)] as {
-				entities?: readonly { type: string; offset: number; length: number }[];
+				parse_mode?: string;
 			};
-			const entity = options?.entities?.find(({ type }) => type === "code");
-			expect(
-				message.text.slice(
-					entity?.offset,
-					(entity?.offset ?? 0) + (entity?.length ?? 0),
-				),
-			).toBe("other");
+			expect(options.parse_mode).toBe("HTML");
+			expect(message.text).toContain("<code>other</code>");
 		}
 		expect(chunks.map(({ text }) => telegramBody(text)).join("")).toBe(
 			longOutput,
@@ -2615,14 +2647,16 @@ describe("Telegram transport", () => {
 			expect(unicodeParts).toHaveLength(2);
 		});
 		expect(
-			unicodeParts.map(({ text }) => text.match(/other · (\d+\/\d+)$/)?.[1]),
+			unicodeParts.map(
+				({ text }) => text.match(/<code>other<\/code> · (\d+\/\d+)$/)?.[1],
+			),
 		).toEqual(["1/2", "2/2"]);
 		expect(unicodeParts.map(({ text }) => telegramBody(text)).join("")).toBe(
 			unicodeReply,
 		);
 		for (const { text } of unicodeParts) {
 			const body = telegramBody(text);
-			expect(text.length).toBeLessThanOrEqual(4096);
+			expect(telegramVisibleText(text).length).toBeLessThanOrEqual(4096);
 			for (let index = 0; index < body.length; index++) {
 				const codePoint = body.charCodeAt(index);
 				if (codePoint >= 0xd800 && codePoint <= 0xdbff) {

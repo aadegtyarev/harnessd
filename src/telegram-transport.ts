@@ -176,6 +176,7 @@ type TelegramRequest = TransportEvent extends infer Event
 type QueuedMessage = {
 	readonly sessionId: SessionId;
 	readonly text: string;
+	readonly output?: true;
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
@@ -475,6 +476,63 @@ function escapeHtml(value: string): string {
 				return "&#39;";
 		}
 	});
+}
+function markdownToTelegramHtml(message: string, sessionId: SessionId): string {
+	const footerStart = message.lastIndexOf("\n\n");
+	const body = footerStart < 0 ? message : message.slice(0, footerStart);
+	const code: string[] = [];
+	const marker = `HARNESSDMD${randomUUID().replace(/-/g, "")}X`;
+	const placeholder = (html: string) => {
+		const index = code.push(html) - 1;
+		return `${marker}${index}ZEND`;
+	};
+	let text = body.replace(
+		/```[^\n]*\n([\s\S]*?)```/g,
+		(_match, value: string) => placeholder(`<pre>${escapeHtml(value)}</pre>`),
+	);
+	text = text.replace(/`([^`\n]+)`/g, (_match, value: string) =>
+		placeholder(`<code>${escapeHtml(value)}</code>`),
+	);
+	text = text.replace(
+		/\[([^\]\n]+)\]\(([^)\n]+)\)/g,
+		(_match, label: string, rawHref: string) => {
+			const href = rawHref.trim();
+			let safe = false;
+			try {
+				const url = new URL(href);
+				safe =
+					url.protocol === "http:" ||
+					url.protocol === "https:" ||
+					url.protocol === "mailto:";
+			} catch {
+				/* Leave malformed and unsupported destinations as plain label text. */
+			}
+			return safe
+				? placeholder(`<a href="${escapeHtml(href)}">${escapeHtml(label)}</a>`)
+				: label;
+		},
+	);
+	text = escapeHtml(text);
+	text = text
+		.replace(/\*\*([^*_~\n]+)\*\*/g, "<b>$1</b>")
+		.replace(/__([^*_~\n]+)__/g, "<b>$1</b>");
+	text = text
+		.replace(/\*([^*_~\n]+)\*/g, "<i>$1</i>")
+		.replace(/_([^*_~\n]+)_/g, "<i>$1</i>")
+		.replace(/~~([^*_~\n]+)~~/g, "<s>$1</s>");
+	text = text.replace(
+		new RegExp(`${marker}(\\d+)ZEND`, "g"),
+		(_match, index: string) => code[Number(index)] ?? "",
+	);
+	if (footerStart < 0) return text;
+	const escapedFooter = escapeHtml(message.slice(footerStart + 2));
+	const escapedSessionId = escapeHtml(sessionId);
+	const sessionOffset = escapedFooter.lastIndexOf(escapedSessionId);
+	const footer =
+		sessionOffset < 0
+			? escapedFooter
+			: `${escapedFooter.slice(0, sessionOffset)}<code>${escapedSessionId}</code>${escapedFooter.slice(sessionOffset + escapedSessionId.length)}`;
+	return `${text}\n\n${footer}`;
 }
 function sessionLabel(session: Pick<SessionSummary, "id" | "name">): string {
 	return `${session.name ? `${oneLine(session.name)} · ` : ""}#${session.id}`;
@@ -3775,17 +3833,18 @@ export class TelegramTransportAdapter
 		if (buffer.overflow)
 			text +=
 				"\n\n[Additional output omitted because the response reached the queue limit.]";
-		this.enqueueForSelected(sessionId, text);
+		this.enqueueForSelected(sessionId, text, undefined, true);
 	}
 
 	private enqueueForSelected(
 		sessionId: SessionId,
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
+		output = false,
 	): void {
 		for (const [chatId, selectedId] of this.selected) {
 			if (selectedId === sessionId)
-				this.enqueue(chatId, sessionId, text, input);
+				this.enqueue(chatId, sessionId, text, input, output);
 		}
 	}
 
@@ -3823,6 +3882,7 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
+		output = false,
 	): void {
 		let queue = this.queues.get(chatId);
 		if (!queue) {
@@ -3855,7 +3915,11 @@ export class TelegramTransportAdapter
 				this.queueOverflow(queue, sessionId);
 				break;
 			}
-			queue.messages.push({ sessionId, text: part });
+			queue.messages.push({
+				sessionId,
+				text: part,
+				...(output ? { output: true as const } : {}),
+			});
 			queue.pendingCharacters += part.length;
 		}
 		this.scheduleDrain(chatId, queue);
@@ -3960,8 +4024,12 @@ export class TelegramTransportAdapter
 			if (this.selected.get(chatId) !== message.sessionId) continue;
 			const delivered = await this.sendWithDeadline(
 				chatId,
-				message.text,
-				sessionIdEntity(message.text, message.sessionId),
+				message.output
+					? markdownToTelegramHtml(message.text, message.sessionId)
+					: message.text,
+				message.output
+					? { parse_mode: "HTML" }
+					: sessionIdEntity(message.text, message.sessionId),
 			);
 			if (!delivered) {
 				queue.failed = true;
