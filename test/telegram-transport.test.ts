@@ -432,9 +432,17 @@ function result(request: TransportEvent): TransportResult {
 		case "create":
 			value = sessions.get("sid");
 			break;
-		case "resume":
-			value = sessions.get(request.sessionId);
+		case "resume": {
+			const session = sessions.get(request.sessionId);
+			if (!session) {
+				value = undefined;
+				break;
+			}
+			const resumed = { ...session, status: "running" as const };
+			sessions.set(request.sessionId, resumed);
+			value = resumed;
 			break;
+		}
 		case "rename": {
 			const session = sessions.get(request.sessionId);
 			if (!session)
@@ -506,6 +514,13 @@ function result(request: TransportEvent): TransportResult {
 		case "effort_set":
 			value = undefined;
 			break;
+		case "stop": {
+			const session = sessions.get(request.sessionId);
+			if (session)
+				sessions.set(request.sessionId, { ...session, status: "stopped" });
+			value = undefined;
+			break;
+		}
 		case "delete":
 			sessions.delete(request.sessionId);
 			value = undefined;
@@ -1222,7 +1237,7 @@ describe("Telegram transport", () => {
 	});
 
 	it("targets preview controls independently from the selected session", async () => {
-		sessions.set("other", sessionWith("other", { status: "stopped" }));
+		sessions.set("other", sessionWith("other", { status: "running" }));
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -1250,13 +1265,6 @@ describe("Telegram transport", () => {
 		expect(
 			requests.findLast((request) => request.kind === "effort_set"),
 		).toMatchObject({ kind: "effort_set", sessionId: "other" });
-		await bot.callback(42, "session:resume:other", panelMessageId);
-		expect(
-			requests.findLast((request) => request.kind === "resume"),
-		).toMatchObject({
-			kind: "resume",
-			sessionId: "other",
-		});
 		await bot.callback(42, "session:stop:other", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Остановить #other?");
 		const stopConfirm = callbackData(
@@ -1467,6 +1475,472 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps slash resume unselected and offers an explicit Select action", async () => {
+		sessions.set("other", {
+			...sessionWith("sid", { status: "stopped" }),
+			id: "other" as SessionId,
+		});
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/resume other");
+		const select = callbackData(bot.sendOptions.at(-1), "action:select:");
+		const selectMessageId = bot.lastMessageId as number;
+		expect(
+			requests.findLast((request) => request.kind === "resume"),
+		).toMatchObject({
+			kind: "resume",
+			sessionId: "other",
+		});
+		expect(bot.sent.at(-1)?.text).toContain("not selected");
+		expect(bot.sendOptions.at(-1)).toMatchObject({
+			reply_markup: {
+				inline_keyboard: [
+					[
+						expect.objectContaining({
+							text: "Выбрать",
+							callback_data: expect.stringMatching(/^action:select:/),
+						}),
+					],
+				],
+			},
+		});
+		await bot.update(42, "still goes to sid");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await bot.callback(42, select, selectMessageId + 1);
+		await bot.update(42, "wrong-message callback changed nothing");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "sid" });
+		await bot.callback(42, select, selectMessageId);
+		await bot.update(42, "bound Select callback changed target");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "other" });
+		await adapter.stop();
+	});
+
+	it("keeps slash resume selection unchanged and omits Select when target already matches", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/resume");
+		expect(bot.sent.at(-1)?.text).toContain("Selection is unchanged");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"ordinary messages still target this session",
+		);
+		expect(bot.sendOptions.at(-1)).toBeUndefined();
+		await bot.update(42, "after selected resume");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("panel Resume distinguishes an already-selected session from a different target", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId as number;
+		await bot.callback(42, "session:resume:sid", panelId);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Selection is unchanged; ordinary messages still target this session.",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("not selected");
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		await bot.update(42, "/use other");
+		await bot.callback(42, "session:resume:sid", panelId);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"ordinary messages still target #other",
+		);
+		expect(bot.sent.at(-1)?.text).toContain("not selected");
+		await adapter.stop();
+	});
+
+	it("gates stopped controls and offers chat-scoped resume and select", async () => {
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		sessions.set("other", {
+			...sessionWith("sid", { status: "running" }),
+			id: "other" as SessionId,
+		});
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use other");
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:models", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("Pi is stopped");
+		expect(requests.some((request) => request.kind === "model_list")).toBe(
+			false,
+		);
+		await bot.update(42, "/use other");
+		await bot.callback(42, "session:resume-select:sid", panelMessageId);
+		expect(
+			requests.findLast((request) => request.kind === "resume"),
+		).toMatchObject({
+			kind: "resume",
+			sessionId: "sid",
+		});
+		await bot.update(42, "message routed to resumed session");
+		await bot.update(43, "other chat remains selected");
+		expect(requests.filter((request) => request.kind === "submit")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ sessionId: "sid" }),
+				expect.objectContaining({ sessionId: "other" }),
+			]),
+		);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(2);
+		await adapter.stop();
+	});
+
+	it("offers a one-time stopped-session resume-and-select action after slash stop", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		const { adapter, requests } = await startAdapter(bot, directory);
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId as number;
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/stop");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const actionMessageId = bot.lastMessageId as number;
+		expect(bot.sent.at(-1)?.text).toContain("Resume and select it below");
+		await bot.callback(43, action, actionMessageId);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		const pinsBeforeAction = bot.pinned.length;
+		await bot.callback(42, action, actionMessageId);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.edited.at(-1)?.messageId).toBe(panelMessageId);
+		expect(bot.pinned).toHaveLength(pinsBeforeAction);
+		const stateFile = (await readdir(directory)).find((name) =>
+			name.startsWith("telegram-panels-"),
+		);
+		if (!stateFile) throw new Error("Missing Telegram state file");
+		const panelState = await readFile(path.join(directory, stateFile), "utf8");
+		expect(panelState).toContain(String(panelMessageId));
+		expect(panelState).not.toContain(String(actionMessageId));
+		await bot.callback(42, action, actionMessageId);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(1);
+		await bot.update(42, "message goes to resumed target");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("warns when resume succeeds but saving the new selection fails", async () => {
+		const directory = await temp();
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, directory);
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const stateFile = (await readdir(directory)).find((name) =>
+			name.startsWith("telegram-panels-"),
+		);
+		if (!stateFile) throw new Error("Missing Telegram state file");
+		const statePath = path.join(directory, stateFile);
+		await rm(statePath);
+		await mkdir(statePath);
+		await writeFile(path.join(statePath, "occupied"), "x");
+		await bot.callback(42, action, bot.lastMessageId as number);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"could not be saved for the next restart",
+		);
+		await bot.update(42, "still targets resumed session");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("offers callback Stop a one-time bound Resume-and-select action", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId as number;
+		await bot.callback(42, "menu:sessions", panelId);
+		await bot.callback(42, "session:details:sid", panelId);
+		await bot.callback(42, "session:stop:sid", panelId);
+		const confirm = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.callback(42, confirm, panelId);
+		const resume = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const actionMessageId = bot.lastMessageId as number;
+		await bot.callback(43, resume, actionMessageId);
+		await bot.callback(42, resume, actionMessageId);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(1);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		await adapter.stop();
+	});
+
+	it("does not select or claim success when resume-select resume fails", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: (request) =>
+				request.kind === "resume"
+					? Promise.resolve({
+							requestId: request.requestId,
+							ok: false,
+							error: { code: "FAILED", message: "resume failed" },
+						})
+					: Promise.resolve(result(request)),
+		});
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		await bot.callback(42, action, bot.lastMessageId as number);
+		expect(bot.sent.at(-1)?.text).toContain("resume failed");
+		expect(bot.sent.at(-1)?.text).toContain("Selection is unchanged");
+		expect(bot.sent.at(-1)?.text).not.toContain("resumed and selected");
+		await bot.update(42, "still targets other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "other" });
+		await adapter.stop();
+	});
+
+	it("keeps resume-select epoch alive while inspect is in flight", async () => {
+		let releaseInspect: ((value: TransportResult) => void) | undefined;
+		let deferInspect = false;
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: (request) => {
+				if (deferInspect && request.kind === "inspect")
+					return new Promise((resolve) => {
+						releaseInspect = resolve;
+					});
+				return Promise.resolve(result(request));
+			},
+		});
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		deferInspect = true;
+		const callback = bot.callback(42, action, bot.lastMessageId as number);
+		await vi.waitFor(() => expect(releaseInspect).toBeDefined());
+		deferInspect = false;
+		await bot.update(42, "/resume sid");
+		const inspected = sessions.get("sid");
+		if (!inspected) throw new Error("Missing session fixture");
+		releaseInspect?.({
+			requestId: "deferred",
+			ok: true,
+			value: { ...inspected, status: "stopped" },
+		});
+		await callback;
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(1);
+		await bot.update(42, "selection remains other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "other" });
+		await adapter.stop();
+	});
+
+	it("does not dispatch resume when stop invalidates it while waiting for the inbox lock", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const inspectBaseline = requests.filter(
+			(request) => request.kind === "inspect",
+		).length;
+		let releaseLock!: () => void;
+		let announceLock!: () => void;
+		let announceCallbackQueued!: () => void;
+		let lockHeld = false;
+		const lockStarted = new Promise<void>(
+			(resolve) => (announceLock = resolve),
+		);
+		const callbackQueued = new Promise<void>(
+			(resolve) => (announceCallbackQueued = resolve),
+		);
+		const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		inbox.withSessionLock = (id, operation) => {
+			const queued = withSessionLock(id, operation);
+			if (lockHeld && id === ("sid" as SessionId)) announceCallbackQueued();
+			return queued;
+		};
+		const heldLock = inbox.withSessionLock("sid" as SessionId, async () => {
+			lockHeld = true;
+			announceLock();
+			await lockGate;
+		});
+		await lockStarted;
+		const callback = bot.callback(42, action, bot.lastMessageId as number);
+		await vi.waitFor(() =>
+			expect(
+				requests.filter((request) => request.kind === "inspect"),
+			).toHaveLength(inspectBaseline + 1),
+		);
+		await callbackQueued;
+		expect(
+			requests.filter((request) => request.kind === "inspect"),
+		).toHaveLength(inspectBaseline + 1);
+		await bot.update(42, "/stop sid");
+		releaseLock();
+		await Promise.all([heldLock, callback]);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		await bot.update(42, "still targets other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			sessionId: "other",
+		});
+		await adapter.stop();
+	});
+
+	it("does not dispatch resume if lifecycle state changes while waiting for the inbox lock", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const inspectBaseline = requests.filter(
+			(request) => request.kind === "inspect",
+		).length;
+		let releaseLock!: () => void;
+		let announceLock!: () => void;
+		let announceCallbackQueued!: () => void;
+		let lockHeld = false;
+		const lockStarted = new Promise<void>(
+			(resolve) => (announceLock = resolve),
+		);
+		const callbackQueued = new Promise<void>(
+			(resolve) => (announceCallbackQueued = resolve),
+		);
+		const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		inbox.withSessionLock = (id, operation) => {
+			const queued = withSessionLock(id, operation);
+			if (lockHeld && id === ("sid" as SessionId)) announceCallbackQueued();
+			return queued;
+		};
+		const heldLock = inbox.withSessionLock("sid" as SessionId, async () => {
+			lockHeld = true;
+			announceLock();
+			await lockGate;
+		});
+		await lockStarted;
+		const callback = bot.callback(42, action, bot.lastMessageId as number);
+		await vi.waitFor(() =>
+			expect(
+				requests.filter((request) => request.kind === "inspect"),
+			).toHaveLength(inspectBaseline + 1),
+		);
+		await callbackQueued;
+		expect(
+			requests.filter((request) => request.kind === "inspect"),
+		).toHaveLength(inspectBaseline + 1);
+		const current = sessions.get("sid");
+		if (!current) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...current, status: "running" });
+		releaseLock();
+		await Promise.all([heldLock, callback]);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		await bot.update(42, "still targets other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			sessionId: "other",
+		});
+		await adapter.stop();
+	});
+
+	it("rejects a stopped-session resume action after the session state changes", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/stop");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const current = sessions.get("sid");
+		if (!current) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...current, status: "running" });
+		await bot.callback(42, action, bot.lastMessageId as number);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain("no longer stopped");
+		await adapter.stop();
+	});
+
 	it("invalidates stop confirmation across stop and resume", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
@@ -1506,18 +1980,15 @@ describe("Telegram transport", () => {
 		await bot.callback(42, "action:cancel", panelMessageId);
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		await bot.callback(42, "session:delete:sid", panelMessageId);
-		expect(bot.edited.at(-1)?.text).toBe(
-			"Удалить запись #sid? Будут удалены запись harnessd и полученные вложения во входящих; файлы в рабочей папке и файлы Pi останутся.",
-		);
+		expect(bot.sent.at(-1)?.text).toContain("not stopped");
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
 		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
-		const canceledToken = callbackData(
+		await bot.callback(42, "session:stop:sid", panelMessageId);
+		const stopToken = callbackData(
 			bot.edited.at(-1)?.options,
 			"action:confirm:",
 		);
-		await bot.callback(42, "action:cancel", panelMessageId);
-		await bot.callback(42, canceledToken, panelMessageId);
-		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await bot.callback(42, stopToken, panelMessageId);
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		await bot.callback(42, "session:delete:sid", panelMessageId);
 		const deleteToken = callbackData(
@@ -1587,6 +2058,7 @@ describe("Telegram transport", () => {
 	});
 
 	it("does not dispatch delete when lifecycle invalidates an in-flight confirmation", async () => {
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
 		const bot = new MockBot();
 		let deferInspect = false;
 		let releaseInspect!: () => void;
@@ -1733,6 +2205,7 @@ describe("Telegram transport", () => {
 	});
 
 	it("rebinds confirmation intents to a replacement panel before keyboard publication", async () => {
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
@@ -1928,6 +2401,10 @@ describe("Telegram transport", () => {
 	});
 
 	it("persists selection clearing after stop and deletion", async () => {
+		sessions.set("other", {
+			...sessionWith("sid", { status: "stopped" }),
+			id: "other" as SessionId,
+		});
 		const directory = await temp();
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, directory);
@@ -2477,6 +2954,10 @@ describe("Telegram transport", () => {
 	});
 
 	it("registers commands and formats IDs as safely escaped code", async () => {
+		sessions.set("other", {
+			...sessionWith("sid", { status: "stopped" }),
+			id: "other" as SessionId,
+		});
 		const bot = new MockBot();
 		const sid = sessions.get("sid");
 		if (!sid) throw new Error("Missing session fixture");
@@ -2543,6 +3024,7 @@ describe("Telegram transport", () => {
 			kind: "submit",
 			sessionId: "other",
 		});
+		await bot.update(100, "/stop other");
 		await bot.update(100, "/delete other");
 		expect(requests.at(-1)).toMatchObject({
 			kind: "delete",
@@ -2586,8 +3068,8 @@ describe("Telegram transport", () => {
 			sessionId: "other",
 		});
 		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
-		expect(bot.sent.at(-2)?.text).toBe(
-			"Session cannot be resumed safely. Choose another session with /sessions or /menu.",
+		expect(bot.sent.at(-2)?.text).toContain(
+			"Selection is unchanged; messages still target #sid",
 		);
 		await adapter.stop();
 	});
@@ -2627,9 +3109,13 @@ describe("Telegram transport", () => {
 			"inspect",
 			"inspect",
 			"session_status",
+			"inspect",
 			"model_list",
+			"inspect",
 			"model_set",
+			"inspect",
 			"effort_list",
+			"inspect",
 			"effort_set",
 			"session_status",
 			"submit",
@@ -2638,24 +3124,24 @@ describe("Telegram transport", () => {
 			kind: "session_status",
 			sessionId: "sid",
 		});
-		expect(requests[3]).toMatchObject({ kind: "model_list", sessionId: "sid" });
-		expect(requests[4]).toMatchObject({
+		expect(requests[4]).toMatchObject({ kind: "model_list", sessionId: "sid" });
+		expect(requests[6]).toMatchObject({
 			kind: "model_set",
 			sessionId: "other",
 			provider: "openai",
 			modelId: "gpt-next",
 			effort: "high",
 		});
-		expect(requests[5]).toMatchObject({
+		expect(requests[8]).toMatchObject({
 			kind: "effort_list",
 			sessionId: "sid",
 		});
-		expect(requests[6]).toMatchObject({
+		expect(requests[10]).toMatchObject({
 			kind: "effort_set",
 			sessionId: "other",
 			effort: "high",
 		});
-		expect(requests[8]).toMatchObject({ kind: "submit", sessionId: "other" });
+		expect(requests[12]).toMatchObject({ kind: "submit", sessionId: "other" });
 		expect(
 			bot.sent.some(
 				({ chatId, text }) => chatId === 100 && text.includes("Tokens: 1,234"),
@@ -3555,7 +4041,7 @@ describe("Telegram transport", () => {
 			[42, 43, 43],
 		);
 		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
-		await bot.update(43, "/delete sid");
+		await bot.update(43, "/stop sid");
 		expect(clearIntervalSpy).toHaveBeenCalled();
 		clearIntervalSpy.mockRestore();
 		emit(harnessEvent("sid", "status", "agent_settled"));
