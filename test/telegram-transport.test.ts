@@ -1957,7 +1957,11 @@ describe("Telegram transport", () => {
 		const bot = new MockBot();
 		const cwd = await temp();
 		const otherCwd = await temp();
-		sessions.set("sid", { ...(sessions.get("sid") as SessionSummary), cwd });
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd,
+			name: `session ${"Name this session (harnessd name prompt):"} label`,
+		});
 		sessions.set("other", {
 			...(sessions.get("other") as SessionSummary),
 			cwd: otherCwd,
@@ -1974,7 +1978,11 @@ describe("Telegram transport", () => {
 			text.includes("Pi activity"),
 		)?.message_id;
 		expect(sourceId).toBeDefined();
-		await bot.updateDocument(42, { replyToMessageId: sourceId });
+		await bot.updateDocument(42, {
+			replyToMessageId: sourceId,
+			replyToMessageText:
+				"assistant output includes Name this session (harnessd name prompt): inline",
+		});
 		await vi.waitFor(() =>
 			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(2),
 		);
@@ -1983,6 +1991,8 @@ describe("Telegram transport", () => {
 		).toMatchObject({ sessionId: "sid" });
 		await bot.update(42, "text reply stays on source", {
 			replyToMessageId: sourceId,
+			replyToMessageText:
+				"assistant output includes Name this session (harnessd name prompt): inline",
 		});
 		expect(
 			requests.filter(({ kind }) => kind === "submit").at(-1),
@@ -2038,6 +2048,50 @@ describe("Telegram transport", () => {
 		});
 	});
 
+	it("does not mistake a marker inside actual assistant output for a stale name prompt", async () => {
+		stubFileDownload();
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "kick off a turn");
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				"Assistant says Name this session (harnessd name prompt): inline.",
+			),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) =>
+					text.includes(
+						"Assistant says Name this session (harnessd name prompt): inline.",
+					),
+				),
+			).toBe(true),
+		);
+		const output = bot.sent.find(({ text }) =>
+			text.includes(
+				"Assistant says Name this session (harnessd name prompt): inline.",
+			),
+		);
+		expect(output).toBeDefined();
+		await bot.update(42, "text reply", {
+			replyToMessageId: output?.message_id,
+			replyToMessageText: output?.text,
+		});
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(2),
+		);
+		await adapter.stop();
+	});
+
 	it("supersedes one name prompt per chat, expires stale media, and restores no prompt after restart", async () => {
 		stubFileDownload();
 		const bot = new MockBot();
@@ -2052,11 +2106,13 @@ describe("Telegram transport", () => {
 		expect(currentPrompt).not.toBe(firstPrompt);
 		await bot.update(42, "stale name", {
 			replyToMessageId: firstPrompt,
-			replyToMessageText: "Name this session (harnessd name prompt): old",
+			replyToMessageText:
+				"Name this session (harnessd name prompt):\nNew session will be created in /work.",
 		});
 		await bot.updateDocument(42, {
 			replyToMessageId: firstPrompt,
-			replyToMessageText: "Name this session (harnessd name prompt): old",
+			replyToMessageText:
+				"Name this session (harnessd name prompt):\nNew session will be created in /work.",
 		});
 		expect(
 			requests.some(({ kind }) => kind === "submit" || kind === "create"),
@@ -2070,7 +2126,7 @@ describe("Telegram transport", () => {
 		await restartedBot.update(42, "reply to expired prompt", {
 			replyToMessageId: currentPrompt,
 			replyToMessageText:
-				"Name this session (harnessd name prompt): expired by restart",
+				"Name this session (harnessd name prompt):\nNew session will be created in /work. expired by restart",
 		});
 		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
 			false,
@@ -2144,6 +2200,48 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("bounds exact control-heavy rename paths on initial and invalid-name retry prompts", async () => {
+		const cwd = `/${"\n".repeat(400)}`;
+		const presentedCwd = `/${"\\u{000A}".repeat(400)}`;
+		sessions.set("sid", sessionWith("sid", { cwd }));
+		const bot = new MockBot();
+		let rejectFirstRename = true;
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "rename" && request.name && rejectFirstRename) {
+					rejectFirstRename = false;
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: { code: "VALIDATION", message: "Invalid name" },
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		await bot.callback(42, "session:rename:sid");
+		const firstPrompt = bot.lastForceReplyMessageId;
+		const firstMessages = bot.sent.map(({ text }) => text);
+		expect(firstMessages.every((text) => text.length <= 4096)).toBe(true);
+		expect(firstMessages.join("")).toContain(presentedCwd);
+		await bot.update(42, "invalid name", { replyToMessageId: firstPrompt });
+		const retryPrompt = bot.lastForceReplyMessageId;
+		expect(retryPrompt).not.toBe(firstPrompt);
+		const retryMessages = bot.sent
+			.slice(firstMessages.length)
+			.map(({ text }) => text);
+		expect(retryMessages.every((text) => text.length <= 4096)).toBe(true);
+		expect(retryMessages.join("")).toContain(presentedCwd);
+		expect(bot.sendOptions.at(-1)).toMatchObject({
+			reply_markup: { force_reply: true, selective: true },
+		});
+		await bot.update(42, "valid name", { replyToMessageId: retryPrompt });
+		expect(requests.filter(({ kind }) => kind === "rename")).toHaveLength(2);
+		await adapter.stop();
+	});
+
 	it("uses ForceReply to create named sessions and consumes only replies to its prompt", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
@@ -2166,7 +2264,8 @@ describe("Telegram transport", () => {
 		expect(requests.some((request) => request.kind === "submit")).toBe(true);
 		await bot.update(42, "old name reply", {
 			replyToMessageId: 999998,
-			replyToMessageText: "Name this session (harnessd name prompt): expired",
+			replyToMessageText:
+				"Name this session (harnessd name prompt):\nNew session will be created in /work. expired",
 		});
 		expect(
 			requests.filter((request) => request.kind === "submit"),

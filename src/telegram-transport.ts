@@ -1410,10 +1410,15 @@ export class TelegramTransportAdapter
 				await this.handleNameReply(chatId, sender, pending, text);
 				return;
 			}
+			const knownReplyRoute =
+				replyTo === undefined
+					? undefined
+					: this.replyRoutes.get(chatId)?.get(replyTo);
 			if (
 				replyTo !== undefined &&
+				!knownReplyRoute &&
 				(this.isStaleNamePrompt(chatId, replyTo) ||
-					ctx.message?.reply_to_message?.text?.includes(NAME_PROMPT_MARKER))
+					this.isNamePromptEnvelope(ctx.message?.reply_to_message?.text))
 			)
 				return this.sendDirect(
 					chatId,
@@ -1426,9 +1431,9 @@ export class TelegramTransportAdapter
 				if (!sessionId)
 					return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 				const sourceSession =
-					routedSessionId !== undefined || replyTo === undefined
+					routedSessionId !== undefined
 						? undefined
-						: this.replyRoutes.get(chatId)?.get(replyTo)?.sessionId;
+						: knownReplyRoute?.sessionId;
 				if (sourceSession && sourceSession !== sessionId)
 					return this.offerReplyRoutes(
 						chatId,
@@ -1619,7 +1624,13 @@ export class TelegramTransportAdapter
 		return (
 			this.pendingNames.get(chatId)?.promptMessageId === messageId ||
 			this.isStaleNamePrompt(chatId, messageId) ||
-			text?.includes(NAME_PROMPT_MARKER) === true
+			this.isNamePromptEnvelope(text)
+		);
+	}
+
+	private isNamePromptEnvelope(text?: string): boolean {
+		return /^Name this session \(harnessd name prompt\):\n(?:New session will be created in |Rename |The exact folder is shown in the preceding messages\.)/.test(
+			text ?? "",
 		);
 	}
 
@@ -1780,8 +1791,13 @@ export class TelegramTransportAdapter
 		const message = ctx.message;
 		if (chatId === undefined || sender === undefined || !message) return;
 		const replyTo = message.reply_to_message?.message_id;
+		const knownReplyRoute =
+			routedSessionId === undefined && replyTo !== undefined
+				? this.replyRoutes.get(chatId)?.get(replyTo)
+				: undefined;
 		if (
 			replyTo !== undefined &&
+			!knownReplyRoute &&
 			this.isNamePromptReply(chatId, replyTo, message.reply_to_message?.text)
 		)
 			return this.sendDirect(
@@ -1790,10 +1806,8 @@ export class TelegramTransportAdapter
 			);
 		const sessionId = routedSessionId ?? this.selected.get(chatId);
 		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-		if (routedSessionId === undefined && replyTo !== undefined) {
-			const sourceSession = this.replyRoutes
-				.get(chatId)
-				?.get(replyTo)?.sessionId;
+		if (knownReplyRoute) {
+			const sourceSession = knownReplyRoute.sessionId;
 			if (sourceSession && sourceSession !== sessionId)
 				return this.offerReplyRoutes(
 					chatId,
@@ -2369,10 +2383,15 @@ export class TelegramTransportAdapter
 			? (inspected.value as SessionSummary)
 			: undefined;
 		if (session) this.rememberSession(session);
-		return this.promptForName(
+		const sessionLabelText = session
+			? sessionLabel(session)
+			: this.sessionFooter(flow.sessionId);
+		return this.promptForPathName(
 			chatId,
 			{ kind: "rename", sessionId: flow.sessionId },
-			`Rename ${session ? sessionLabel(session) : this.sessionFooter(flow.sessionId)} (${this.sessionFooter(flow.sessionId)}) in ${safePathPresentation(session?.cwd ?? this.sessionCwds.get(flow.sessionId) ?? "unknown cwd")}. Reply with a name; use Cancel below.`,
+			session?.cwd ?? this.sessionCwds.get(flow.sessionId) ?? "unknown cwd",
+			`Rename ${sessionLabelText} (${this.sessionFooter(flow.sessionId)}) in `,
+			"Reply with a name; use Cancel below.",
 		);
 	}
 
@@ -2381,28 +2400,41 @@ export class TelegramTransportAdapter
 		cwd: string,
 		includeCancel: boolean,
 	): Promise<void> {
-		const path = safePathPresentation(cwd);
 		const instructions = includeCancel
 			? "Reply with a name. Create unnamed and Cancel buttons are below."
 			: "Reply with a name. Create unnamed and Cancel buttons are below.";
-		const prefix = "New session will be created in ";
-		if (`${prefix}${path}. ${instructions}`.length <= 3800) {
-			return this.promptForName(
-				chatId,
-				{ kind: "create", cwd },
-				`${prefix}${path}. ${instructions}`,
-			);
-		}
-		await this.sendDirect(
+		return this.promptForPathName(
 			chatId,
+			{ kind: "create", cwd },
+			cwd,
+			"New session will be created in ",
+			instructions,
 			"Exact session creation folder (control characters escaped):",
 		);
+	}
+
+	private async promptForPathName(
+		chatId: number,
+		flow: PendingNameRequest,
+		cwd: string,
+		prefix: string,
+		instructions: string,
+		pathHeader = "Exact session folder (control characters escaped):",
+	): Promise<void> {
+		const path = safePathPresentation(cwd);
+		if (`${prefix}${path}. ${instructions}`.length <= 3800)
+			return this.promptForName(
+				chatId,
+				flow,
+				`${prefix}${path}. ${instructions}`,
+			);
+		await this.sendDirect(chatId, pathHeader);
 		for (const chunk of splitTelegramText(path))
 			await this.sendWithDeadline(chatId, chunk);
 		return this.promptForName(
 			chatId,
-			{ kind: "create", cwd },
-			`New session will be created in the exact folder shown above. ${instructions}`,
+			flow,
+			`The exact folder is shown in the preceding messages. ${instructions}`,
 		);
 	}
 
@@ -2446,7 +2478,7 @@ export class TelegramTransportAdapter
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
-				`${NAME_PROMPT_MARKER} ${text}`,
+				`${NAME_PROMPT_MARKER}\n${text}`,
 				{ reply_markup: { force_reply: true, selective: true } },
 				signal,
 			),
@@ -4166,10 +4198,12 @@ export class TelegramTransportAdapter
 		if (!result.ok) return this.sendDirect(chatId, result.error.message);
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
-		await this.promptForName(
+		await this.promptForPathName(
 			chatId,
 			{ kind: "rename", sessionId },
-			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)}) in ${safePathPresentation(session.cwd)}. Reply with a name; use Cancel below.`,
+			session.cwd,
+			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)}) in `,
+			"Reply with a name; use Cancel below.",
 		);
 	}
 
