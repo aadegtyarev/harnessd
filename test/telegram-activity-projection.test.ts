@@ -46,6 +46,65 @@ describe("Telegram activity projection", () => {
 		expect(visible.at(-1)).toBe("• Ещё завершено: 3");
 	});
 
+	it("bounds child slots and tools together, prioritizing active and failed states", () => {
+		const rows: ActivityRow[] = [];
+		for (let i = 0; i < 5; i++) {
+			updateActivityRow(rows, `done-${i}`, `read: ${i}`);
+			updateActivityRow(rows, `done-${i}`, undefined, false);
+		}
+		updateActivityRow(rows, "active", "bash: active");
+		updateActivityRow(rows, "failed", "bash: failed");
+		updateActivityRow(rows, "failed", undefined, true);
+		const children = new Map([["Worker", "Задача Worker: выполняется"]]);
+		const lines = visibleActivityRows(rows, children);
+		expect(lines).toHaveLength(7);
+		expect(lines).toContain("• Задача Worker: выполняется …");
+		expect(lines).toContain("• bash: active …");
+		expect(lines).toContain("• bash: failed ❌");
+		expect(lines.at(-1)).toBe("• Ещё завершено: 2");
+	});
+
+	it("projects only approved role labels and coalesces the notification slot", () => {
+		const rows: ActivityRow[] = [];
+		expect(meaningfulToolSummary("subagent · workflow · inspect")).toBe(false);
+		expect(meaningfulToolSummary("subagent · worker · secret task text")).toBe(
+			true,
+		);
+		expect(meaningfulToolSummary("subagent · manager · secret task text")).toBe(
+			false,
+		);
+		updateActivityRow(rows, "private-id", "subagent · worker · SECRET_SUFFIX");
+		const lines = visibleActivityRows(rows);
+		expect(lines).toEqual(["• Задача Worker: выполняется …"]);
+		const coalesced = visibleActivityRows(
+			rows,
+			new Map([["Worker", "Задача Worker: завершён"]]),
+		);
+		expect(coalesced).toEqual(["• Задача Worker: завершён ✓"]);
+		expect(coalesced.join(" ")).not.toContain("SECRET_SUFFIX");
+		expect(coalesced.join(" ")).not.toContain("private-id");
+	});
+
+	it("retains a bounded exact-call window", () => {
+		const rows: ActivityRow[] = [];
+		for (let i = 0; i < 60; i++)
+			updateActivityRow(rows, `id-${i}`, `read: ${i}`);
+		expect(rows).toHaveLength(40);
+		expect(rows[0]?.id).toBe("id-20");
+	});
+
+	it("reports omitted running and failed operations without calling them completed", () => {
+		const rows: ActivityRow[] = [];
+		for (let i = 0; i < 7; i++)
+			updateActivityRow(rows, `run-${i}`, `bash: ${i}`);
+		updateActivityRow(rows, "failed", "bash: failed");
+		updateActivityRow(rows, "failed", undefined, true);
+		const lines = visibleActivityRows(rows);
+		expect(lines).toContain("• Ещё выполняется: 1");
+		expect(lines).toContain("• Ещё ошибок: 1");
+		expect(lines).not.toContain("• Ещё завершено: 2");
+	});
+
 	it("formats local wall-clock time using the host timezone", () => {
 		process.env.TZ = "America/New_York";
 		expect(localActivityTime(new Date("2024-01-01T12:34:56.000Z"))).toBe(

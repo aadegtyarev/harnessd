@@ -4041,6 +4041,7 @@ export class TelegramTransportAdapter
 			current.finishTimer = undefined;
 			current.submittedWhileRunning = this.runningSessions.has(sessionId);
 			if (startsIndependentTurn) {
+				current.tools.splice(0);
 				current.subagentStatus = undefined;
 				current.childStatuses.clear();
 				current.queuedInputs.splice(0, current.queuedInputs.length);
@@ -4105,7 +4106,7 @@ export class TelegramTransportAdapter
 		if (activity.thinking) lines.push("• Думаю…");
 		for (const notice of activity.notices.slice(-4))
 			lines.push(`• ${truncateDiagnostic(notice, 180)}`);
-		lines.push(...visibleActivityRows(activity.tools));
+		lines.push(...visibleActivityRows(activity.tools, activity.childStatuses));
 		const visibleInputs = activity.queuedInputs.slice(-5);
 		const olderUnresolved = activity.queuedInputs
 			.slice(0, -visibleInputs.length)
@@ -5708,6 +5709,7 @@ export class TelegramTransportAdapter
 					)
 						this.associateInputWithTurn(record, turn);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
+					activity.tools.splice(0);
 					activity.subagentStatus = undefined;
 					activity.childStatuses.clear();
 					activity.status = "Pi выполняет ход сессии";

@@ -1009,6 +1009,9 @@ describe("Telegram transport", () => {
 			activityEvent: { type: "tool_end", toolCallId: "missing", failed: false },
 		});
 		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.edited.at(-1)?.text).toContain(`Обновлено: ${changedTimestamp}`);
+		await new Promise((resolve) => setTimeout(resolve, 2500));
+		expect(bot.edited.at(-1)?.text).toContain(`Обновлено: ${changedTimestamp}`);
 		emit({
 			sessionId: "sid" as SessionId,
 			kind: "activity",
@@ -5742,7 +5745,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("resets subagent status at each new agent run", async () => {
+	it("coalesces sequential Worker and Reviewer status without workflow spam", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -5755,19 +5758,27 @@ describe("Telegram transport", () => {
 			harnessEvent(
 				"sid",
 				"output",
-				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"scout","state":"running"}]}',
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
 			),
 		);
 		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Задача Scout: выполняется"),
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
 		);
-		emit(harnessEvent("sid", "status", "agent_start"));
-		await vi.waitFor(() => {
-			expect(bot.edited.at(-1)?.text).toContain("Pi выполняет ход сессии");
-			expect(bot.edited.at(-1)?.text).not.toContain(
-				"Задача Scout: выполняется",
-			);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: 'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"completed"},{"kind":"subagent","label":"reviewer","state":"running","id":"PRIVATE_REVIEW_ID"}]}',
+			},
 		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Reviewer: выполняется"),
+		);
+		const visible = bot.edited.at(-1)?.text ?? "";
+		expect(visible).not.toContain("workflow");
+		expect(visible).not.toContain("PRIVATE_REVIEW_ID");
+		expect(visible).not.toContain("subagent ·");
 		await adapter.stop();
 	});
 
