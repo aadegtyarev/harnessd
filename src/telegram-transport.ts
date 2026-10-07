@@ -271,6 +271,12 @@ type ResumeSelectIntent = {
 	readonly invalidationEpoch: number;
 	messageId?: number;
 };
+type SelectIntent = {
+	readonly chatId: number;
+	readonly sender: number;
+	readonly sessionId: SessionId;
+	messageId?: number;
+};
 type ActivityTool = {
 	readonly id: string;
 	readonly summary: string;
@@ -1047,6 +1053,7 @@ export class TelegramTransportAdapter
 	private readonly folderIntents = new Map<string, FolderIntent>();
 	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
 	private readonly resumeSelectIntents = new Map<string, ResumeSelectIntent>();
+	private readonly selectIntents = new Map<string, SelectIntent>();
 	private readonly confirmationEpochs = new Map<SessionId, number>();
 	private readonly inFlightConfirmationRefs = new Map<SessionId, number>();
 	private readonly sessionPages = new Map<number, number>();
@@ -2304,16 +2311,23 @@ export class TelegramTransportAdapter
 				const text = sameTarget
 					? `Session ${this.sessionFooter(sessionId)} resumed. Selection is unchanged; ordinary messages still target this session.`
 					: `Session ${this.sessionFooter(sessionId)} is running, not selected. Selection is unchanged; ordinary messages still target ${target ? this.sessionFooter(target) : "no session"}.`;
+				const selectToken = sameTarget
+					? undefined
+					: this.createSelectIntent(chatId, sender, sessionId);
 				await this.sendWithDeadline(
 					chatId,
 					text,
-					sameTarget
-						? undefined
-						: {
+					selectToken
+						? {
 								reply_markup: keyboard([
-									[inlineButton("Выбрать", `session:select:${sessionId}`)],
+									[inlineButton("Выбрать", `action:select:${selectToken}`)],
 								]),
-							},
+							}
+						: undefined,
+					undefined,
+					(messageId) => {
+						if (selectToken) this.bindSelectMessage(selectToken, messageId);
+					},
 				);
 				return;
 			}
@@ -3163,7 +3177,10 @@ export class TelegramTransportAdapter
 			await this.dispatchNameChoice(chatId, sender, callback.data, messageId);
 			return;
 		}
-		await this.savePanelReference(chatId, messageId);
+		const directAction =
+			callback.data.startsWith("action:resume-select:") ||
+			callback.data.startsWith("action:select:");
+		if (!directAction) await this.savePanelReference(chatId, messageId);
 		try {
 			await this.dispatchCallback(chatId, sender, callback.data, messageId);
 		} catch (error) {
@@ -3282,6 +3299,13 @@ export class TelegramTransportAdapter
 				chatId,
 				sender,
 				data.slice(21),
+				messageId,
+			);
+		if (data.startsWith("action:select:"))
+			return this.performSelectIntent(
+				chatId,
+				sender,
+				data.slice(14),
 				messageId,
 			);
 		if (data.startsWith("action:confirm:"))
@@ -4463,6 +4487,62 @@ export class TelegramTransportAdapter
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
+	private createSelectIntent(
+		chatId: number,
+		sender: number,
+		sessionId: SessionId,
+	): string {
+		const token = this.makeIntentToken();
+		this.selectIntents.set(token, { chatId, sender, sessionId });
+		return token;
+	}
+
+	private bindSelectMessage(
+		token: string,
+		messageId: number | undefined,
+	): void {
+		const intent = this.selectIntents.get(token);
+		if (intent && messageId !== undefined) intent.messageId = messageId;
+	}
+
+	private async performSelectIntent(
+		chatId: number,
+		sender: number,
+		token: string,
+		messageId: number,
+	): Promise<void> {
+		const intent = this.selectIntents.get(token);
+		if (
+			!intent ||
+			intent.chatId !== chatId ||
+			intent.sender !== sender ||
+			intent.messageId !== messageId
+		) {
+			await this.sendDirect(
+				chatId,
+				"This action is stale or belongs to another chat.",
+			);
+			return;
+		}
+		this.selectIntents.delete(token);
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId: intent.sessionId,
+		});
+		if (!inspected.ok) {
+			await this.sendDirect(chatId, inspected.error.message);
+			return;
+		}
+		this.rememberSession(inspected.value as SessionSummary);
+		const saved = await this.setSelected(chatId, intent.sessionId);
+		this.previews.delete(chatId);
+		await this.sendDirect(
+			chatId,
+			`Selected ${sessionLabel(inspected.value as SessionSummary)}.${saved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		);
+		await this.refreshExistingPanel(chatId, sender);
+	}
+
 	private createResumeSelectIntent(
 		chatId: number,
 		sender: number,
@@ -4506,59 +4586,72 @@ export class TelegramTransportAdapter
 			return;
 		}
 		this.resumeSelectIntents.delete(token);
-		if (
-			(this.confirmationEpochs.get(intent.sessionId) ?? 0) !==
-			intent.invalidationEpoch
-		) {
-			await this.sendDirect(
-				chatId,
-				"This action is stale; inspect the current session in /menu.",
-			);
-			return;
-		}
-		const inspected = await this.request(sender, {
-			kind: "inspect",
-			sessionId: intent.sessionId,
-		});
-		if (
-			!inspected.ok ||
-			(inspected.value as SessionSummary).status !== "stopped"
-		) {
-			await this.sendDirect(
-				chatId,
-				"This session is no longer stopped. No action was taken; inspect /menu.",
-			);
-			return;
-		}
-		if (
-			(this.confirmationEpochs.get(intent.sessionId) ?? 0) !==
-			intent.invalidationEpoch
-		) {
-			await this.sendDirect(
-				chatId,
-				"This action is stale; inspect the current session in /menu.",
-			);
-			return;
-		}
-		const resumed = await this.request(sender, {
-			kind: "resume",
-			sessionId: intent.sessionId,
-		});
-		if (!resumed.ok) {
-			await this.sendDirect(
-				chatId,
-				`${resumed.error.message} Selection is unchanged; ordinary messages still target ${this.selected.get(chatId) ? this.sessionFooter(this.selected.get(chatId) as SessionId) : "no session"}.`,
-			);
-			return;
-		}
-		this.invalidateSessionConfirmations(intent.sessionId);
-		this.rememberSession(resumed.value as SessionSummary);
-		const saved = await this.setSelected(chatId, intent.sessionId);
-		this.previews.delete(chatId);
-		await this.sendDirect(
-			chatId,
-			`Session ${this.sessionFooter(intent.sessionId)} resumed and selected. Ordinary messages now target ${this.sessionFooter(intent.sessionId)}.${saved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		this.inFlightConfirmationRefs.set(
+			intent.sessionId,
+			(this.inFlightConfirmationRefs.get(intent.sessionId) ?? 0) + 1,
 		);
+		try {
+			const isCurrent = () =>
+				(this.confirmationEpochs.get(intent.sessionId) ?? 0) ===
+				intent.invalidationEpoch;
+			if (!isCurrent()) {
+				await this.sendDirect(
+					chatId,
+					"This action is stale; inspect the current session in /menu.",
+				);
+				return;
+			}
+			const inspected = await this.request(sender, {
+				kind: "inspect",
+				sessionId: intent.sessionId,
+			});
+			if (!isCurrent()) {
+				await this.sendDirect(
+					chatId,
+					"This action is stale; inspect the current session in /menu.",
+				);
+				return;
+			}
+			if (
+				!inspected.ok ||
+				(inspected.value as SessionSummary).status !== "stopped"
+			) {
+				await this.sendDirect(
+					chatId,
+					"This session is no longer stopped. No action was taken; inspect /menu.",
+				);
+				return;
+			}
+			const resumed = await this.request(sender, {
+				kind: "resume",
+				sessionId: intent.sessionId,
+			});
+			if (!resumed.ok) {
+				await this.sendDirect(
+					chatId,
+					`${resumed.error.message} Selection is unchanged; ordinary messages still target ${this.selected.get(chatId) ? this.sessionFooter(this.selected.get(chatId) as SessionId) : "no session"}.`,
+				);
+				return;
+			}
+			this.rememberSession(resumed.value as SessionSummary);
+			if (!isCurrent()) {
+				await this.sendDirect(
+					chatId,
+					`Session ${this.sessionFooter(intent.sessionId)} resumed, but this action became stale; selection is unchanged. Inspect /menu.`,
+				);
+				return;
+			}
+			const saved = await this.setSelected(chatId, intent.sessionId);
+			this.invalidateSessionConfirmations(intent.sessionId);
+			this.previews.delete(chatId);
+			await this.sendDirect(
+				chatId,
+				`Session ${this.sessionFooter(intent.sessionId)} resumed and selected. Ordinary messages now target ${this.sessionFooter(intent.sessionId)}.${saved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+			);
+		} finally {
+			this.releaseInFlightConfirmation(intent.sessionId);
+			await this.refreshExistingPanel(chatId, sender);
+		}
 	}
 
 	private async resumeSessionFromPanel(
@@ -4590,7 +4683,9 @@ export class TelegramTransportAdapter
 			const target = this.selected.get(chatId);
 			await this.sendDirect(
 				chatId,
-				`Session ${this.sessionFooter(sessionId)} resumed and is running, not selected. ${target ? `Messages still target ${this.sessionFooter(target)}.` : "No session is selected for messages."} Select it with /use ${sessionId} or the Select button.`,
+				target === sessionId
+					? `Session ${this.sessionFooter(sessionId)} resumed. Selection is unchanged; ordinary messages still target this session.`
+					: `Session ${this.sessionFooter(sessionId)} is running, not selected. Selection is unchanged; ordinary messages still target ${target ? this.sessionFooter(target) : "no session"}. Select it with /use ${sessionId} or the Select button.`,
 			);
 		}
 		await this.renderPanel(chatId, sender, messageId);

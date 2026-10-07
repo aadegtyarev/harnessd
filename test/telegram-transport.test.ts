@@ -1484,6 +1484,8 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/resume other");
+		const select = callbackData(bot.sendOptions.at(-1), "action:select:");
+		const selectMessageId = bot.lastMessageId as number;
 		expect(
 			requests.findLast((request) => request.kind === "resume"),
 		).toMatchObject({
@@ -1497,7 +1499,7 @@ describe("Telegram transport", () => {
 					[
 						expect.objectContaining({
 							text: "Выбрать",
-							callback_data: "session:select:other",
+							callback_data: expect.stringMatching(/^action:select:/),
 						}),
 					],
 				],
@@ -1510,6 +1512,16 @@ describe("Telegram transport", () => {
 			kind: "submit",
 			sessionId: "sid",
 		});
+		await bot.callback(42, select, selectMessageId + 1);
+		await bot.update(42, "wrong-message callback changed nothing");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "sid" });
+		await bot.callback(42, select, selectMessageId);
+		await bot.update(42, "bound Select callback changed target");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "other" });
 		await adapter.stop();
 	});
 
@@ -1530,6 +1542,28 @@ describe("Telegram transport", () => {
 			kind: "submit",
 			sessionId: "sid",
 		});
+		await adapter.stop();
+	});
+
+	it("panel Resume distinguishes an already-selected session from a different target", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId as number;
+		await bot.callback(42, "session:resume:sid", panelId);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Selection is unchanged; ordinary messages still target this session.",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("not selected");
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		await bot.update(42, "/use other");
+		await bot.callback(42, "session:resume:sid", panelId);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"ordinary messages still target #other",
+		);
+		expect(bot.sent.at(-1)?.text).toContain("not selected");
 		await adapter.stop();
 	});
 
@@ -1574,7 +1608,10 @@ describe("Telegram transport", () => {
 
 	it("offers a one-time stopped-session resume-and-select action after slash stop", async () => {
 		const bot = new MockBot();
-		const { adapter, requests } = await startAdapter(bot, await temp());
+		const directory = await temp();
+		const { adapter, requests } = await startAdapter(bot, directory);
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId as number;
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/stop");
 		const action = callbackData(
@@ -1587,8 +1624,18 @@ describe("Telegram transport", () => {
 		expect(
 			requests.filter((request) => request.kind === "resume"),
 		).toHaveLength(0);
+		const pinsBeforeAction = bot.pinned.length;
 		await bot.callback(42, action, actionMessageId);
 		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.edited.at(-1)?.messageId).toBe(panelMessageId);
+		expect(bot.pinned).toHaveLength(pinsBeforeAction);
+		const stateFile = (await readdir(directory)).find((name) =>
+			name.startsWith("telegram-panels-"),
+		);
+		if (!stateFile) throw new Error("Missing Telegram state file");
+		const panelState = await readFile(path.join(directory, stateFile), "utf8");
+		expect(panelState).toContain(String(panelMessageId));
+		expect(panelState).not.toContain(String(actionMessageId));
 		await bot.callback(42, action, actionMessageId);
 		expect(
 			requests.filter((request) => request.kind === "resume"),
@@ -1658,6 +1705,77 @@ describe("Telegram transport", () => {
 			requests.filter((request) => request.kind === "resume"),
 		).toHaveLength(1);
 		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		await adapter.stop();
+	});
+
+	it("does not select or claim success when resume-select resume fails", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: (request) =>
+				request.kind === "resume"
+					? Promise.resolve({
+							requestId: request.requestId,
+							ok: false,
+							error: { code: "FAILED", message: "resume failed" },
+						})
+					: Promise.resolve(result(request)),
+		});
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		await bot.callback(42, action, bot.lastMessageId as number);
+		expect(bot.sent.at(-1)?.text).toContain("resume failed");
+		expect(bot.sent.at(-1)?.text).toContain("Selection is unchanged");
+		expect(bot.sent.at(-1)?.text).not.toContain("resumed and selected");
+		await bot.update(42, "still targets other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "other" });
+		await adapter.stop();
+	});
+
+	it("keeps resume-select epoch alive while inspect is in flight", async () => {
+		let releaseInspect: ((value: TransportResult) => void) | undefined;
+		let deferInspect = false;
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: (request) => {
+				if (deferInspect && request.kind === "inspect")
+					return new Promise((resolve) => {
+						releaseInspect = resolve;
+					});
+				return Promise.resolve(result(request));
+			},
+		});
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		deferInspect = true;
+		const callback = bot.callback(42, action, bot.lastMessageId as number);
+		await vi.waitFor(() => expect(releaseInspect).toBeDefined());
+		deferInspect = false;
+		await bot.update(42, "/resume sid");
+		const inspected = sessions.get("sid");
+		if (!inspected) throw new Error("Missing session fixture");
+		releaseInspect?.({
+			requestId: "deferred",
+			ok: true,
+			value: { ...inspected, status: "stopped" },
+		});
+		await callback;
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(1);
+		await bot.update(42, "selection remains other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ sessionId: "other" });
 		await adapter.stop();
 	});
 
