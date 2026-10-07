@@ -83,7 +83,12 @@ type Context = {
 			height: number;
 		}[];
 		message_id?: number;
-		reply_to_message?: { message_id: number; text?: string };
+		reply_to_message?: {
+			message_id: number;
+			text?: string;
+			from?: { id: number; is_bot?: boolean };
+			entities?: readonly { type: string; offset: number; length: number }[];
+		};
 	};
 	callbackQuery?: {
 		id: string;
@@ -91,7 +96,18 @@ type Context = {
 		message?: { message_id: number };
 	};
 };
+function replyPlainText(text?: string): string | undefined {
+	return text?.replace(/<code>(.*?)<\/code>/g, "$1");
+}
+function replyCodeEntities(text?: string) {
+	if (!text) return [];
+	const match = /<code>(.*?)<\/code>/.exec(text);
+	if (!match) return [];
+	const offset = text.slice(0, match.index).replace(/<[^>]+>/g, "").length;
+	return [{ type: "code", offset, length: (match[1] ?? "").length }];
+}
 class MockBot {
+	botInfo = { id: 999 };
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
 	photoHandler?: (ctx: Context) => Promise<void>;
@@ -144,7 +160,8 @@ class MockBot {
 				_other?: unknown,
 				_signal?: AbortSignal,
 			): Promise<unknown> => {
-				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
+				if (telegramVisibleText(text).length > 4096)
+					throw new Error("Telegram text limit exceeded");
 				await this.sendMessageBehavior();
 				const message_id = this.nextMessageId++;
 				this.sent.push({ chatId, text, message_id });
@@ -160,7 +177,8 @@ class MockBot {
 				text: string,
 				options?: unknown,
 			) => {
-				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
+				if (telegramVisibleText(text).length > 4096)
+					throw new Error("Telegram text limit exceeded");
 				await this.editMessageBehavior();
 				this.edited.push({ chatId, messageId, text, options });
 				return { message_id: messageId };
@@ -256,6 +274,8 @@ class MockBot {
 			missingSender?: boolean;
 			replyToMessageId?: number;
 			replyToMessageText?: string;
+			replySenderIsBot?: boolean;
+			replySenderId?: number;
 		} = {},
 	) {
 		const {
@@ -274,7 +294,14 @@ class MockBot {
 					: {
 							reply_to_message: {
 								message_id: options.replyToMessageId,
-								text: options.replyToMessageText,
+								text: replyPlainText(options.replyToMessageText),
+								from: {
+									id:
+										options.replySenderId ??
+										(options.replySenderIsBot === false ? 42 : this.botInfo.id),
+									is_bot: options.replySenderIsBot !== false,
+								},
+								entities: replyCodeEntities(options.replyToMessageText),
 							},
 						}),
 			},
@@ -311,7 +338,9 @@ class MockBot {
 					: {
 							reply_to_message: {
 								message_id: options.replyToMessageId,
-								text: options.replyToMessageText,
+								text: replyPlainText(options.replyToMessageText),
+								from: { id: this.botInfo.id, is_bot: true },
+								entities: replyCodeEntities(options.replyToMessageText),
 							},
 						}),
 			},
@@ -865,6 +894,461 @@ describe("Telegram transport", () => {
 		);
 		expect(answer?.text).toContain("All checks passed.");
 		expect(answer?.text).not.toContain("Pi activity");
+		await adapter.stop();
+	});
+
+	it("delivers a completed answer after switching away with a one-time session switch action", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "start background answer");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "Finished after switch."));
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Finished after switch.")),
+			).toBe(true),
+		);
+		const answer = bot.sent.find(({ text }) =>
+			text.includes("Finished after switch."),
+		);
+		expect(answer?.text).toContain("Фоновая сессия");
+		expect(answer?.text).toContain("sid");
+		expect(
+			callbackData(
+				bot.sendOptions[bot.sent.indexOf(answer as (typeof bot.sent)[number])],
+				"action:select:",
+			),
+		).toMatch(/^action:select:/);
+		await adapter.stop();
+	});
+
+	it("attributes only accepted submissions to a turn and retires recipients at settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit" && request.text.includes("reject me")
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: { code: "INVALID_INPUT", message: "rejected" },
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(42, "accepted message");
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1),
+		);
+		await bot.update(42, "/use other");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "owned by chat 42"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("owned by chat 42")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.filter(
+				({ chatId, text }) =>
+					chatId === 43 && text.includes("owned by chat 42"),
+			),
+		).toHaveLength(0);
+
+		await bot.update(43, "reject me");
+		await bot.update(43, "/use other");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "rejected input has no ownership"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("rejected input has no ownership"),
+			),
+		).toBe(false);
+		expect(
+			[
+				...(
+					adapter as unknown as {
+						inputAttributions: Map<string, { terminal: boolean }>;
+					}
+				).inputAttributions.values(),
+			].filter((record) => !record.terminal),
+		).toHaveLength(0);
+		await adapter.stop();
+	});
+
+	it("retains run ownership when settlement races an accepted submission reply", async () => {
+		let accept!: (value: TransportResult) => void;
+		let submitRequest: TransportEvent | undefined;
+		const gate = new Promise<TransportResult>((resolve) => (accept = resolve));
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") {
+					submitRequest = request;
+					return gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		const sending = bot.update(42, "racing accepted input");
+		await vi.waitFor(() => expect(submitRequest).toBeDefined());
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "answer settled before ack"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await bot.update(42, "/use other");
+		if (!submitRequest) throw new Error("missing submit request");
+		accept(result(submitRequest));
+		await sending;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("answer settled before ack")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.find(({ text }) => text.includes("answer settled before ack"))
+				?.text,
+		).toContain("Фоновая сессия");
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("attributes uncertain submissions to the active queued turn", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "UNCERTAIN_INPUT_DELIVERY",
+								message: "ack lost",
+								inputId: "input-uncertain" as never,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(42, "queued uncertain message");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-uncertain" as never, state: "pending" },
+		});
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "output", "uncertain run answer"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("uncertain run answer")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.find(({ text }) => text.includes("uncertain run answer"))?.text,
+		).toContain("Фоновая сессия");
+		await adapter.stop();
+	});
+
+	it("retires handled and canceled InputIds without inheriting later run output", async () => {
+		let submission = 0;
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				submission++;
+				return { ...result(request), value: `input-${submission}` as never };
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "handled without a run");
+		for (const state of ["pending", "accepted", "completed"] as const)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: { inputId: "input-1" as never, state },
+			});
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "unrelated later run"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await bot.update(42, "/use sid");
+		await bot.update(42, "input canceled during its run");
+		await bot.update(42, "/use other");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-2" as never, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "canceled run output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "input-2" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		expect(
+			bot.sent.some(({ text }) => text.includes("unrelated later run")),
+		).toBe(false);
+		expect(
+			bot.sent.some(({ text }) => text.includes("canceled run output")),
+		).toBe(false);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(2);
+		await adapter.stop();
+	});
+
+	it("reassociates a steered pending input with the next run after settlement", async () => {
+		let submission = 0;
+		let releaseSecond!: (value: TransportResult) => void;
+		let secondRequest: TransportEvent | undefined;
+		const secondGate = new Promise<TransportResult>(
+			(resolve) => (releaseSecond = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				submission++;
+				if (submission === 2) {
+					secondRequest = request;
+					return secondGate;
+				}
+				return { ...result(request), value: "input-first" as never };
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "first run input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-first" as never, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(43, "/use sid");
+		const secondSend = bot.update(43, "held until cancellation settles");
+		await vi.waitFor(() => expect(secondRequest).toBeDefined());
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-second" as never, state: "pending" },
+		});
+		await bot.update(42, "/use other");
+		await bot.update(43, "/use other");
+		emit(harnessEvent("sid", "output", "preceding run output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-first" as never, state: "completed" },
+		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		if (!secondRequest) throw new Error("missing second submit request");
+		const acceptedSecond = result(secondRequest);
+		if (!acceptedSecond.ok) throw new Error("second submission was rejected");
+		releaseSecond({ ...acceptedSecond, value: "input-second" as never });
+		await secondSend;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "following run output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-second" as never, state: "completed" },
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("following run output")),
+			).toBe(true),
+		);
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "unrelated subsequent run"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		expect(
+			bot.sent.some(({ text }) => text.includes("unrelated subsequent run")),
+		).toBe(false);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 42 && text.includes("preceding run output"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 43 && text.includes("preceding run output"),
+			),
+		).toBe(false);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 43 && text.includes("following run output"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 42 && text.includes("following run output"),
+			),
+		).toBe(false);
+		expect(
+			bot.sent.find(({ text }) => text.includes("following run output"))?.text,
+		).toContain("Фоновая сессия");
+		await adapter.stop();
+	});
+
+	it("keeps a canceling input on its old run while a later prompt waits for the abort gate", async () => {
+		let submitCount = 0;
+		let releaseCancel!: (value: TransportResult) => void;
+		let releaseNext!: (value: TransportResult) => void;
+		let nextRequest: TransportEvent | undefined;
+		const cancelGate = new Promise<TransportResult>(
+			(resolve) => (releaseCancel = resolve),
+		);
+		const nextGate = new Promise<TransportResult>(
+			(resolve) => (releaseNext = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "cancel") return cancelGate;
+				if (request.kind !== "submit") return result(request);
+				submitCount++;
+				if (submitCount === 2) {
+					nextRequest = request;
+					return nextGate;
+				}
+				return { ...result(request), value: "cancel-owner" as never };
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "input that will be canceled");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "cancel-owner" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "cancel-owner" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const cancel = bot.update(42, "/cancel cancel-owner");
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "cancel")).toHaveLength(1),
+		);
+		const next = bot.update(42, "prompt after cancellation");
+		await vi.waitFor(() => expect(nextRequest).toBeDefined());
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "output", "canceled run partial output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		const canceled = result(
+			requests.find(({ kind }) => kind === "cancel") as TransportEvent,
+		);
+		if (!canceled.ok) throw new Error("cancel fixture was rejected");
+		releaseCancel(canceled);
+		await cancel;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "cancel-owner" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-after-cancel" as never, state: "pending" },
+		});
+		if (!nextRequest) throw new Error("missing queued submit request");
+		const accepted = result(nextRequest);
+		if (!accepted.ok) throw new Error("queued submission was rejected");
+		releaseNext({ ...accepted, value: "input-after-cancel" as never });
+		await next;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "post-cancel run answer"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "input-after-cancel" as never,
+				state: "completed",
+			},
+		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		expect(
+			bot.sent.some(({ text }) => text.includes("canceled run partial output")),
+		).toBe(false);
+		expect(
+			bot.sent.some(({ text }) => text.includes("post-cancel run answer")),
+		).toBe(true);
+		expect(
+			bot.sent.find(({ text }) => text.includes("post-cancel run answer"))
+				?.text,
+		).toContain("Фоновая сессия");
 		await adapter.stop();
 	});
 
@@ -2090,10 +2574,10 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("retires epochs for lifecycle churn without confirmation references", async () => {
+	it("retires volatile turn and confirmation state during lifecycle churn", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
-		for (let index = 0; index < 100; index++) {
+		for (let index = 0; index < 200; index++) {
 			emit(harnessEvent(`churn-${index}`, "status", "agent_start"));
 			emit(harnessEvent(`churn-${index}`, "status", "agent_settled"));
 		}
@@ -2101,6 +2585,14 @@ describe("Telegram transport", () => {
 		expect(
 			(adapter as unknown as { confirmationEpochs: Map<SessionId, number> })
 				.confirmationEpochs.size,
+		).toBe(0);
+		expect(
+			(adapter as unknown as { turnBuffers: Map<SessionId, unknown> })
+				.turnBuffers.size,
+		).toBe(0);
+		expect(
+			(adapter as unknown as { inputAttributions: Map<string, unknown> })
+				.inputAttributions.size,
 		).toBe(0);
 		await adapter.stop();
 	});
@@ -2114,7 +2606,11 @@ describe("Telegram transport", () => {
 			new Error("temporary API failure"),
 		);
 		await bot.update(42, "/menu");
-		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
+		expect(bot.sent.at(-1)?.text).toContain("Не удалось обновить панель");
+		expect(callbackData(bot.sendOptions.at(-1), "panel:refresh")).toBe(
+			"panel:refresh",
+		);
 
 		bot.api.editMessageText.mockRejectedValueOnce(
 			Object.assign(new Error("Telegram rejected edit"), {
@@ -2122,10 +2618,35 @@ describe("Telegram transport", () => {
 			}),
 		);
 		await bot.update(42, "/menu");
-		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 2);
 		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(2);
 		await bot.update(42, "/sessions");
 		expect(bot.sent.at(-1)?.text).toContain("#sid");
+		await adapter.stop();
+	});
+
+	it("refreshes a stale panel from its notice without adopting or repinning the notice", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelId = (
+			adapter as unknown as { panelMessageIds: Map<number, number> }
+		).panelMessageIds.get(42);
+		const pinCount = bot.pinned.length;
+		bot.api.editMessageText.mockRejectedValueOnce(
+			new Error("temporary failure"),
+		);
+		await bot.update(42, "/menu");
+		const noticeId = bot.lastMessageId;
+		expect(noticeId).not.toBe(panelId);
+		const sentBeforeRefresh = bot.api.sendMessage.mock.calls.length;
+		await bot.callback(42, "panel:refresh", noticeId);
+		expect(bot.edited.at(-1)?.messageId).toBe(panelId);
+		expect(bot.pinned).toHaveLength(pinCount);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sentBeforeRefresh);
+		expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain(
+			"panel:refresh",
+		);
 		await adapter.stop();
 	});
 
@@ -2476,51 +2997,37 @@ describe("Telegram transport", () => {
 		).toMatchObject({ sessionId: "sid" });
 
 		await bot.update(42, "/use other");
-		await bot.update(42, "text reply needs a choice", {
+		await bot.update(42, "text reply routes directly to source", {
 			replyToMessageId: sourceId,
 		});
-		const textChoice = bot.sent.at(-1);
-		const selectedChoiceData = callbackData(
-			bot.sendOptions.at(-1),
-			"reply:",
-		).replace(/:s$/, ":c");
-		await bot.update(42, "/use sid");
-		await bot.callback(42, selectedChoiceData, textChoice?.message_id);
-		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(3);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4);
+		expect(
+			requests.filter(({ kind }) => kind === "submit").at(-1),
+		).toMatchObject({
+			sessionId: "sid",
+		});
 		await bot.update(42, "/use other");
 		fetchFile.mockClear();
 
-		await bot.updatePhoto(
-			42,
-			undefined,
-			42,
-			sourceId,
-			"Name this session (harnessd name prompt):\nNew session will be created in /work. Reply with a name. Create unnamed and Cancel buttons are below.",
-		);
-		expect(fetchFile).not.toHaveBeenCalled();
-		const choice = bot.sent.at(-1);
-		const choiceData = (
-			bot.sendOptions.at(-1) as {
-				reply_markup: { inline_keyboard: { callback_data: string }[][] };
-			}
-		).reply_markup.inline_keyboard[0]?.[0]?.callback_data;
-		expect(choice?.text).toContain("selected session is");
-		expect(choiceData).toMatch(/^reply:[a-f0-9]{12}:s$/);
-		await bot.callback(42, choiceData as string, choice?.message_id);
-		await vi.waitFor(() =>
-			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4),
-		);
+		await bot.updatePhoto(42, undefined, 42, sourceId);
+		await vi.waitFor(() => expect(fetchFile).toHaveBeenCalledTimes(1));
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5);
 		expect(
 			requests.filter(({ kind }) => kind === "submit").at(-1),
-		).toMatchObject({ sessionId: "sid" });
-		expect(fetchFile).toHaveBeenCalledTimes(1);
-		await bot.callback(42, choiceData as string, choice?.message_id);
-		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4);
-		expect(fetchFile).toHaveBeenCalledTimes(1);
+		).toMatchObject({
+			sessionId: "sid",
+		});
 
 		await bot.updateDocument(42, { replyToMessageId: 999999 });
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5);
+		const unknownReply = bot.sent.at(-1);
+		const selectedTarget = callbackData(
+			bot.sendOptions.at(-1),
+			"reply:",
+		).replace(/:[sx]$/, ":c");
+		await bot.callback(42, selectedTarget, unknownReply?.message_id);
 		await vi.waitFor(() =>
-			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5),
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(6),
 		);
 		expect(
 			requests.filter(({ kind }) => kind === "submit").at(-1),
@@ -2608,6 +3115,23 @@ describe("Telegram transport", () => {
 
 		const restartedBot = new MockBot();
 		const restarted = await startAdapter(restartedBot, stateDirectory);
+		await restartedBot.update(42, "spoofed text", {
+			replyToMessageId: output?.message_id,
+			replyToMessageText: output?.text,
+			replySenderIsBot: false,
+		});
+		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+			false,
+		);
+		expect(restartedBot.sent.at(-1)?.text).toContain("Reply source is unknown");
+		await restartedBot.update(42, "spoofed bot text", {
+			replyToMessageId: output?.message_id,
+			replyToMessageText: output?.text,
+			replySenderId: 998,
+		});
+		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+			false,
+		);
 		await restartedBot.update(42, "text after restart", {
 			replyToMessageId: output?.message_id,
 			replyToMessageText: output?.text,
@@ -2629,6 +3153,104 @@ describe("Telegram transport", () => {
 		await restarted.adapter.stop();
 		if (previousSession) sessions.set("sid", previousSession);
 	});
+
+	it.each([undefined, "Named session"])(
+		"routes %s multipart assistant footers after restart",
+		async (name) => {
+			const previous = sessions.get("sid");
+			if (!previous) throw new Error("missing session fixture");
+			sessions.set("sid", {
+				...previous,
+				...(name ? { name } : { name: undefined }),
+			});
+			const stateDirectory = await temp();
+			const firstBot = new MockBot();
+			const first = await startAdapter(firstBot, stateDirectory);
+			await firstBot.update(42, "/use sid");
+			first.emit(harnessEvent("sid", "status", "agent_start"));
+			first.emit(
+				harnessEvent("sid", "output", `Large answer ${"x".repeat(10_000)}`),
+			);
+			first.emit(harnessEvent("sid", "status", "agent_settled"));
+			await vi.waitFor(() =>
+				expect(firstBot.sent.some(({ text }) => / · 1\/\d+$/.test(text))).toBe(
+					true,
+				),
+			);
+			const part = firstBot.sent.find(({ text }) => / · 1\/\d+$/.test(text));
+			expect(part).toBeDefined();
+			await first.adapter.stop();
+
+			const restartedBot = new MockBot();
+			const restarted = await startAdapter(restartedBot, stateDirectory);
+			await restartedBot.update(42, "reply to first part", {
+				replyToMessageId: part?.message_id,
+				replyToMessageText: part?.text,
+			});
+			expect(
+				restarted.requests.filter(({ kind }) => kind === "submit"),
+			).toHaveLength(1);
+			await restarted.adapter.stop();
+			sessions.set("sid", previous);
+		},
+	);
+
+	it.each([
+		{ oldName: "Previous name", currentName: "Renamed session" },
+		{ oldName: undefined, currentName: "Named after reply" },
+	])(
+		"routes historical footer after name changes from $oldName",
+		async ({ oldName, currentName }) => {
+			const previous = sessions.get("sid");
+			if (!previous) throw new Error("missing session fixture");
+			sessions.set("sid", {
+				...previous,
+				...(oldName ? { name: oldName } : { name: undefined }),
+			});
+			const stateDirectory = await temp();
+			const firstBot = new MockBot();
+			const first = await startAdapter(firstBot, stateDirectory);
+			await firstBot.update(42, "/use sid");
+			first.emit(harnessEvent("sid", "status", "agent_start"));
+			first.emit(harnessEvent("sid", "output", "historical name answer"));
+			first.emit(harnessEvent("sid", "status", "agent_settled"));
+			await vi.waitFor(() =>
+				expect(
+					firstBot.sent.some(({ text }) =>
+						text.includes("historical name answer"),
+					),
+				).toBe(true),
+			);
+			const answer = firstBot.sent.find(({ text }) =>
+				text.includes("historical name answer"),
+			);
+			await first.adapter.stop();
+			sessions.set("sid", { ...previous, name: currentName });
+			const restartedBot = new MockBot();
+			const restarted = await startAdapter(restartedBot, stateDirectory);
+			await restartedBot.update(42, "reply to old generated footer", {
+				replyToMessageId: answer?.message_id,
+				replyToMessageText: answer?.text,
+			});
+			expect(
+				restarted.requests.filter(({ kind }) => kind === "submit"),
+			).toHaveLength(1);
+			if (oldName && answer?.text) {
+				await restartedBot.update(42, "reject malformed historical name", {
+					replyToMessageId: answer.message_id,
+					replyToMessageText: answer.text.replace(
+						oldName,
+						"Previous\u0085name",
+					),
+				});
+				expect(
+					restarted.requests.filter(({ kind }) => kind === "submit"),
+				).toHaveLength(1);
+			}
+			await restarted.adapter.stop();
+			sessions.set("sid", previous);
+		},
+	);
 
 	it("rejects restarted text and media replies to the generated long-path create prompt", async () => {
 		const cwd = `/workspace/${"long".repeat(1100)}`;
@@ -2922,7 +3544,16 @@ describe("Telegram transport", () => {
 		);
 		expect(requests.some((request) => request.kind === "submit")).toBe(false);
 		await bot.update(42, "stale prompt response", { replyToMessageId: 999999 });
-		expect(requests.some((request) => request.kind === "submit")).toBe(true);
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		const unknownSourceChoice = bot.sent.at(-1);
+		const targetChoice = callbackData(bot.sendOptions.at(-1), "reply:").replace(
+			/:[sx]$/,
+			":c",
+		);
+		await bot.callback(42, targetChoice, unknownSourceChoice?.message_id);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(1);
 		await bot.update(42, "old name reply", {
 			replyToMessageId: 999998,
 			replyToMessageText:
@@ -2931,6 +3562,312 @@ describe("Telegram transport", () => {
 		expect(
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("rechecks confirmed-current media selection after inspection before saving", async () => {
+		stubFileDownload();
+		const previousSession = sessions.get("sid");
+		if (!previousSession) throw new Error("missing session fixture");
+		sessions.set("sid", { ...previousSession, cwd: await temp() });
+		let releaseInspect!: () => void;
+		let signalInspect!: () => void;
+		let deferInspect = false;
+		const inspectGate = new Promise<void>(
+			(resolve) => (releaseInspect = resolve),
+		);
+		const inspectStarted = new Promise<void>(
+			(resolve) => (signalInspect = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (
+					deferInspect &&
+					request.kind === "inspect" &&
+					request.sessionId === "sid"
+				) {
+					signalInspect();
+					await inspectGate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		deferInspect = true;
+		const upload = bot.updateDocument(42);
+		await inspectStarted;
+		await bot.update(42, "/use other");
+		releaseInspect();
+		await upload;
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		const inbox = (adapter as unknown as { inbox: { rootDirectory: string } })
+			.inbox;
+		await expect(
+			readdir(path.join(inbox.rootDirectory, "sid")),
+		).rejects.toThrow();
+		await adapter.stop();
+		if (previousSession) sessions.set("sid", previousSession);
+	});
+
+	it("removes a just-saved attachment if current selection changes during save", async () => {
+		stubFileDownload();
+		const previousSession = sessions.get("sid");
+		if (!previousSession) throw new Error("missing session fixture");
+		sessions.set("sid", { ...previousSession, cwd: await temp() });
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					rootDirectory: string;
+					saveUnderLock: (
+						id: SessionId,
+						name: string,
+						data: Buffer,
+						removeExpired: boolean,
+						workspacePath: string,
+					) => Promise<{ path: string }>;
+				};
+			}
+		).inbox;
+		let savedDuringUpload = false;
+		const save = inbox.saveUnderLock.bind(inbox);
+		inbox.saveUnderLock = async (
+			id,
+			name,
+			data,
+			removeExpired,
+			workspacePath,
+		) => {
+			const saved = await save(id, name, data, removeExpired, workspacePath);
+			savedDuringUpload = true;
+			await bot.update(42, "/use other");
+			return saved;
+		};
+		await bot.updateDocument(42);
+		expect(savedDuringUpload).toBe(true);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		const files = await readdir(path.join(inbox.rootDirectory, "sid")).catch(
+			(error: unknown) => {
+				if (
+					typeof error === "object" &&
+					error !== null &&
+					"code" in error &&
+					error.code === "ENOENT"
+				)
+					return [];
+				throw error;
+			},
+		);
+		expect(files).toEqual([]);
+		await adapter.stop();
+		sessions.set("sid", previousSession);
+	});
+
+	it("revalidates a confirmed-current media route after its download", async () => {
+		let finishDownload!: (response: Response) => void;
+		const fetchGate = new Promise<Response>(
+			(resolve) => (finishDownload = resolve),
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(() => fetchGate),
+		);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42, {
+			replyToMessageId: 777,
+			replyToMessageText: "unknown user-authored message",
+		});
+		const notice = bot.sent.at(-1);
+		const currentChoice = callbackData(
+			bot.sendOptions.at(-1),
+			"reply:",
+		).replace(/:[sx]$/, ":c");
+		const choice = bot.callback(42, currentChoice, notice?.message_id);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+		await bot.update(42, "/use other");
+		finishDownload(new Response(Buffer.from("media")));
+		await choice;
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("selected session changed while receiving"),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("keeps a reliable media reply on its source session after selection changes", async () => {
+		let finishDownload!: (response: Response) => void;
+		const fetchGate = new Promise<Response>(
+			(resolve) => (finishDownload = resolve),
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(() => fetchGate),
+		);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "create reply route");
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
+				true,
+			),
+		);
+		const source = bot.sent.find(({ text }) => text.includes("Pi activity"));
+		await bot.update(42, "/use other");
+		const upload = bot.updateDocument(42, {
+			replyToMessageId: source?.message_id,
+			replyToMessageText: source?.text,
+		});
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+		finishDownload(new Response(Buffer.from("media")));
+		await upload;
+		expect(requests.findLast(({ kind }) => kind === "submit")).toMatchObject({
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("rechecks a disabled event channel at text dispatch after waiting for the inbox lock", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "initialize queue"));
+		await vi.waitFor(() =>
+			expect(
+				(adapter as unknown as { queues: Map<number, unknown> }).queues.has(42),
+			).toBe(true),
+		);
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		let release!: () => void;
+		let announce!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		const started = new Promise<void>((resolve) => (announce = resolve));
+		const lock = withSessionLock("sid" as SessionId, async () => {
+			announce();
+			await gate;
+		});
+		await started;
+		let queued!: () => void;
+		const queuedWait = new Promise<void>((resolve) => (queued = resolve));
+		inbox.withSessionLock = (id, operation) => {
+			const result = withSessionLock(id, operation);
+			if (id === "sid") queued();
+			return result;
+		};
+		const message = bot.update(42, "wait behind lock");
+		await queuedWait;
+		const queues = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues;
+		const queue = queues.get(42);
+		if (!queue) throw new Error("missing chat event queue");
+		queue.failed = true;
+		await bot.update(42, "/menu");
+		const reset = callbackData(bot.sendOptions.at(-1), "events:enable");
+		await bot.callback(42, reset, bot.lastMessageId);
+		release();
+		await Promise.all([lock, message]);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("blocks text dispatch when the event channel stays disabled through the lock boundary", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "initialize queue"));
+		await vi.waitFor(() =>
+			expect(
+				(adapter as unknown as { queues: Map<number, unknown> }).queues.has(42),
+			).toBe(true),
+		);
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		let release!: () => void;
+		let started!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		const heldStarted = new Promise<void>((resolve) => (started = resolve));
+		const held = withSessionLock("sid" as SessionId, async () => {
+			started();
+			await gate;
+		});
+		await heldStarted;
+		let queued!: () => void;
+		const queuedWait = new Promise<void>((resolve) => (queued = resolve));
+		inbox.withSessionLock = (id, operation) => {
+			const pending = withSessionLock(id, operation);
+			if (id === "sid") queued();
+			return pending;
+		};
+		const submission = bot.update(42, "blocked at final boundary");
+		await queuedWait;
+		const queues = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues;
+		const queue = queues.get(42);
+		if (!queue) throw new Error("missing event queue");
+		queue.failed = true;
+		release();
+		await Promise.all([held, submission]);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		await adapter.stop();
+	});
+
+	it("blocks media dispatch when the channel is disabled during download", async () => {
+		let finishDownload!: (response: Response) => void;
+		const fetchGate = new Promise<Response>(
+			(resolve) => (finishDownload = resolve),
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(() => fetchGate),
+		);
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "initialize queue"));
+		await vi.waitFor(() =>
+			expect(
+				(adapter as unknown as { queues: Map<number, unknown> }).queues.has(42),
+			).toBe(true),
+		);
+		const upload = bot.updateDocument(42);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+		const queues = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues;
+		const queue = queues.get(42);
+		if (!queue) throw new Error("missing chat event queue");
+		queue.failed = true;
+		finishDownload(new Response(Buffer.from("media")));
+		await upload;
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
 		await adapter.stop();
 	});
 
@@ -3692,7 +4629,10 @@ describe("Telegram transport", () => {
 			),
 			images: [{ mimeType: "image/jpeg", data: "aGVsbG8=" }],
 		});
-		expect(bot.api.getFile).toHaveBeenCalledWith("largest-photo-id");
+		expect(bot.api.getFile).toHaveBeenCalledWith(
+			"largest-photo-id",
+			expect.any(AbortSignal),
+		);
 		expect(bot.reactions).toContainEqual({
 			chatId: 42,
 			messageId: 1002,
@@ -3763,6 +4703,26 @@ describe("Telegram transport", () => {
 		expect(await readFile(savedPath, "utf8")).toBe("hello");
 		expect(await readdir(dir)).toEqual([]);
 		await adapter.stop();
+	});
+
+	it("acknowledges a stalled attachment and times out without submitting it", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.getFile = vi.fn(() => new Promise(() => {}));
+		const update = bot.updateDocument(42);
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Получаю вложение")),
+			).toBe(true),
+		);
+		await vi.advanceTimersByTimeAsync(60_000);
+		await update;
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		expect(bot.sent.at(-1)?.text).toContain("timed out after 60 seconds");
+		await adapter.stop();
+		vi.useRealTimers();
 	});
 
 	it("does not submit oversized or failed incoming documents", async () => {
@@ -4459,6 +5419,172 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("delivers an overflow notice to a switched background recipient", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "run that will overflow");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		bot.api.sendMessage.mockImplementation(async (chatId, text, options) => {
+			if (chatId === 42 && telegramBody(text) === "Session status changed.")
+				await gate;
+			bot.sent.push({ chatId, text });
+			bot.sendOptions.push(options);
+		});
+		emit(harnessEvent("sid", "status", "unknown"));
+		await vi.waitFor(() =>
+			expect(
+				bot.api.sendMessage.mock.calls.some(
+					([chatId, text]) =>
+						chatId === 42 && telegramBody(text) === "Session status changed.",
+				),
+			).toBe(true),
+		);
+		for (let index = 0; index < 45; index++)
+			emit(harnessEvent("sid", "status", "unknown"));
+		const queues = (
+			adapter as unknown as {
+				queues: Map<number, { overflowNotices: Set<string> }>;
+			}
+		).queues;
+		await vi.waitFor(() =>
+			expect(queues.get(42)?.overflowNotices.size).toBe(1),
+		);
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "output", "x".repeat(33_000)));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		release();
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		const noticeIndex = bot.sent.findIndex(({ text }) =>
+			text.includes("Additional notifications were omitted"),
+		);
+		expect(noticeIndex).toBeGreaterThanOrEqual(0);
+		expect(bot.sendOptions[noticeIndex]).toMatchObject({
+			reply_markup: {
+				inline_keyboard: [[{ text: "Переключиться на эту сессию" }]],
+			},
+		});
+		await adapter.stop();
+	});
+
+	it("keeps congestion notices scoped to each omitted session and delivery context", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const enqueue = (
+			adapter as unknown as {
+				enqueue: (
+					chatId: number,
+					sessionId: SessionId,
+					text: string,
+					input:
+						| { readonly inputId: string; readonly state: string }
+						| undefined,
+					output: boolean,
+					background: boolean,
+				) => void;
+			}
+		).enqueue.bind(adapter);
+		for (let index = 0; index < 25; index++)
+			enqueue(
+				42,
+				"sid" as SessionId,
+				`A output ${index}`,
+				undefined,
+				true,
+				false,
+			);
+		for (let index = 0; index < 8; index++)
+			enqueue(
+				42,
+				"sid" as SessionId,
+				`A input ${index}`,
+				{ inputId: `A-${index}`, state: "accepted" },
+				false,
+				false,
+			);
+		enqueue(
+			42,
+			"other" as SessionId,
+			"B input",
+			{ inputId: "B-0", state: "accepted" },
+			false,
+			false,
+		);
+		for (let index = 0; index < 23; index++)
+			enqueue(
+				42,
+				"sid" as SessionId,
+				`A refill ${index}`,
+				undefined,
+				true,
+				false,
+			);
+		enqueue(
+			42,
+			"other" as SessionId,
+			"B background output",
+			undefined,
+			true,
+			true,
+		);
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		const notices = bot.sent
+			.map((message, index) => ({ message, options: bot.sendOptions[index] }))
+			.filter(({ message }) =>
+				message.text.includes("Additional notifications were omitted"),
+			);
+		expect(notices).toHaveLength(2);
+		const noticeA = notices.find(({ message }) => message.text.includes("sid"));
+		const noticeB = notices.find(({ message }) =>
+			message.text.includes("other"),
+		);
+		expect(noticeA?.message.text).toContain("sid");
+		expect(noticeB?.message.text).toContain("other");
+		expect(noticeA?.options).not.toHaveProperty("reply_markup");
+		expect(noticeB?.options).toMatchObject({
+			reply_markup: {
+				inline_keyboard: [[{ text: "Переключиться на эту сессию" }]],
+			},
+		});
+		const selectIntents = (
+			adapter as unknown as {
+				selectIntents: Map<string, { sessionId: SessionId }>;
+			}
+		).selectIntents;
+		expect(
+			[...selectIntents.values()].map(({ sessionId }) => sessionId),
+		).toContain("other");
+		await adapter.stop();
+	});
+
 	it("preserves uncertain input IDs when output saturates the notification queue", async () => {
 		const bot = new MockBot();
 		const { adapter, requests, emit } = await startAdapter(bot, await temp());
@@ -4521,6 +5647,41 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_end"));
 		await vi.advanceTimersByTimeAsync(100);
 		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await adapter.stop();
+	});
+
+	it("blocks new submissions after event-channel failure and resets only future events", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockRejectedValueOnce(new Error("network unavailable"));
+		emit(harnessEvent("sid", "status", "custom event"));
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as { queues: Map<number, { failed: boolean }> }
+				).queues.get(42)?.failed,
+			).toBe(true),
+		);
+		const submissionsBefore = requests.filter(
+			(request) => request.kind === "submit",
+		).length;
+		await bot.update(42, "must not submit");
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(submissionsBefore);
+		await bot.update(42, "/menu");
+		const reset = callbackData(bot.sendOptions.at(-1), "events:enable");
+		expect(reset).toBe("events:enable");
+		await bot.callback(42, reset);
+		expect(
+			(
+				adapter as unknown as { queues: Map<number, { failed: boolean }> }
+			).queues.get(42)?.failed,
+		).toBe(false);
+		bot.api.sendMessage.mockClear();
+		emit(harnessEvent("sid", "status", "future event"));
+		await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
 		await adapter.stop();
 	});
 

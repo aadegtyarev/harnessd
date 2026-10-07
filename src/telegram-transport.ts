@@ -27,6 +27,8 @@ import type {
 	AdapterId,
 	HarnessActivityEvent,
 	HarnessEvent,
+	InputDeliveryState,
+	InputId,
 	SessionId,
 	SessionSummary,
 } from "./core/types.js";
@@ -53,6 +55,7 @@ const STOP_TIMEOUT_MS = 6000;
 const MAX_QUEUED_MESSAGES = 32;
 const MAX_OUTPUT_MESSAGES = 24;
 const MAX_INPUT_MESSAGES = 8;
+const MAX_OVERFLOW_NOTICES = 8;
 const MAX_QUEUED_CHARACTERS = 32_768;
 const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
@@ -76,6 +79,7 @@ const RENAME_NAME_FALLBACK =
 const RENAME_NAME_PREFIX = "Rename ";
 const RENAME_NAME_SEPARATOR = " in ";
 const MAX_CORRELATED_MESSAGES_PER_CHAT = 128;
+const MAX_INPUT_ATTRIBUTIONS = 512;
 type UpdateContext = {
 	from?: { id: number };
 	chat?: { id: number; type: string };
@@ -95,7 +99,16 @@ type UpdateContext = {
 			width: number;
 			height: number;
 		}[];
-		reply_to_message?: { message_id?: number; text?: string };
+		reply_to_message?: {
+			message_id?: number;
+			text?: string;
+			from?: { id: number; is_bot?: boolean };
+			entities?: readonly {
+				type: string;
+				offset: number;
+				length: number;
+			}[];
+		};
 	};
 	callbackQuery?: {
 		id: string;
@@ -190,9 +203,11 @@ type QueuedMessage = {
 	readonly sessionId: SessionId;
 	readonly text: string;
 	readonly output?: true;
+	readonly background?: true;
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
+	overflowKey?: string;
 };
 type PendingNameFlow =
 	| {
@@ -240,14 +255,30 @@ type ChatQueue = {
 	draining?: Promise<void>;
 	drainTimer?: NodeJS.Timeout;
 	failed: boolean;
-	overflowQueued: boolean;
+	readonly overflowNotices: Set<string>;
 	readonly idleWaiters: (() => void)[];
 };
 type TurnBuffer = {
 	readonly chunks: string[];
+	readonly recipients: Set<number>;
+	readonly pendingInputs: Set<InputId>;
 	characters: number;
+	settled: boolean;
+	interrupted: boolean;
 	overflow: boolean;
 };
+type InputAttribution = {
+	readonly inputId: InputId;
+	readonly sessionId: SessionId;
+	chatId?: number;
+	state: InputDeliveryState;
+	terminal: boolean;
+	pendingSeen: boolean;
+	steered: boolean;
+	waitingForRun: boolean;
+	turn?: TurnBuffer;
+};
+type InFlightSubmission = { readonly chatId: number };
 type FolderIntent = {
 	readonly chatId: number;
 	messageId: number;
@@ -674,6 +705,20 @@ function formatSession(session: SessionSummary): string {
 function formatSessionList(session: SessionSummary, selected: boolean): string {
 	return `${selected ? "✓ " : ""}${escapeHtml(shortSessionLabel(session))} · ${escapeHtml(session.status)} · ${escapeHtml(compactSessionPath(session.cwd))}`;
 }
+function isGeneratedSessionFooterName(value: string): boolean {
+	if (!value || [...value].length > 64) return false;
+	for (const character of value) {
+		const codePoint = character.codePointAt(0) ?? 0;
+		if (
+			codePoint <= 0x1f ||
+			(codePoint >= 0x7f && codePoint <= 0x9f) ||
+			codePoint === 0x2028 ||
+			codePoint === 0x2029
+		)
+			return false;
+	}
+	return value === value.trim().replace(/\s+/gu, " ");
+}
 function oneLine(value: string): string {
 	return [...value]
 		.map((character) => {
@@ -1047,8 +1092,15 @@ export class TelegramTransportAdapter
 	private readonly modelChoices = new Map<number, ModelChoices>();
 	private readonly effortChoices = new Map<number, EffortChoices>();
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
+	private readonly inputAttributions = new Map<InputId, InputAttribution>();
+	private readonly cancelingInputs = new Map<InputId, number>();
+	private readonly inFlightSubmissions = new Map<
+		SessionId,
+		InFlightSubmission
+	>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
+	private readonly panelStaleChats = new Set<number>();
 	private readonly panelGenerations = new Map<number, number>();
 	private readonly folderIntents = new Map<string, FolderIntent>();
 	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
@@ -1348,6 +1400,7 @@ export class TelegramTransportAdapter
 			if (queue.drainTimer) clearTimeout(queue.drainTimer);
 			queue.messages.length = 0;
 			queue.pendingCharacters = 0;
+			queue.overflowNotices.clear();
 			for (const resolve of queue.idleWaiters.splice(0)) resolve();
 		}
 		for (const activity of this.liveActivities.values()) {
@@ -1355,6 +1408,10 @@ export class TelegramTransportAdapter
 			if (activity.finishTimer) clearTimeout(activity.finishTimer);
 		}
 		this.liveActivities.clear();
+		this.turnBuffers.clear();
+		this.inputAttributions.clear();
+		this.cancelingInputs.clear();
+		this.inFlightSubmissions.clear();
 		try {
 			if (this.initializationPromise)
 				await withDeadline(this.initializationPromise, STOP_TIMEOUT_MS);
@@ -1461,6 +1518,7 @@ export class TelegramTransportAdapter
 	private async onText(
 		ctx: UpdateContext,
 		routedSessionId?: SessionId,
+		confirmedCurrentSession?: SessionId,
 	): Promise<void> {
 		const chatId = ctx.chat?.id;
 		const sender = ctx.from?.id;
@@ -1481,6 +1539,11 @@ export class TelegramTransportAdapter
 				replyTo === undefined
 					? undefined
 					: this.replyRoutes.get(chatId)?.get(replyTo);
+			const footerSession =
+				knownReplyRoute === undefined
+					? this.sessionFromReplyFooter(ctx.message?.reply_to_message)
+					: undefined;
+			const sourceSession = knownReplyRoute?.sessionId ?? footerSession;
 			if (
 				routedSessionId === undefined &&
 				replyTo !== undefined &&
@@ -1495,19 +1558,21 @@ export class TelegramTransportAdapter
 			if (text.startsWith("/")) {
 				await this.command(chatId, sender, text);
 			} else {
-				const sessionId = routedSessionId ?? this.selected.get(chatId);
+				if (this.eventChannelDisabled(chatId))
+					return this.sendDirect(
+						chatId,
+						"Канал событий отключён: новые сообщения не отправлены. Откройте /menu и включите канал для новых событий.",
+					);
+				const sessionId =
+					routedSessionId ?? sourceSession ?? this.selected.get(chatId);
 				if (!sessionId)
 					return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-				const sourceSession =
-					routedSessionId !== undefined
-						? undefined
-						: knownReplyRoute?.sessionId;
-				if (sourceSession && sourceSession !== sessionId)
+				if (replyTo !== undefined && !sourceSession && !routedSessionId)
 					return this.offerReplyRoutes(
 						chatId,
 						sender,
 						ctx.message?.message_id ?? 0,
-						sourceSession,
+						sessionId,
 						sessionId,
 						{ text },
 					);
@@ -1517,11 +1582,17 @@ export class TelegramTransportAdapter
 					ctx.message?.message_id,
 				);
 				submissionPending = true;
-				const result = await this.request(sender, {
-					kind: "submit",
-					sessionId,
-					text,
-				});
+				const result = await this.submitFromChat(
+					chatId,
+					sender,
+					{ kind: "submit", sessionId, text },
+					confirmedCurrentSession,
+				);
+				if (!result) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					return;
+				}
 				if (result.ok) {
 					submissionPending = false;
 					await this.confirmInputAccepted(
@@ -1719,6 +1790,56 @@ export class TelegramTransportAdapter
 			routes.delete(routes.keys().next().value as number);
 	}
 
+	private sessionFromReplyFooter(
+		reply: NonNullable<UpdateContext["message"]>["reply_to_message"],
+	): SessionId | undefined {
+		if (!reply) return undefined;
+		const text = reply.text;
+		const botId = (this.bot as TelegramBot & { botInfo?: { id: number } })
+			.botInfo?.id;
+		if (
+			!text ||
+			botId === undefined ||
+			!reply.from?.is_bot ||
+			reply.from.id !== botId
+		)
+			return undefined;
+		const match =
+			/\n\n(?:(.+) · )?([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?: · (\d+)\/(\d+))?$/.exec(
+				text,
+			);
+		const id = match?.[2];
+		if (!id || !this.knownSessions.has(id as SessionId)) return undefined;
+		const footerName = match[1];
+		if (footerName !== undefined && !isGeneratedSessionFooterName(footerName))
+			return undefined;
+		if (match[3] !== undefined) {
+			const part = Number(match[3]);
+			const total = Number(match[4]);
+			if (
+				!Number.isSafeInteger(part) ||
+				!Number.isSafeInteger(total) ||
+				part < 1 ||
+				total < 2 ||
+				part > total
+			)
+				return undefined;
+		}
+		const entities = reply.entities ?? [];
+		const expectedOffset = text.lastIndexOf(id);
+		const footerEntities = entities.filter(
+			(entity) => entity.offset + entity.length > expectedOffset,
+		);
+		if (
+			footerEntities.length !== 1 ||
+			footerEntities[0]?.type !== "code" ||
+			footerEntities[0]?.offset !== expectedOffset ||
+			footerEntities[0]?.length !== id.length
+		)
+			return undefined;
+		return id as SessionId;
+	}
+
 	private async offerReplyRoutes(
 		chatId: number,
 		sender: number,
@@ -1744,12 +1865,18 @@ export class TelegramTransportAdapter
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
-				`This message belongs to ${this.sessionFooter(sourceSession)}, but the selected session is ${this.sessionFooter(selectedSession)}. Choose where to send it:`,
+				sourceSession === selectedSession
+					? `Reply source is unknown. Send only to selected ${this.sessionFooter(selectedSession)} or cancel:`
+					: `This message belongs to ${this.sessionFooter(sourceSession)}, but the selected session is ${this.sessionFooter(selectedSession)}. Choose where to send it:`,
 				{
 					reply_markup: keyboard([
 						[
-							inlineButton("Send to source", `reply:${token}:s`),
-							inlineButton("Send to selected", `reply:${token}:c`),
+							...(sourceSession === selectedSession
+								? [inlineButton("Send to selected", `reply:${token}:c`)]
+								: [
+										inlineButton("Send to source", `reply:${token}:s`),
+										inlineButton("Send to selected", `reply:${token}:c`),
+									]),
 							inlineButton("Cancel", `reply:${token}:x`),
 						],
 					]),
@@ -1830,6 +1957,7 @@ export class TelegramTransportAdapter
 					message: { text: choice.text, message_id: choice.incomingMessageId },
 				},
 				target,
+				match?.[2] === "c" ? choice.selectedSession : undefined,
 			);
 		if (choice.message)
 			return this.onMedia(
@@ -1839,6 +1967,7 @@ export class TelegramTransportAdapter
 					message: choice.message,
 				},
 				target,
+				match?.[2] === "c" ? choice.selectedSession : undefined,
 			);
 	}
 
@@ -1854,15 +1983,25 @@ export class TelegramTransportAdapter
 	private async onMedia(
 		ctx: UpdateContext,
 		routedSessionId?: SessionId,
+		confirmedCurrentSession?: SessionId,
 	): Promise<void> {
 		const chatId = ctx.chat?.id;
 		const sender = ctx.from?.id;
 		const message = ctx.message;
 		if (chatId === undefined || sender === undefined || !message) return;
+		if (this.eventChannelDisabled(chatId))
+			return this.sendDirect(
+				chatId,
+				"Канал событий отключён: вложение не отправлено. Откройте /menu и включите канал для новых событий.",
+			);
 		const replyTo = message.reply_to_message?.message_id;
 		const knownReplyRoute =
 			routedSessionId === undefined && replyTo !== undefined
 				? this.replyRoutes.get(chatId)?.get(replyTo)
+				: undefined;
+		const footerSession =
+			knownReplyRoute === undefined
+				? this.sessionFromReplyFooter(message.reply_to_message)
 				: undefined;
 		if (
 			routedSessionId === undefined &&
@@ -1874,20 +2013,26 @@ export class TelegramTransportAdapter
 				chatId,
 				"This name prompt has expired or requires text; the attachment was not submitted.",
 			);
-		const sessionId = routedSessionId ?? this.selected.get(chatId);
+		const sessionId =
+			routedSessionId ??
+			knownReplyRoute?.sessionId ??
+			footerSession ??
+			this.selected.get(chatId);
 		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-		if (knownReplyRoute) {
-			const sourceSession = knownReplyRoute.sessionId;
-			if (sourceSession && sourceSession !== sessionId)
-				return this.offerReplyRoutes(
-					chatId,
-					sender,
-					message.message_id ?? 0,
-					sourceSession,
-					sessionId,
-					{ message },
-				);
-		}
+		if (
+			replyTo !== undefined &&
+			!knownReplyRoute &&
+			!footerSession &&
+			!routedSessionId
+		)
+			return this.offerReplyRoutes(
+				chatId,
+				sender,
+				message.message_id ?? 0,
+				sessionId,
+				sessionId,
+				{ message },
+			);
 		const document = message.document;
 		const photo = largestPhoto(message.photo);
 		if (!document && !photo)
@@ -1907,7 +2052,66 @@ export class TelegramTransportAdapter
 		const inbox = this.inbox;
 		if (!inbox)
 			return this.sendDirect(chatId, "The session inbox is unavailable.");
+		const explicitlyRouted = Boolean(
+			knownReplyRoute ||
+				footerSession ||
+				(routedSessionId && !confirmedCurrentSession),
+		);
+		const selectedAtDownload =
+			confirmedCurrentSession ?? this.selected.get(chatId);
+		await this.sendDirect(chatId, "Получаю вложение…");
+		let downloaded: Buffer;
+		try {
+			const controller = new AbortController();
+			downloaded = await withDeadline(
+				(async () => {
+					const file = await this.bot.api.getFile(fileId, controller.signal);
+					if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
+						throw new TelegramAttachmentTooLargeError();
+					if (!file.file_path) throw new Error("file unavailable");
+					const response = await fetch(
+						telegramFileDownloadUrl(this.options.token, file.file_path),
+						{ signal: controller.signal },
+					);
+					if (!response.ok) throw new Error("download failed");
+					const data = await readBoundedResponse(
+						response,
+						MAX_TELEGRAM_DOWNLOAD_BYTES,
+					);
+					if (!data.length || data.length > MAX_TELEGRAM_DOWNLOAD_BYTES)
+						throw new Error("file size invalid");
+					return data;
+				})(),
+				60_000,
+			).catch((error: unknown) => {
+				controller.abort();
+				throw error;
+			});
+		} catch (error) {
+			if (error instanceof TelegramAttachmentTooLargeError)
+				return this.sendDirect(
+					chatId,
+					"Attachment exceeds Telegram's 20 MB download limit.",
+				);
+			return this.sendDirect(
+				chatId,
+				error instanceof Error &&
+					(error.message.includes("timed out") || error.message === "deadline")
+					? "Attachment download timed out after 60 seconds; it was not submitted. Send it again if still needed."
+					: "Could not safely download or save this attachment. It was not submitted.",
+			);
+		}
 		await inbox.withSessionLock(sessionId, async () => {
+			if (
+				(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+				this.selected.get(chatId) !== selectedAtDownload
+			) {
+				await this.sendDirect(
+					chatId,
+					"The selected session changed while receiving the attachment; it was not submitted.",
+				);
+				return;
+			}
 			const inspected = await this.request(sender, {
 				kind: "inspect",
 				sessionId,
@@ -1918,22 +2122,20 @@ export class TelegramTransportAdapter
 			}
 			const session = inspected.value as SessionSummary;
 			this.rememberSession(session);
+			const selectionChanged =
+				(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+				this.selected.get(chatId) !== selectedAtDownload;
+			if (selectionChanged) {
+				await this.sendDirect(
+					chatId,
+					"The selected session changed while receiving the attachment; it was not submitted.",
+				);
+				return;
+			}
 			let activity: LiveActivity | undefined;
 			let submissionPending = false;
 			try {
-				const file = await this.bot.api.getFile(fileId);
-				if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
-					throw new TelegramAttachmentTooLargeError();
-				if (!file.file_path) throw new Error("file unavailable");
-				const url = telegramFileDownloadUrl(this.options.token, file.file_path);
-				const response = await fetch(url);
-				if (!response.ok) throw new Error("download failed");
-				const data = await readBoundedResponse(
-					response,
-					MAX_TELEGRAM_DOWNLOAD_BYTES,
-				);
-				if (!data.length || data.length > MAX_TELEGRAM_DOWNLOAD_BYTES)
-					throw new Error("file size invalid");
+				const data = downloaded;
 				const saved = await inbox.saveUnderLock(
 					session.id,
 					document?.file_name ?? (photo ? "photo.jpg" : "attachment"),
@@ -1941,6 +2143,17 @@ export class TelegramTransportAdapter
 					session.status === "stopped" || session.status === "failed",
 					session.cwd,
 				);
+				if (
+					(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+					this.selected.get(chatId) !== selectedAtDownload
+				) {
+					await inbox.removeSavedAttachmentUnderLock(sessionId, saved.path);
+					await this.sendDirect(
+						chatId,
+						"The selected session changed while receiving the attachment; it was not submitted.",
+					);
+					return;
+				}
 				const caption = message.caption?.trim();
 				const text = `The user sent an attachment saved in the harnessd inbox at ${saved.path}.${caption ? ` Caption (untrusted user text): ${caption}` : ""}`;
 				const image = photo
@@ -1952,7 +2165,29 @@ export class TelegramTransportAdapter
 					message.message_id,
 				);
 				submissionPending = true;
-				const submitted = await this.dispatchRequest(sender, {
+				if (
+					(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+					this.selected.get(chatId) !== selectedAtDownload
+				) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					await inbox.removeSavedAttachmentUnderLock(sessionId, saved.path);
+					await this.sendDirect(
+						chatId,
+						"The selected session changed while receiving the attachment; it was not submitted.",
+					);
+					return;
+				}
+				if (this.eventChannelDisabled(chatId)) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					await this.sendDirect(
+						chatId,
+						"Канал событий отключён: вложение не отправлено. Откройте /menu и включите канал для новых событий.",
+					);
+					return;
+				}
+				const submitted = await this.dispatchSubmission(chatId, sender, {
 					kind: "submit",
 					sessionId,
 					text,
@@ -2438,11 +2673,23 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-			const result = await this.request(sender, {
-				kind: "cancel",
-				sessionId,
-				inputId: args[0] as never,
-			});
+			const inputId = args[0] as InputId;
+			this.cancelingInputs.set(
+				inputId,
+				(this.cancelingInputs.get(inputId) ?? 0) + 1,
+			);
+			let result: TransportResult;
+			try {
+				result = await this.request(sender, {
+					kind: "cancel",
+					sessionId,
+					inputId,
+				});
+			} finally {
+				const pendingCancels = this.cancelingInputs.get(inputId) ?? 0;
+				if (pendingCancels <= 1) this.cancelingInputs.delete(inputId);
+				else this.cancelingInputs.set(inputId, pendingCancels - 1);
+			}
 			return this.sendDirect(
 				chatId,
 				result.ok
@@ -2806,6 +3053,66 @@ export class TelegramTransportAdapter
 			: operation();
 	}
 
+	private submitFromChat(
+		chatId: number,
+		sender: number,
+		request: Extract<TelegramRequest, { kind: "submit" }>,
+		expectedSelection?: SessionId,
+	): Promise<TransportResult | undefined> {
+		return this.withSessionRequestLock(request.sessionId, async () => {
+			if (
+				expectedSelection !== undefined &&
+				this.selected.get(chatId) !== expectedSelection
+			) {
+				await this.sendDirect(
+					chatId,
+					"The selected session changed before dispatch; nothing was sent.",
+				);
+				return undefined;
+			}
+			if (this.eventChannelDisabled(chatId)) {
+				await this.sendDirect(
+					chatId,
+					"Канал событий отключён: новое сообщение не отправлено. Откройте /menu и включите канал для новых событий.",
+				);
+				return undefined;
+			}
+			return this.dispatchSubmission(chatId, sender, request);
+		});
+	}
+
+	private async dispatchSubmission(
+		chatId: number,
+		sender: number,
+		request: Extract<TelegramRequest, { kind: "submit" }>,
+	): Promise<TransportResult> {
+		const pending: InFlightSubmission = { chatId };
+		this.inFlightSubmissions.set(request.sessionId, pending);
+		try {
+			const result = await this.dispatchRequest(sender, request);
+			if (result.ok)
+				this.recordInputOutcome(
+					request.sessionId,
+					result.value as InputId,
+					chatId,
+					"accepted",
+				);
+			else if (result.error.inputId)
+				this.recordInputOutcome(
+					request.sessionId,
+					result.error.inputId as InputId,
+					chatId,
+					result.error.code === "UNCERTAIN_INPUT_DELIVERY"
+						? "uncertain"
+						: "failed",
+				);
+			return result;
+		} finally {
+			if (this.inFlightSubmissions.get(request.sessionId) === pending)
+				this.inFlightSubmissions.delete(request.sessionId);
+		}
+	}
+
 	private request(
 		sender: number,
 		request: TelegramRequest,
@@ -2832,6 +3139,7 @@ export class TelegramTransportAdapter
 		chatId: number,
 		sender: number,
 		messageId?: number,
+		hideStaleAction = false,
 	): Promise<void> {
 		const listed = await this.request(sender, { kind: "list" });
 		const sessions = listed.ok
@@ -2901,6 +3209,10 @@ export class TelegramTransportAdapter
 			);
 		if (!listed.ok)
 			lines.push(`Не удалось обновить список сессий: ${listed.error.message}`);
+		if (this.panelStaleChats.has(chatId))
+			lines.push(
+				"Операция завершена отдельно от панели; её обновление не удалось. Используйте «Обновить панель».",
+			);
 		if (preview) {
 			lines.push(
 				`Существует: да · Выбрана для сообщений: ${this.selected.get(chatId) === preview.id ? "да" : "нет"}`,
@@ -2925,6 +3237,12 @@ export class TelegramTransportAdapter
 			inlineButton("Папки", "menu:folders"),
 		]);
 		rows.push([inlineButton("Новая сессия", "menu:new")]);
+		if (this.panelStaleChats.has(chatId) && !hideStaleAction)
+			rows.push([inlineButton("Обновить панель", "panel:refresh")]);
+		if (this.eventChannelDisabled(chatId))
+			rows.push([
+				inlineButton("Включить канал для новых событий", "events:enable"),
+			]);
 		if (previewId && preview) {
 			if (preview.status === "running" || preview.status === "stopped")
 				rows.push([
@@ -2965,11 +3283,27 @@ export class TelegramTransportAdapter
 	private async refreshExistingPanel(
 		chatId: number,
 		sender: number,
+		hideStaleAction = false,
 	): Promise<void> {
 		const messageId =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
 		if (messageId !== undefined)
-			await this.renderPanel(chatId, sender, messageId);
+			await this.renderPanel(chatId, sender, messageId, hideStaleAction);
+	}
+
+	private async notifyPanelStale(chatId: number): Promise<void> {
+		await this.telegramCall((signal) =>
+			this.bot.api.sendMessage(
+				chatId,
+				"Не удалось обновить панель. Это не отменяет и не повторяет операцию; не нажимайте её повторно. Проверьте результат в панели после обновления или через /status.",
+				{
+					reply_markup: keyboard([
+						[inlineButton("Обновить панель", "panel:refresh")],
+					]),
+				},
+				signal,
+			),
+		);
 	}
 
 	private async updatePanel(
@@ -3008,10 +3342,13 @@ export class TelegramTransportAdapter
 			);
 			if (edited.ok || isMessageNotModified(edited.error)) {
 				await this.savePanelReference(chatId, existing);
+				this.panelStaleChats.delete(chatId);
 				return true;
 			}
 			if (!isMessageNotFound(edited.error)) {
 				this.dropPanelGenerationIntents(chatId, generation);
+				this.panelStaleChats.add(chatId);
+				await this.notifyPanelStale(chatId);
 				return false;
 			}
 		}
@@ -3035,6 +3372,8 @@ export class TelegramTransportAdapter
 		);
 		if (!sent.ok) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			this.panelStaleChats.add(chatId);
+			await this.notifyPanelStale(chatId);
 			return false;
 		}
 		const createdMessageId = messageIdFrom(sent.value);
@@ -3043,6 +3382,7 @@ export class TelegramTransportAdapter
 			return false;
 		}
 		await this.savePanelReference(chatId, createdMessageId);
+		this.panelStaleChats.delete(chatId);
 		if (hasBoundIntents) {
 			for (const intent of this.folderIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)
@@ -3188,7 +3528,8 @@ export class TelegramTransportAdapter
 		}
 		const directAction =
 			callback.data.startsWith("action:resume-select:") ||
-			callback.data.startsWith("action:select:");
+			callback.data.startsWith("action:select:") ||
+			callback.data === "panel:refresh";
 		if (!directAction) await this.savePanelReference(chatId, messageId);
 		try {
 			await this.dispatchCallback(chatId, sender, callback.data, messageId);
@@ -3212,6 +3553,22 @@ export class TelegramTransportAdapter
 	): Promise<void> {
 		if (data === "menu:home")
 			return this.renderPanel(chatId, sender, messageId);
+		if (data === "panel:refresh")
+			return this.refreshExistingPanel(chatId, sender, true);
+		if (data === "events:enable") {
+			const queue = this.queues.get(chatId);
+			if (queue) {
+				queue.failed = false;
+				queue.messages.length = 0;
+				queue.pendingCharacters = 0;
+				queue.overflowNotices.clear();
+			}
+			await this.sendDirect(
+				chatId,
+				"Канал включён только для новых событий; старые события не отправляются.",
+			);
+			return this.renderPanel(chatId, sender, messageId);
+		}
 		if (data === "session:prev" || data === "session:next")
 			return this.browseSessions(
 				chatId,
@@ -3953,9 +4310,11 @@ export class TelegramTransportAdapter
 		this.rememberSession(session);
 		const selectionSaved = await this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
+		await this.sendDirect(
+			chatId,
+			`Selected ${sessionLabel(session)}. Ordinary messages now target this session.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
-		if (!selectionSaved)
-			await this.sendDirect(chatId, SELECTION_NOT_SAVED_WARNING.trim());
 	}
 
 	private async selectSession(
@@ -3973,9 +4332,11 @@ export class TelegramTransportAdapter
 		this.rememberSession(session);
 		const selectionSaved = await this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
+		await this.sendDirect(
+			chatId,
+			`Selected ${sessionLabel(session)}. Ordinary messages now target this session.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
-		if (!selectionSaved)
-			await this.sendDirect(chatId, SELECTION_NOT_SAVED_WARNING.trim());
 	}
 
 	private async renderSessions(
@@ -4354,11 +4715,12 @@ export class TelegramTransportAdapter
 			return this.renderModels(chatId, sender, messageId);
 		}
 		const change = result.value as HarnessModelChangeResult;
-		if (change.effortConfirmed === false)
-			await this.sendDirect(
-				chatId,
-				`Модель выбрана, но усилие не подтверждено. Проверьте /status перед повтором.`,
-			);
+		await this.sendDirect(
+			chatId,
+			change.effortConfirmed === false
+				? "Модель выбрана, но усилие не подтверждено. Проверьте /status перед повтором."
+				: `Модель ${model.provider}/${model.id} выбрана.`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
@@ -4493,6 +4855,7 @@ export class TelegramTransportAdapter
 			effort,
 		});
 		if (!result.ok) await this.sendDirect(chatId, result.error.message);
+		else await this.sendDirect(chatId, `Усилие установлено: ${effort}.`);
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
@@ -4503,6 +4866,10 @@ export class TelegramTransportAdapter
 	): string {
 		const token = this.makeIntentToken();
 		this.selectIntents.set(token, { chatId, sender, sessionId });
+		while (this.selectIntents.size > 128)
+			this.selectIntents.delete(
+				this.selectIntents.keys().next().value as string,
+			);
 		return token;
 	}
 
@@ -4799,6 +5166,10 @@ export class TelegramTransportAdapter
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
+		await this.sendDirect(
+			chatId,
+			`Имя сессии ${this.sessionFooter(sessionId)} очищено.`,
+		);
 		await this.renderSessionDetails(chatId, sender, sessionId, messageId);
 	}
 
@@ -5042,11 +5413,23 @@ export class TelegramTransportAdapter
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.add(event.sessionId);
 				this.startTyping(event.sessionId);
-				this.turnBuffers.set(event.sessionId, {
+				const turn: TurnBuffer = {
 					chunks: [],
+					recipients: new Set(),
+					pendingInputs: new Set(),
 					characters: 0,
+					settled: false,
+					interrupted: false,
 					overflow: false,
-				});
+				};
+				this.turnBuffers.set(event.sessionId, turn);
+				for (const record of this.inputAttributions.values())
+					if (
+						record.sessionId === event.sessionId &&
+						record.waitingForRun &&
+						!record.terminal
+					)
+						this.associateInputWithTurn(record, turn);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
 					activity.status = "Pi выполняет ход сессии";
 					activity.thinking = false;
@@ -5060,6 +5443,8 @@ export class TelegramTransportAdapter
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
+				const turn = this.turnBuffers.get(event.sessionId);
+				if (turn) this.settleInputAttributions(turn);
 				this.flushTurn(event.sessionId);
 				this.reconcileOverflowAtRunSettlement(event.sessionId);
 				this.scheduleLiveActivityFinish(event.sessionId, true);
@@ -5105,6 +5490,7 @@ export class TelegramTransportAdapter
 		}
 		if (event.kind === "input" && event.inputEvent) {
 			const { inputId, state, detail } = event.inputEvent;
+			this.trackInputEvent(event.sessionId, inputId, state);
 			const canceledByUser =
 				state === "failed" && detail?.toLowerCase() === "input canceled";
 			const inputPresentation = canceledByUser
@@ -5206,10 +5592,179 @@ export class TelegramTransportAdapter
 		}
 	}
 
+	private getInputAttribution(
+		sessionId: SessionId,
+		inputId: InputId,
+	): InputAttribution | undefined {
+		const existing = this.inputAttributions.get(inputId);
+		if (existing)
+			return existing.sessionId === sessionId ? existing : undefined;
+		if (this.inputAttributions.size >= MAX_INPUT_ATTRIBUTIONS) {
+			const expired = [...this.inputAttributions].find(
+				([, record]) => record.terminal,
+			);
+			if (expired) this.inputAttributions.delete(expired[0]);
+		}
+		if (this.inputAttributions.size >= MAX_INPUT_ATTRIBUTIONS) return undefined;
+		const record: InputAttribution = {
+			inputId,
+			sessionId,
+			state: "pending",
+			terminal: false,
+			pendingSeen: false,
+			steered: false,
+			waitingForRun: false,
+		};
+		this.inputAttributions.set(inputId, record);
+		return record;
+	}
+
+	private associateInputWithTurn(
+		record: InputAttribution,
+		turn: TurnBuffer,
+	): void {
+		record.turn = turn;
+		record.waitingForRun = false;
+		turn.pendingInputs.add(record.inputId);
+		if (record.state === "uncertain" && record.chatId !== undefined)
+			if (turn.recipients.size < 128) turn.recipients.add(record.chatId);
+	}
+
+	private associateInputWithObservedRun(record: InputAttribution): void {
+		if (record.turn || record.terminal) return;
+		const turn = this.turnBuffers.get(record.sessionId);
+		if (turn && this.runningSessions.has(record.sessionId) && !turn.settled)
+			this.associateInputWithTurn(record, turn);
+		else record.waitingForRun = true;
+	}
+
+	private recordInputOutcome(
+		sessionId: SessionId,
+		inputId: InputId,
+		chatId: number,
+		state: "accepted" | "uncertain" | "failed",
+	): void {
+		const record = this.getInputAttribution(sessionId, inputId);
+		if (!record || record.terminal) return;
+		record.chatId = chatId;
+		record.state = state;
+		if (state === "failed") {
+			this.finishInputAttribution(record, false);
+			return;
+		}
+		if (state === "accepted" && !record.turn)
+			this.associateInputWithObservedRun(record);
+		if (
+			record.turn &&
+			state === "uncertain" &&
+			record.turn.recipients.size < 128
+		)
+			record.turn.recipients.add(chatId);
+		if (record.turn?.settled && state === "uncertain")
+			this.finishInputAttribution(record, true);
+	}
+
+	private trackInputEvent(
+		sessionId: SessionId,
+		inputId: InputId,
+		state: InputDeliveryState,
+	): void {
+		const record = this.getInputAttribution(sessionId, inputId);
+		if (!record || record.terminal) return;
+		if (state === "pending") {
+			if (!record.pendingSeen)
+				record.steered =
+					this.runningSessions.has(sessionId) ||
+					[...this.inputAttributions.values()].some(
+						(other) =>
+							other !== record &&
+							other.sessionId === sessionId &&
+							!other.terminal,
+					);
+			record.pendingSeen = true;
+			const flight = this.inFlightSubmissions.get(sessionId);
+			if (flight) record.chatId ??= flight.chatId;
+			if (!record.turn) this.associateInputWithObservedRun(record);
+			return;
+		}
+		const previousState = record.state;
+		record.state = state;
+		if (state === "accepted" && !record.turn)
+			this.associateInputWithObservedRun(record);
+		if (state === "uncertain" && record.turn && record.chatId !== undefined)
+			if (record.turn.recipients.size < 128)
+				record.turn.recipients.add(record.chatId);
+		if (state === "uncertain") {
+			if (record.turn?.settled) this.finishInputAttribution(record, true);
+			return;
+		}
+		if (state === "completed" || state === "failed") {
+			const handledWithoutRunOutput =
+				state === "completed" &&
+				previousState === "accepted" &&
+				record.steered &&
+				record.turn !== undefined &&
+				!record.turn.settled;
+			this.finishInputAttribution(
+				record,
+				state === "completed" && !handledWithoutRunOutput,
+			);
+		}
+	}
+
+	private finishInputAttribution(
+		record: InputAttribution,
+		includeRecipient: boolean,
+	): void {
+		if (record.terminal) return;
+		record.terminal = true;
+		record.waitingForRun = false;
+		const turn = record.turn;
+		if (!turn) return;
+		if (
+			includeRecipient &&
+			record.chatId !== undefined &&
+			turn.recipients.size < 128
+		)
+			turn.recipients.add(record.chatId);
+		turn.pendingInputs.delete(record.inputId);
+		if (turn.settled && turn.pendingInputs.size === 0)
+			this.flushTurn(record.sessionId, turn.interrupted, turn);
+	}
+
+	private settleInputAttributions(turn: TurnBuffer): void {
+		for (const record of this.inputAttributions.values()) {
+			if (record.turn !== turn || record.terminal) continue;
+			if (
+				record.state === "pending" &&
+				record.pendingSeen &&
+				record.steered &&
+				!this.cancelingInputs.has(record.inputId)
+			) {
+				turn.pendingInputs.delete(record.inputId);
+				record.turn = undefined;
+				record.waitingForRun = true;
+				continue;
+			}
+			if (record.state === "uncertain")
+				this.finishInputAttribution(record, true);
+			else if (!record.pendingSeen && record.state === "accepted")
+				this.finishInputAttribution(record, true);
+		}
+	}
+
 	private appendTurnOutput(sessionId: SessionId, text: string): void {
 		let buffer = this.turnBuffers.get(sessionId);
 		if (!buffer) {
-			buffer = { chunks: [], characters: 0, overflow: false };
+			buffer = {
+				chunks: [],
+				recipients: new Set(),
+				pendingInputs: new Set(),
+				characters: 0,
+				settled: false,
+				interrupted: false,
+				overflow: false,
+			};
 			this.turnBuffers.set(sessionId, buffer);
 		}
 		const remaining = MAX_QUEUED_CHARACTERS - buffer.characters;
@@ -5229,21 +5784,53 @@ export class TelegramTransportAdapter
 		}
 	}
 
-	private flushTurn(sessionId: SessionId, interrupted = false): void {
-		const buffer = this.turnBuffers.get(sessionId);
-		this.turnBuffers.delete(sessionId);
-		if (!buffer || (buffer.characters === 0 && !buffer.overflow)) return;
+	private flushTurn(
+		sessionId: SessionId,
+		interrupted = false,
+		target?: TurnBuffer,
+	): void {
+		const buffer = target ?? this.turnBuffers.get(sessionId);
+		if (!buffer) return;
+		buffer.settled = true;
+		buffer.interrupted ||= interrupted;
+		if (buffer.pendingInputs.size > 0) return;
+		if (this.turnBuffers.get(sessionId) === buffer)
+			this.turnBuffers.delete(sessionId);
+		if (buffer.characters === 0 && !buffer.overflow) return;
 		let text = buffer.chunks.join("");
 		text = text
 			.split(/\r?\n/)
 			.filter((line) => !line.trimStart().startsWith(INTERNAL_WIDGET_PREFIX))
 			.join("\n");
 		if (!text.trim()) return;
-		if (interrupted) text += "\n\n[Response interrupted before completion.]";
+		if (buffer.interrupted)
+			text += "\n\n[Response interrupted before completion.]";
 		if (buffer.overflow)
 			text +=
 				"\n\n[Additional output omitted because the response reached the queue limit.]";
-		this.enqueueForSelected(sessionId, text, undefined, true);
+		const selectedChats = new Set<number>();
+		for (const [chatId, selectedId] of this.selected)
+			if (selectedId === sessionId) selectedChats.add(chatId);
+		const recipients = buffer.recipients.size
+			? buffer.recipients
+			: selectedChats;
+		for (const chatId of recipients) {
+			const attributed = buffer.recipients.has(chatId);
+			this.enqueue(
+				chatId,
+				sessionId,
+				attributed
+					? `Фоновая сессия · ${this.eventFooter(sessionId)}\n\n${text}`
+					: text,
+				undefined,
+				true,
+				attributed,
+			);
+		}
+	}
+
+	private eventChannelDisabled(chatId: number): boolean {
+		return this.queues.get(chatId)?.failed ?? false;
 	}
 
 	private enqueueForSelected(
@@ -5269,6 +5856,10 @@ export class TelegramTransportAdapter
 	}
 
 	private invalidateSession(sessionId: SessionId): void {
+		this.turnBuffers.delete(sessionId);
+		for (const [inputId, record] of this.inputAttributions)
+			if (record.sessionId === sessionId)
+				this.inputAttributions.delete(inputId);
 		this.knownSessions.delete(sessionId);
 		this.sessionNames.delete(sessionId);
 		this.sessionCwds.delete(sessionId);
@@ -5305,6 +5896,7 @@ export class TelegramTransportAdapter
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
 		output = false,
+		background = false,
 	): void {
 		let queue = this.queues.get(chatId);
 		if (!queue) {
@@ -5312,7 +5904,7 @@ export class TelegramTransportAdapter
 				messages: [],
 				pendingCharacters: 0,
 				failed: false,
-				overflowQueued: false,
+				overflowNotices: new Set(),
 				idleWaiters: [],
 			};
 			this.queues.set(chatId, queue);
@@ -5336,13 +5928,14 @@ export class TelegramTransportAdapter
 				queue.pendingCharacters + part.length >
 					MAX_QUEUED_CHARACTERS - INPUT_CHARACTER_RESERVE
 			) {
-				this.queueOverflow(queue, sessionId);
+				this.queueOverflow(queue, sessionId, background);
 				break;
 			}
 			queue.messages.push({
 				sessionId,
 				text: part,
 				...(output ? { output: true as const } : {}),
+				...(background ? { background: true as const } : {}),
 			});
 			queue.pendingCharacters += part.length;
 		}
@@ -5376,8 +5969,14 @@ export class TelegramTransportAdapter
 			);
 			if (outputIndex >= 0) {
 				const [removed] = queue.messages.splice(outputIndex, 1);
-				if (removed) queue.pendingCharacters -= removed.text.length;
-				this.queueOverflow(queue, sessionId);
+				if (removed) {
+					queue.pendingCharacters -= removed.text.length;
+					this.queueOverflow(
+						queue,
+						removed.sessionId,
+						removed.background === true,
+					);
+				}
 				continue;
 			}
 			const replaceableInputIndex = queue.messages.findIndex(
@@ -5399,9 +5998,17 @@ export class TelegramTransportAdapter
 		queue.pendingCharacters += messageCharacters;
 	}
 
-	private queueOverflow(queue: ChatQueue, sessionId: SessionId): void {
-		if (queue.overflowQueued) return;
-		queue.overflowQueued = true;
+	private queueOverflow(
+		queue: ChatQueue,
+		sessionId: SessionId,
+		background = false,
+	): void {
+		const overflowKey = JSON.stringify([sessionId, background]);
+		if (
+			queue.overflowNotices.has(overflowKey) ||
+			queue.overflowNotices.size >= MAX_OVERFLOW_NOTICES
+		)
+			return;
 		const notice = {
 			sessionId,
 			text:
@@ -5409,8 +6016,11 @@ export class TelegramTransportAdapter
 					OVERFLOW_NOTICE,
 					this.eventFooter(sessionId),
 				)[0] ?? OVERFLOW_NOTICE,
+			...(background ? { background: true as const } : {}),
 			overflow: true as const,
+			overflowKey,
 		};
+		queue.overflowNotices.add(overflowKey);
 		queue.messages.push(notice);
 		queue.pendingCharacters += notice.text.length;
 	}
@@ -5434,6 +6044,7 @@ export class TelegramTransportAdapter
 				queue.failed = true;
 				queue.messages.length = 0;
 				queue.pendingCharacters = 0;
+				queue.overflowNotices.clear();
 				finish();
 			});
 		}, OUTPUT_COALESCE_MS);
@@ -5444,20 +6055,54 @@ export class TelegramTransportAdapter
 			const message = queue.messages.shift();
 			if (!message) break;
 			queue.pendingCharacters -= message.text.length;
-			if (message.overflow) queue.overflowQueued = false;
-			if (this.selected.get(chatId) !== message.sessionId) continue;
+			if (message.overflowKey)
+				queue.overflowNotices.delete(message.overflowKey);
+			const backgroundDelivery =
+				message.background && this.selected.get(chatId) !== message.sessionId;
+			if (
+				!message.background &&
+				this.selected.get(chatId) !== message.sessionId
+			)
+				continue;
+			const sender = this.authorizedChatPrincipals.get(chatId);
+			const token =
+				backgroundDelivery && sender !== undefined
+					? this.createSelectIntent(chatId, sender, message.sessionId)
+					: undefined;
+			const text =
+				message.background && !backgroundDelivery
+					? message.text.replace(/^Фоновая сессия · [^\n]+\n\n/, "")
+					: message.text;
 			const delivered = await this.sendWithDeadline(
 				chatId,
-				message.text,
-				message.output
-					? { parse_mode: "HTML" }
-					: sessionIdEntity(message.text, message.sessionId),
+				text,
+				{
+					...(message.output ? { parse_mode: "HTML" } : {}),
+					...(backgroundDelivery && token
+						? {
+								reply_markup: keyboard([
+									[
+										inlineButton(
+											"Переключиться на эту сессию",
+											`action:select:${token}`,
+										),
+									],
+								]),
+							}
+						: !message.output
+							? sessionIdEntity(text, message.sessionId)
+							: {}),
+				},
 				message.output ? message.sessionId : undefined,
+				(messageId) => {
+					if (token) this.bindSelectMessage(token, messageId);
+				},
 			);
 			if (!delivered) {
 				queue.failed = true;
 				queue.messages.length = 0;
 				queue.pendingCharacters = 0;
+				queue.overflowNotices.clear();
 			}
 		}
 	}
