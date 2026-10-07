@@ -161,6 +161,35 @@ describe("parseSubagentWidgetLine", () => {
 		const singleChunk = new SubagentTextStream().consume(raw);
 		expect(singleChunk.visibleText).toBe("");
 		expect(singleChunk.statuses).toEqual([]);
+
+		const padded = new SubagentTextStream();
+		padded.consume(" ".repeat(33_000));
+		for (const char of "Pi: PI_SUBAGENT_ASYNC_JSON:") padded.consume(char);
+		const suffix = padded.consume(`${body}\nVisible\n`, true);
+		expect(suffix.visibleText).toBe("Visible\n");
+		expect(suffix.visibleText).not.toContain("WHITESPACE_SENTINEL");
+	});
+
+	it("resolves partitioned marker lookalikes as prose without swallowing later lines", () => {
+		const spaces = " ".repeat(33_000);
+		const split = new SubagentTextStream();
+		const whitespace = split.consume(spaces);
+		const candidate = split.consume("P");
+		const prose = split.consume("rose\nVisible\n");
+		expect(whitespace.visibleText + candidate.visibleText).toBe("");
+		expect(whitespace.overflow || candidate.overflow).toBe(false);
+		expect(prose.overflow).toBe(true);
+		expect(prose.visibleText).toContain("Prose\n");
+		expect(prose.visibleText).toContain("Visible\n");
+
+		for (const prefix of ["P", "Pi", "Pi: ", "Pi: PI_SUBAGENT_"]) {
+			const stream = new SubagentTextStream();
+			const pending = stream.consume(`${spaces}${prefix}`);
+			const divergent = stream.consume("rose\nVisible\n", true);
+			expect(pending.visibleText).toBe("");
+			expect(divergent.overflow).toBe(true);
+			expect(divergent.visibleText).toContain("Visible\n");
+		}
 	});
 
 	it("keeps oversized whitespace-only and whitespace-prefixed prose on ordinary overflow", () => {

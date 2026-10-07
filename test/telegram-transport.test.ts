@@ -5257,6 +5257,7 @@ describe("Telegram transport", () => {
 				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot"}',
 			),
 		);
+		emit(harnessEvent("sid", "output", "   \n"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(bot.sent).toHaveLength(messagesBeforeTurn);
@@ -5275,6 +5276,27 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(bot.sent).toHaveLength(messagesBeforeTurn);
+		await adapter.stop();
+	});
+
+	it("reports overflow when padded prose diverges from a streamed widget prefix", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", " ".repeat(33_000)));
+		emit(harnessEvent("sid", "output", "P"));
+		emit(harnessEvent("sid", "output", "rose\nVisible\n"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes(
+						"Additional output omitted because the response reached the queue limit",
+					),
+				),
+			).toHaveLength(1),
+		);
 		await adapter.stop();
 	});
 

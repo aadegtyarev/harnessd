@@ -1,9 +1,9 @@
 import {
 	finishPhysicalLine,
-	isPotentialParts,
-	isWhitespaceParts,
 	type PhysicalLineState,
 } from "./telegram-subagent-framing.js";
+import { OversizedLineClassifier } from "./telegram-subagent-overflow.js";
+import { isPotentialParts } from "./telegram-subagent-prefix.js";
 import {
 	MAX_SUBAGENT_ENVELOPE_CHARS,
 	parseSubagentWidgetLine,
@@ -25,7 +25,7 @@ export class SubagentTextStream {
 	};
 	private discarding = false;
 	private continuation = false;
-	private leadingWhitespaceOverflow = false;
+	private readonly oversized = new OversizedLineClassifier();
 
 	consume(chunk: string, final = false): SubagentTextResult {
 		let visibleText = "";
@@ -49,43 +49,36 @@ export class SubagentTextStream {
 				cursor = newline + 1;
 				continue;
 			}
-			const tooLong =
-				this.line.length + segment.length > MAX_SUBAGENT_ENVELOPE_CHARS;
-			if (
-				tooLong &&
-				!this.framing.fenced &&
-				isPotentialParts(this.line, segment)
-			) {
+			const classified = this.oversized.classify(
+				this.line,
+				segment,
+				newline >= 0,
+				this.framing.fenced,
+			);
+			if (classified) {
+				if (classified.kind === "pending") {
+					this.line = classified.line ?? "";
+					break;
+				}
 				this.line = "";
-				this.framing.statusReported = false;
-				this.leadingWhitespaceOverflow = false;
-				if (newline < 0) this.discarding = true;
-				else cursor = newline + 1;
-				continue;
-			}
-			if (
-				tooLong &&
-				!this.framing.fenced &&
-				isWhitespaceParts(this.line, segment)
-			) {
-				this.line += segment.slice(
-					0,
-					MAX_SUBAGENT_ENVELOPE_CHARS - this.line.length,
-				);
-				this.leadingWhitespaceOverflow = true;
-				if (newline >= 0) {
-					overflow = true;
-					visibleText += finishPhysicalLine(this.line, this.framing, statuses);
-					this.line = "";
+				if (classified.kind === "discard") {
 					this.framing.statusReported = false;
-					cursor = newline + 1;
+					if (newline < 0) this.discarding = true;
+					else cursor = newline + 1;
 					continue;
 				}
-				break;
+				visibleText += classified.text ?? "";
+				overflow ||= classified.overflow ?? false;
+				if (classified.continuation) {
+					this.continuation = true;
+					break;
+				}
+				cursor = newline + 1;
+				continue;
 			}
+			const tooLong =
+				this.line.length + segment.length > MAX_SUBAGENT_ENVELOPE_CHARS;
 			if (tooLong) {
-				overflow ||= this.leadingWhitespaceOverflow;
-				this.leadingWhitespaceOverflow = false;
 				visibleText += this.line + segment + (newline < 0 ? "" : "\n");
 				this.line = "";
 				if (newline < 0) this.continuation = true;
@@ -94,8 +87,6 @@ export class SubagentTextStream {
 			}
 			this.line += segment;
 			if (newline >= 0) {
-				overflow ||= this.leadingWhitespaceOverflow;
-				this.leadingWhitespaceOverflow = false;
 				visibleText += finishPhysicalLine(this.line, this.framing, statuses);
 				this.line = "";
 				this.framing.statusReported = false;
@@ -112,9 +103,13 @@ export class SubagentTextStream {
 			break;
 		}
 		if (final) {
+			const resolved = this.oversized.finish(this.line);
+			if (resolved) {
+				visibleText += resolved.text ?? "";
+				overflow ||= resolved.overflow ?? false;
+				this.line = "";
+			}
 			if (this.line) {
-				overflow ||= this.leadingWhitespaceOverflow;
-				this.leadingWhitespaceOverflow = false;
 				visibleText += this.framing.fenced
 					? this.line
 					: finishPhysicalLine(this.line, this.framing, statuses, false);
@@ -123,7 +118,6 @@ export class SubagentTextStream {
 			this.discarding = false;
 			this.framing.statusReported = false;
 			this.continuation = false;
-			this.leadingWhitespaceOverflow = false;
 		}
 		return { visibleText, statuses, overflow };
 	}

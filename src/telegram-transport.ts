@@ -5881,12 +5881,16 @@ export class TelegramTransportAdapter
 			this.turnBuffers.delete(sessionId);
 		if (buffer.characters === 0 && !buffer.overflow) return;
 		let text = buffer.chunks.join("");
-		if (!text.trim()) return;
-		if (buffer.interrupted)
-			text += "\n\n[Response interrupted before completion.]";
-		if (buffer.overflow)
-			text +=
-				"\n\n[Additional output omitted because the response reached the queue limit.]";
+		const overflowNotice =
+			"[Additional output omitted because the response reached the queue limit.]";
+		if (!text.trim()) {
+			if (!buffer.overflow) return;
+			text = overflowNotice;
+		} else {
+			if (buffer.interrupted)
+				text += "\n\n[Response interrupted before completion.]";
+			if (buffer.overflow) text += `\n\n${overflowNotice}`;
+		}
 		const selectedChats = new Set<number>();
 		for (const [chatId, selectedId] of this.selected)
 			if (selectedId === sessionId) selectedChats.add(chatId);
