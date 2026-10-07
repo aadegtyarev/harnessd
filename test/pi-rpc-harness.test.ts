@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ReloadError } from "../src/core/errors.js";
 import type {
 	ManagedProcess,
 	ProcessLaunchRequest,
@@ -875,6 +876,64 @@ describe("PiRpcHarnessAdapter", () => {
 			await instance.shutdown();
 		},
 	);
+
+	it("rechecks adapter busy state at the held write boundary", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const adapter = new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		});
+		const instance = await adapter.launch(request);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		(instance as unknown as { writeChain: Promise<void> }).writeChain = held;
+		const events = instance.events[Symbol.asyncIterator]();
+		const reload = instance.control?.reload?.(() => true);
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await events.next();
+		release();
+		await expect(reload).rejects.toMatchObject({ code: "RELOAD_BUSY" });
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(0);
+		fake.stdout.write('{"type":"agent_settled"}\n');
+		await events.next();
+		await instance.control?.reload?.(() => true);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it("releases timed-out reload ownership after a definite held-write rejection", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const adapter = new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 15,
+		});
+		const instance = await adapter.launch(request);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		(instance as unknown as { writeChain: Promise<void> }).writeChain = held;
+		let first = true;
+		const reload = instance.control?.reload?.(() => {
+			if (first) {
+				first = false;
+				throw new ReloadError("RELOAD_SELECTION_CHANGED");
+			}
+		});
+		const timedOut = reload?.catch((error: unknown) => error);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(await timedOut).toBeInstanceOf(PiControlError);
+		release();
+		await new Promise((resolve) => setImmediate(resolve));
+		await instance.control?.reload?.(() => true);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
 
 	it.each([
 		["missing command", () => []],

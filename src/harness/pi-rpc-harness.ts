@@ -719,6 +719,15 @@ class PiRpcInstance implements HarnessInstance {
 				true,
 				true,
 				() => {
+					if (this.eventsClosed || this.childExited || this.stdoutEnded)
+						throw new PiControlError("PI_CONTROL_FAILED");
+					if (
+						this.agentRunning ||
+						this.compacting ||
+						this.activeInputs.size > 0 ||
+						this.abortInFlight
+					)
+						throw new PiControlError("RELOAD_BUSY");
 					validateDispatch();
 					this.reloadDispatched = true;
 				},
@@ -1151,8 +1160,19 @@ class PiRpcInstance implements HarnessInstance {
 		this.pending.set(id, pending);
 		void response.catch(() => {});
 		try {
+			const write = this.write({ id, type: command, ...extra }, beforeWrite);
+			if (pending.isReload) {
+				void write.catch(() => {
+					if (this.reloadDispatched) return;
+					this.pending.delete(id);
+					if (pending.timer) clearTimeout(pending.timer);
+					this.reloadPending = false;
+					this.reloadDispatched = false;
+					this.reloadTimedOut = false;
+				});
+			}
 			await within(
-				this.write({ id, type: command, ...extra }, beforeWrite),
+				write,
 				this.options.commandTimeoutMs ?? 30_000,
 				`Pi RPC ${command} write timed out`,
 			);
