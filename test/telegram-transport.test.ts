@@ -5078,6 +5078,13 @@ describe("Telegram transport", () => {
 			],
 			generatedAt: "SENTINEL_TIMESTAMP",
 		})}`;
+		const fencedWidget =
+			'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[],"id":"fenced-example"}';
+		emit(harnessEvent("sid", "output", "```json"));
+		emit(harnessEvent("sid", "output", "\n"));
+		emit(harnessEvent("sid", "output", fencedWidget));
+		emit(harnessEvent("sid", "output", "\n```"));
+		emit(harnessEvent("sid", "output", "\n"));
 		emit(harnessEvent("sid", "output", widget.slice(0, 24)));
 		emit(harnessEvent("sid", "output", widget.slice(24)));
 		await vi.waitFor(() =>
@@ -5110,6 +5117,9 @@ describe("Telegram transport", () => {
 		expect(payloads.join("\n")).not.toContain("SENTINEL_PAYLOAD_ID");
 		expect(payloads.join("\n")).not.toContain("SENTINEL_TIMESTAMP");
 		expect(payloads.join("\n")).not.toContain("Additional output omitted");
+		expect(bot.sent.some(({ text }) => text.includes("fenced-example"))).toBe(
+			true,
+		);
 		expect(
 			bot.api.editMessageText.mock.calls.filter(
 				([, messageId]) => messageId === bubbleId,

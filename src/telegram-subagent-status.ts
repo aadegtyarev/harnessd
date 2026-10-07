@@ -6,23 +6,23 @@ export type SubagentLineResult = {
 };
 
 const MARKER = "PI_SUBAGENT_ASYNC_JSON:";
-const ROLES: Readonly<Record<string, string>> = {
-	scout: "Scout",
-	worker: "Worker",
-	reviewer: "Reviewer",
-	researcher: "Researcher",
-};
-const STATES: Readonly<Record<string, string>> = {
-	pending: "ожидает",
-	queued: "ожидает",
-	running: "выполняется",
-	active: "выполняется",
-	completed: "завершён",
-	succeeded: "завершён",
-	failed: "ошибка",
-	error: "ошибка",
-	stopped: "ошибка",
-};
+const ROLES = new Map([
+	["scout", "Scout"],
+	["worker", "Worker"],
+	["reviewer", "Reviewer"],
+	["researcher", "Researcher"],
+]);
+const STATES = new Map([
+	["pending", "ожидает"],
+	["queued", "ожидает"],
+	["running", "выполняется"],
+	["active", "выполняется"],
+	["completed", "завершён"],
+	["succeeded", "завершён"],
+	["failed", "ошибка"],
+	["error", "ошибка"],
+	["stopped", "ошибка"],
+]);
 
 export function parseSubagentWidgetLine(line: string): SubagentLineResult {
 	const candidate = line.trim().replace(/^Pi:\s*/, "");
@@ -42,12 +42,12 @@ export function parseSubagentWidgetLine(line: string): SubagentLineResult {
 		const label = typeof run.label === "string" ? run.label.toLowerCase() : "";
 		const state =
 			typeof run.state === "string"
-				? STATES[run.state.toLowerCase()]
+				? STATES.get(run.state.toLowerCase())
 				: undefined;
 		return {
 			matched: true,
 			status: state
-				? `Задача ${ROLES[label] ?? "Помощник"}: ${state}`
+				? `Задача ${ROLES.get(label) ?? "Помощник"}: ${state}`
 				: "Задача помощника: обновляется",
 		};
 	} catch {

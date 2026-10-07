@@ -46,10 +46,7 @@ import {
 } from "./telegram-filesystem.js";
 import { TelegramInbox, TelegramInboxQuotaError } from "./telegram-inbox.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
-import {
-	parseNotificationText,
-	SubagentTextStream,
-} from "./telegram-subagent-stream.js";
+import { SubagentTextStream } from "./telegram-subagent-stream.js";
 
 const TELEGRAM_LIMIT = 4096;
 const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
@@ -5545,7 +5542,7 @@ export class TelegramTransportAdapter
 		const activities = this.activitiesForSession(sessionId);
 		const notification =
 			event.type === "notification"
-				? parseNotificationText(event.text)
+				? new SubagentTextStream().consume(event.text, true)
 				: undefined;
 		if (notification) {
 			const turn = this.turnBuffers.get(sessionId);
