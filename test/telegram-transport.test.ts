@@ -2153,6 +2153,50 @@ describe("Telegram transport", () => {
 		if (previousSession) sessions.set("sid", previousSession);
 	});
 
+	it.each(["\u2028", "\u2029"])(
+		"rejects restarted replies to a generated unnamed rename prompt with separator cwd %s",
+		async (separator) => {
+			const fetchFile = stubFileDownload();
+			const stateDirectory = await temp();
+			const cwd = `/workspace${separator}subdir`;
+			const previousSession = sessions.get("sid");
+			sessions.set("sid", sessionWith("sid", { cwd, name: undefined }));
+			const firstBot = new MockBot();
+			const first = await startAdapter(firstBot, stateDirectory);
+			await firstBot.update(42, "/use sid");
+			await firstBot.update(42, "/menu");
+			await firstBot.callback(42, "session:rename:sid", firstBot.lastMessageId);
+			const promptId = firstBot.lastForceReplyMessageId;
+			const prompt = firstBot.sent.find(
+				({ message_id }) => message_id === promptId,
+			);
+			expect(prompt?.text).toContain(
+				`Rename #sid (#sid) in /workspace${separator}subdir.`,
+			);
+			await first.adapter.stop();
+
+			const restartedBot = new MockBot();
+			const restarted = await startAdapter(restartedBot, stateDirectory);
+			await restartedBot.update(42, "stale text", {
+				replyToMessageId: promptId,
+				replyToMessageText: prompt?.text,
+			});
+			await restartedBot.updateDocument(42, {
+				replyToMessageId: promptId,
+				replyToMessageText: prompt?.text,
+			});
+			expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+				false,
+			);
+			expect(fetchFile).not.toHaveBeenCalled();
+			expect(restartedBot.sent.at(-1)?.text).toContain(
+				"name prompt has expired",
+			);
+			await restarted.adapter.stop();
+			if (previousSession) sessions.set("sid", previousSession);
+		},
+	);
+
 	it("supersedes one name prompt per chat, expires stale media, and restores no prompt after restart", async () => {
 		stubFileDownload();
 		const bot = new MockBot();

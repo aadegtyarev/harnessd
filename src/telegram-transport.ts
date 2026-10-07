@@ -696,6 +696,44 @@ function safePathPresentation(value: string): string {
 		})
 		.join("");
 }
+function hasGeneratedNamePromptBody(body: string): boolean {
+	const createSuffix =
+		". Reply with a name. Create unnamed and Cancel buttons are below.";
+	const createPrefix = "New session will be created in ";
+	if (
+		body.startsWith(createPrefix) &&
+		body.endsWith(createSuffix) &&
+		body.length > createPrefix.length + createSuffix.length
+	)
+		return true;
+	if (
+		body.startsWith("The exact folder is shown in the preceding messages. ") &&
+		body.endsWith(createSuffix)
+	)
+		return true;
+
+	const renameSuffix = ". Reply with a name; use Cancel below.";
+	if (!body.startsWith("Rename ") || !body.endsWith(renameSuffix)) return false;
+	const renameBody = body.slice("Rename ".length, -renameSuffix.length);
+	let boundary = renameBody.indexOf(") in ");
+	while (boundary !== -1) {
+		const target = renameBody.slice(0, boundary + 1);
+		const path = renameBody.slice(boundary + ") in ".length);
+		if (
+			path.length > 0 &&
+			/^(?:[^\n]* )?\(#(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})\)$/.test(target)
+		)
+			return true;
+		boundary = renameBody.indexOf(") in ", boundary + 1);
+	}
+	const fallback = " in the exact folder shown in the preceding messages";
+	const identity = renameBody.endsWith(fallback)
+		? renameBody.slice(0, -fallback.length)
+		: "";
+	return /^(?:[^\n]* )?\(#(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})\)$/.test(
+		identity,
+	);
+}
 function boundedPathPresentation(value: string, limit = 500): string {
 	const path = [...safePathPresentation(value)];
 	return path.length > limit
@@ -1630,9 +1668,9 @@ export class TelegramTransportAdapter
 	}
 
 	private isNamePromptEnvelope(text?: string): boolean {
-		return /^Name this session \(harnessd name prompt\):\n(?:New session will be created in .+\. Reply with a name\. Create unnamed and Cancel buttons are below\.|Rename .+ \(.+#\S+\) in (?:.+|the exact folder shown in the preceding messages)\. Reply with a name; use Cancel below\.|The exact folder is shown in the preceding messages\. Reply with a name\. Create unnamed and Cancel buttons are below\.)$/.test(
-			text ?? "",
-		);
+		const prefix = `${NAME_PROMPT_MARKER}\n`;
+		if (!text?.startsWith(prefix)) return false;
+		return hasGeneratedNamePromptBody(text.slice(prefix.length));
 	}
 
 	private rememberReplyRoute(
