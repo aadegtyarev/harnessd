@@ -136,6 +136,7 @@ class MockBot {
 				_other?: unknown,
 				_signal?: AbortSignal,
 			): Promise<unknown> => {
+				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
 				await this.sendMessageBehavior();
 				this.sent.push({ chatId, text });
 				this.sendOptions.push(_other);
@@ -151,6 +152,7 @@ class MockBot {
 				text: string,
 				options?: unknown,
 			) => {
+				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
 				await this.editMessageBehavior();
 				this.edited.push({ chatId, messageId, text, options });
 				return { message_id: messageId };
@@ -357,6 +359,14 @@ const sessions = new Map<string, SessionSummary>([
 	],
 ]);
 const initialSessions = [...sessions];
+function sessionWith(
+	id: string,
+	updates: Partial<SessionSummary>,
+): SessionSummary {
+	const session = sessions.get(id);
+	if (!session) throw new Error(`Missing session fixture: ${id}`);
+	return { ...session, ...updates };
+}
 beforeEach(() => {
 	sessions.clear();
 	for (const [id, session] of initialSessions) sessions.set(id, session);
@@ -526,7 +536,8 @@ async function startAdapter(
 }
 
 describe("Telegram transport", () => {
-	it("shows Pi-reported context usage in session status without deriving it", async () => {
+	it("shows session name and full identity with Pi-reported context in status", async () => {
+		sessions.set("sid", sessionWith("sid", { name: "Focused task" }));
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -536,6 +547,7 @@ describe("Telegram transport", () => {
 				text.includes("Context: 53.3%/145k/272k (auto)"),
 			),
 		).toBe(true);
+		expect(bot.sent.at(-1)?.text).toContain("Session: Focused task · sid");
 		await adapter.stop();
 	});
 
@@ -699,13 +711,16 @@ describe("Telegram transport", () => {
 	});
 
 	it("edits one reply bubble with Pi tool activity, sends the final answer separately, then deletes the bubble", async () => {
+		sessions.set("sid", sessionWith("sid", { name: "Review task" }));
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		const sourceMessageId = bot.nextMessageId;
 		await bot.update(42, "Run the requested checks");
 		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+			expect(bot.sent.at(-1)?.text).toContain(
+				"Pi activity · Review task · sid",
+			),
 		);
 		const bubbleId = bot.lastMessageId;
 		emit(harnessEvent("sid", "status", "agent_start"));
@@ -1025,13 +1040,18 @@ describe("Telegram transport", () => {
 		const panelMessageId = bot.lastMessageId;
 		expect(panelMessageId).toBeDefined();
 		expect(bot.pinned).toEqual([{ chatId: 42, messageId: panelMessageId }]);
-		expect(bot.sent.at(-1)?.text).toContain("Выбрана: не выбрана");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Выбрана (обычные сообщения →): не выбрана",
+		);
 		await bot.update(42, "/menu");
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		expect(bot.api.pinChatMessage).toHaveBeenCalledOnce();
 
 		await bot.callback(42, "session:next", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Выбрана (обычные сообщения →): не выбрана",
+		);
 		await bot.callback(42, "session:choose", panelMessageId);
 		await bot.update(42, "/model");
 		expect(requests.at(-1)).toMatchObject({
@@ -1039,7 +1059,7 @@ describe("Telegram transport", () => {
 			sessionId: "other",
 		});
 		await bot.callback(42, "menu:models", panelMessageId);
-		expect(bot.edited.at(-1)?.text).toContain("Модель · #other");
+		expect(bot.edited.at(-1)?.text).toContain("Модель просмотра · other");
 		await bot.callback(42, "model:select:0", panelMessageId);
 		expect(
 			requests.some(
@@ -1060,6 +1080,260 @@ describe("Telegram transport", () => {
 		await bot.callback(42, "session:select:bad/id", panelMessageId);
 		await bot.callback(42, "session:select:sid", panelMessageId, 42, "group");
 		expect(requests).toHaveLength(callsBeforeUnauthorized);
+		await adapter.stop();
+	});
+
+	it("distinguishes similarly named sessions by short ID and marks selection", async () => {
+		sessions.set("sid", sessionWith("sid", { name: "Shared name" }));
+		sessions.set("other", sessionWith("other", { name: "Shared name" }));
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/sessions");
+		const text = bot.sent.at(-1)?.text ?? "";
+		expect(text).toContain("✓ Shared name · #sid · running · /work");
+		expect(text).toContain("Shared name · #other · running · /other");
+		await adapter.stop();
+	});
+
+	it("clears the selected label after a successful list omits the session", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		sessions.delete("sid");
+		await bot.update(42, "/menu");
+		const panelText = bot.edited.at(-1)?.text ?? bot.sent.at(-1)?.text ?? "";
+		expect(panelText).toContain("Выбрана (обычные сообщения →): не выбрана");
+		expect(panelText).not.toContain("Выбрана (обычные сообщения →): #sid");
+		await bot.update(42, "must not submit to the removed session");
+		expect(requests.at(-1)?.kind).not.toBe("submit");
+		await adapter.stop();
+	});
+
+	it("truncates compact cwd without splitting Unicode code points", async () => {
+		sessions.set(
+			"sid",
+			sessionWith("sid", { cwd: `${"a".repeat(3)}😀${"b".repeat(69)}` }),
+		);
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/sessions");
+		expect(bot.sent.at(-1)?.text).toContain("😀");
+		expect(
+			[...(bot.sent.at(-1)?.text ?? "")].some(
+				(character) =>
+					character.length === 1 &&
+					character.charCodeAt(0) >= 0xdc00 &&
+					character.charCodeAt(0) <= 0xdfff,
+			),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("preserves the selected session after a transient panel list failure", async () => {
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		let failList = false;
+		const { adapter, requests } = await startAdapter(bot, stateDirectory, {
+			dispatch: async (request) => {
+				if (failList && request.kind === "list") {
+					failList = false;
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: {
+							code: "INTERNAL_ERROR",
+							message: "Temporary list failure",
+						},
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		failList = true;
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Temporary list failure");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Выбрана (обычные сообщения →): #sid",
+		);
+		await bot.update(42, "still for selected");
+		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
+		await adapter.stop();
+		const restartedBot = new MockBot();
+		const restarted = await startAdapter(restartedBot, stateDirectory);
+		await restartedBot.update(42, "still selected after restart");
+		expect(restarted.requests.at(-1)).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await restarted.adapter.stop();
+	});
+
+	it("targets preview controls independently from the selected session", async () => {
+		sessions.set("other", sessionWith("other", { status: "stopped" }));
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "session:next", panelMessageId);
+		const panel = bot.edited.at(-1)?.text ?? "";
+		expect(panel).toContain("Выбрана (обычные сообщения →): #sid");
+		expect(panel).toContain("Просмотр: #other");
+		await bot.callback(42, "menu:models", panelMessageId);
+		expect(requests.at(-1)).toMatchObject({
+			kind: "model_list",
+			sessionId: "other",
+		});
+		await bot.callback(42, "model:select:0", panelMessageId);
+		expect(
+			requests.findLast((request) => request.kind === "model_set"),
+		).toMatchObject({ kind: "model_set", sessionId: "other" });
+		await bot.callback(42, "menu:efforts", panelMessageId);
+		expect(requests.at(-1)).toMatchObject({
+			kind: "effort_list",
+			sessionId: "other",
+		});
+		await bot.callback(42, "effort:select:0", panelMessageId);
+		expect(
+			requests.findLast((request) => request.kind === "effort_set"),
+		).toMatchObject({ kind: "effort_set", sessionId: "other" });
+		await bot.callback(42, "session:resume:other", panelMessageId);
+		expect(
+			requests.findLast((request) => request.kind === "resume"),
+		).toMatchObject({
+			kind: "resume",
+			sessionId: "other",
+		});
+		await bot.callback(42, "session:stop:other", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("Остановить #other?");
+		await bot.callback(42, "action:confirm-stop:other", panelMessageId);
+		expect(
+			requests.findLast((request) => request.kind === "stop"),
+		).toMatchObject({ kind: "stop", sessionId: "other" });
+		await bot.callback(42, "session:delete:other", panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("Удалить запись #other?");
+		await bot.callback(42, "action:confirm-delete:other", panelMessageId);
+		expect(
+			requests.findLast((request) => request.kind === "delete"),
+		).toMatchObject({
+			kind: "delete",
+			sessionId: "other",
+		});
+		await bot.update(42, "still selected sid");
+		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
+		await adapter.stop();
+	});
+
+	it("invalidates deleted previews and cached controls across chats", async () => {
+		sessions.set("other", sessionWith("other", { status: "stopped" }));
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(43, "/use sid");
+		await bot.update(43, "/menu");
+		const stalePanelId = bot.lastMessageId;
+		await bot.callback(43, "session:next", stalePanelId);
+		await bot.callback(43, "menu:models", stalePanelId);
+		await bot.callback(43, "menu:efforts", stalePanelId);
+		await bot.update(42, "/delete other");
+		const afterDeletion = requests.length;
+		for (const data of [
+			"model:select:0",
+			"effort:select:0",
+			"session:resume:other",
+			"session:stop:other",
+			"session:delete:other",
+			"action:confirm-delete:other",
+		]) {
+			await bot.callback(43, data, stalePanelId);
+		}
+		expect(requests.slice(afterDeletion)).toEqual([]);
+		expect(
+			requests.some(
+				(request) => request.kind === "delete" && request.sessionId === "other",
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("shows the exact new-session folder in the creation prompt", async () => {
+		const directory = await temp();
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		expect(bot.sent.at(-1)?.text).toContain(`папка создания: ${directory}`);
+		await bot.callback(42, "menu:new", panelMessageId);
+		expect(bot.sent.at(-1)?.text).toContain(`создана в папке ${directory}`);
+		await adapter.stop();
+	});
+
+	it("preserves repeated spaces and escapes controls in creation paths", async () => {
+		const cwd = "/work/repeated  spaces/line\nbreak\\t\tend";
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: cwd,
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		expect(bot.sent.at(-1)?.text).toContain("repeated  spaces");
+		await bot.callback(42, "menu:new", panelMessageId);
+		const prompt = bot.sent.at(-1)?.text ?? "";
+		expect(prompt).toContain("repeated  spaces");
+		expect(prompt).toContain("\\u{000A}");
+		expect(prompt).toContain("\\u{0009}");
+		expect(prompt).toContain("\\\\t");
+		await bot.update(42, "/skip", { replyToMessageId: bot.lastMessageId });
+		expect(requests.find((request) => request.kind === "create")).toMatchObject(
+			{
+				cwd,
+			},
+		);
+		await adapter.stop();
+	});
+
+	it("bounds panel and ForceReply text while presenting the full long creation path", async () => {
+		const cwd = `/work/${"segment  ".repeat(700)}`;
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			initialCwd: cwd,
+		});
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text.length).toBeLessThanOrEqual(4096);
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelMessageId);
+		const pathMessages = bot.sent.slice(1, -1).map((message) => message.text);
+		expect(pathMessages.join("")).toContain(cwd);
+		expect(bot.sent.every((message) => message.text.length <= 4096)).toBe(true);
+		expect(bot.sendOptions.at(-1)).toMatchObject({
+			reply_markup: { force_reply: true, selective: true },
+		});
+		expect(bot.sent.at(-1)?.text.length).toBeLessThanOrEqual(4096);
+		await adapter.stop();
+	});
+
+	it("presents diagnostic-looking creation path chunks literally and creates the exact cwd", async () => {
+		const marker = "Invalid api_key=folder/";
+		const cwd = `/${"a".repeat(2999)}${marker}${"x".repeat(1000)}`;
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: cwd,
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelMessageId);
+		const pathChunks = bot.sent.slice(2, -1).map((message) => message.text);
+		expect(pathChunks[1]).toMatch(/^Invalid api_key=folder/);
+		expect(pathChunks.join("")).toBe(cwd);
+		await bot.update(42, "/skip", { replyToMessageId: bot.lastMessageId });
+		expect(requests.find((request) => request.kind === "create")).toMatchObject(
+			{
+				cwd,
+			},
+		);
 		await adapter.stop();
 	});
 
@@ -1085,6 +1359,9 @@ describe("Telegram transport", () => {
 		});
 		expect(bot.sent.at(-1)?.text).toContain("/work");
 		await bot.callback(42, "folder:new", panelMessageId);
+		expect(bot.sent.at(-1)?.text).toContain(
+			`Новая сессия будет создана в папке ${childDirectory}`,
+		);
 		const promptMessageId = bot.lastMessageId;
 		await bot.update(42, "nested task", { replyToMessageId: promptMessageId });
 		expect(requests.find((request) => request.kind === "create")).toMatchObject(
@@ -1655,7 +1932,7 @@ describe("Telegram transport", () => {
 			bot.sent.some(
 				({ text }) =>
 					text.includes("Folder: /work") &&
-					text.includes("Session: stopped") &&
+					text.includes("Status: stopped") &&
 					text.includes("Model: unavailable") &&
 					text.includes("Live Pi data: unavailable"),
 			),

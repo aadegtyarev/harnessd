@@ -605,11 +605,17 @@ function shortSessionLabel(
 ): string {
 	return `${session.name ? `${buttonLabel(session.name, 25)} · ` : ""}#${session.id.slice(0, 8)}`;
 }
+function activitySessionLabel(sessionId: SessionId, name?: string): string {
+	return `${name ? `${oneLine(name)} · ` : ""}${sessionId}`;
+}
 function formatSession(session: SessionSummary): string {
 	const cwd = [...oneLine(session.cwd)];
 	const displayCwd =
 		cwd.length > 600 ? `${cwd.slice(0, 599).join("")}…` : cwd.join("");
 	return `${escapeHtml(sessionLabel(session))} · ${escapeHtml(session.status)}\n${escapeHtml(displayCwd)}`;
+}
+function formatSessionList(session: SessionSummary, selected: boolean): string {
+	return `${selected ? "✓ " : ""}${escapeHtml(shortSessionLabel(session))} · ${escapeHtml(session.status)} · ${escapeHtml(compactSessionPath(session.cwd))}`;
 }
 function oneLine(value: string): string {
 	return [...value]
@@ -644,7 +650,58 @@ function buttonLabel(value: string, limit = 44): string {
 		: text.join("");
 }
 function panelPath(value: string): string {
-	return buttonLabel(value, 1200);
+	return buttonLabel(value, 500);
+}
+function safePathPresentation(value: string): string {
+	return [...value]
+		.map((character) => {
+			const code = character.codePointAt(0) ?? 0;
+			if (character === "\\") return "\\\\";
+			return code < 32 || code === 127
+				? `\\u{${code.toString(16).toUpperCase().padStart(4, "0")}}`
+				: character;
+		})
+		.join("");
+}
+function boundedPathPresentation(value: string, limit = 500): string {
+	const path = [...safePathPresentation(value)];
+	return path.length > limit
+		? `${path.slice(0, limit - 1).join("")}…`
+		: path.join("");
+}
+function boundedPanelText(lines: readonly string[]): string {
+	const result: string[] = [];
+	let length = 0;
+	for (const line of lines) {
+		const addition = (result.length ? 1 : 0) + line.length;
+		if (length + addition > 3900) {
+			result.push(
+				"… Панель сокращена; откройте раздел повторно для обновления.",
+			);
+			break;
+		}
+		result.push(line);
+		length += addition;
+	}
+	return result.join("\n");
+}
+function splitTelegramText(value: string, limit = 3000): string[] {
+	const chunks: string[] = [];
+	let chunk = "";
+	for (const character of value) {
+		if (chunk.length + character.length > limit) {
+			chunks.push(chunk);
+			chunk = "";
+		}
+		chunk += character;
+	}
+	if (chunk || chunks.length === 0) chunks.push(chunk);
+	return chunks;
+}
+function compactSessionPath(value: string): string {
+	const path = oneLine(value);
+	const points = [...path];
+	return points.length > 72 ? `…${points.slice(-71).join("")}` : path;
 }
 function messageIdFrom(value: unknown): number | undefined {
 	if (value === null || typeof value !== "object" || !("message_id" in value))
@@ -737,8 +794,9 @@ function compactUsage(usage: HarnessUsageStats | undefined): string {
 function formatStatus(status: HarnessSessionStatus): string {
 	const { session, live } = status;
 	const lines = [
+		`Session: ${activitySessionLabel(session.id, session.name)}`,
 		`Folder: ${oneLine(session.cwd)}`,
-		`Session: ${session.status}`,
+		`Status: ${session.status}`,
 		`Model: ${live?.model ? modelId(live.model) : "unavailable"}`,
 		`Effort: ${live?.effort ? oneLine(live.effort) : "unavailable"}`,
 	];
@@ -1820,8 +1878,13 @@ export class TelegramTransportAdapter
 				chatId,
 				result.ok
 					? (result.value as readonly SessionSummary[])
-							.map(formatSession)
-							.join("\n\n") || "No sessions."
+							.map((session) =>
+								formatSessionList(
+									session,
+									this.selected.get(chatId) === session.id,
+								),
+							)
+							.join("\n") || "No sessions."
 					: escapeHtml(result.error.message),
 			);
 		}
@@ -1913,9 +1976,7 @@ export class TelegramTransportAdapter
 			);
 			let selectionsCleared = true;
 			if (result.ok) {
-				this.sessionNames.delete(sessionId);
-				this.knownSessions.delete(sessionId);
-				this.reportedErrors.delete(sessionId);
+				this.invalidateSession(sessionId);
 				for (const [selectedChat, selectedId] of this.selected) {
 					if (selectedId === sessionId) {
 						selectionsCleared =
@@ -2010,6 +2071,36 @@ export class TelegramTransportAdapter
 		await this.sendDirect(
 			chatId,
 			`Session name updated: ${sessionLabel(session)}.`,
+		);
+	}
+
+	private async promptForCreation(
+		chatId: number,
+		cwd: string,
+		includeCancel: boolean,
+	): Promise<void> {
+		const path = safePathPresentation(cwd);
+		const instructions = includeCancel
+			? "Ответьте именем или /skip, чтобы создать её без имени. Для отмены ответьте /cancel."
+			: "Ответьте именем или /skip. Для отмены — /cancel.";
+		const prefix = "Новая сессия будет создана в папке ";
+		if (`${prefix}${path}. ${instructions}`.length <= 3800) {
+			return this.promptForName(
+				chatId,
+				{ kind: "create", cwd },
+				`${prefix}${path}. ${instructions}`,
+			);
+		}
+		await this.sendDirect(
+			chatId,
+			"Точный путь папки создания (экранированы управляющие символы):",
+		);
+		for (const chunk of splitTelegramText(path))
+			await this.sendWithDeadline(chatId, chunk);
+		return this.promptForName(
+			chatId,
+			{ kind: "create", cwd },
+			`Новая сессия будет создана в указанной выше папке. ${instructions}`,
 		);
 	}
 
@@ -2189,14 +2280,23 @@ export class TelegramTransportAdapter
 			? (listed.value as readonly SessionSummary[])
 			: [];
 		if (listed.ok) this.rememberSessions(sessions);
-		const selectedId = this.selected.get(chatId);
+		let selectedId = this.selected.get(chatId);
 		let selectionClearFailed = false;
-		if (selectedId && !sessions.some((session) => session.id === selectedId)) {
+		if (
+			listed.ok &&
+			selectedId &&
+			!sessions.some((session) => session.id === selectedId)
+		) {
 			selectionClearFailed = !(await this.clearSelected(chatId));
+			selectedId = this.selected.get(chatId);
 			this.previews.delete(chatId);
 		}
 		let previewId = this.previews.get(chatId);
-		if (previewId && !sessions.some((session) => session.id === previewId)) {
+		if (
+			listed.ok &&
+			previewId &&
+			!sessions.some((session) => session.id === previewId)
+		) {
 			this.previews.delete(chatId);
 			previewId = undefined;
 		}
@@ -2205,49 +2305,57 @@ export class TelegramTransportAdapter
 			if (previewId && previewId !== this.selected.get(chatId))
 				this.previews.set(chatId, previewId);
 		}
-		const current = sessions.find(
+		const selected = sessions.find(
 			(session) => session.id === this.selected.get(chatId),
 		);
-		const preview = sessions.find((session) => session.id === previewId);
+		const previewFromList = sessions.find(
+			(session) => session.id === previewId,
+		);
 		let status: HarnessSessionStatus | undefined;
-		if (preview) {
+		if (previewId) {
 			const result = await this.request(sender, {
 				kind: "session_status",
-				sessionId: preview.id,
+				sessionId: previewId,
 			});
 			if (result.ok) {
 				status = result.value as HarnessSessionStatus;
 				this.rememberSession(status.session);
 			}
 		}
+		const preview = status?.session ?? previewFromList;
+		const selectedLabel = selected
+			? sessionLabel(selected)
+			: selectedId
+				? sessionLabel({
+						id: selectedId,
+						name: this.sessionNames.get(selectedId),
+					})
+				: "не выбрана";
 		const lines = [
-			"📌 Текущая сессия",
-			`Выбрана: ${current ? sessionLabel(current) : "не выбрана"}`,
+			"📌 Панель сессий",
+			`Выбрана (обычные сообщения →): ${selectedLabel}`,
+			`Просмотр: ${preview ? sessionLabel(preview) : previewId ? activitySessionLabel(previewId, this.sessionNames.get(previewId)) : "нет"}`,
+			`Новая сессия · папка создания: ${boundedPathPresentation(this.currentDirectories.get(chatId) ?? this.options.initialCwd)}`,
 		];
 		if (selectionClearFailed)
 			lines.push(
 				"Не удалось сохранить очистку выбора; он может вернуться после перезапуска.",
 			);
-		if (preview && preview.id !== current?.id)
-			lines.push(`Просмотр: ${sessionLabel(preview)}`);
-		const display = status?.session ?? preview ?? current;
-		if (display) {
+		if (!listed.ok)
+			lines.push(`Не удалось обновить список сессий: ${listed.error.message}`);
+		if (preview) {
 			lines.push(
-				`Папка: ${panelPath(display.cwd)}`,
-				`Статус: ${display.status}`,
+				`Папка просмотра: ${panelPath(preview.cwd)}`,
+				`Статус просмотра: ${preview.status}`,
 			);
-			lines.push(compactUsage(status?.live?.usage));
+			if (status) lines.push(compactUsage(status.live?.usage));
 			if (status?.live?.model)
 				lines.push(
 					`Модель: ${modelId(status.live.model)}${status.live.effort ? ` · ${oneLine(status.live.effort)}` : ""}`,
 				);
-		} else if (!listed.ok) lines.push(listed.error.message);
-		else
-			lines.push(
-				`Папка: ${panelPath(this.currentDirectories.get(chatId) ?? this.options.initialCwd)}`,
-			);
+		}
 		const rows: InlineButton[][] = [];
-		if (sessions.length)
+		if (previewId && listed.ok)
 			rows.push([
 				inlineButton("◀", "session:prev"),
 				inlineButton("Выбрать", "session:choose"),
@@ -2258,16 +2366,26 @@ export class TelegramTransportAdapter
 			inlineButton("Папки", "menu:folders"),
 		]);
 		rows.push([inlineButton("Новая сессия", "menu:new")]);
-		rows.push([
-			inlineButton("Модель", "menu:models"),
-			inlineButton("Усилие", "menu:efforts"),
-		]);
-		if (current)
+		if (previewId) {
 			rows.push([
-				inlineButton("Остановить", `session:stop:${current.id}`),
-				inlineButton("Удалить", `session:delete:${current.id}`),
+				inlineButton("Модель просмотра", "menu:models"),
+				inlineButton("Усилие просмотра", "menu:efforts"),
 			]);
-		await this.updatePanel(chatId, lines.join("\n"), keyboard(rows), messageId);
+			rows.push([
+				inlineButton("Остановить просмотр", `session:stop:${previewId}`),
+				inlineButton("Удалить просмотр", `session:delete:${previewId}`),
+			]);
+			if (preview?.status === "stopped")
+				rows.push([
+					inlineButton("Продолжить просмотр", `session:resume:${previewId}`),
+				]);
+		}
+		await this.updatePanel(
+			chatId,
+			boundedPanelText(lines),
+			keyboard(rows),
+			messageId,
+		);
 	}
 
 	private async refreshExistingPanel(
@@ -2399,26 +2517,18 @@ export class TelegramTransportAdapter
 			return this.renderSessions(chatId, sender, messageId);
 		if (data === "menu:folders")
 			return this.renderFolders(chatId, sender, messageId);
-		if (data === "menu:new")
-			return this.promptForName(
-				chatId,
-				{
-					kind: "create",
-					cwd: this.currentDirectories.get(chatId) ?? this.options.initialCwd,
-				},
-				"Ответьте именем новой сессии или /skip, чтобы создать её без имени. Для отмены ответьте /cancel.",
-			);
+		if (data === "menu:new") {
+			const cwd =
+				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
+			return this.promptForCreation(chatId, cwd, true);
+		}
 		if (data === "folder:parent")
 			return this.changeFolder(chatId, sender, "parent", messageId);
-		if (data === "folder:new")
-			return this.promptForName(
-				chatId,
-				{
-					kind: "create",
-					cwd: this.currentDirectories.get(chatId) ?? this.options.initialCwd,
-				},
-				`Ответьте именем сессии для папки ${oneLine(this.currentDirectories.get(chatId) ?? this.options.initialCwd)} или /skip. Для отмены — /cancel.`,
-			);
+		if (data === "folder:new") {
+			const cwd =
+				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
+			return this.promptForCreation(chatId, cwd, false);
+		}
 		if (data.startsWith("folder:page:"))
 			return this.setPageAndRender(
 				chatId,
@@ -2642,7 +2752,10 @@ export class TelegramTransportAdapter
 	}
 
 	private liveActivityText(activity: LiveActivity): string {
-		const lines = ["🔧 Pi activity:"];
+		const name = this.sessionNames.get(activity.sessionId);
+		const lines = [
+			`🔧 Pi activity · ${activitySessionLabel(activity.sessionId, name)}`,
+		];
 		if (activity.thinking) lines.push("• Думаю…");
 		for (const notice of activity.notices.slice(-4))
 			lines.push(`• ${truncateDiagnostic(notice, 180)}`);
@@ -3162,12 +3275,16 @@ export class TelegramTransportAdapter
 		const rows: InlineButton[][] = visible.flatMap((session) => [
 			[
 				inlineButton(
-					shortSessionLabel(session),
+					`${this.selected.get(chatId) === session.id ? "✓ " : ""}${shortSessionLabel(session)}`,
 					`session:select:${session.id}`,
 				),
 				inlineButton("Подробнее", `session:details:${session.id}`),
 			],
 		]);
+		const summaries = visible.map(
+			(session) =>
+				`${this.selected.get(chatId) === session.id ? "✓ " : ""}${shortSessionLabel(session)} · ${session.status} · ${compactSessionPath(session.cwd)}`,
+		);
 		if (lastPage > 0)
 			rows.push([
 				inlineButton("◀", `sessions:page:${Math.max(0, page - 1)}`),
@@ -3178,7 +3295,7 @@ export class TelegramTransportAdapter
 		await this.updatePanel(
 			chatId,
 			sessions.length
-				? `Сессии · ${sessions.length}\nВыберите сессию или откройте подробности.`
+				? `Сессии · ${sessions.length}\nВыберите сессию или откройте подробности.\n${summaries.join("\n")}`
 				: "Сохранённых сессий пока нет.",
 			keyboard(rows),
 			messageId,
@@ -3351,7 +3468,9 @@ export class TelegramTransportAdapter
 		sender: number,
 		messageId: number,
 	): Promise<void> {
-		const sessionId = this.selected.get(chatId);
+		const sessionId = this.previews.get(chatId) ?? this.selected.get(chatId);
+		if (sessionId && !this.knownSessions.has(sessionId))
+			return this.showStaleCallback(chatId, messageId);
 		if (!sessionId)
 			return this.updatePanel(
 				chatId,
@@ -3405,7 +3524,7 @@ export class TelegramTransportAdapter
 		rows.push([inlineButton("Назад", "menu:home")]);
 		await this.updatePanel(
 			chatId,
-			`Модель · ${sessionLabel({ id: sessionId, name: this.sessionNames.get(sessionId) })}`,
+			`Модель просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))}`,
 			keyboard(rows),
 			messageId,
 		);
@@ -3418,13 +3537,15 @@ export class TelegramTransportAdapter
 		messageId: number,
 	): Promise<void> {
 		const choices = this.modelChoices.get(chatId);
+		if (!choices || !this.knownSessions.has(choices.sessionId))
+			return this.showStaleCallback(chatId, messageId);
 		const index = Number(rawIndex);
-		const model = choices?.models[index];
+		const model = choices.models[index];
 		if (
-			!choices ||
 			!Number.isSafeInteger(index) ||
 			!model ||
-			this.selected.get(chatId) !== choices.sessionId
+			(this.previews.get(chatId) ?? this.selected.get(chatId)) !==
+				choices.sessionId
 		)
 			return this.renderModels(chatId, sender, messageId);
 		const result = await this.request(sender, {
@@ -3451,7 +3572,9 @@ export class TelegramTransportAdapter
 		sender: number,
 		messageId: number,
 	): Promise<void> {
-		const sessionId = this.selected.get(chatId);
+		const sessionId = this.previews.get(chatId) ?? this.selected.get(chatId);
+		if (sessionId && !this.knownSessions.has(sessionId))
+			return this.showStaleCallback(chatId, messageId);
 		if (!sessionId)
 			return this.updatePanel(
 				chatId,
@@ -3502,7 +3625,7 @@ export class TelegramTransportAdapter
 		rows.push([inlineButton("Назад", "menu:home")]);
 		await this.updatePanel(
 			chatId,
-			`Усилие · ${catalog.current ? oneLine(catalog.current) : "не задано"}`,
+			`Усилие просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${catalog.current ? oneLine(catalog.current) : "не задано"}`,
 			keyboard(rows),
 			messageId,
 		);
@@ -3515,13 +3638,15 @@ export class TelegramTransportAdapter
 		messageId: number,
 	): Promise<void> {
 		const choices = this.effortChoices.get(chatId);
+		if (!choices || !this.knownSessions.has(choices.sessionId))
+			return this.showStaleCallback(chatId, messageId);
 		const index = Number(rawIndex);
-		const effort = choices?.levels[index];
+		const effort = choices.levels[index];
 		if (
-			!choices ||
 			!Number.isSafeInteger(index) ||
 			effort === undefined ||
-			this.selected.get(chatId) !== choices.sessionId
+			(this.previews.get(chatId) ?? this.selected.get(chatId)) !==
+				choices.sessionId
 		)
 			return this.renderEfforts(chatId, sender, messageId);
 		const result = await this.request(sender, {
@@ -3542,7 +3667,7 @@ export class TelegramTransportAdapter
 		const result = await this.request(sender, { kind: "resume", sessionId });
 		if (!result.ok) await this.sendDirect(chatId, result.error.message);
 		else this.rememberSession(result.value as SessionSummary);
-		await this.renderSessionDetails(chatId, sender, sessionId, messageId);
+		await this.renderPanel(chatId, sender, messageId);
 	}
 
 	private async promptRename(
@@ -3640,9 +3765,7 @@ export class TelegramTransportAdapter
 				this.previews.delete(chatId);
 			}
 		} else {
-			this.sessionNames.delete(sessionId);
-			this.knownSessions.delete(sessionId);
-			this.reportedErrors.delete(sessionId);
+			this.invalidateSession(sessionId);
 			if (cleanupPending)
 				await this.sendDirect(
 					chatId,
@@ -3955,6 +4078,22 @@ export class TelegramTransportAdapter
 		return `${name ? `${oneLine(name)} · ` : ""}${sessionId}`;
 	}
 
+	private invalidateSession(sessionId: SessionId): void {
+		this.knownSessions.delete(sessionId);
+		this.sessionNames.delete(sessionId);
+		this.sessionCwds.delete(sessionId);
+		this.reportedErrors.delete(sessionId);
+		for (const [chatId, previewId] of this.previews) {
+			if (previewId === sessionId) this.previews.delete(chatId);
+		}
+		for (const [chatId, choices] of this.modelChoices) {
+			if (choices.sessionId === sessionId) this.modelChoices.delete(chatId);
+		}
+		for (const [chatId, choices] of this.effortChoices) {
+			if (choices.sessionId === sessionId) this.effortChoices.delete(chatId);
+		}
+	}
+
 	private rememberSession(session: SessionSummary): void {
 		this.knownSessions.add(session.id);
 		this.sessionCwds.set(session.id, session.cwd);
@@ -3965,11 +4104,7 @@ export class TelegramTransportAdapter
 	private rememberSessions(sessions: readonly SessionSummary[]): void {
 		const present = new Set(sessions.map((session) => session.id));
 		for (const sessionId of this.knownSessions) {
-			if (!present.has(sessionId)) {
-				this.knownSessions.delete(sessionId);
-				this.sessionNames.delete(sessionId);
-				this.reportedErrors.delete(sessionId);
-			}
+			if (!present.has(sessionId)) this.invalidateSession(sessionId);
 		}
 		for (const session of sessions) this.rememberSession(session);
 	}
