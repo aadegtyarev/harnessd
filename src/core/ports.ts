@@ -240,7 +240,7 @@ export interface HarnessControl {
 	listEfforts(): Promise<readonly string[]>;
 	setModel(provider: string, modelId: string): Promise<HarnessModelInfo>;
 	setEffort(level: string): Promise<void>;
-	reload?(): Promise<void>;
+	reload?(beforeDispatch?: () => void): Promise<void>;
 }
 
 export interface HarnessSessionStatus {

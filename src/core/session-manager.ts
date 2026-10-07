@@ -69,6 +69,7 @@ export class SessionManager {
 	private readonly delays = new Map<SessionId, () => void>();
 	private readonly unsettledInputs = new Map<SessionId, Set<InputId>>();
 	private readonly reloads = new Set<SessionId>();
+	private readonly reloadWaiters = new Map<SessionId, (() => void)[]>();
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
 
 	constructor(
@@ -475,6 +476,7 @@ export class SessionManager {
 		text: string,
 		images?: readonly { readonly mimeType: string; readonly data: string }[],
 	): Promise<InputId> {
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
@@ -496,6 +498,7 @@ export class SessionManager {
 		}
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		const input: Input = {
 			id: randomUUID() as Input["id"],
 			sessionId: id,
@@ -519,6 +522,7 @@ export class SessionManager {
 	}
 
 	async cancel(id: SessionId, inputId: InputId): Promise<void> {
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
@@ -531,6 +535,7 @@ export class SessionManager {
 		const instance = this.instances.get(id);
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		await instance.cancel(inputId);
 	}
 
@@ -635,10 +640,33 @@ export class SessionManager {
 			)
 				throw new ReloadError("RELOAD_BUSY");
 			if (!beforeDispatch()) throw new ReloadError("RELOAD_SELECTION_CHANGED");
-			await control.reload();
+			await control.reload(() => {
+				if (!beforeDispatch())
+					throw new ReloadError("RELOAD_SELECTION_CHANGED");
+				if (
+					this.instances.get(id) !== instance ||
+					this.closing ||
+					this.stopping.has(id) ||
+					this.terminal.has(id) ||
+					this.recovery.has(id) ||
+					(this.unsettledInputs.get(id)?.size ?? 0) > 0
+				)
+					throw new ReloadError("RELOAD_BUSY");
+			});
 		} finally {
 			this.reloads.delete(id);
+			for (const resolve of this.reloadWaiters.get(id) ?? []) resolve();
+			this.reloadWaiters.delete(id);
 		}
+	}
+
+	private waitForReload(id: SessionId): Promise<void> {
+		if (!this.reloads.has(id)) return Promise.resolve();
+		return new Promise((resolve) => {
+			const waiters = this.reloadWaiters.get(id) ?? [];
+			waiters.push(resolve);
+			this.reloadWaiters.set(id, waiters);
+		});
 	}
 
 	private async requireControl(
@@ -693,6 +721,7 @@ export class SessionManager {
 				}
 				this.unsettledInputs.delete(id);
 				this.instances.delete(id);
+				if (this.reloads.has(id)) await this.waitForReload(id);
 				let task!: Promise<void>;
 				task = this.recover(id)
 					.catch(async (error) => {

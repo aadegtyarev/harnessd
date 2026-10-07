@@ -851,8 +851,14 @@ describe("SQLite session management", () => {
 		const started = deferred<void>();
 		const complete = deferred<void>();
 		let calls = 0;
+		let selected = true;
 		const harness = harnessPort({
-			capabilities: ["harness.launch", "harness.stop", "harness.reload"],
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.reload",
+				"input.submit",
+			],
 			launch: async () => ({
 				processId: "reload-test" as never,
 				exit: new Promise(() => {}),
@@ -874,10 +880,11 @@ describe("SQLite session management", () => {
 						return { provider, id, name: id };
 					},
 					async setEffort() {},
-					async reload() {
+					async reload(beforeDispatch) {
 						calls++;
 						started.resolve();
 						await complete.promise;
+						beforeDispatch?.();
 					},
 				},
 				async send() {},
@@ -897,14 +904,24 @@ describe("SQLite session management", () => {
 				manager.reload(session.id, () => false),
 			).rejects.toMatchObject({ code: "RELOAD_SELECTION_CHANGED" });
 			expect(calls).toBe(0);
-			const first = manager.reload(session.id, () => true);
+			const first = manager.reload(session.id, () => selected);
 			await started.promise;
 			await expect(
-				manager.reload(session.id, () => true),
+				manager.submit(session.id, "ordinary input"),
+			).rejects.toMatchObject({
+				code: "RELOAD_BUSY",
+			});
+			await expect(
+				manager.reload(session.id, () => selected),
 			).rejects.toMatchObject({ code: "RELOAD_ALREADY_RUNNING" });
 			expect(calls).toBe(1);
+			selected = false;
 			complete.resolve();
-			await first;
+			await expect(first).rejects.toMatchObject({
+				code: "RELOAD_SELECTION_CHANGED",
+			});
+			selected = true;
+			await manager.reload(session.id, () => selected);
 		} finally {
 			await manager.close();
 			store.close();
