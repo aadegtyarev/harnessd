@@ -55,6 +55,7 @@ const STOP_TIMEOUT_MS = 6000;
 const MAX_QUEUED_MESSAGES = 32;
 const MAX_OUTPUT_MESSAGES = 24;
 const MAX_INPUT_MESSAGES = 8;
+const MAX_OVERFLOW_NOTICES = 8;
 const MAX_QUEUED_CHARACTERS = 32_768;
 const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
@@ -206,6 +207,7 @@ type QueuedMessage = {
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
+	overflowKey?: string;
 };
 type PendingNameFlow =
 	| {
@@ -253,7 +255,7 @@ type ChatQueue = {
 	draining?: Promise<void>;
 	drainTimer?: NodeJS.Timeout;
 	failed: boolean;
-	overflowQueued: boolean;
+	readonly overflowNotices: Set<string>;
 	readonly idleWaiters: (() => void)[];
 };
 type TurnBuffer = {
@@ -1398,6 +1400,7 @@ export class TelegramTransportAdapter
 			if (queue.drainTimer) clearTimeout(queue.drainTimer);
 			queue.messages.length = 0;
 			queue.pendingCharacters = 0;
+			queue.overflowNotices.clear();
 			for (const resolve of queue.idleWaiters.splice(0)) resolve();
 		}
 		for (const activity of this.liveActivities.values()) {
@@ -3558,7 +3561,7 @@ export class TelegramTransportAdapter
 				queue.failed = false;
 				queue.messages.length = 0;
 				queue.pendingCharacters = 0;
-				queue.overflowQueued = false;
+				queue.overflowNotices.clear();
 			}
 			await this.sendDirect(
 				chatId,
@@ -5901,7 +5904,7 @@ export class TelegramTransportAdapter
 				messages: [],
 				pendingCharacters: 0,
 				failed: false,
-				overflowQueued: false,
+				overflowNotices: new Set(),
 				idleWaiters: [],
 			};
 			this.queues.set(chatId, queue);
@@ -5966,8 +5969,14 @@ export class TelegramTransportAdapter
 			);
 			if (outputIndex >= 0) {
 				const [removed] = queue.messages.splice(outputIndex, 1);
-				if (removed) queue.pendingCharacters -= removed.text.length;
-				this.queueOverflow(queue, sessionId, removed?.background === true);
+				if (removed) {
+					queue.pendingCharacters -= removed.text.length;
+					this.queueOverflow(
+						queue,
+						removed.sessionId,
+						removed.background === true,
+					);
+				}
 				continue;
 			}
 			const replaceableInputIndex = queue.messages.findIndex(
@@ -5994,18 +6003,12 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		background = false,
 	): void {
-		if (queue.overflowQueued) {
-			if (background) {
-				const existing = queue.messages.findIndex(
-					(message) => message.overflow,
-				);
-				const notice = queue.messages[existing];
-				if (notice && !notice.background)
-					queue.messages[existing] = { ...notice, background: true };
-			}
+		const overflowKey = JSON.stringify([sessionId, background]);
+		if (
+			queue.overflowNotices.has(overflowKey) ||
+			queue.overflowNotices.size >= MAX_OVERFLOW_NOTICES
+		)
 			return;
-		}
-		queue.overflowQueued = true;
 		const notice = {
 			sessionId,
 			text:
@@ -6015,7 +6018,9 @@ export class TelegramTransportAdapter
 				)[0] ?? OVERFLOW_NOTICE,
 			...(background ? { background: true as const } : {}),
 			overflow: true as const,
+			overflowKey,
 		};
+		queue.overflowNotices.add(overflowKey);
 		queue.messages.push(notice);
 		queue.pendingCharacters += notice.text.length;
 	}
@@ -6039,6 +6044,7 @@ export class TelegramTransportAdapter
 				queue.failed = true;
 				queue.messages.length = 0;
 				queue.pendingCharacters = 0;
+				queue.overflowNotices.clear();
 				finish();
 			});
 		}, OUTPUT_COALESCE_MS);
@@ -6049,7 +6055,8 @@ export class TelegramTransportAdapter
 			const message = queue.messages.shift();
 			if (!message) break;
 			queue.pendingCharacters -= message.text.length;
-			if (message.overflow) queue.overflowQueued = false;
+			if (message.overflowKey)
+				queue.overflowNotices.delete(message.overflowKey);
 			const backgroundDelivery =
 				message.background && this.selected.get(chatId) !== message.sessionId;
 			if (
@@ -6095,6 +6102,7 @@ export class TelegramTransportAdapter
 				queue.failed = true;
 				queue.messages.length = 0;
 				queue.pendingCharacters = 0;
+				queue.overflowNotices.clear();
 			}
 		}
 	}

@@ -5456,10 +5456,12 @@ describe("Telegram transport", () => {
 			emit(harnessEvent("sid", "status", "unknown"));
 		const queues = (
 			adapter as unknown as {
-				queues: Map<number, { overflowQueued: boolean }>;
+				queues: Map<number, { overflowNotices: Set<string> }>;
 			}
 		).queues;
-		await vi.waitFor(() => expect(queues.get(42)?.overflowQueued).toBe(true));
+		await vi.waitFor(() =>
+			expect(queues.get(42)?.overflowNotices.size).toBe(1),
+		);
 		await bot.update(42, "/use other");
 		emit(harnessEvent("sid", "output", "x".repeat(33_000)));
 		emit(harnessEvent("sid", "status", "agent_settled"));
@@ -5484,6 +5486,102 @@ describe("Telegram transport", () => {
 				inline_keyboard: [[{ text: "Переключиться на эту сессию" }]],
 			},
 		});
+		await adapter.stop();
+	});
+
+	it("keeps congestion notices scoped to each omitted session and delivery context", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const enqueue = (
+			adapter as unknown as {
+				enqueue: (
+					chatId: number,
+					sessionId: SessionId,
+					text: string,
+					input:
+						| { readonly inputId: string; readonly state: string }
+						| undefined,
+					output: boolean,
+					background: boolean,
+				) => void;
+			}
+		).enqueue.bind(adapter);
+		for (let index = 0; index < 25; index++)
+			enqueue(
+				42,
+				"sid" as SessionId,
+				`A output ${index}`,
+				undefined,
+				true,
+				false,
+			);
+		for (let index = 0; index < 8; index++)
+			enqueue(
+				42,
+				"sid" as SessionId,
+				`A input ${index}`,
+				{ inputId: `A-${index}`, state: "accepted" },
+				false,
+				false,
+			);
+		enqueue(
+			42,
+			"other" as SessionId,
+			"B input",
+			{ inputId: "B-0", state: "accepted" },
+			false,
+			false,
+		);
+		for (let index = 0; index < 23; index++)
+			enqueue(
+				42,
+				"sid" as SessionId,
+				`A refill ${index}`,
+				undefined,
+				true,
+				false,
+			);
+		enqueue(
+			42,
+			"other" as SessionId,
+			"B background output",
+			undefined,
+			true,
+			true,
+		);
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		const notices = bot.sent
+			.map((message, index) => ({ message, options: bot.sendOptions[index] }))
+			.filter(({ message }) =>
+				message.text.includes("Additional notifications were omitted"),
+			);
+		expect(notices).toHaveLength(2);
+		const noticeA = notices.find(({ message }) => message.text.includes("sid"));
+		const noticeB = notices.find(({ message }) =>
+			message.text.includes("other"),
+		);
+		expect(noticeA?.message.text).toContain("sid");
+		expect(noticeB?.message.text).toContain("other");
+		expect(noticeA?.options).not.toHaveProperty("reply_markup");
+		expect(noticeB?.options).toMatchObject({
+			reply_markup: {
+				inline_keyboard: [[{ text: "Переключиться на эту сессию" }]],
+			},
+		});
+		const selectIntents = (
+			adapter as unknown as {
+				selectIntents: Map<string, { sessionId: SessionId }>;
+			}
+		).selectIntents;
+		expect(
+			[...selectIntents.values()].map(({ sessionId }) => sessionId),
+		).toContain("other");
 		await adapter.stop();
 	});
 
