@@ -1788,10 +1788,18 @@ describe("Telegram transport", () => {
 			bot.sendOptions.at(-1),
 			"action:resume-select:",
 		);
+		const inspectBaseline = requests.filter(
+			(request) => request.kind === "inspect",
+		).length;
 		let releaseLock!: () => void;
 		let announceLock!: () => void;
+		let announceCallbackQueued!: () => void;
+		let lockHeld = false;
 		const lockStarted = new Promise<void>(
 			(resolve) => (announceLock = resolve),
+		);
+		const callbackQueued = new Promise<void>(
+			(resolve) => (announceCallbackQueued = resolve),
 		);
 		const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
 		const inbox = (
@@ -1804,7 +1812,14 @@ describe("Telegram transport", () => {
 				};
 			}
 		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		inbox.withSessionLock = (id, operation) => {
+			const queued = withSessionLock(id, operation);
+			if (lockHeld && id === ("sid" as SessionId)) announceCallbackQueued();
+			return queued;
+		};
 		const heldLock = inbox.withSessionLock("sid" as SessionId, async () => {
+			lockHeld = true;
 			announceLock();
 			await lockGate;
 		});
@@ -1813,8 +1828,12 @@ describe("Telegram transport", () => {
 		await vi.waitFor(() =>
 			expect(
 				requests.filter((request) => request.kind === "inspect"),
-			).toHaveLength(1),
+			).toHaveLength(inspectBaseline + 1),
 		);
+		await callbackQueued;
+		expect(
+			requests.filter((request) => request.kind === "inspect"),
+		).toHaveLength(inspectBaseline + 1);
 		await bot.update(42, "/stop sid");
 		releaseLock();
 		await Promise.all([heldLock, callback]);
@@ -1839,10 +1858,18 @@ describe("Telegram transport", () => {
 			bot.sendOptions.at(-1),
 			"action:resume-select:",
 		);
+		const inspectBaseline = requests.filter(
+			(request) => request.kind === "inspect",
+		).length;
 		let releaseLock!: () => void;
 		let announceLock!: () => void;
+		let announceCallbackQueued!: () => void;
+		let lockHeld = false;
 		const lockStarted = new Promise<void>(
 			(resolve) => (announceLock = resolve),
+		);
+		const callbackQueued = new Promise<void>(
+			(resolve) => (announceCallbackQueued = resolve),
 		);
 		const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
 		const inbox = (
@@ -1855,7 +1882,14 @@ describe("Telegram transport", () => {
 				};
 			}
 		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		inbox.withSessionLock = (id, operation) => {
+			const queued = withSessionLock(id, operation);
+			if (lockHeld && id === ("sid" as SessionId)) announceCallbackQueued();
+			return queued;
+		};
 		const heldLock = inbox.withSessionLock("sid" as SessionId, async () => {
+			lockHeld = true;
 			announceLock();
 			await lockGate;
 		});
@@ -1864,8 +1898,12 @@ describe("Telegram transport", () => {
 		await vi.waitFor(() =>
 			expect(
 				requests.filter((request) => request.kind === "inspect"),
-			).toHaveLength(1),
+			).toHaveLength(inspectBaseline + 1),
 		);
+		await callbackQueued;
+		expect(
+			requests.filter((request) => request.kind === "inspect"),
+		).toHaveLength(inspectBaseline + 1);
 		const current = sessions.get("sid");
 		if (!current) throw new Error("Missing session fixture");
 		sessions.set("sid", { ...current, status: "running" });
