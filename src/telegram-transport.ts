@@ -73,7 +73,6 @@ const INBOX_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
-const INTERNAL_WIDGET_PREFIX = "PI_SUBAGENT_ASYNC_JSON:";
 const NAME_PROMPT_MARKER = "Назовите сессию (запрос имени harnessd):";
 const NAME_PROMPT_ENVELOPE_PREFIX = `${NAME_PROMPT_MARKER}\n`;
 const CREATE_NAME_INSTRUCTIONS =
