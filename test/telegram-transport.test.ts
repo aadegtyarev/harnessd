@@ -535,6 +535,19 @@ async function startAdapter(
 	};
 }
 
+function callbackData(options: unknown, prefix: string): string {
+	const markup = options as {
+		reply_markup?: {
+			inline_keyboard?: readonly (readonly { callback_data?: string }[])[];
+		};
+	};
+	const found = markup.reply_markup?.inline_keyboard
+		?.flat()
+		.find((button) => button.callback_data?.startsWith(prefix))?.callback_data;
+	if (!found) throw new Error(`Missing callback data with prefix ${prefix}`);
+	return found;
+}
+
 describe("Telegram transport", () => {
 	it("shows session name and full identity with Pi-reported context in status", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Focused task" }));
@@ -1208,13 +1221,21 @@ describe("Telegram transport", () => {
 		});
 		await bot.callback(42, "session:stop:other", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Остановить #other?");
-		await bot.callback(42, "action:confirm-stop:other", panelMessageId);
+		const stopConfirm = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, stopConfirm, panelMessageId);
 		expect(
 			requests.findLast((request) => request.kind === "stop"),
 		).toMatchObject({ kind: "stop", sessionId: "other" });
 		await bot.callback(42, "session:delete:other", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Удалить запись #other?");
-		await bot.callback(42, "action:confirm-delete:other", panelMessageId);
+		const deleteConfirm = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, deleteConfirm, panelMessageId);
 		expect(
 			requests.findLast((request) => request.kind === "delete"),
 		).toMatchObject({
@@ -1350,8 +1371,14 @@ describe("Telegram transport", () => {
 		const panelMessageId = bot.lastMessageId;
 		await bot.callback(42, "menu:folders", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain(directory);
-		await bot.callback(42, "folder:open:0", panelMessageId);
+		const folderCallback = callbackData(bot.edited.at(-1)?.options, "folder:");
+		expect(folderCallback.length).toBeLessThanOrEqual(64);
+		await mkdir(path.join(directory, "a inserted later"));
+		await bot.callback(42, folderCallback, panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain(childDirectory);
+		await bot.callback(42, folderCallback, panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("действие устарело");
+		expect(bot.edited.at(-1)?.text).not.toContain("Папки\n");
 		await bot.update(42, "/inspect");
 		expect(requests.at(-1)).toMatchObject({
 			kind: "inspect",
@@ -1395,6 +1422,29 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("invalidates stop confirmation across stop and resume", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:sessions", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:stop:sid", panelMessageId);
+		const confirm = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.update(42, "/stop sid");
+		await bot.update(42, "/resume sid");
+		const stopsBeforeStaleTap = requests.filter(
+			(request) => request.kind === "stop",
+		).length;
+		await bot.callback(42, confirm, panelMessageId);
+		expect(requests.filter((request) => request.kind === "stop")).toHaveLength(
+			stopsBeforeStaleTap,
+		);
+		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		await adapter.stop();
+	});
+
 	it("requires confirmation before callback stop and delete operations", async () => {
 		const bot = new MockBot();
 		const { adapter, requests, emit } = await startAdapter(bot, await temp());
@@ -1416,12 +1466,27 @@ describe("Telegram transport", () => {
 		);
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
 		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
-		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		const canceledToken = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, "action:cancel", panelMessageId);
+		await bot.callback(42, canceledToken, panelMessageId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:delete:sid", panelMessageId);
+		const deleteToken = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(43, deleteToken, panelMessageId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await bot.callback(42, deleteToken, panelMessageId);
 		expect(clearIntervalSpy).toHaveBeenCalled();
 		clearIntervalSpy.mockRestore();
 		expect(requests.some((request) => request.kind === "delete")).toBe(true);
 		const requestsAfterDelete = requests.length;
-		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		await bot.callback(42, deleteToken, panelMessageId);
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		expect(requests).toHaveLength(requestsAfterDelete);
 		await adapter.stop();
