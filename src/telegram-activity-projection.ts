@@ -12,7 +12,10 @@ export type ActivityRow = {
 	status: "running" | "done" | "failed";
 };
 
-const MAX_RETAINED_ROWS = 40;
+export const MAX_EXACT_ACTIVITY_ROWS = 256;
+const OVERFLOW_ID = "__untracked_activity_overflow__";
+const OVERFLOW_SUMMARY =
+	"Дополнительные операции не отслеживаются (достигнут предел)";
 
 export function updateActivityRow(
 	rows: ActivityRow[],
@@ -29,9 +32,17 @@ export function updateActivityRow(
 			existing.summary = summary;
 			return true;
 		}
-		rows.push({ id, summary, status: "running" });
-		while (rows.length > MAX_RETAINED_ROWS) rows.shift();
-		return true;
+		if (rows.length < MAX_EXACT_ACTIVITY_ROWS) {
+			rows.push({ id, summary, status: "running" });
+			return true;
+		}
+		if (!rows.some((row) => row.id === OVERFLOW_ID))
+			rows.push({
+				id: OVERFLOW_ID,
+				summary: OVERFLOW_SUMMARY,
+				status: "running",
+			});
+		return false;
 	}
 	if (existing?.status !== "running" || failed === undefined) return false;
 	existing.status = failed ? "failed" : "done";
@@ -42,23 +53,30 @@ export function visibleActivityRows(
 	rows: readonly ActivityRow[],
 	children: ReadonlyMap<string, string> = new Map(),
 ): string[] {
-	const operations: { summary: string; status: ActivityRow["status"] }[] =
-		rows.flatMap((row) => {
-			const role = approvedSubagentRole(row.summary);
-			if (role && children.has(role)) return [];
-			const state =
-				row.status === "failed"
-					? "ошибка"
-					: row.status === "done"
-						? "завершён"
-						: "выполняется";
-			return [
-				{
-					summary: role ? `Задача ${role}: ${state}` : row.summary,
-					status: row.status,
-				},
-			];
+	const byRole = new Map<string, ActivityRow>();
+	const overflowed = rows.some((row) => row.id === OVERFLOW_ID);
+	const operations: { summary: string; status: ActivityRow["status"] }[] = [];
+	for (const row of rows) {
+		if (row.id === OVERFLOW_ID) continue;
+		const role = approvedSubagentRole(row.summary);
+		if (role) {
+			if (!children.has(role)) byRole.set(role, row);
+			continue;
+		}
+		operations.push({ summary: row.summary, status: row.status });
+	}
+	for (const [role, row] of byRole) {
+		const state =
+			row.status === "failed"
+				? "ошибка"
+				: row.status === "done"
+					? "завершён"
+					: "выполняется";
+		operations.push({
+			summary: `Задача ${role}: ${state}`,
+			status: row.status,
 		});
+	}
 	for (const [_role, summary] of children) {
 		const state = /: (завершён|ошибка)$/.exec(summary)?.[1];
 		operations.push({
@@ -81,6 +99,7 @@ export function visibleActivityRows(
 	if (done) lines.push(`• Ещё завершено: ${done}`);
 	if (running) lines.push(`• Ещё выполняется: ${running}`);
 	if (failed) lines.push(`• Ещё ошибок: ${failed}`);
+	if (overflowed) lines.push(`• ${OVERFLOW_SUMMARY}`);
 	return lines;
 }
 

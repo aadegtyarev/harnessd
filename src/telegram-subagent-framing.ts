@@ -16,7 +16,7 @@ export function reportPartialSubagentStatus(
 	if (state.fenced || !isPotentialParts(line, "")) return;
 	const parsed = parseSubagentWidgetLine(line);
 	if (parsed.status && !state.statusReported) {
-		statuses.push(parsed.status);
+		statuses.push(...(parsed.statuses ?? [parsed.status]));
 		state.statusReported = true;
 	}
 }
@@ -41,7 +41,7 @@ export function finishPhysicalLine(
 	}
 	const parsed = parseSubagentWidgetLine(line);
 	if (parsed.status && !state.statusReported) {
-		statuses.push(parsed.status);
+		statuses.push(...(parsed.statuses ?? [parsed.status]));
 		state.statusReported = true;
 	}
 	return parsed.matched ? "" : line + (newline ? "\n" : "");

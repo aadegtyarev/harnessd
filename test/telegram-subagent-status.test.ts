@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseSubagentWidgetLine } from "../src/telegram-subagent-status.js";
 
 describe("parseSubagentWidgetLine", () => {
-	it("normalizes only the last relevant run and ignores all extra fields", () => {
+	it("normalizes the latest safe state for every role and ignores extra fields", () => {
 		const line = ` Pi: PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
 			kind: "pi-subagents.async-status-snapshot",
 			generatedAt: "SENTINEL_TIME",
@@ -25,6 +25,7 @@ describe("parseSubagentWidgetLine", () => {
 		expect(parseSubagentWidgetLine(line)).toEqual({
 			matched: true,
 			status: "Задача Reviewer: выполняется",
+			statuses: ["Задача Scout: ожидает", "Задача Reviewer: выполняется"],
 		});
 	});
 
@@ -38,10 +39,10 @@ describe("parseSubagentWidgetLine", () => {
 				parseSubagentWidgetLine(
 					`PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
 						kind: "pi-subagents.async-status-snapshot",
-						runs: [{ kind: "subagent", label: "untrusted", state }],
+						runs: [{ kind: "subagent", label: "worker", state }],
 					})}`,
 				).status,
-			).toBe(`Задача Помощник: ${translated}`);
+			).toBe(`Задача Worker: ${translated}`);
 		}
 	});
 
@@ -54,7 +55,7 @@ describe("parseSubagentWidgetLine", () => {
 						runs: [{ kind: "subagent", label: value, state: value }],
 					})}`,
 				).status,
-			).toBe("Задача помощника: обновляется");
+			).toBeUndefined();
 	});
 
 	it("hides malformed, unsupported, empty, and preserves lookalikes", () => {

@@ -5745,6 +5745,34 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps the transport operation projection to six rows", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track bounded tools");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		for (let index = 0; index < 8; index++) {
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `bounded-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		}
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 2"),
+		);
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text.match(/^• read:/gm) ?? []).toHaveLength(6);
+		expect(text).toContain("Ещё выполняется: 2");
+		await adapter.stop();
+	});
+
 	it("coalesces sequential Worker and Reviewer status without workflow spam", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
@@ -5776,6 +5804,15 @@ describe("Telegram transport", () => {
 			expect(bot.edited.at(-1)?.text).toContain("Задача Reviewer: выполняется"),
 		);
 		const visible = bot.edited.at(-1)?.text ?? "";
+		expect(visible).toContain("Задача Worker: завершён ✓");
+		expect(visible).toContain("Задача Reviewer: выполняется …");
+		expect(visible.match(/Задача Worker: завершён/g)).toHaveLength(1);
+		expect(visible.match(/Задача Reviewer: выполняется/g)).toHaveLength(1);
+		expect(
+			visible.match(
+				/^• (?!Задача Worker|Задача Reviewer|Input|Ещё|Pi activity|⏳)/gm,
+			) ?? [],
+		).toEqual([]);
 		expect(visible).not.toContain("workflow");
 		expect(visible).not.toContain("PRIVATE_REVIEW_ID");
 		expect(visible).not.toContain("subagent ·");

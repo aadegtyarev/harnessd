@@ -4130,8 +4130,6 @@ export class TelegramTransportAdapter
 		const effort = live?.effort
 			? truncateDiagnostic(oneLine(live.effort), 60)
 			: "effort unavailable";
-		for (const childStatus of activity.childStatuses.values())
-			lines.push(`• ${childStatus}`);
 		lines.push(
 			`⏳ ${activity.status} · ${compactUsage(live?.usage)} · ${model} · ${effort}`,
 		);

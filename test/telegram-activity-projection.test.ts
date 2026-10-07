@@ -71,12 +71,55 @@ describe("Telegram activity projection", () => {
 		expect(coalesced.join(" ")).not.toContain("private-id");
 	});
 
-	it("retains a bounded exact-call window", () => {
+	it("retains exact running state through 60 ends and keeps terminal IDs recognized", () => {
 		const rows: ActivityRow[] = [];
 		for (let i = 0; i < 60; i++)
 			updateActivityRow(rows, `id-${i}`, `read: ${i}`);
-		expect(rows).toHaveLength(40);
-		expect(rows[0]?.id).toBe("id-20");
+		for (let i = 0; i < 60; i++)
+			updateActivityRow(rows, `id-${i}`, undefined, false);
+		expect(rows).toHaveLength(60);
+		expect(rows.every((row) => row.status === "done")).toBe(true);
+		expect(updateActivityRow(rows, "id-0", "read: regression")).toBe(false);
+		expect(visibleActivityRows(rows)).toContain("• Ещё завершено: 54");
+	});
+
+	it("accounts for omitted active, failed, and completed operations", () => {
+		const rows: ActivityRow[] = [];
+		for (let i = 0; i < 60; i++)
+			updateActivityRow(rows, `id-${i}`, `read: ${i}`);
+		for (let i = 0; i < 60; i++)
+			updateActivityRow(rows, `id-${i}`, undefined, i % 3 === 0);
+		const lines = visibleActivityRows(rows);
+		expect(lines).toContain("• Ещё ошибок: 14");
+		expect(lines).toContain("• Ещё завершено: 40");
+	});
+
+	it("does not silently lose active end events and marks hard-cap overflow", () => {
+		const rows: ActivityRow[] = [];
+		for (let i = 0; i < 257; i++)
+			updateActivityRow(rows, `id-${i}`, `read: ${i}`);
+		expect(
+			rows.filter(
+				(row) => row.id.startsWith("id-") && row.status === "running",
+			),
+		).toHaveLength(256);
+		expect(
+			visibleActivityRows(rows).some((line) =>
+				line.includes("не отслеживаются"),
+			),
+		).toBe(true);
+		expect(updateActivityRow(rows, "id-255", undefined, false)).toBe(true);
+		expect(updateActivityRow(rows, "id-256", undefined, false)).toBe(false);
+	});
+
+	it("coalesces sequential approved-role tools into one latest-state slot", () => {
+		const rows: ActivityRow[] = [];
+		updateActivityRow(rows, "first", "subagent · worker · first task");
+		updateActivityRow(rows, "first", undefined, false);
+		updateActivityRow(rows, "second", "subagent · worker · second task");
+		expect(visibleActivityRows(rows)).toEqual([
+			"• Задача Worker: выполняется …",
+		]);
 	});
 
 	it("reports omitted running and failed operations without calling them completed", () => {
