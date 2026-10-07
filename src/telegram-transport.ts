@@ -2055,7 +2055,11 @@ export class TelegramTransportAdapter
 			knownReplyRoute?.sessionId ??
 			footerSession ??
 			this.selected.get(chatId);
-		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+		if (!sessionId)
+			return this.sendDirect(
+				chatId,
+				"Нет выбранной сессии. Выберите сессию через /sessions и /use <sessionId> или откройте /menu.",
+			);
 		if (
 			replyTo !== undefined &&
 			!knownReplyRoute &&
@@ -2145,7 +2149,7 @@ export class TelegramTransportAdapter
 			) {
 				await this.sendDirect(
 					chatId,
-					"The selected session changed while receiving the attachment; it was not submitted.",
+					"Выбранная сессия изменилась во время получения вложения; оно не отправлено.",
 				);
 				return;
 			}
@@ -2165,7 +2169,7 @@ export class TelegramTransportAdapter
 			if (selectionChanged) {
 				await this.sendDirect(
 					chatId,
-					"The selected session changed while receiving the attachment; it was not submitted.",
+					"Выбранная сессия изменилась во время получения вложения; оно не отправлено.",
 				);
 				return;
 			}
@@ -2187,7 +2191,7 @@ export class TelegramTransportAdapter
 					await inbox.removeSavedAttachmentUnderLock(sessionId, saved.path);
 					await this.sendDirect(
 						chatId,
-						"The selected session changed while receiving the attachment; it was not submitted.",
+						"Выбранная сессия изменилась во время получения вложения; оно не отправлено.",
 					);
 					return;
 				}
@@ -2211,7 +2215,7 @@ export class TelegramTransportAdapter
 					await inbox.removeSavedAttachmentUnderLock(sessionId, saved.path);
 					await this.sendDirect(
 						chatId,
-						"The selected session changed while receiving the attachment; it was not submitted.",
+						"Выбранная сессия изменилась во время получения вложения; оно не отправлено.",
 					);
 					return;
 				}
@@ -2278,7 +2282,7 @@ export class TelegramTransportAdapter
 				if (error instanceof TelegramAttachmentTooLargeError)
 					return this.sendDirect(
 						chatId,
-						"Attachment exceeds Telegram's 20 MB download limit.",
+						"Вложение превышает лимит загрузки Telegram 20 MB.",
 					);
 				if (error instanceof TelegramInboxQuotaError)
 					return this.sendDirect(

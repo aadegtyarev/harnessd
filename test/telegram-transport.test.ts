@@ -1,4 +1,5 @@
 import {
+	chmod,
 	mkdir,
 	mkdtemp,
 	readdir,
@@ -1895,6 +1896,25 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("caps the folder panel independently and explains how to reach other paths", async () => {
+		const directory = await temp();
+		for (let index = 0; index < 105; index++) {
+			await writeFile(path.join(directory, `a-file-${index}.txt`), "");
+			await mkdir(path.join(directory, `z-folder-${index}`));
+		}
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/menu");
+		await bot.callback(42, "menu:folders", bot.lastMessageId);
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Показаны первые 100 папок из 105",
+		);
+		expect(bot.edited.at(-1)?.text).toContain("/cd <путь>");
+		await adapter.stop();
+	});
+
 	it("browses folders and creates a named session in the selected folder", async () => {
 		const directory = await temp();
 		const childDirectory = path.join(directory, "child folder");
@@ -3695,7 +3715,9 @@ describe("Telegram transport", () => {
 		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
 		expect(
 			bot.sent.some(({ text }) =>
-				text.includes("selected session changed while receiving"),
+				text.includes(
+					"Выбранная сессия изменилась во время получения вложения",
+				),
 			),
 		).toBe(true);
 		await adapter.stop();
@@ -4672,6 +4694,18 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("reports an unavailable incoming-file session before downloading", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.updateDocument(42);
+		expect(bot.sent.at(-1)?.text).toContain("Нет выбранной сессии");
+		expect(bot.api.getFile).not.toHaveBeenCalled();
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+		await adapter.stop();
+	});
+
 	it("downloads selected-session documents and submits their path with the caption", async () => {
 		const fetchFile = stubFileDownload();
 		const bot = new MockBot();
@@ -4808,6 +4842,41 @@ describe("Telegram transport", () => {
 		).rejects.toMatchObject({
 			code: "ENOENT",
 		});
+		await adapter.stop();
+	});
+
+	it("reports incoming inbox quota without submitting or automatic retry", async () => {
+		stubFileDownload();
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		const workspace = await temp();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: workspace,
+		});
+		const inboxDirectory = path.join(stateDirectory, "inbox", "sid");
+		await mkdir(inboxDirectory, { recursive: true, mode: 0o700 });
+		for (let index = 0; index < 10; index++) {
+			await writeFile(
+				path.join(
+					inboxDirectory,
+					`${Date.now() + index}-aaaaaaaaaaaaaaaa-file-${index}.txt`,
+				),
+				"retained",
+				{ mode: 0o600 },
+			);
+		}
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42);
+		expect(bot.sent.at(-1)?.text).toContain("Достигнут лимит хранилища сессии");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"очистка пропускает работающие сессии",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("повтор");
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
 		await adapter.stop();
 	});
 
@@ -4953,6 +5022,57 @@ describe("Telegram transport", () => {
 		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
 		await adapter.stop();
 	});
+
+	it("reports distinct /send file failures without retrying", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const outside = await temp();
+		const oversized = path.join(dir, "oversized.bin");
+		await writeFile(oversized, "");
+		await truncate(oversized, 20 * 1024 * 1024 + 1);
+		await mkdir(path.join(dir, "folder"));
+		await writeFile(path.join(outside, "outside.txt"), "outside");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: dir,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const deliver = bot.api.sendDocument;
+		await bot.update(42, "/send missing.txt");
+		expect(bot.sent.at(-1)?.text).toContain("Файл не найден");
+		await bot.update(42, `/send ${path.join(outside, "outside.txt")}`);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"должен находиться внутри рабочей папки",
+		);
+		await bot.update(42, "/send folder");
+		expect(bot.sent.at(-1)?.text).toContain("только обычный файл");
+		await bot.update(42, "/send oversized.bin");
+		expect(bot.sent.at(-1)?.text).toContain("превышает лимит Telegram 20 MiB");
+		expect(deliver).not.toHaveBeenCalled();
+		await adapter.stop();
+	});
+
+	it.skipIf(process.getuid?.() === 0)(
+		"reports an inaccessible /send file without retrying",
+		async () => {
+			const bot = new MockBot();
+			const dir = await temp();
+			const file = path.join(dir, "private.txt");
+			await writeFile(file, "private", { mode: 0o000 });
+			sessions.set("sid", {
+				...(sessions.get("sid") as SessionSummary),
+				cwd: dir,
+			});
+			const { adapter } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			await bot.update(42, "/send private.txt");
+			expect(bot.sent.at(-1)?.text).toContain("Файл недоступен для чтения");
+			expect(bot.api.sendDocument).not.toHaveBeenCalled();
+			await chmod(file, 0o600);
+			await adapter.stop();
+		},
+	);
 
 	it("sends only selected-session files through /send with paths containing spaces", async () => {
 		const bot = new MockBot();

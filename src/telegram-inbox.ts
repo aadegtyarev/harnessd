@@ -29,17 +29,18 @@ export class TelegramInboxQuotaError extends Error {
 	}
 }
 
-export class TelegramInboxWorkspaceError extends Error {
-	constructor() {
-		super("Inbox cannot be inside the session workspace");
-		this.name = "TelegramInboxWorkspaceError";
-	}
-}
-
 export class TelegramInboxError extends Error {
 	constructor(options?: ErrorOptions) {
 		super("Telegram inbox operation failed", options);
 		this.name = "TelegramInboxError";
+	}
+}
+
+export class TelegramInboxWorkspaceError extends TelegramInboxError {
+	constructor() {
+		super();
+		this.message = "Inbox cannot be inside the session workspace";
+		this.name = "TelegramInboxWorkspaceError";
 	}
 }
 
