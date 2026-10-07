@@ -1415,6 +1415,7 @@ export class TelegramTransportAdapter
 					? undefined
 					: this.replyRoutes.get(chatId)?.get(replyTo);
 			if (
+				routedSessionId === undefined &&
 				replyTo !== undefined &&
 				!knownReplyRoute &&
 				(this.isStaleNamePrompt(chatId, replyTo) ||
@@ -1629,7 +1630,7 @@ export class TelegramTransportAdapter
 	}
 
 	private isNamePromptEnvelope(text?: string): boolean {
-		return /^Name this session \(harnessd name prompt\):\n(?:New session will be created in |Rename |The exact folder is shown in the preceding messages\.)/.test(
+		return /^Name this session \(harnessd name prompt\):\n(?:New session will be created in .+\. Reply with a name\. Create unnamed and Cancel buttons are below\.|Rename .+ \(.+#\S+\) in (?:.+|the exact folder shown in the preceding messages)\. Reply with a name; use Cancel below\.|The exact folder is shown in the preceding messages\. Reply with a name\. Create unnamed and Cancel buttons are below\.)$/.test(
 			text ?? "",
 		);
 	}
@@ -1796,6 +1797,7 @@ export class TelegramTransportAdapter
 				? this.replyRoutes.get(chatId)?.get(replyTo)
 				: undefined;
 		if (
+			routedSessionId === undefined &&
 			replyTo !== undefined &&
 			!knownReplyRoute &&
 			this.isNamePromptReply(chatId, replyTo, message.reply_to_message?.text)
@@ -2392,6 +2394,8 @@ export class TelegramTransportAdapter
 			session?.cwd ?? this.sessionCwds.get(flow.sessionId) ?? "unknown cwd",
 			`Rename ${sessionLabelText} (${this.sessionFooter(flow.sessionId)}) in `,
 			"Reply with a name; use Cancel below.",
+			undefined,
+			`Rename ${sessionLabelText} (${this.sessionFooter(flow.sessionId)})`,
 		);
 	}
 
@@ -2420,6 +2424,7 @@ export class TelegramTransportAdapter
 		prefix: string,
 		instructions: string,
 		pathHeader = "Exact session folder (control characters escaped):",
+		fallbackIdentity?: string,
 	): Promise<void> {
 		const path = safePathPresentation(cwd);
 		if (`${prefix}${path}. ${instructions}`.length <= 3800)
@@ -2431,11 +2436,10 @@ export class TelegramTransportAdapter
 		await this.sendDirect(chatId, pathHeader);
 		for (const chunk of splitTelegramText(path))
 			await this.sendWithDeadline(chatId, chunk);
-		return this.promptForName(
-			chatId,
-			flow,
-			`The exact folder is shown in the preceding messages. ${instructions}`,
-		);
+		const identity = fallbackIdentity
+			? `${fallbackIdentity} in the exact folder shown in the preceding messages.`
+			: "The exact folder is shown in the preceding messages.";
+		return this.promptForName(chatId, flow, `${identity} ${instructions}`);
 	}
 
 	private async promptForName(
@@ -4204,6 +4208,8 @@ export class TelegramTransportAdapter
 			session.cwd,
 			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)}) in `,
 			"Reply with a name; use Cancel below.",
+			undefined,
+			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)})`,
 		);
 	}
 
