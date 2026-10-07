@@ -30,12 +30,14 @@ export function updateActivityRow(
 			rows.push({ id, summary, status: "running" });
 			return true;
 		}
-		if (!rows.some((row) => row.id === OVERFLOW_ID))
+		if (!rows.some((row) => row.id === OVERFLOW_ID)) {
 			rows.push({
 				id: OVERFLOW_ID,
 				summary: OVERFLOW_SUMMARY,
 				status: "running",
 			});
+			return true;
+		}
 		return false;
 	}
 	if (existing?.status !== "running" || failed === undefined) return false;

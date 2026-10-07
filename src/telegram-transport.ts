@@ -38,6 +38,7 @@ import {
 	truncateDiagnostic,
 } from "./error-diagnostics.js";
 import {
+	approvedSubagentRole,
 	localActivityTime,
 	updateActivityRow,
 	visibleActivityRows,
@@ -5845,11 +5846,17 @@ export class TelegramTransportAdapter
 					);
 					if (!updateActivityRow(activity.tools, event.toolCallId, summary))
 						continue;
+					const role = approvedSubagentRole(summary);
+					if (role && activity.childStatuses.has(role)) continue;
 					activity.status = "Вызов инструмента";
 					void this.refreshLiveActivityStats(activity);
 					break;
 				}
 				case "tool_end": {
+					const previous = activity.tools.find(
+						(row) => row.id === event.toolCallId,
+					);
+					const role = approvedSubagentRole(previous?.summary ?? "");
 					if (
 						!updateActivityRow(
 							activity.tools,
@@ -5859,6 +5866,7 @@ export class TelegramTransportAdapter
 						)
 					)
 						continue;
+					if (role && activity.childStatuses.has(role)) continue;
 					activity.status = "Pi выполняет ход сессии";
 					void this.refreshLiveActivityStats(activity);
 					break;

@@ -5773,6 +5773,99 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps coalesced Worker tool events out of visible status and update time", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `12:00:0${date.getSeconds()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track coalesced worker");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
+		);
+		const before = bot.edited.at(-1)?.text;
+		for (const event of [
+			{
+				type: "tool_start" as const,
+				toolCallId: "worker-tool",
+				summary: "subagent · worker · task",
+			},
+			{ type: "tool_end" as const, toolCallId: "worker-tool", failed: false },
+		]) {
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: event,
+			});
+		}
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(bot.edited.at(-1)?.text).toBe(before);
+		await adapter.stop();
+	});
+
+	it("publishes the activity overflow warning on its first over-cap tool", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track activity overflow");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		for (let index = 0; index < 256; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `cap-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 250"),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "cap-over",
+				summary: "read: overflow",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"Дополнительные операции не отслеживаются",
+			),
+		);
+		const edits = bot.edited.length;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "cap-over-2",
+				summary: "read: overflow again",
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(bot.edited).toHaveLength(edits);
+		await adapter.stop();
+	});
+
 	it("coalesces sequential Worker and Reviewer status without workflow spam", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());

@@ -31,8 +31,22 @@ describe("Telegram activity ledger", () => {
 
 	it("bounds exact rows and keeps overflow explicit without losing known ends", () => {
 		const rows: ActivityRow[] = [];
-		for (let i = 0; i < MAX_EXACT_ACTIVITY_ROWS + 1; i++)
-			updateActivityRow(rows, `id-${i}`, `read: ${i}`);
+		for (let i = 0; i < MAX_EXACT_ACTIVITY_ROWS; i++)
+			expect(updateActivityRow(rows, `id-${i}`, `read: ${i}`)).toBe(true);
+		expect(
+			updateActivityRow(
+				rows,
+				`id-${MAX_EXACT_ACTIVITY_ROWS}`,
+				"read: overflow",
+			),
+		).toBe(true);
+		expect(
+			updateActivityRow(
+				rows,
+				`id-${MAX_EXACT_ACTIVITY_ROWS + 1}`,
+				"read: overflow",
+			),
+		).toBe(false);
 		expect(
 			rows.filter(
 				(row) => row.id.startsWith("id-") && row.status === "running",
