@@ -190,6 +190,7 @@ type QueuedMessage = {
 	readonly sessionId: SessionId;
 	readonly text: string;
 	readonly output?: true;
+	readonly background?: true;
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
@@ -245,6 +246,7 @@ type ChatQueue = {
 };
 type TurnBuffer = {
 	readonly chunks: string[];
+	readonly recipients: Set<number>;
 	characters: number;
 	overflow: boolean;
 };
@@ -1049,6 +1051,7 @@ export class TelegramTransportAdapter
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
+	private readonly panelStaleChats = new Set<number>();
 	private readonly panelGenerations = new Map<number, number>();
 	private readonly folderIntents = new Map<string, FolderIntent>();
 	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
@@ -1481,6 +1484,11 @@ export class TelegramTransportAdapter
 				replyTo === undefined
 					? undefined
 					: this.replyRoutes.get(chatId)?.get(replyTo);
+			const footerSession =
+				knownReplyRoute === undefined
+					? this.sessionFromReplyFooter(ctx.message?.reply_to_message?.text)
+					: undefined;
+			const sourceSession = knownReplyRoute?.sessionId ?? footerSession;
 			if (
 				routedSessionId === undefined &&
 				replyTo !== undefined &&
@@ -1495,19 +1503,21 @@ export class TelegramTransportAdapter
 			if (text.startsWith("/")) {
 				await this.command(chatId, sender, text);
 			} else {
-				const sessionId = routedSessionId ?? this.selected.get(chatId);
+				if (this.eventChannelDisabled(chatId))
+					return this.sendDirect(
+						chatId,
+						"Канал событий отключён: новые сообщения не отправлены. Откройте /menu и включите канал для новых событий.",
+					);
+				const sessionId =
+					routedSessionId ?? sourceSession ?? this.selected.get(chatId);
 				if (!sessionId)
 					return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-				const sourceSession =
-					routedSessionId !== undefined
-						? undefined
-						: knownReplyRoute?.sessionId;
-				if (sourceSession && sourceSession !== sessionId)
+				if (replyTo !== undefined && !sourceSession && !routedSessionId)
 					return this.offerReplyRoutes(
 						chatId,
 						sender,
 						ctx.message?.message_id ?? 0,
-						sourceSession,
+						sessionId,
 						sessionId,
 						{ text },
 					);
@@ -1719,6 +1729,19 @@ export class TelegramTransportAdapter
 			routes.delete(routes.keys().next().value as number);
 	}
 
+	private sessionFromReplyFooter(text?: string): SessionId | undefined {
+		if (!text) return undefined;
+		const plainText = text.replace(/<\/?code>/g, "").replace(/&middot;/g, "·");
+		const match =
+			/\n\n(?:[^\n]* · )?([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$/.exec(
+				plainText,
+			);
+		const id = match?.[1];
+		return id && this.knownSessions.has(id as SessionId)
+			? (id as SessionId)
+			: undefined;
+	}
+
 	private async offerReplyRoutes(
 		chatId: number,
 		sender: number,
@@ -1744,12 +1767,18 @@ export class TelegramTransportAdapter
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
-				`This message belongs to ${this.sessionFooter(sourceSession)}, but the selected session is ${this.sessionFooter(selectedSession)}. Choose where to send it:`,
+				sourceSession === selectedSession
+					? `Reply source is unknown. Send only to selected ${this.sessionFooter(selectedSession)} or cancel:`
+					: `This message belongs to ${this.sessionFooter(sourceSession)}, but the selected session is ${this.sessionFooter(selectedSession)}. Choose where to send it:`,
 				{
 					reply_markup: keyboard([
 						[
-							inlineButton("Send to source", `reply:${token}:s`),
-							inlineButton("Send to selected", `reply:${token}:c`),
+							...(sourceSession === selectedSession
+								? [inlineButton("Send to selected", `reply:${token}:c`)]
+								: [
+										inlineButton("Send to source", `reply:${token}:s`),
+										inlineButton("Send to selected", `reply:${token}:c`),
+									]),
 							inlineButton("Cancel", `reply:${token}:x`),
 						],
 					]),
@@ -1859,10 +1888,19 @@ export class TelegramTransportAdapter
 		const sender = ctx.from?.id;
 		const message = ctx.message;
 		if (chatId === undefined || sender === undefined || !message) return;
+		if (this.eventChannelDisabled(chatId))
+			return this.sendDirect(
+				chatId,
+				"Канал событий отключён: вложение не отправлено. Откройте /menu и включите канал для новых событий.",
+			);
 		const replyTo = message.reply_to_message?.message_id;
 		const knownReplyRoute =
 			routedSessionId === undefined && replyTo !== undefined
 				? this.replyRoutes.get(chatId)?.get(replyTo)
+				: undefined;
+		const footerSession =
+			knownReplyRoute === undefined
+				? this.sessionFromReplyFooter(message.reply_to_message?.text)
 				: undefined;
 		if (
 			routedSessionId === undefined &&
@@ -1874,20 +1912,26 @@ export class TelegramTransportAdapter
 				chatId,
 				"This name prompt has expired or requires text; the attachment was not submitted.",
 			);
-		const sessionId = routedSessionId ?? this.selected.get(chatId);
+		const sessionId =
+			routedSessionId ??
+			knownReplyRoute?.sessionId ??
+			footerSession ??
+			this.selected.get(chatId);
 		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-		if (knownReplyRoute) {
-			const sourceSession = knownReplyRoute.sessionId;
-			if (sourceSession && sourceSession !== sessionId)
-				return this.offerReplyRoutes(
-					chatId,
-					sender,
-					message.message_id ?? 0,
-					sourceSession,
-					sessionId,
-					{ message },
-				);
-		}
+		if (
+			replyTo !== undefined &&
+			!knownReplyRoute &&
+			!footerSession &&
+			!routedSessionId
+		)
+			return this.offerReplyRoutes(
+				chatId,
+				sender,
+				message.message_id ?? 0,
+				sessionId,
+				sessionId,
+				{ message },
+			);
 		const document = message.document;
 		const photo = largestPhoto(message.photo);
 		if (!document && !photo)
@@ -1907,7 +1951,63 @@ export class TelegramTransportAdapter
 		const inbox = this.inbox;
 		if (!inbox)
 			return this.sendDirect(chatId, "The session inbox is unavailable.");
+		const explicitlyRouted = Boolean(
+			knownReplyRoute || footerSession || routedSessionId,
+		);
+		const selectedAtDownload = this.selected.get(chatId);
+		await this.sendDirect(chatId, "Получаю вложение…");
+		let downloaded: Buffer;
+		try {
+			const controller = new AbortController();
+			downloaded = await withDeadline(
+				(async () => {
+					const file = await this.bot.api.getFile(fileId, controller.signal);
+					if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
+						throw new TelegramAttachmentTooLargeError();
+					if (!file.file_path) throw new Error("file unavailable");
+					const response = await fetch(
+						telegramFileDownloadUrl(this.options.token, file.file_path),
+						{ signal: controller.signal },
+					);
+					if (!response.ok) throw new Error("download failed");
+					const data = await readBoundedResponse(
+						response,
+						MAX_TELEGRAM_DOWNLOAD_BYTES,
+					);
+					if (!data.length || data.length > MAX_TELEGRAM_DOWNLOAD_BYTES)
+						throw new Error("file size invalid");
+					return data;
+				})(),
+				60_000,
+			).catch((error: unknown) => {
+				controller.abort();
+				throw error;
+			});
+		} catch (error) {
+			if (error instanceof TelegramAttachmentTooLargeError)
+				return this.sendDirect(
+					chatId,
+					"Attachment exceeds Telegram's 20 MB download limit.",
+				);
+			return this.sendDirect(
+				chatId,
+				error instanceof Error &&
+					(error.message.includes("timed out") || error.message === "deadline")
+					? "Attachment download timed out after 60 seconds; it was not submitted. Send it again if still needed."
+					: "Could not safely download or save this attachment. It was not submitted.",
+			);
+		}
 		await inbox.withSessionLock(sessionId, async () => {
+			if (
+				!explicitlyRouted &&
+				this.selected.get(chatId) !== selectedAtDownload
+			) {
+				await this.sendDirect(
+					chatId,
+					"The selected session changed while receiving the attachment; it was not submitted.",
+				);
+				return;
+			}
 			const inspected = await this.request(sender, {
 				kind: "inspect",
 				sessionId,
@@ -1921,19 +2021,7 @@ export class TelegramTransportAdapter
 			let activity: LiveActivity | undefined;
 			let submissionPending = false;
 			try {
-				const file = await this.bot.api.getFile(fileId);
-				if ((file.file_size ?? 0) > MAX_TELEGRAM_DOWNLOAD_BYTES)
-					throw new TelegramAttachmentTooLargeError();
-				if (!file.file_path) throw new Error("file unavailable");
-				const url = telegramFileDownloadUrl(this.options.token, file.file_path);
-				const response = await fetch(url);
-				if (!response.ok) throw new Error("download failed");
-				const data = await readBoundedResponse(
-					response,
-					MAX_TELEGRAM_DOWNLOAD_BYTES,
-				);
-				if (!data.length || data.length > MAX_TELEGRAM_DOWNLOAD_BYTES)
-					throw new Error("file size invalid");
+				const data = downloaded;
 				const saved = await inbox.saveUnderLock(
 					session.id,
 					document?.file_name ?? (photo ? "photo.jpg" : "attachment"),
@@ -2901,6 +2989,10 @@ export class TelegramTransportAdapter
 			);
 		if (!listed.ok)
 			lines.push(`Не удалось обновить список сессий: ${listed.error.message}`);
+		if (this.panelStaleChats.has(chatId))
+			lines.push(
+				"Операция завершена отдельно от панели; её обновление не удалось. Используйте «Обновить панель».",
+			);
 		if (preview) {
 			lines.push(
 				`Существует: да · Выбрана для сообщений: ${this.selected.get(chatId) === preview.id ? "да" : "нет"}`,
@@ -2925,6 +3017,12 @@ export class TelegramTransportAdapter
 			inlineButton("Папки", "menu:folders"),
 		]);
 		rows.push([inlineButton("Новая сессия", "menu:new")]);
+		if (this.panelStaleChats.has(chatId))
+			rows.push([inlineButton("Обновить панель", "panel:refresh")]);
+		if (this.eventChannelDisabled(chatId))
+			rows.push([
+				inlineButton("Включить канал для новых событий", "events:enable"),
+			]);
 		if (previewId && preview) {
 			if (preview.status === "running" || preview.status === "stopped")
 				rows.push([
@@ -2972,6 +3070,21 @@ export class TelegramTransportAdapter
 			await this.renderPanel(chatId, sender, messageId);
 	}
 
+	private async notifyPanelStale(chatId: number): Promise<void> {
+		await this.telegramCall((signal) =>
+			this.bot.api.sendMessage(
+				chatId,
+				"Не удалось обновить панель. Это не отменяет и не повторяет операцию; не нажимайте её повторно. Проверьте результат в панели после обновления или через /status.",
+				{
+					reply_markup: keyboard([
+						[inlineButton("Обновить панель", "panel:refresh")],
+					]),
+				},
+				signal,
+			),
+		);
+	}
+
 	private async updatePanel(
 		chatId: number,
 		text: string,
@@ -3012,6 +3125,8 @@ export class TelegramTransportAdapter
 			}
 			if (!isMessageNotFound(edited.error)) {
 				this.dropPanelGenerationIntents(chatId, generation);
+				this.panelStaleChats.add(chatId);
+				await this.notifyPanelStale(chatId);
 				return false;
 			}
 		}
@@ -3035,6 +3150,8 @@ export class TelegramTransportAdapter
 		);
 		if (!sent.ok) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			this.panelStaleChats.add(chatId);
+			await this.notifyPanelStale(chatId);
 			return false;
 		}
 		const createdMessageId = messageIdFrom(sent.value);
@@ -3043,6 +3160,7 @@ export class TelegramTransportAdapter
 			return false;
 		}
 		await this.savePanelReference(chatId, createdMessageId);
+		this.panelStaleChats.delete(chatId);
 		if (hasBoundIntents) {
 			for (const intent of this.folderIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)
@@ -3210,8 +3328,24 @@ export class TelegramTransportAdapter
 		data: string,
 		messageId: number,
 	): Promise<void> {
-		if (data === "menu:home")
+		if (data === "menu:home" || data === "panel:refresh") {
+			this.panelStaleChats.delete(chatId);
 			return this.renderPanel(chatId, sender, messageId);
+		}
+		if (data === "events:enable") {
+			const queue = this.queues.get(chatId);
+			if (queue) {
+				queue.failed = false;
+				queue.messages.length = 0;
+				queue.pendingCharacters = 0;
+				queue.overflowQueued = false;
+			}
+			await this.sendDirect(
+				chatId,
+				"Канал включён только для новых событий; старые события не отправляются.",
+			);
+			return this.renderPanel(chatId, sender, messageId);
+		}
 		if (data === "session:prev" || data === "session:next")
 			return this.browseSessions(
 				chatId,
@@ -3411,6 +3545,9 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		sourceMessageId: number | undefined,
 	): LiveActivity {
+		const currentTurn = this.turnBuffers.get(sessionId);
+		if (currentTurn && currentTurn.recipients.size < 128)
+			currentTurn.recipients.add(chatId);
 		let activity = this.liveActivities.get(activityKey(chatId, sessionId));
 		if (activity && activity.sessionId === sessionId) {
 			const current = activity;
@@ -4503,6 +4640,10 @@ export class TelegramTransportAdapter
 	): string {
 		const token = this.makeIntentToken();
 		this.selectIntents.set(token, { chatId, sender, sessionId });
+		while (this.selectIntents.size > 128)
+			this.selectIntents.delete(
+				this.selectIntents.keys().next().value as string,
+			);
 		return token;
 	}
 
@@ -5044,6 +5185,11 @@ export class TelegramTransportAdapter
 				this.startTyping(event.sessionId);
 				this.turnBuffers.set(event.sessionId, {
 					chunks: [],
+					recipients: new Set(
+						this.activitiesForSession(event.sessionId)
+							.slice(0, 128)
+							.map((activity) => activity.chatId),
+					),
 					characters: 0,
 					overflow: false,
 				});
@@ -5209,7 +5355,12 @@ export class TelegramTransportAdapter
 	private appendTurnOutput(sessionId: SessionId, text: string): void {
 		let buffer = this.turnBuffers.get(sessionId);
 		if (!buffer) {
-			buffer = { chunks: [], characters: 0, overflow: false };
+			buffer = {
+				chunks: [],
+				recipients: new Set(),
+				characters: 0,
+				overflow: false,
+			};
 			this.turnBuffers.set(sessionId, buffer);
 		}
 		const remaining = MAX_QUEUED_CHARACTERS - buffer.characters;
@@ -5243,7 +5394,23 @@ export class TelegramTransportAdapter
 		if (buffer.overflow)
 			text +=
 				"\n\n[Additional output omitted because the response reached the queue limit.]";
-		this.enqueueForSelected(sessionId, text, undefined, true);
+		const selectedChats = new Set<number>();
+		for (const [chatId, selectedId] of this.selected)
+			if (selectedId === sessionId) selectedChats.add(chatId);
+		const recipients = new Set([...buffer.recipients, ...selectedChats]);
+		for (const chatId of recipients)
+			this.enqueue(
+				chatId,
+				sessionId,
+				`Фоновая сессия · ${this.eventFooter(sessionId)}\n\n${text}`,
+				undefined,
+				true,
+				true,
+			);
+	}
+
+	private eventChannelDisabled(chatId: number): boolean {
+		return this.queues.get(chatId)?.failed ?? false;
 	}
 
 	private enqueueForSelected(
@@ -5305,6 +5472,7 @@ export class TelegramTransportAdapter
 		text: string,
 		input?: { readonly inputId: string; readonly state: string },
 		output = false,
+		background = false,
 	): void {
 		let queue = this.queues.get(chatId);
 		if (!queue) {
@@ -5343,6 +5511,7 @@ export class TelegramTransportAdapter
 				sessionId,
 				text: part,
 				...(output ? { output: true as const } : {}),
+				...(background ? { background: true as const } : {}),
 			});
 			queue.pendingCharacters += part.length;
 		}
@@ -5445,14 +5614,46 @@ export class TelegramTransportAdapter
 			if (!message) break;
 			queue.pendingCharacters -= message.text.length;
 			if (message.overflow) queue.overflowQueued = false;
-			if (this.selected.get(chatId) !== message.sessionId) continue;
+			const backgroundDelivery =
+				message.background && this.selected.get(chatId) !== message.sessionId;
+			if (
+				!message.background &&
+				this.selected.get(chatId) !== message.sessionId
+			)
+				continue;
+			const sender = this.authorizedChatPrincipals.get(chatId);
+			const token =
+				backgroundDelivery && sender !== undefined
+					? this.createSelectIntent(chatId, sender, message.sessionId)
+					: undefined;
+			const text =
+				message.background && !backgroundDelivery
+					? message.text.replace(/^Фоновая сессия · [^\n]+\n\n/, "")
+					: message.text;
 			const delivered = await this.sendWithDeadline(
 				chatId,
-				message.text,
-				message.output
-					? { parse_mode: "HTML" }
-					: sessionIdEntity(message.text, message.sessionId),
+				text,
+				{
+					...(message.output ? { parse_mode: "HTML" } : {}),
+					...(backgroundDelivery && token
+						? {
+								reply_markup: keyboard([
+									[
+										inlineButton(
+											"Переключиться на эту сессию",
+											`action:select:${token}`,
+										),
+									],
+								]),
+							}
+						: !message.output
+							? sessionIdEntity(text, message.sessionId)
+							: {}),
+				},
 				message.output ? message.sessionId : undefined,
+				(messageId) => {
+					if (token) this.bindSelectMessage(token, messageId);
+				},
 			);
 			if (!delivered) {
 				queue.failed = true;

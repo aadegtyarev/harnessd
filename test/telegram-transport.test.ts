@@ -868,6 +868,34 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("delivers a completed answer after switching away with a one-time session switch action", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "start background answer");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "Finished after switch."));
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Finished after switch.")),
+			).toBe(true),
+		);
+		const answer = bot.sent.find(({ text }) =>
+			text.includes("Finished after switch."),
+		);
+		expect(answer?.text).toContain("Фоновая сессия");
+		expect(answer?.text).toContain("sid");
+		expect(
+			callbackData(
+				bot.sendOptions[bot.sent.indexOf(answer as (typeof bot.sent)[number])],
+				"action:select:",
+			),
+		).toMatch(/^action:select:/);
+		await adapter.stop();
+	});
+
 	it("bounds input history and reconciles overflow at run settlement", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
@@ -2114,7 +2142,11 @@ describe("Telegram transport", () => {
 			new Error("temporary API failure"),
 		);
 		await bot.update(42, "/menu");
-		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
+		expect(bot.sent.at(-1)?.text).toContain("Не удалось обновить панель");
+		expect(callbackData(bot.sendOptions.at(-1), "panel:refresh")).toBe(
+			"panel:refresh",
+		);
 
 		bot.api.editMessageText.mockRejectedValueOnce(
 			Object.assign(new Error("Telegram rejected edit"), {
@@ -2122,7 +2154,7 @@ describe("Telegram transport", () => {
 			}),
 		);
 		await bot.update(42, "/menu");
-		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 2);
 		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(2);
 		await bot.update(42, "/sessions");
 		expect(bot.sent.at(-1)?.text).toContain("#sid");
@@ -2476,51 +2508,37 @@ describe("Telegram transport", () => {
 		).toMatchObject({ sessionId: "sid" });
 
 		await bot.update(42, "/use other");
-		await bot.update(42, "text reply needs a choice", {
+		await bot.update(42, "text reply routes directly to source", {
 			replyToMessageId: sourceId,
 		});
-		const textChoice = bot.sent.at(-1);
-		const selectedChoiceData = callbackData(
-			bot.sendOptions.at(-1),
-			"reply:",
-		).replace(/:s$/, ":c");
-		await bot.update(42, "/use sid");
-		await bot.callback(42, selectedChoiceData, textChoice?.message_id);
-		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(3);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4);
+		expect(
+			requests.filter(({ kind }) => kind === "submit").at(-1),
+		).toMatchObject({
+			sessionId: "sid",
+		});
 		await bot.update(42, "/use other");
 		fetchFile.mockClear();
 
-		await bot.updatePhoto(
-			42,
-			undefined,
-			42,
-			sourceId,
-			"Name this session (harnessd name prompt):\nNew session will be created in /work. Reply with a name. Create unnamed and Cancel buttons are below.",
-		);
-		expect(fetchFile).not.toHaveBeenCalled();
-		const choice = bot.sent.at(-1);
-		const choiceData = (
-			bot.sendOptions.at(-1) as {
-				reply_markup: { inline_keyboard: { callback_data: string }[][] };
-			}
-		).reply_markup.inline_keyboard[0]?.[0]?.callback_data;
-		expect(choice?.text).toContain("selected session is");
-		expect(choiceData).toMatch(/^reply:[a-f0-9]{12}:s$/);
-		await bot.callback(42, choiceData as string, choice?.message_id);
-		await vi.waitFor(() =>
-			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4),
-		);
+		await bot.updatePhoto(42, undefined, 42, sourceId);
+		await vi.waitFor(() => expect(fetchFile).toHaveBeenCalledTimes(1));
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5);
 		expect(
 			requests.filter(({ kind }) => kind === "submit").at(-1),
-		).toMatchObject({ sessionId: "sid" });
-		expect(fetchFile).toHaveBeenCalledTimes(1);
-		await bot.callback(42, choiceData as string, choice?.message_id);
-		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4);
-		expect(fetchFile).toHaveBeenCalledTimes(1);
+		).toMatchObject({
+			sessionId: "sid",
+		});
 
 		await bot.updateDocument(42, { replyToMessageId: 999999 });
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5);
+		const unknownReply = bot.sent.at(-1);
+		const selectedTarget = callbackData(
+			bot.sendOptions.at(-1),
+			"reply:",
+		).replace(/:[sx]$/, ":c");
+		await bot.callback(42, selectedTarget, unknownReply?.message_id);
 		await vi.waitFor(() =>
-			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5),
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(6),
 		);
 		expect(
 			requests.filter(({ kind }) => kind === "submit").at(-1),
@@ -2922,7 +2940,16 @@ describe("Telegram transport", () => {
 		);
 		expect(requests.some((request) => request.kind === "submit")).toBe(false);
 		await bot.update(42, "stale prompt response", { replyToMessageId: 999999 });
-		expect(requests.some((request) => request.kind === "submit")).toBe(true);
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		const unknownSourceChoice = bot.sent.at(-1);
+		const targetChoice = callbackData(bot.sendOptions.at(-1), "reply:").replace(
+			/:[sx]$/,
+			":c",
+		);
+		await bot.callback(42, targetChoice, unknownSourceChoice?.message_id);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(1);
 		await bot.update(42, "old name reply", {
 			replyToMessageId: 999998,
 			replyToMessageText:
@@ -3692,7 +3719,10 @@ describe("Telegram transport", () => {
 			),
 			images: [{ mimeType: "image/jpeg", data: "aGVsbG8=" }],
 		});
-		expect(bot.api.getFile).toHaveBeenCalledWith("largest-photo-id");
+		expect(bot.api.getFile).toHaveBeenCalledWith(
+			"largest-photo-id",
+			expect.any(AbortSignal),
+		);
 		expect(bot.reactions).toContainEqual({
 			chatId: 42,
 			messageId: 1002,
@@ -3763,6 +3793,26 @@ describe("Telegram transport", () => {
 		expect(await readFile(savedPath, "utf8")).toBe("hello");
 		expect(await readdir(dir)).toEqual([]);
 		await adapter.stop();
+	});
+
+	it("acknowledges a stalled attachment and times out without submitting it", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.getFile = vi.fn(() => new Promise(() => {}));
+		const update = bot.updateDocument(42);
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Получаю вложение")),
+			).toBe(true),
+		);
+		await vi.advanceTimersByTimeAsync(60_000);
+		await update;
+		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		expect(bot.sent.at(-1)?.text).toContain("timed out after 60 seconds");
+		await adapter.stop();
+		vi.useRealTimers();
 	});
 
 	it("does not submit oversized or failed incoming documents", async () => {
@@ -4521,6 +4571,41 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_end"));
 		await vi.advanceTimersByTimeAsync(100);
 		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await adapter.stop();
+	});
+
+	it("blocks new submissions after event-channel failure and resets only future events", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockRejectedValueOnce(new Error("network unavailable"));
+		emit(harnessEvent("sid", "status", "custom event"));
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as { queues: Map<number, { failed: boolean }> }
+				).queues.get(42)?.failed,
+			).toBe(true),
+		);
+		const submissionsBefore = requests.filter(
+			(request) => request.kind === "submit",
+		).length;
+		await bot.update(42, "must not submit");
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(submissionsBefore);
+		await bot.update(42, "/menu");
+		const reset = callbackData(bot.sendOptions.at(-1), "events:enable");
+		expect(reset).toBe("events:enable");
+		await bot.callback(42, reset);
+		expect(
+			(
+				adapter as unknown as { queues: Map<number, { failed: boolean }> }
+			).queues.get(42)?.failed,
+		).toBe(false);
+		bot.api.sendMessage.mockClear();
+		emit(harnessEvent("sid", "status", "future event"));
+		await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
 		await adapter.stop();
 	});
 
