@@ -27,6 +27,8 @@ import type {
 	AdapterId,
 	HarnessActivityEvent,
 	HarnessEvent,
+	InputDeliveryState,
+	InputId,
 	SessionId,
 	SessionSummary,
 } from "./core/types.js";
@@ -76,6 +78,7 @@ const RENAME_NAME_FALLBACK =
 const RENAME_NAME_PREFIX = "Rename ";
 const RENAME_NAME_SEPARATOR = " in ";
 const MAX_CORRELATED_MESSAGES_PER_CHAT = 128;
+const MAX_INPUT_ATTRIBUTIONS = 512;
 type UpdateContext = {
 	from?: { id: number };
 	chat?: { id: number; type: string };
@@ -256,12 +259,23 @@ type ChatQueue = {
 type TurnBuffer = {
 	readonly chunks: string[];
 	readonly recipients: Set<number>;
+	readonly pendingInputs: Set<InputId>;
 	characters: number;
-	pendingSubmissions: number;
 	settled: boolean;
 	interrupted: boolean;
 	overflow: boolean;
 };
+type InputAttribution = {
+	readonly inputId: InputId;
+	readonly sessionId: SessionId;
+	chatId?: number;
+	state: InputDeliveryState;
+	terminal: boolean;
+	pendingSeen: boolean;
+	waitingForRun: boolean;
+	turn?: TurnBuffer;
+};
+type InFlightSubmission = { readonly chatId: number };
 type FolderIntent = {
 	readonly chatId: number;
 	messageId: number;
@@ -319,8 +333,6 @@ type LiveActivity = {
 	statsTimer?: NodeJS.Timeout;
 	statsInFlight: boolean;
 	pendingSubmissions: number;
-	submittedRunSequence: number;
-	submissionTurn?: TurnBuffer;
 	turnGeneration: number;
 	finishTimer?: ReturnType<typeof setTimeout>;
 	finishing: boolean;
@@ -689,6 +701,20 @@ function formatSession(session: SessionSummary): string {
 }
 function formatSessionList(session: SessionSummary, selected: boolean): string {
 	return `${selected ? "✓ " : ""}${escapeHtml(shortSessionLabel(session))} · ${escapeHtml(session.status)} · ${escapeHtml(compactSessionPath(session.cwd))}`;
+}
+function isGeneratedSessionFooterName(value: string): boolean {
+	if (!value || [...value].length > 64) return false;
+	for (const character of value) {
+		const codePoint = character.codePointAt(0) ?? 0;
+		if (
+			codePoint <= 0x1f ||
+			(codePoint >= 0x7f && codePoint <= 0x9f) ||
+			codePoint === 0x2028 ||
+			codePoint === 0x2029
+		)
+			return false;
+	}
+	return value === value.trim().replace(/\s+/gu, " ");
 }
 function oneLine(value: string): string {
 	return [...value]
@@ -1063,12 +1089,11 @@ export class TelegramTransportAdapter
 	private readonly modelChoices = new Map<number, ModelChoices>();
 	private readonly effortChoices = new Map<number, EffortChoices>();
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
-	private readonly pendingTurnRecipients = new Map<SessionId, Set<number>>();
-	private readonly pendingTurnSubmissions = new Map<
+	private readonly inputAttributions = new Map<InputId, InputAttribution>();
+	private readonly inFlightSubmissions = new Map<
 		SessionId,
-		Set<LiveActivity>
+		InFlightSubmission
 	>();
-	private readonly turnSequences = new Map<SessionId, number>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
 	private readonly panelStaleChats = new Set<number>();
@@ -1379,9 +1404,8 @@ export class TelegramTransportAdapter
 		}
 		this.liveActivities.clear();
 		this.turnBuffers.clear();
-		this.pendingTurnRecipients.clear();
-		this.pendingTurnSubmissions.clear();
-		this.turnSequences.clear();
+		this.inputAttributions.clear();
+		this.inFlightSubmissions.clear();
 		try {
 			if (this.initializationPromise)
 				await withDeadline(this.initializationPromise, STOP_TIMEOUT_MS);
@@ -1557,7 +1581,6 @@ export class TelegramTransportAdapter
 					sender,
 					{ kind: "submit", sessionId, text },
 					confirmedCurrentSession,
-					activity,
 				);
 				if (!result) {
 					submissionPending = false;
@@ -1574,8 +1597,6 @@ export class TelegramTransportAdapter
 					);
 				} else {
 					submissionPending = false;
-					if (result.error.code === "UNCERTAIN_INPUT_DELIVERY")
-						this.attributeAcceptedSubmission(activity);
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
@@ -1783,11 +1804,8 @@ export class TelegramTransportAdapter
 			);
 		const id = match?.[2];
 		if (!id || !this.knownSessions.has(id as SessionId)) return undefined;
-		const expectedName = this.sessionNames.get(id as SessionId);
-		if (
-			(match[1] ?? undefined) !==
-			(expectedName ? oneLine(expectedName) : undefined)
-		)
+		const footerName = match[1];
+		if (footerName !== undefined && !isGeneratedSessionFooterName(footerName))
 			return undefined;
 		if (match[3] !== undefined) {
 			const part = Number(match[3]);
@@ -2098,6 +2116,16 @@ export class TelegramTransportAdapter
 			}
 			const session = inspected.value as SessionSummary;
 			this.rememberSession(session);
+			const selectionChanged =
+				(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+				this.selected.get(chatId) !== selectedAtDownload;
+			if (selectionChanged) {
+				await this.sendDirect(
+					chatId,
+					"The selected session changed while receiving the attachment; it was not submitted.",
+				);
+				return;
+			}
 			let activity: LiveActivity | undefined;
 			let submissionPending = false;
 			try {
@@ -2109,6 +2137,17 @@ export class TelegramTransportAdapter
 					session.status === "stopped" || session.status === "failed",
 					session.cwd,
 				);
+				if (
+					(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+					this.selected.get(chatId) !== selectedAtDownload
+				) {
+					await inbox.removeSavedAttachmentUnderLock(sessionId, saved.path);
+					await this.sendDirect(
+						chatId,
+						"The selected session changed while receiving the attachment; it was not submitted.",
+					);
+					return;
+				}
 				const caption = message.caption?.trim();
 				const text = `The user sent an attachment saved in the harnessd inbox at ${saved.path}.${caption ? ` Caption (untrusted user text): ${caption}` : ""}`;
 				const image = photo
@@ -2120,6 +2159,19 @@ export class TelegramTransportAdapter
 					message.message_id,
 				);
 				submissionPending = true;
+				if (
+					(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
+					this.selected.get(chatId) !== selectedAtDownload
+				) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					await inbox.removeSavedAttachmentUnderLock(sessionId, saved.path);
+					await this.sendDirect(
+						chatId,
+						"The selected session changed while receiving the attachment; it was not submitted.",
+					);
+					return;
+				}
 				if (this.eventChannelDisabled(chatId)) {
 					submissionPending = false;
 					this.finishActivitySubmission(activity);
@@ -2129,10 +2181,7 @@ export class TelegramTransportAdapter
 					);
 					return;
 				}
-				activity.submittedWhileRunning = this.runningSessions.has(sessionId);
-				activity.submittedRunSequence = this.turnSequences.get(sessionId) ?? 0;
-				this.captureSubmissionTurn(activity);
-				const submitted = await this.dispatchRequest(sender, {
+				const submitted = await this.dispatchSubmission(chatId, sender, {
 					kind: "submit",
 					sessionId,
 					text,
@@ -2140,8 +2189,6 @@ export class TelegramTransportAdapter
 				});
 				if (!submitted.ok) {
 					submissionPending = false;
-					if (submitted.error.code === "UNCERTAIN_INPUT_DELIVERY")
-						this.attributeAcceptedSubmission(activity);
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
@@ -2993,7 +3040,6 @@ export class TelegramTransportAdapter
 		sender: number,
 		request: Extract<TelegramRequest, { kind: "submit" }>,
 		expectedSelection?: SessionId,
-		activity?: LiveActivity,
 	): Promise<TransportResult | undefined> {
 		return this.withSessionRequestLock(request.sessionId, async () => {
 			if (
@@ -3013,16 +3059,40 @@ export class TelegramTransportAdapter
 				);
 				return undefined;
 			}
-			if (activity) {
-				activity.submittedWhileRunning = this.runningSessions.has(
-					request.sessionId,
-				);
-				activity.submittedRunSequence =
-					this.turnSequences.get(request.sessionId) ?? 0;
-				this.captureSubmissionTurn(activity);
-			}
-			return this.dispatchRequest(sender, request);
+			return this.dispatchSubmission(chatId, sender, request);
 		});
+	}
+
+	private async dispatchSubmission(
+		chatId: number,
+		sender: number,
+		request: Extract<TelegramRequest, { kind: "submit" }>,
+	): Promise<TransportResult> {
+		const pending: InFlightSubmission = { chatId };
+		this.inFlightSubmissions.set(request.sessionId, pending);
+		try {
+			const result = await this.dispatchRequest(sender, request);
+			if (result.ok)
+				this.recordInputOutcome(
+					request.sessionId,
+					result.value as InputId,
+					chatId,
+					"accepted",
+				);
+			else if (result.error.inputId)
+				this.recordInputOutcome(
+					request.sessionId,
+					result.error.inputId as InputId,
+					chatId,
+					result.error.code === "UNCERTAIN_INPUT_DELIVERY"
+						? "uncertain"
+						: "failed",
+				);
+			return result;
+		} finally {
+			if (this.inFlightSubmissions.get(request.sessionId) === pending)
+				this.inFlightSubmissions.delete(request.sessionId);
+		}
 	}
 
 	private request(
@@ -3691,7 +3761,6 @@ export class TelegramTransportAdapter
 			if (current.finishTimer) clearTimeout(current.finishTimer);
 			current.finishTimer = undefined;
 			current.submittedWhileRunning = this.runningSessions.has(sessionId);
-			current.submittedRunSequence = this.turnSequences.get(sessionId) ?? 0;
 			if (startsIndependentTurn) {
 				current.queuedInputs.splice(0, current.queuedInputs.length);
 				current.overflowInputIds.clear();
@@ -3733,7 +3802,6 @@ export class TelegramTransportAdapter
 			renderQueue: Promise.resolve(),
 			statsInFlight: false,
 			pendingSubmissions: 1,
-			submittedRunSequence: this.turnSequences.get(sessionId) ?? 0,
 			turnGeneration: 1,
 			finishing: false,
 		};
@@ -3893,14 +3961,6 @@ export class TelegramTransportAdapter
 
 	private finishActivitySubmission(activity: LiveActivity): void {
 		if (activity.pendingSubmissions > 0) activity.pendingSubmissions--;
-		if (!activity.submissionTurn) this.removePendingTurnSubmission(activity);
-		const turn = activity.submissionTurn;
-		activity.submissionTurn = undefined;
-		if (turn) {
-			turn.pendingSubmissions = Math.max(0, turn.pendingSubmissions - 1);
-			if (turn.settled && turn.pendingSubmissions === 0)
-				this.flushTurn(activity.sessionId, turn.interrupted, turn);
-		}
 	}
 
 	private updateLiveActivity(
@@ -4116,62 +4176,6 @@ export class TelegramTransportAdapter
 		}
 	}
 
-	private attributeAcceptedSubmission(activity: LiveActivity): void {
-		const sessionId = activity.sessionId;
-		const turn = this.turnBuffers.get(sessionId);
-		const sequence = this.turnSequences.get(sessionId) ?? 0;
-		const submittedTurn = activity.submissionTurn;
-		if (submittedTurn) {
-			if (submittedTurn.recipients.size < 128)
-				submittedTurn.recipients.add(activity.chatId);
-			return;
-		}
-		this.removePendingTurnSubmission(activity);
-		if (activity.submittedWhileRunning) {
-			if (turn && turn.recipients.size < 128)
-				turn.recipients.add(activity.chatId);
-			return;
-		}
-		if (turn && sequence > activity.submittedRunSequence) {
-			if (turn.recipients.size < 128) turn.recipients.add(activity.chatId);
-			return;
-		}
-		if (sequence !== activity.submittedRunSequence) return;
-		const pending = this.pendingTurnRecipients.get(sessionId);
-		if (!pending && this.pendingTurnRecipients.size >= 128) return;
-		const recipients = pending ?? new Set<number>();
-		if (recipients.size >= 128) return;
-		recipients.add(activity.chatId);
-		this.pendingTurnRecipients.set(sessionId, recipients);
-	}
-
-	private captureSubmissionTurn(activity: LiveActivity): void {
-		const turn = this.turnBuffers.get(activity.sessionId);
-		if (turn && activity.submittedWhileRunning) {
-			turn.pendingSubmissions++;
-			activity.submissionTurn = turn;
-			return;
-		}
-		if (
-			this.pendingTurnSubmissions.size >= 128 &&
-			!this.pendingTurnSubmissions.has(activity.sessionId)
-		)
-			return;
-		const pending =
-			this.pendingTurnSubmissions.get(activity.sessionId) ??
-			new Set<LiveActivity>();
-		if (pending.size >= 128) return;
-		pending.add(activity);
-		this.pendingTurnSubmissions.set(activity.sessionId, pending);
-	}
-
-	private removePendingTurnSubmission(activity: LiveActivity): void {
-		const pending = this.pendingTurnSubmissions.get(activity.sessionId);
-		pending?.delete(activity);
-		if (pending?.size === 0)
-			this.pendingTurnSubmissions.delete(activity.sessionId);
-	}
-
 	private async confirmInputAccepted(
 		chatId: number,
 		messageId: number | undefined,
@@ -4179,7 +4183,6 @@ export class TelegramTransportAdapter
 		activity: LiveActivity,
 		acknowledgement?: string,
 	): Promise<void> {
-		this.attributeAcceptedSubmission(activity);
 		this.finishActivitySubmission(activity);
 		if (messageId !== undefined)
 			void this.reactToAcceptedInput(chatId, messageId, inputId);
@@ -5389,37 +5392,26 @@ export class TelegramTransportAdapter
 				this.stopTyping(event.sessionId);
 			}
 			if (event.text === "agent_start") {
-				this.turnSequences.set(
-					event.sessionId,
-					(this.turnSequences.get(event.sessionId) ?? 0) + 1,
-				);
-				while (this.turnSequences.size > 128)
-					this.turnSequences.delete(
-						this.turnSequences.keys().next().value as SessionId,
-					);
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.add(event.sessionId);
 				this.startTyping(event.sessionId);
-				const recipients =
-					this.pendingTurnRecipients.get(event.sessionId) ?? new Set();
-				this.pendingTurnRecipients.delete(event.sessionId);
 				const turn: TurnBuffer = {
 					chunks: [],
-					recipients,
+					recipients: new Set(),
+					pendingInputs: new Set(),
 					characters: 0,
-					pendingSubmissions: 0,
 					settled: false,
 					interrupted: false,
 					overflow: false,
 				};
-				for (const activity of this.pendingTurnSubmissions.get(
-					event.sessionId,
-				) ?? []) {
-					activity.submissionTurn = turn;
-					turn.pendingSubmissions++;
-				}
-				this.pendingTurnSubmissions.delete(event.sessionId);
 				this.turnBuffers.set(event.sessionId, turn);
+				for (const record of this.inputAttributions.values())
+					if (
+						record.sessionId === event.sessionId &&
+						record.waitingForRun &&
+						!record.terminal
+					)
+						this.associateInputWithTurn(record, turn);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
 					activity.status = "Pi выполняет ход сессии";
 					activity.thinking = false;
@@ -5433,8 +5425,9 @@ export class TelegramTransportAdapter
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
+				const turn = this.turnBuffers.get(event.sessionId);
+				if (turn) this.settleInputAttributions(turn);
 				this.flushTurn(event.sessionId);
-				this.pendingTurnRecipients.delete(event.sessionId);
 				this.reconcileOverflowAtRunSettlement(event.sessionId);
 				this.scheduleLiveActivityFinish(event.sessionId, true);
 				return;
@@ -5479,6 +5472,7 @@ export class TelegramTransportAdapter
 		}
 		if (event.kind === "input" && event.inputEvent) {
 			const { inputId, state, detail } = event.inputEvent;
+			this.trackInputEvent(event.sessionId, inputId, state);
 			const canceledByUser =
 				state === "failed" && detail?.toLowerCase() === "input canceled";
 			const inputPresentation = canceledByUser
@@ -5580,14 +5574,156 @@ export class TelegramTransportAdapter
 		}
 	}
 
+	private getInputAttribution(
+		sessionId: SessionId,
+		inputId: InputId,
+	): InputAttribution | undefined {
+		const existing = this.inputAttributions.get(inputId);
+		if (existing)
+			return existing.sessionId === sessionId ? existing : undefined;
+		if (this.inputAttributions.size >= MAX_INPUT_ATTRIBUTIONS) {
+			const expired = [...this.inputAttributions].find(
+				([, record]) => record.terminal,
+			);
+			if (expired) this.inputAttributions.delete(expired[0]);
+		}
+		if (this.inputAttributions.size >= MAX_INPUT_ATTRIBUTIONS) return undefined;
+		const record: InputAttribution = {
+			inputId,
+			sessionId,
+			state: "pending",
+			terminal: false,
+			pendingSeen: false,
+			waitingForRun: false,
+		};
+		this.inputAttributions.set(inputId, record);
+		return record;
+	}
+
+	private associateInputWithTurn(
+		record: InputAttribution,
+		turn: TurnBuffer,
+	): void {
+		record.turn = turn;
+		record.waitingForRun = false;
+		turn.pendingInputs.add(record.inputId);
+		if (
+			(record.state === "accepted" || record.state === "uncertain") &&
+			record.chatId !== undefined
+		)
+			if (turn.recipients.size < 128) turn.recipients.add(record.chatId);
+	}
+
+	private associateInputWithObservedRun(record: InputAttribution): void {
+		if (record.turn || record.terminal) return;
+		const turn = this.turnBuffers.get(record.sessionId);
+		if (turn && this.runningSessions.has(record.sessionId) && !turn.settled)
+			this.associateInputWithTurn(record, turn);
+		else record.waitingForRun = true;
+	}
+
+	private recordInputOutcome(
+		sessionId: SessionId,
+		inputId: InputId,
+		chatId: number,
+		state: "accepted" | "uncertain" | "failed",
+	): void {
+		const record = this.getInputAttribution(sessionId, inputId);
+		if (!record || record.terminal) return;
+		record.chatId = chatId;
+		record.state = state;
+		if (state === "failed") {
+			this.finishInputAttribution(record, false);
+			return;
+		}
+		if (state === "accepted" && !record.turn)
+			this.associateInputWithObservedRun(record);
+		if (
+			record.turn &&
+			state === "accepted" &&
+			record.turn.recipients.size < 128
+		)
+			record.turn.recipients.add(chatId);
+		if (
+			record.turn &&
+			state === "uncertain" &&
+			record.turn.recipients.size < 128
+		)
+			record.turn.recipients.add(chatId);
+		if (record.turn?.settled && state === "uncertain")
+			this.finishInputAttribution(record, true);
+	}
+
+	private trackInputEvent(
+		sessionId: SessionId,
+		inputId: InputId,
+		state: InputDeliveryState,
+	): void {
+		const record = this.getInputAttribution(sessionId, inputId);
+		if (!record || record.terminal) return;
+		if (state === "pending") {
+			record.pendingSeen = true;
+			const flight = this.inFlightSubmissions.get(sessionId);
+			if (flight) record.chatId ??= flight.chatId;
+			if (!record.turn) this.associateInputWithObservedRun(record);
+			return;
+		}
+		record.state = state;
+		if (state === "accepted" && !record.turn)
+			this.associateInputWithObservedRun(record);
+		if (
+			(state === "accepted" || state === "uncertain") &&
+			record.turn &&
+			record.chatId !== undefined
+		)
+			if (record.turn.recipients.size < 128)
+				record.turn.recipients.add(record.chatId);
+		if (state === "uncertain") {
+			if (record.turn?.settled) this.finishInputAttribution(record, true);
+			return;
+		}
+		if (state === "completed" || state === "failed")
+			this.finishInputAttribution(record, state === "completed");
+	}
+
+	private finishInputAttribution(
+		record: InputAttribution,
+		includeRecipient: boolean,
+	): void {
+		if (record.terminal) return;
+		record.terminal = true;
+		record.waitingForRun = false;
+		const turn = record.turn;
+		if (!turn) return;
+		if (
+			includeRecipient &&
+			record.chatId !== undefined &&
+			turn.recipients.size < 128
+		)
+			turn.recipients.add(record.chatId);
+		turn.pendingInputs.delete(record.inputId);
+		if (turn.settled && turn.pendingInputs.size === 0)
+			this.flushTurn(record.sessionId, turn.interrupted, turn);
+	}
+
+	private settleInputAttributions(turn: TurnBuffer): void {
+		for (const record of this.inputAttributions.values()) {
+			if (record.turn !== turn || record.terminal) continue;
+			if (record.state === "uncertain")
+				this.finishInputAttribution(record, true);
+			else if (!record.pendingSeen && record.state === "accepted")
+				this.finishInputAttribution(record, true);
+		}
+	}
+
 	private appendTurnOutput(sessionId: SessionId, text: string): void {
 		let buffer = this.turnBuffers.get(sessionId);
 		if (!buffer) {
 			buffer = {
 				chunks: [],
 				recipients: new Set(),
+				pendingInputs: new Set(),
 				characters: 0,
-				pendingSubmissions: 0,
 				settled: false,
 				interrupted: false,
 				overflow: false,
@@ -5620,7 +5756,7 @@ export class TelegramTransportAdapter
 		if (!buffer) return;
 		buffer.settled = true;
 		buffer.interrupted ||= interrupted;
-		if (buffer.pendingSubmissions > 0) return;
+		if (buffer.pendingInputs.size > 0) return;
 		if (this.turnBuffers.get(sessionId) === buffer)
 			this.turnBuffers.delete(sessionId);
 		if (buffer.characters === 0 && !buffer.overflow) return;
@@ -5683,9 +5819,10 @@ export class TelegramTransportAdapter
 	}
 
 	private invalidateSession(sessionId: SessionId): void {
-		this.pendingTurnRecipients.delete(sessionId);
-		this.pendingTurnSubmissions.delete(sessionId);
 		this.turnBuffers.delete(sessionId);
+		for (const [inputId, record] of this.inputAttributions)
+			if (record.sessionId === sessionId)
+				this.inputAttributions.delete(inputId);
 		this.knownSessions.delete(sessionId);
 		this.sessionNames.delete(sessionId);
 		this.sessionCwds.delete(sessionId);

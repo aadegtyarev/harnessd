@@ -141,6 +141,31 @@ export class TelegramInbox {
 		}
 	}
 
+	async removeSavedAttachmentUnderLock(
+		sessionId: SessionId,
+		savedPath: string,
+	): Promise<void> {
+		this.validateSessionId(sessionId);
+		try {
+			const directory = await realpath(
+				path.join(this.rootDirectory, sessionId),
+			);
+			const canonicalFile = await realpath(savedPath);
+			if (
+				path.dirname(canonicalFile) !== directory ||
+				!FILE_NAME_PATTERN.test(path.basename(canonicalFile))
+			)
+				throw new Error("Saved attachment path validation failed");
+			const info = await lstat(savedPath);
+			if (info.isSymbolicLink() || !info.isFile())
+				throw new Error("Saved attachment is not a regular file");
+			await unlink(canonicalFile);
+		} catch (error) {
+			if (isCode(error, "ENOENT")) return;
+			throw new TelegramInboxError({ cause: error });
+		}
+	}
+
 	async removeSession(sessionId: SessionId): Promise<void> {
 		await this.withSessionLock(sessionId, () =>
 			this.removeSessionUnderLock(sessionId),

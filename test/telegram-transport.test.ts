@@ -944,9 +944,24 @@ describe("Telegram transport", () => {
 			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1),
 		);
 		await bot.update(42, "/use other");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "owned by chat 42"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(({ text }) => text.includes("owned by chat 42")),
@@ -971,12 +986,14 @@ describe("Telegram transport", () => {
 			),
 		).toBe(false);
 		expect(
-			(
-				adapter as unknown as {
-					pendingTurnRecipients: Map<SessionId, Set<number>>;
-				}
-			).pendingTurnRecipients.size,
-		).toBe(0);
+			[
+				...(
+					adapter as unknown as {
+						inputAttributions: Map<string, { terminal: boolean }>;
+					}
+				).inputAttributions.values(),
+			].filter((record) => !record.terminal),
+		).toHaveLength(0);
 		await adapter.stop();
 	});
 
@@ -997,6 +1014,11 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		const sending = bot.update(42, "racing accepted input");
 		await vi.waitFor(() => expect(submitRequest).toBeDefined());
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "answer settled before ack"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
@@ -1004,6 +1026,16 @@ describe("Telegram transport", () => {
 		if (!submitRequest) throw new Error("missing submit request");
 		accept(result(submitRequest));
 		await sending;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(({ text }) => text.includes("answer settled before ack")),
@@ -1036,6 +1068,11 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		emit(harnessEvent("sid", "status", "agent_start"));
 		await bot.update(42, "queued uncertain message");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-uncertain" as never, state: "pending" },
+		});
 		await bot.update(42, "/use other");
 		emit(harnessEvent("sid", "output", "uncertain run answer"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
@@ -1046,6 +1083,151 @@ describe("Telegram transport", () => {
 		);
 		expect(
 			bot.sent.find(({ text }) => text.includes("uncertain run answer"))?.text,
+		).toContain("Фоновая сессия");
+		await adapter.stop();
+	});
+
+	it("retires handled and canceled InputIds without inheriting later run output", async () => {
+		let submission = 0;
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				submission++;
+				return { ...result(request), value: `input-${submission}` as never };
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "handled without a run");
+		for (const state of ["pending", "accepted", "completed"] as const)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: { inputId: "input-1" as never, state },
+			});
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "unrelated later run"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await bot.update(42, "/use sid");
+		await bot.update(42, "input canceled during its run");
+		await bot.update(42, "/use other");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-2" as never, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "canceled run output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "input-2" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(
+			bot.sent.some(({ text }) => text.includes("unrelated later run")),
+		).toBe(false);
+		expect(
+			bot.sent.some(({ text }) => text.includes("canceled run output")),
+		).toBe(false);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(2);
+		await adapter.stop();
+	});
+
+	it("does not attach a submission held across settlement to the preceding run", async () => {
+		let submission = 0;
+		let releaseSecond!: (value: TransportResult) => void;
+		let secondRequest: TransportEvent | undefined;
+		const secondGate = new Promise<TransportResult>(
+			(resolve) => (releaseSecond = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				submission++;
+				if (submission === 2) {
+					secondRequest = request;
+					return secondGate;
+				}
+				return { ...result(request), value: "input-first" as never };
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "first run input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-first" as never, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(43, "/use sid");
+		const secondSend = bot.update(43, "held until cancellation settles");
+		await vi.waitFor(() => expect(secondRequest).toBeDefined());
+		await bot.update(42, "/use other");
+		await bot.update(43, "/use other");
+		emit(harnessEvent("sid", "output", "preceding run output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-first" as never, state: "completed" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-second" as never, state: "pending" },
+		});
+		if (!secondRequest) throw new Error("missing second submit request");
+		const acceptedSecond = result(secondRequest);
+		if (!acceptedSecond.ok) throw new Error("second submission was rejected");
+		releaseSecond({ ...acceptedSecond, value: "input-second" as never });
+		await secondSend;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "following run output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-second" as never, state: "completed" },
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("following run output")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 42 && text.includes("preceding run output"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 43 && text.includes("preceding run output"),
+			),
+		).toBe(false);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 43 && text.includes("following run output"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.some(
+				({ chatId, text }) =>
+					chatId === 42 && text.includes("following run output"),
+			),
+		).toBe(false);
+		expect(
+			bot.sent.find(({ text }) => text.includes("following run output"))?.text,
 		).toContain("Фоновая сессия");
 		await adapter.stop();
 	});
@@ -2285,22 +2467,12 @@ describe("Telegram transport", () => {
 				.confirmationEpochs.size,
 		).toBe(0);
 		expect(
-			(
-				adapter as unknown as {
-					pendingTurnRecipients: Map<SessionId, Set<number>>;
-				}
-			).pendingTurnRecipients.size,
+			(adapter as unknown as { turnBuffers: Map<SessionId, unknown> })
+				.turnBuffers.size,
 		).toBe(0);
 		expect(
-			(adapter as unknown as { turnSequences: Map<SessionId, number> })
-				.turnSequences.size,
-		).toBeLessThanOrEqual(128);
-		expect(
-			(
-				adapter as unknown as {
-					pendingTurnSubmissions: Map<SessionId, Set<unknown>>;
-				}
-			).pendingTurnSubmissions.size,
+			(adapter as unknown as { inputAttributions: Map<string, unknown> })
+				.inputAttributions.size,
 		).toBe(0);
 		await adapter.stop();
 	});
@@ -2903,6 +3075,63 @@ describe("Telegram transport", () => {
 		},
 	);
 
+	it.each([
+		{ oldName: "Previous name", currentName: "Renamed session" },
+		{ oldName: undefined, currentName: "Named after reply" },
+	])(
+		"routes historical footer after name changes from $oldName",
+		async ({ oldName, currentName }) => {
+			const previous = sessions.get("sid");
+			if (!previous) throw new Error("missing session fixture");
+			sessions.set("sid", {
+				...previous,
+				...(oldName ? { name: oldName } : { name: undefined }),
+			});
+			const stateDirectory = await temp();
+			const firstBot = new MockBot();
+			const first = await startAdapter(firstBot, stateDirectory);
+			await firstBot.update(42, "/use sid");
+			first.emit(harnessEvent("sid", "status", "agent_start"));
+			first.emit(harnessEvent("sid", "output", "historical name answer"));
+			first.emit(harnessEvent("sid", "status", "agent_settled"));
+			await vi.waitFor(() =>
+				expect(
+					firstBot.sent.some(({ text }) =>
+						text.includes("historical name answer"),
+					),
+				).toBe(true),
+			);
+			const answer = firstBot.sent.find(({ text }) =>
+				text.includes("historical name answer"),
+			);
+			await first.adapter.stop();
+			sessions.set("sid", { ...previous, name: currentName });
+			const restartedBot = new MockBot();
+			const restarted = await startAdapter(restartedBot, stateDirectory);
+			await restartedBot.update(42, "reply to old generated footer", {
+				replyToMessageId: answer?.message_id,
+				replyToMessageText: answer?.text,
+			});
+			expect(
+				restarted.requests.filter(({ kind }) => kind === "submit"),
+			).toHaveLength(1);
+			if (oldName && answer?.text) {
+				await restartedBot.update(42, "reject malformed historical name", {
+					replyToMessageId: answer.message_id,
+					replyToMessageText: answer.text.replace(
+						oldName,
+						"Previous\u0085name",
+					),
+				});
+				expect(
+					restarted.requests.filter(({ kind }) => kind === "submit"),
+				).toHaveLength(1);
+			}
+			await restarted.adapter.stop();
+			sessions.set("sid", previous);
+		},
+	);
+
 	it("rejects restarted text and media replies to the generated long-path create prompt", async () => {
 		const cwd = `/workspace/${"long".repeat(1100)}`;
 		const stateDirectory = await temp();
@@ -3214,6 +3443,107 @@ describe("Telegram transport", () => {
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(1);
 		await adapter.stop();
+	});
+
+	it("rechecks confirmed-current media selection after inspection before saving", async () => {
+		stubFileDownload();
+		const previousSession = sessions.get("sid");
+		if (!previousSession) throw new Error("missing session fixture");
+		sessions.set("sid", { ...previousSession, cwd: await temp() });
+		let releaseInspect!: () => void;
+		let signalInspect!: () => void;
+		let deferInspect = false;
+		const inspectGate = new Promise<void>(
+			(resolve) => (releaseInspect = resolve),
+		);
+		const inspectStarted = new Promise<void>(
+			(resolve) => (signalInspect = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (
+					deferInspect &&
+					request.kind === "inspect" &&
+					request.sessionId === "sid"
+				) {
+					signalInspect();
+					await inspectGate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		deferInspect = true;
+		const upload = bot.updateDocument(42);
+		await inspectStarted;
+		await bot.update(42, "/use other");
+		releaseInspect();
+		await upload;
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		const inbox = (adapter as unknown as { inbox: { rootDirectory: string } })
+			.inbox;
+		await expect(
+			readdir(path.join(inbox.rootDirectory, "sid")),
+		).rejects.toThrow();
+		await adapter.stop();
+		if (previousSession) sessions.set("sid", previousSession);
+	});
+
+	it("removes a just-saved attachment if current selection changes during save", async () => {
+		stubFileDownload();
+		const previousSession = sessions.get("sid");
+		if (!previousSession) throw new Error("missing session fixture");
+		sessions.set("sid", { ...previousSession, cwd: await temp() });
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					rootDirectory: string;
+					saveUnderLock: (
+						id: SessionId,
+						name: string,
+						data: Buffer,
+						removeExpired: boolean,
+						workspacePath: string,
+					) => Promise<{ path: string }>;
+				};
+			}
+		).inbox;
+		let savedDuringUpload = false;
+		const save = inbox.saveUnderLock.bind(inbox);
+		inbox.saveUnderLock = async (
+			id,
+			name,
+			data,
+			removeExpired,
+			workspacePath,
+		) => {
+			const saved = await save(id, name, data, removeExpired, workspacePath);
+			savedDuringUpload = true;
+			await bot.update(42, "/use other");
+			return saved;
+		};
+		await bot.updateDocument(42);
+		expect(savedDuringUpload).toBe(true);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		const files = await readdir(path.join(inbox.rootDirectory, "sid")).catch(
+			(error: unknown) => {
+				if (
+					typeof error === "object" &&
+					error !== null &&
+					"code" in error &&
+					error.code === "ENOENT"
+				)
+					return [];
+				throw error;
+			},
+		);
+		expect(files).toEqual([]);
+		await adapter.stop();
+		sessions.set("sid", previousSession);
 	});
 
 	it("revalidates a confirmed-current media route after its download", async () => {
