@@ -847,6 +847,87 @@ describe("SQLite session management", () => {
 		store.close();
 	});
 
+	it("revalidates reload preconditions and rejects concurrent reloads without queueing", async () => {
+		const started = deferred<void>();
+		const complete = deferred<void>();
+		let calls = 0;
+		let selected = true;
+		const harness = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.reload",
+				"input.submit",
+			],
+			launch: async () => ({
+				processId: "reload-test" as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				control: {
+					async getSelection() {
+						return {};
+					},
+					async getStatus() {
+						return {};
+					},
+					async listModels() {
+						return [];
+					},
+					async listEfforts() {
+						return [];
+					},
+					async setModel(provider, id) {
+						return { provider, id, name: id };
+					},
+					async setEffort() {},
+					async reload(beforeDispatch) {
+						calls++;
+						started.resolve();
+						await complete.promise;
+						beforeDispatch?.();
+					},
+				},
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		}).harness;
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const manager = new SessionManager(store, [harness]);
+		const session = await manager.create({
+			id: "reload-test",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		try {
+			await expect(
+				manager.reload(session.id, () => false),
+			).rejects.toMatchObject({ code: "RELOAD_SELECTION_CHANGED" });
+			expect(calls).toBe(0);
+			const first = manager.reload(session.id, () => selected);
+			await started.promise;
+			await expect(
+				manager.submit(session.id, "ordinary input"),
+			).rejects.toMatchObject({
+				code: "RELOAD_BUSY",
+			});
+			await expect(
+				manager.reload(session.id, () => selected),
+			).rejects.toMatchObject({ code: "RELOAD_ALREADY_RUNNING" });
+			expect(calls).toBe(1);
+			selected = false;
+			complete.resolve();
+			await expect(first).rejects.toMatchObject({
+				code: "RELOAD_SELECTION_CHANGED",
+			});
+			selected = true;
+			await manager.reload(session.id, () => selected);
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
 	it("enforces each declared model and effort capability before calling controls", async () => {
 		const controlCapabilities = [
 			"harness.model.list",

@@ -6,6 +6,7 @@ import {
 	DuplicateSessionIdError,
 	InvalidSessionNameError,
 	InvalidWorkingDirectoryError,
+	ReloadError,
 	requireCapability,
 	SessionNotFoundError,
 	SessionNotResumableError,
@@ -67,6 +68,8 @@ export class SessionManager {
 	private readonly attempts = new Map<SessionId, number>();
 	private readonly delays = new Map<SessionId, () => void>();
 	private readonly unsettledInputs = new Map<SessionId, Set<InputId>>();
+	private readonly reloads = new Set<SessionId>();
+	private readonly reloadWaiters = new Map<SessionId, (() => void)[]>();
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
 
 	constructor(
@@ -473,6 +476,7 @@ export class SessionManager {
 		text: string,
 		images?: readonly { readonly mimeType: string; readonly data: string }[],
 	): Promise<InputId> {
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
@@ -494,6 +498,7 @@ export class SessionManager {
 		}
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		const input: Input = {
 			id: randomUUID() as Input["id"],
 			sessionId: id,
@@ -517,6 +522,7 @@ export class SessionManager {
 	}
 
 	async cancel(id: SessionId, inputId: InputId): Promise<void> {
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
@@ -529,6 +535,7 @@ export class SessionManager {
 		const instance = this.instances.get(id);
 		if (!instance || session.status !== "running")
 			throw new SessionNotFoundError(id);
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		await instance.cancel(inputId);
 	}
 
@@ -607,13 +614,69 @@ export class SessionManager {
 		await control.setEffort(effort);
 	}
 
+	async reload(id: SessionId, beforeDispatch: () => boolean): Promise<void> {
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_ALREADY_RUNNING");
+		this.reloads.add(id);
+		try {
+			const { control } = await this.requireControl(id, "harness.reload");
+			const session = await this.get(id);
+			const instance = this.instances.get(id);
+			if (
+				this.closing ||
+				this.stopping.has(id) ||
+				this.terminal.has(id) ||
+				session.status !== "running" ||
+				!instance ||
+				this.recovery.has(id) ||
+				(this.unsettledInputs.get(id)?.size ?? 0) > 0
+			)
+				throw new ReloadError("RELOAD_BUSY");
+			if (!control.reload)
+				throw new UnsupportedCapabilityError("harness.reload", id);
+			if (
+				this.instances.get(id) !== instance ||
+				this.recovery.has(id) ||
+				this.stopping.has(id)
+			)
+				throw new ReloadError("RELOAD_BUSY");
+			if (!beforeDispatch()) throw new ReloadError("RELOAD_SELECTION_CHANGED");
+			await control.reload(() => {
+				if (!beforeDispatch())
+					throw new ReloadError("RELOAD_SELECTION_CHANGED");
+				if (
+					this.instances.get(id) !== instance ||
+					this.closing ||
+					this.stopping.has(id) ||
+					this.terminal.has(id) ||
+					this.recovery.has(id) ||
+					(this.unsettledInputs.get(id)?.size ?? 0) > 0
+				)
+					throw new ReloadError("RELOAD_BUSY");
+			});
+		} finally {
+			this.reloads.delete(id);
+			for (const resolve of this.reloadWaiters.get(id) ?? []) resolve();
+			this.reloadWaiters.delete(id);
+		}
+	}
+
+	private waitForReload(id: SessionId): Promise<void> {
+		if (!this.reloads.has(id)) return Promise.resolve();
+		return new Promise((resolve) => {
+			const waiters = this.reloadWaiters.get(id) ?? [];
+			waiters.push(resolve);
+			this.reloadWaiters.set(id, waiters);
+		});
+	}
+
 	private async requireControl(
 		id: SessionId,
 		capability:
 			| "harness.model.list"
 			| "harness.model.set"
 			| "harness.effort.list"
-			| "harness.effort.set",
+			| "harness.effort.set"
+			| "harness.reload",
 	): Promise<{ control: HarnessControl; harness: HarnessAdapter }> {
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
@@ -658,6 +721,7 @@ export class SessionManager {
 				}
 				this.unsettledInputs.delete(id);
 				this.instances.delete(id);
+				if (this.reloads.has(id)) await this.waitForReload(id);
 				let task!: Promise<void>;
 				task = this.recover(id)
 					.catch(async (error) => {

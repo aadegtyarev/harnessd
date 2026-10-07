@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ReloadError } from "../src/core/errors.js";
 import type {
 	ManagedProcess,
 	ProcessLaunchRequest,
@@ -39,9 +40,14 @@ interface FakeOptions {
 	readonly sessionId?: string;
 	readonly promptSuccess?: boolean;
 	readonly promptDisposition?: string;
+	readonly reloadExtensionError?: {
+		readonly extensionPath: string;
+		readonly event: string;
+	};
 	readonly abortSuccess?: boolean;
 	readonly exitOnTerm?: boolean;
 	readonly missingStream?: "stdin" | "stdout" | "stderr";
+	readonly commandListing?: (name: string) => unknown;
 	readonly rpcResponses?: Readonly<
 		Record<
 			string,
@@ -146,6 +152,24 @@ function fakeProvider(options: FakeOptions = {}) {
 			if (options.beforeResponse) {
 				options.beforeResponse(command, stdout);
 			}
+			if (
+				command.type === "prompt" &&
+				command.message ===
+					`/${String(launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND)}` &&
+				options.reloadExtensionError
+			) {
+				stdout.write(
+					`${JSON.stringify({
+						type: "extension_error",
+						...options.reloadExtensionError,
+						extensionPath:
+							options.reloadExtensionError.extensionPath === "$reload"
+								? `command:${String(launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND)}`
+								: options.reloadExtensionError.extensionPath,
+						error: "reload failed",
+					})}\n`,
+				);
+			}
 			if (command.type === "prompt" && options.malformedPromptAck) {
 				stdout.write(
 					`${JSON.stringify({
@@ -200,20 +224,40 @@ function fakeProvider(options: FakeOptions = {}) {
 							success: true,
 							data: { sessionId: options.sessionId ?? "native-exact" },
 						}
-					: {
-							type: "response",
-							id: command.id,
-							command: command.type,
-							success:
-								command.type === "prompt"
-									? (options.promptSuccess ?? true)
-									: command.type === "abort"
-										? (options.abortSuccess ?? true)
-										: true,
-							...(command.type === "prompt" && options.promptDisposition
-								? { data: { disposition: options.promptDisposition } }
-								: {}),
-						};
+					: command.type === "get_commands"
+						? {
+								type: "response",
+								id: command.id,
+								command: command.type,
+								success: true,
+								data: {
+									commands: options.commandListing?.(
+										String(launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND),
+									) ?? [
+										{
+											name: String(
+												launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND,
+											),
+											source: "extension",
+											description: "harnessd internal reload command",
+										},
+									],
+								},
+							}
+						: {
+								type: "response",
+								id: command.id,
+								command: command.type,
+								success:
+									command.type === "prompt"
+										? (options.promptSuccess ?? true)
+										: command.type === "abort"
+											? (options.abortSuccess ?? true)
+											: true,
+								...(command.type === "prompt" && options.promptDisposition
+									? { data: { disposition: options.promptDisposition } }
+									: {}),
+							};
 			const override = options.rpcResponses?.[String(command.type)];
 			stdout.write(
 				`${JSON.stringify(override ? { ...response, ...override } : response)}\r\n`,
@@ -299,13 +343,26 @@ describe("PiRpcHarnessAdapter", () => {
 			"harness.model.set",
 			"harness.effort.list",
 			"harness.effort.set",
+			"harness.reload",
 			"input.submit",
 		]);
 		expect(fake.launchRequest).toMatchObject({
 			executable: options.executable,
-			args: ["--model", "model name", "--mode", "rpc"],
+			args: [
+				"--model",
+				"model name",
+				"--mode",
+				"rpc",
+				"--extension",
+				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+			],
 			cwd: request.cwd,
-			env: options.env,
+			env: {
+				...options.env,
+				HARNESSD_PI_RELOAD_COMMAND: expect.stringMatching(
+					/^harnessd-reload-[a-f0-9-]{36}$/,
+				),
+			},
 			stdio: "pipe",
 		});
 		expect(instance.nativeSessionId).toBe("native-exact");
@@ -328,15 +385,25 @@ describe("PiRpcHarnessAdapter", () => {
 		const instance = await adapter.launch(request);
 		const launchRequest = fake.launchRequest;
 		expect(launchRequest?.args).toContain("--extension");
-		const extensionIndex = launchRequest?.args.indexOf("--extension") ?? -1;
-		expect(launchRequest?.args[extensionIndex + 1]).toMatch(
-			/agent-file-send-extension\.(?:ts|js)$/,
+		const extensionPaths =
+			launchRequest?.args.flatMap((arg, index, args) =>
+				arg === "--extension" ? [args[index + 1]] : [],
+			) ?? [];
+		expect(extensionPaths).toEqual(
+			expect.arrayContaining([
+				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				expect.stringMatching(/agent-file-send-extension\.(?:ts|js)$/),
+			]),
 		);
 		const env = launchRequest?.env ?? {};
 		const url = env[AGENT_FILE_SEND_URL_ENV];
 		const token = env[AGENT_FILE_SEND_TOKEN_ENV];
 		expect(Object.keys(env).sort()).toEqual(
-			[AGENT_FILE_SEND_TOKEN_ENV, AGENT_FILE_SEND_URL_ENV].sort(),
+			[
+				AGENT_FILE_SEND_TOKEN_ENV,
+				AGENT_FILE_SEND_URL_ENV,
+				"HARNESSD_PI_RELOAD_COMMAND",
+			].sort(),
 		);
 		const response = await fetch(url as string, {
 			method: "POST",
@@ -525,9 +592,19 @@ describe("PiRpcHarnessAdapter", () => {
 			}).launch(request);
 			expect(fake.launchRequest).toMatchObject({
 				executable: process.execPath,
-				args: [executable, "--mode", "rpc"],
+				args: [
+					executable,
+					"--mode",
+					"rpc",
+					"--extension",
+					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				],
 				cwd: request.cwd,
-				env: undefined,
+				env: {
+					HARNESSD_PI_RELOAD_COMMAND: expect.stringMatching(
+						/^harnessd-reload-[a-f0-9-]{36}$/,
+					),
+				},
 				stdio: "pipe",
 			});
 			await instance.shutdown();
@@ -563,7 +640,13 @@ describe("PiRpcHarnessAdapter", () => {
 			}).launch({ ...request, cwd: childCwd });
 			expect(fake.launchRequest).toMatchObject({
 				executable: process.execPath,
-				args: [executable, "--mode", "rpc"],
+				args: [
+					executable,
+					"--mode",
+					"rpc",
+					"--extension",
+					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				],
 				env: { PATH: envPath },
 			});
 			await instance.shutdown();
@@ -587,6 +670,8 @@ describe("PiRpcHarnessAdapter", () => {
 			"  const command = JSON.parse(line);",
 			'  if (command.type === "get_state") {',
 			'    process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "get_state", success: true, data: { sessionId: JSON.stringify({ version: process.version, env: Object.keys(process.env).sort() }) } }) + "\\n");',
+			'  } else if (command.type === "get_commands") {',
+			'    process.stdout.write(JSON.stringify({ type: "response", id: command.id, command: "get_commands", success: true, data: { commands: [{ name: process.env.HARNESSD_PI_RELOAD_COMMAND, source: "extension", description: "harnessd internal reload command" }] } }) + "\\n");',
 			"  }",
 			"});",
 		].join("\n");
@@ -599,7 +684,7 @@ describe("PiRpcHarnessAdapter", () => {
 			).launch({ ...request, cwd });
 			expect(JSON.parse(instance.nativeSessionId ?? "null")).toEqual({
 				version: process.version,
-				env: [],
+				env: ["HARNESSD_PI_RELOAD_COMMAND"],
 			});
 			await instance.shutdown();
 		} finally {
@@ -619,7 +704,12 @@ describe("PiRpcHarnessAdapter", () => {
 				startupTimeoutMs: 100,
 			}).launch(request);
 			expect(fake.launchRequest?.executable).toBe(executable);
-			expect(fake.launchRequest?.args).toEqual(["--mode", "rpc"]);
+			expect(fake.launchRequest?.args).toEqual([
+				"--mode",
+				"rpc",
+				"--extension",
+				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+			]);
 			await instance.shutdown();
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
@@ -705,6 +795,292 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("reloads through one internal handled prompt and correlates its exact command error", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await instance.control?.reload?.();
+		expect(
+			fake.commands.filter((command) => command.type === "get_commands"),
+		).toHaveLength(1);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toEqual([
+			expect.objectContaining({
+				type: "prompt",
+				message: `/${String(fake.launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND)}`,
+			}),
+		]);
+		await instance.shutdown();
+
+		const correlated = fakeProvider({
+			promptDisposition: "handled",
+			reloadExtensionError: {
+				extensionPath: "$reload",
+				event: "command",
+			},
+		});
+		const failedInstance = await new PiRpcHarnessAdapter(correlated.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const events = failedInstance.events[Symbol.asyncIterator]();
+		await expect(failedInstance.control?.reload?.()).rejects.toBeInstanceOf(
+			PiControlError,
+		);
+		const event = await Promise.race([
+			events.next(),
+			new Promise<undefined>((resolve) => setTimeout(resolve, 10)),
+		]);
+		expect(event).toBeUndefined();
+		await failedInstance.shutdown();
+	});
+
+	it("uses one model-capable prompt per reload and reuses startup verification", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await instance.control?.reload?.(() => true);
+		await instance.control?.reload?.(() => true);
+		expect(
+			fake.commands.filter((command) => command.type === "get_commands"),
+		).toHaveLength(1);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(2);
+		await instance.shutdown();
+	});
+
+	it.each(["agent_start", "compaction_start"])(
+		"rejects reload during %s without prompt side effects",
+		async (event) => {
+			const fake = fakeProvider();
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable: "pi",
+				startupTimeoutMs: 100,
+			}).launch(request);
+			fake.stdout.write(`${JSON.stringify({ type: event })}\n`);
+			await new Promise((resolve) => setImmediate(resolve));
+			await expect(
+				instance.control?.reload?.(() => true),
+			).rejects.toMatchObject({
+				code: "RELOAD_BUSY",
+			});
+			expect(
+				fake.commands.filter((command) => command.type === "prompt"),
+			).toHaveLength(0);
+			await instance.shutdown();
+		},
+	);
+
+	it("rechecks adapter busy state at the held write boundary", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const adapter = new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		});
+		const instance = await adapter.launch(request);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		(instance as unknown as { writeChain: Promise<void> }).writeChain = held;
+		const events = instance.events[Symbol.asyncIterator]();
+		const reload = instance.control?.reload?.(() => true);
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await events.next();
+		release();
+		await expect(reload).rejects.toMatchObject({ code: "RELOAD_BUSY" });
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(0);
+		fake.stdout.write('{"type":"agent_settled"}\n');
+		await events.next();
+		await instance.control?.reload?.(() => true);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it("releases timed-out reload ownership after a definite held-write rejection", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const adapter = new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 15,
+		});
+		const instance = await adapter.launch(request);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		(instance as unknown as { writeChain: Promise<void> }).writeChain = held;
+		let first = true;
+		const reload = instance.control?.reload?.(() => {
+			if (first) {
+				first = false;
+				throw new ReloadError("RELOAD_SELECTION_CHANGED");
+			}
+		});
+		const timedOut = reload?.catch((error: unknown) => error);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(await timedOut).toBeInstanceOf(PiControlError);
+		release();
+		await new Promise((resolve) => setImmediate(resolve));
+		await instance.control?.reload?.(() => true);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it.each([
+		["missing command", () => []],
+		[
+			"collision-renamed command",
+			(name: string) => [
+				{
+					name: `${name}:1`,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+			],
+		],
+		[
+			"duplicate command collision",
+			(name: string) => [
+				{
+					name,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{
+					name,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+			],
+		],
+		[
+			"wrong source",
+			(name: string) => [
+				{
+					name,
+					source: "built-in",
+					description: "harnessd internal reload command",
+				},
+			],
+		],
+		[
+			"wrong description",
+			(name: string) => [
+				{
+					name,
+					source: "extension",
+					description: "unrelated command",
+				},
+			],
+		],
+	])(
+		"refuses %s before exposing the instance",
+		async (_case, commandListing) => {
+			const fake = fakeProvider({ commandListing });
+			await expect(
+				new PiRpcHarnessAdapter(fake.provider, {
+					executable: "/bin/pi",
+					startupTimeoutMs: 100,
+				}).launch(request),
+			).rejects.toMatchObject({ code: "PI_STARTUP_FAILED" });
+			expect(
+				fake.commands.filter((command) => command.type === "prompt"),
+			).toEqual([]);
+		},
+	);
+
+	it("reports reload process exit as uncertain failure without retry", async () => {
+		const fake = fakeProvider({ exitOnPrompt: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 30,
+		}).launch(request);
+		await expect(instance.control?.reload?.()).rejects.toBeInstanceOf(
+			PiControlError,
+		);
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it("retains timed-out reload ownership until the correlated acknowledgement", async () => {
+		const fake = fakeProvider({ holdPrompt: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "/bin/pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 15,
+		}).launch(request);
+		const events = instance.events[Symbol.asyncIterator]();
+		await expect(instance.control?.reload?.()).rejects.toBeInstanceOf(
+			PiControlError,
+		);
+		await expect(instance.control?.reload?.()).rejects.toMatchObject({
+			code: "RELOAD_BUSY",
+		});
+		const prompt = fake.commands.find((command) => command.type === "prompt");
+		expect(prompt).toBeDefined();
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "extension_error",
+				extensionPath: "/private/extensions/example.js",
+				event: "session_start",
+				error: "late private detail",
+			})}\n${JSON.stringify({
+				type: "response",
+				id: prompt?.id,
+				command: "prompt",
+				success: true,
+				data: { disposition: "handled" },
+			})}\n`,
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		const event = await Promise.race([
+			events.next(),
+			new Promise<undefined>((resolve) => setTimeout(resolve, 10)),
+		]);
+		expect(event).toBeUndefined();
+		await instance.shutdown();
+	});
+
+	it.each(["session_shutdown", "session_start"])(
+		"suppresses and fails reload lifecycle error %s",
+		async (event) => {
+			const fake = fakeProvider({
+				promptDisposition: "handled",
+				reloadExtensionError: {
+					extensionPath: "/private/extensions/example.js",
+					event,
+				},
+			});
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable: "pi",
+				startupTimeoutMs: 100,
+			}).launch(request);
+			const events = instance.events[Symbol.asyncIterator]();
+			await expect(instance.control?.reload?.()).rejects.toMatchObject({
+				code: "PI_CONTROL_FAILED",
+			});
+			expect(
+				await Promise.race([
+					events.next(),
+					new Promise<undefined>((resolve) => setTimeout(resolve, 10)),
+				]),
+			).toBeUndefined();
+			await instance.shutdown();
+		},
+	);
+
 	it.each(["--no-session", "--continue", "-c", "--resume", "-r", "--fork"])(
 		"rejects conflicting option %s",
 		async (flag) => {
@@ -734,6 +1110,8 @@ describe("PiRpcHarnessAdapter", () => {
 			"rpc",
 			"--session",
 			"saved-id",
+			"--extension",
+			expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
 		]);
 		await instance.shutdown();
 	});
@@ -1348,12 +1726,12 @@ describe("PiRpcHarnessAdapter", () => {
 				executable: "pi",
 				startupTimeoutMs: 100,
 				shutdownTimeoutMs: 5,
-				maxRecordBytes: 150,
+				maxRecordBytes: 1024,
 			}).launch(request);
 			fake.stdout.write(
 				kind === "bad-json"
 					? "{bad}\n"
-					: `{"type":"agent_start"}\n${"x".repeat(200)}`,
+					: `{"type":"agent_start"}\n${"x".repeat(1200)}`,
 			);
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			expect(fake.signals).toContain("SIGTERM");

@@ -17,6 +17,7 @@ export type Capability =
 	| "harness.model.set"
 	| "harness.effort.list"
 	| "harness.effort.set"
+	| "harness.reload"
 	| "harness.file.send"
 	| "process.launch"
 	| "process.signal"
@@ -80,6 +81,18 @@ export class InvalidSessionNameError extends Error {
 	) {
 		super(message);
 		this.name = "InvalidSessionNameError";
+	}
+}
+
+export type ReloadErrorCode =
+	| "RELOAD_ALREADY_RUNNING"
+	| "RELOAD_BUSY"
+	| "RELOAD_SELECTION_CHANGED";
+
+export class ReloadError extends Error {
+	constructor(readonly code: ReloadErrorCode) {
+		super(code);
+		this.name = "ReloadError";
 	}
 }
 

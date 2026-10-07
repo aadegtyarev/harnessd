@@ -94,6 +94,9 @@ const safeErrorMessages = new Map([
 		"PI_CONTROL_FAILED",
 		"Pi did not confirm this control request; check /status before retrying.",
 	],
+	["RELOAD_BUSY", "The session is busy; wait for Pi to become idle."],
+	["RELOAD_ALREADY_RUNNING", "A reload is already in progress."],
+	["RELOAD_SELECTION_CHANGED", "The selected session changed before reload."],
 	["MODEL_NOT_AVAILABLE", "Model is not available; use /model to see choices."],
 	[
 		"EFFORT_NOT_SUPPORTED",
@@ -396,6 +399,10 @@ export class ApplicationRuntime {
 					break;
 				case "effort_set":
 					await this.manager.setEffort(request.sessionId, request.effort);
+					value = undefined as typeof value;
+					break;
+				case "reload":
+					await this.manager.reload(request.sessionId, request.beforeDispatch);
 					value = undefined as typeof value;
 					break;
 			}
