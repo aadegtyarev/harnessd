@@ -153,6 +153,15 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
+		usage: "/reload",
+		telegram: {
+			command: "reload",
+			description: "Перезагрузить ресурсы Pi без перезапуска сессии.",
+		},
+	},
+	{
+		visibility: "telegram-only",
+		section: "private-chat",
 		usage: "/model [provider/modelId [effort]]",
 		telegram: { command: "model", description: "Показать или выбрать модель." },
 	},

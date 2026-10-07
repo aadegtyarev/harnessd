@@ -39,6 +39,10 @@ interface FakeOptions {
 	readonly sessionId?: string;
 	readonly promptSuccess?: boolean;
 	readonly promptDisposition?: string;
+	readonly reloadExtensionError?: {
+		readonly extensionPath: string;
+		readonly event: string;
+	};
 	readonly abortSuccess?: boolean;
 	readonly exitOnTerm?: boolean;
 	readonly missingStream?: "stdin" | "stdout" | "stderr";
@@ -145,6 +149,19 @@ function fakeProvider(options: FakeOptions = {}) {
 			}
 			if (options.beforeResponse) {
 				options.beforeResponse(command, stdout);
+			}
+			if (
+				command.type === "prompt" &&
+				command.message === "/harnessd-reload" &&
+				options.reloadExtensionError
+			) {
+				stdout.write(
+					`${JSON.stringify({
+						type: "extension_error",
+						...options.reloadExtensionError,
+						error: "reload failed",
+					})}\n`,
+				);
 			}
 			if (command.type === "prompt" && options.malformedPromptAck) {
 				stdout.write(
@@ -733,6 +750,53 @@ describe("PiRpcHarnessAdapter", () => {
 			"accepted",
 			"completed",
 		]);
+		await instance.shutdown();
+	});
+
+	it("reloads through one internal handled prompt and correlates its exact command error", async () => {
+		const fake = fakeProvider({ promptDisposition: "handled" });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await instance.control?.reload?.();
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toEqual([
+			expect.objectContaining({ type: "prompt", message: "/harnessd-reload" }),
+		]);
+		await instance.shutdown();
+
+		const correlated = fakeProvider({
+			promptDisposition: "handled",
+			reloadExtensionError: {
+				extensionPath: "command:harnessd-reload",
+				event: "command",
+			},
+		});
+		const failedInstance = await new PiRpcHarnessAdapter(correlated.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await expect(failedInstance.control?.reload?.()).rejects.toBeInstanceOf(
+			PiControlError,
+		);
+		await failedInstance.shutdown();
+	});
+
+	it("does not treat a similarly named extension error as the reload command error", async () => {
+		const fake = fakeProvider({
+			promptDisposition: "handled",
+			reloadExtensionError: {
+				extensionPath: "command:harnessd-reload-extra",
+				event: "command",
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await expect(instance.control?.reload?.()).resolves.toBeUndefined();
 		await instance.shutdown();
 	});
 

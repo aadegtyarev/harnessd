@@ -614,16 +614,26 @@ export class SessionManager {
 		try {
 			const { control } = await this.requireControl(id, "harness.reload");
 			const session = await this.get(id);
+			const instance = this.instances.get(id);
 			if (
+				this.closing ||
+				this.stopping.has(id) ||
+				this.terminal.has(id) ||
 				session.status !== "running" ||
-				!this.instances.has(id) ||
+				!instance ||
 				this.recovery.has(id) ||
 				(this.unsettledInputs.get(id)?.size ?? 0) > 0
 			)
 				throw new Error("RELOAD_BUSY");
-			if (!beforeDispatch()) throw new Error("RELOAD_SELECTION_CHANGED");
 			if (!control.reload)
 				throw new UnsupportedCapabilityError("harness.reload", id);
+			if (
+				this.instances.get(id) !== instance ||
+				this.recovery.has(id) ||
+				this.stopping.has(id)
+			)
+				throw new Error("RELOAD_BUSY");
+			if (!beforeDispatch()) throw new Error("RELOAD_SELECTION_CHANGED");
 			await control.reload();
 		} finally {
 			this.reloads.delete(id);

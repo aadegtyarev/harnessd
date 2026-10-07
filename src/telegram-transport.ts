@@ -2520,6 +2520,44 @@ export class TelegramTransportAdapter
 					...getTelegramHelpLines(),
 				].join("\n"),
 			);
+		if (name === "/reload") {
+			if (args.length !== 0)
+				return this.sendDirect(chatId, "Использование: /reload");
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId)
+				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const result = await this.request(sender, {
+				kind: "reload",
+				sessionId,
+				beforeDispatch: () => this.selected.get(chatId) === sessionId,
+			});
+			if (result.ok) {
+				const name = this.sessionNames.get(sessionId);
+				return this.sendDirect(
+					chatId,
+					`Ресурсы Pi перезагружены для ${name ? `${oneLine(name)} · ` : ""}#${sessionId}. Выбор не изменён; обычные сообщения по-прежнему направляются в эту сессию.`,
+				);
+			}
+			const messages: Record<string, string> = {
+				RELOAD_ALREADY_RUNNING:
+					"Перезагрузка уже выполняется; повторять команду не нужно.",
+				RELOAD_BUSY:
+					"Сессия занята или не готова. Дождитесь завершения работы Pi и повторите команду.",
+				RELOAD_SELECTION_CHANGED:
+					"Выбранная сессия изменилась; перезагрузка не выполнялась.",
+				UNSUPPORTED_CAPABILITY:
+					"Эта сессия не поддерживает перезагрузку ресурсов Pi.",
+				SESSION_NOT_FOUND:
+					"Выбранная сессия недоступна. Проверьте /sessions и выберите её снова.",
+				PI_CONTROL_FAILED:
+					"Pi не подтвердил перезагрузку. Результат неизвестен; автоматически команда не повторялась.",
+			};
+			return this.sendDirect(
+				chatId,
+				messages[result.error.code] ??
+					"Не удалось подтвердить перезагрузку Pi. Автоматического повтора не было; проверьте /status.",
+			);
+		}
 		if (name === "/status" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)

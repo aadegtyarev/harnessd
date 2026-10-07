@@ -847,6 +847,70 @@ describe("SQLite session management", () => {
 		store.close();
 	});
 
+	it("revalidates reload preconditions and rejects concurrent reloads without queueing", async () => {
+		const started = deferred<void>();
+		const complete = deferred<void>();
+		let calls = 0;
+		const harness = harnessPort({
+			capabilities: ["harness.launch", "harness.stop", "harness.reload"],
+			launch: async () => ({
+				processId: "reload-test" as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				control: {
+					async getSelection() {
+						return {};
+					},
+					async getStatus() {
+						return {};
+					},
+					async listModels() {
+						return [];
+					},
+					async listEfforts() {
+						return [];
+					},
+					async setModel(provider, id) {
+						return { provider, id, name: id };
+					},
+					async setEffort() {},
+					async reload() {
+						calls++;
+						started.resolve();
+						await complete.promise;
+					},
+				},
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		}).harness;
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const manager = new SessionManager(store, [harness]);
+		const session = await manager.create({
+			id: "reload-test",
+			harnessId: harness.descriptor.id,
+			cwd: os.homedir(),
+		});
+		try {
+			await expect(manager.reload(session.id, () => false)).rejects.toThrow(
+				"RELOAD_SELECTION_CHANGED",
+			);
+			expect(calls).toBe(0);
+			const first = manager.reload(session.id, () => true);
+			await started.promise;
+			await expect(manager.reload(session.id, () => true)).rejects.toThrow(
+				"RELOAD_ALREADY_RUNNING",
+			);
+			expect(calls).toBe(1);
+			complete.resolve();
+			await first;
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
 	it("enforces each declared model and effort capability before calling controls", async () => {
 		const controlCapabilities = [
 			"harness.model.list",

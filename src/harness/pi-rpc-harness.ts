@@ -844,10 +844,7 @@ class PiRpcInstance implements HarnessInstance {
 		if (record.type === "extension_error") {
 			if (
 				this.reloadPending &&
-				typeof record.extensionPath === "string" &&
-				path
-					.basename(record.extensionPath)
-					.startsWith("pi-reload-extension.") &&
+				record.extensionPath === "command:harnessd-reload" &&
 				record.event === "command"
 			)
 				this.reloadExtensionError = true;
