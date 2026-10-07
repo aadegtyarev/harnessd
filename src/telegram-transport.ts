@@ -5819,8 +5819,10 @@ export class TelegramTransportAdapter
 		result: {
 			readonly visibleText: string;
 			readonly statuses: readonly string[];
+			readonly overflow: boolean;
 		},
 	): void {
+		if (result.overflow) buffer.overflow = true;
 		if (result.visibleText) this.appendTurnVisible(buffer, result.visibleText);
 		for (const status of result.statuses) {
 			buffer.subagentStatus = status;

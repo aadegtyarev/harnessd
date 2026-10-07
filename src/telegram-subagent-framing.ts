@@ -33,15 +33,37 @@ export function finishPhysicalLine(
 	return parsed.matched ? "" : line + (newline ? "\n" : "");
 }
 
-export function isPotential(line: string): boolean {
-	let text = line.trimStart();
-	if (text.length === 0) return false;
-	if ("Pi:".startsWith(text)) return true;
-	if (text.startsWith("Pi:")) text = text.slice(3).trimStart();
-	return (
-		text.startsWith("PI_SUBAGENT_ASYNC_JSON:") ||
-		"PI_SUBAGENT_ASYNC_JSON:".startsWith(text)
-	);
+const MARKER = "PI_SUBAGENT_ASYNC_JSON:";
+
+export function isPotentialParts(left: string, right: string): boolean {
+	const total = left.length + right.length;
+	const charAt = (index: number): string =>
+		index < left.length
+			? (left[index] as string)
+			: (right[index - left.length] as string);
+	let cursor = 0;
+	while (cursor < total && /\s/.test(charAt(cursor))) cursor++;
+	const remaining = total - cursor;
+	if (remaining === 0) return false;
+	const piPrefix = "Pi:";
+	let piMatches = true;
+	for (let index = 0; index < Math.min(remaining, piPrefix.length); index++)
+		if (charAt(cursor + index) !== piPrefix[index]) piMatches = false;
+	if (piMatches && remaining < piPrefix.length) return true;
+	if (piMatches && remaining >= piPrefix.length) {
+		cursor += piPrefix.length;
+		while (cursor < total && /\s/.test(charAt(cursor))) cursor++;
+	}
+	const chars = total - cursor;
+	for (let index = 0; index < Math.min(chars, MARKER.length); index++)
+		if (charAt(cursor + index) !== MARKER[index]) return false;
+	return true;
+}
+
+export function isWhitespaceParts(left: string, right: string): boolean {
+	for (const char of left) if (!/\s/.test(char)) return false;
+	for (const char of right) if (!/\s/.test(char)) return false;
+	return true;
 }
 
 export function fenceDelimiter(

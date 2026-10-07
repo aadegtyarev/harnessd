@@ -5099,6 +5099,19 @@ describe("Telegram transport", () => {
 		);
 		for (let index = 0; index < 100; index++)
 			emit(harnessEvent("sid", "output", `${widget}\n`));
+		const paddedEnvelope = `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+			kind: "pi-subagents.async-status-snapshot",
+			runs: [{ kind: "subagent", label: "scout", state: "running" }],
+			ignored: "x".repeat(33_000),
+			id: "WHITESPACE_SENTINEL",
+		})}`;
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				`${" ".repeat(129)}Pi: ${paddedEnvelope}\\n`,
+			),
+		);
 		emit({
 			sessionId: "sid" as SessionId,
 			kind: "input",
@@ -5116,6 +5129,7 @@ describe("Telegram transport", () => {
 		];
 		expect(payloads.join("\n")).not.toContain("SENTINEL_PAYLOAD_ID");
 		expect(payloads.join("\n")).not.toContain("SENTINEL_TIMESTAMP");
+		expect(payloads.join("\n")).not.toContain("WHITESPACE_SENTINEL");
 		expect(payloads.join("\n")).not.toContain("Additional output omitted");
 		expect(bot.sent.some(({ text }) => text.includes("fenced-example"))).toBe(
 			true,

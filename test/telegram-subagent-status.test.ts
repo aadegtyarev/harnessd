@@ -135,6 +135,47 @@ describe("parseSubagentWidgetLine", () => {
 		expect(after.statuses).toEqual(["Задача Scout: выполняется"]);
 	});
 
+	it("redacts oversized envelopes after arbitrary leading whitespace at every prefix boundary", () => {
+		const body = JSON.stringify({
+			kind: "pi-subagents.async-status-snapshot",
+			runs: [{ kind: "subagent", label: "scout", state: "running" }],
+			ignored: "x".repeat(33_000),
+			id: "WHITESPACE_SENTINEL",
+		});
+		const raw = `${" ".repeat(129)}Pi: PI_SUBAGENT_ASYNC_JSON:${body}\n`;
+		const prefixes = `${" ".repeat(129)}Pi: PI_SUBAGENT_ASYNC_JSON:`;
+		for (let boundary = 0; boundary <= prefixes.length; boundary++) {
+			const stream = new SubagentTextStream();
+			const first = stream.consume(raw.slice(0, boundary));
+			const second = stream.consume(raw.slice(boundary));
+			const final = stream.consume("", true);
+			expect(first.visibleText + second.visibleText + final.visibleText).toBe(
+				"",
+			);
+			expect([
+				...first.statuses,
+				...second.statuses,
+				...final.statuses,
+			]).toEqual([]);
+		}
+		const singleChunk = new SubagentTextStream().consume(raw);
+		expect(singleChunk.visibleText).toBe("");
+		expect(singleChunk.statuses).toEqual([]);
+	});
+
+	it("keeps oversized whitespace-only and whitespace-prefixed prose on ordinary overflow", () => {
+		const spaces = " ".repeat(33_000);
+		const whitespace = new SubagentTextStream().consume(`${spaces}\n`);
+		expect(whitespace.overflow).toBe(true);
+		expect(whitespace.visibleText.length).toBe(32_769);
+		const proseStream = new SubagentTextStream();
+		const leading = proseStream.consume(spaces);
+		const prose = proseStream.consume("ordinary prose\n");
+		expect(leading.overflow).toBe(false);
+		expect(prose.overflow).toBe(true);
+		expect(prose.visibleText).toContain("ordinary prose\n");
+	});
+
 	it("discards oversized service envelopes but preserves oversized lookalikes", () => {
 		const service = new SubagentTextStream().consume(
 			`PI_SUBAGENT_ASYNC_JSON:${"x".repeat(33_000)}\nVisible\n`,

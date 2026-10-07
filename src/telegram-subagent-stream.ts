@@ -1,6 +1,7 @@
 import {
 	finishPhysicalLine,
-	isPotential,
+	isPotentialParts,
+	isWhitespaceParts,
 	type PhysicalLineState,
 } from "./telegram-subagent-framing.js";
 import {
@@ -11,6 +12,7 @@ import {
 export type SubagentTextResult = {
 	readonly visibleText: string;
 	readonly statuses: readonly string[];
+	readonly overflow: boolean;
 };
 
 export class SubagentTextStream {
@@ -23,9 +25,11 @@ export class SubagentTextStream {
 	};
 	private discarding = false;
 	private continuation = false;
+	private leadingWhitespaceOverflow = false;
 
 	consume(chunk: string, final = false): SubagentTextResult {
 		let visibleText = "";
+		let overflow = false;
 		const statuses: string[] = [];
 		let cursor = 0;
 		while (cursor < chunk.length) {
@@ -50,15 +54,38 @@ export class SubagentTextStream {
 			if (
 				tooLong &&
 				!this.framing.fenced &&
-				isPotential(`${this.line}${segment.slice(0, 128)}`)
+				isPotentialParts(this.line, segment)
 			) {
 				this.line = "";
 				this.framing.statusReported = false;
+				this.leadingWhitespaceOverflow = false;
 				if (newline < 0) this.discarding = true;
 				else cursor = newline + 1;
 				continue;
 			}
+			if (
+				tooLong &&
+				!this.framing.fenced &&
+				isWhitespaceParts(this.line, segment)
+			) {
+				this.line += segment.slice(
+					0,
+					MAX_SUBAGENT_ENVELOPE_CHARS - this.line.length,
+				);
+				this.leadingWhitespaceOverflow = true;
+				if (newline >= 0) {
+					overflow = true;
+					visibleText += finishPhysicalLine(this.line, this.framing, statuses);
+					this.line = "";
+					this.framing.statusReported = false;
+					cursor = newline + 1;
+					continue;
+				}
+				break;
+			}
 			if (tooLong) {
+				overflow ||= this.leadingWhitespaceOverflow;
+				this.leadingWhitespaceOverflow = false;
 				visibleText += this.line + segment + (newline < 0 ? "" : "\n");
 				this.line = "";
 				if (newline < 0) this.continuation = true;
@@ -67,13 +94,15 @@ export class SubagentTextStream {
 			}
 			this.line += segment;
 			if (newline >= 0) {
+				overflow ||= this.leadingWhitespaceOverflow;
+				this.leadingWhitespaceOverflow = false;
 				visibleText += finishPhysicalLine(this.line, this.framing, statuses);
 				this.line = "";
 				this.framing.statusReported = false;
 				cursor = newline + 1;
 				continue;
 			}
-			if (!this.framing.fenced && isPotential(this.line)) {
+			if (!this.framing.fenced && isPotentialParts(this.line, "")) {
 				const parsed = parseSubagentWidgetLine(this.line);
 				if (parsed.status && !this.framing.statusReported) {
 					statuses.push(parsed.status);
@@ -84,6 +113,8 @@ export class SubagentTextStream {
 		}
 		if (final) {
 			if (this.line) {
+				overflow ||= this.leadingWhitespaceOverflow;
+				this.leadingWhitespaceOverflow = false;
 				visibleText += this.framing.fenced
 					? this.line
 					: finishPhysicalLine(this.line, this.framing, statuses, false);
@@ -92,7 +123,8 @@ export class SubagentTextStream {
 			this.discarding = false;
 			this.framing.statusReported = false;
 			this.continuation = false;
+			this.leadingWhitespaceOverflow = false;
 		}
-		return { visibleText, statuses };
+		return { visibleText, statuses, overflow };
 	}
 }
