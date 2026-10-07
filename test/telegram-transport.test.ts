@@ -640,10 +640,10 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/status");
 		expect(
 			bot.sent.some(({ text }) =>
-				text.includes("Context: 53.3%/145k/272k (auto)"),
+				text.includes("Контекст: 53.3%/145k/272k (auto)"),
 			),
 		).toBe(true);
-		expect(bot.sent.at(-1)?.text).toContain("Session: Focused task · sid");
+		expect(bot.sent.at(-1)?.text).toContain("Сессия: Focused task · sid");
 		await adapter.stop();
 	});
 
@@ -750,7 +750,7 @@ describe("Telegram transport", () => {
 		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
 		expect(
 			bot.edited.some(({ text }) =>
-				text.includes("Input input-1: uncertain (not resent)"),
+				text.includes("Ввод input-1: uncertain (повторно не отправлялся)"),
 			),
 		).toBe(true);
 		await adapter.stop();
@@ -781,7 +781,7 @@ describe("Telegram transport", () => {
 		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
 		expect(
 			bot.edited.some(({ text }) =>
-				text.includes("Input input-180: uncertain (not resent)"),
+				text.includes("Ввод input-180: uncertain (повторно не отправлялся)"),
 			),
 		).toBe(true);
 		await adapter.stop();
@@ -1642,8 +1642,10 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/sessions");
 		const text = bot.sent.at(-1)?.text ?? "";
-		expect(text).toContain("✓ Shared name · #sid · running · /work");
-		expect(text).toContain("Shared name · #other · running · /other");
+		expect(text).toContain("✓ Shared name · #sid · running (работает) · /work");
+		expect(text).toContain(
+			"Shared name · #other · running (работает) · /other",
+		);
 		await adapter.stop();
 	});
 
@@ -1820,7 +1822,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain(`папка создания: ${directory}`);
 		await bot.callback(42, "menu:new", panelMessageId);
 		expect(bot.sent.at(-1)?.text).toContain(
-			`New session will be created in ${directory}`,
+			`Новая сессия будет создана в ${directory}`,
 		);
 		await adapter.stop();
 	});
@@ -1944,7 +1946,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("/work");
 		await bot.callback(42, "folder:new", panelMessageId);
 		expect(bot.sent.at(-1)?.text).toContain(
-			`New session will be created in ${childDirectory}`,
+			`Новая сессия будет создана в ${childDirectory}`,
 		);
 		const promptMessageId = bot.lastMessageId;
 		await bot.update(42, "nested task", { replyToMessageId: promptMessageId });
@@ -1996,7 +1998,7 @@ describe("Telegram transport", () => {
 			kind: "resume",
 			sessionId: "other",
 		});
-		expect(bot.sent.at(-1)?.text).toContain("not selected");
+		expect(bot.sent.at(-1)?.text).toContain("не выбрана");
 		expect(bot.sendOptions.at(-1)).toMatchObject({
 			reply_markup: {
 				inline_keyboard: [
@@ -2034,9 +2036,9 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/resume");
-		expect(bot.sent.at(-1)?.text).toContain("Selection is unchanged");
+		expect(bot.sent.at(-1)?.text).toContain("Выбор не изменён");
 		expect(bot.sent.at(-1)?.text).toContain(
-			"ordinary messages still target this session",
+			"обычные сообщения по-прежнему направляются в эту сессию",
 		);
 		expect(bot.sendOptions.at(-1)).toBeUndefined();
 		await bot.update(42, "after selected resume");
@@ -2058,16 +2060,16 @@ describe("Telegram transport", () => {
 		const panelId = bot.lastMessageId as number;
 		await bot.callback(42, "session:resume:sid", panelId);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Selection is unchanged; ordinary messages still target this session.",
+			"Выбор не изменён; обычные сообщения по-прежнему направляются в эту сессию.",
 		);
 		expect(bot.sent.at(-1)?.text).not.toContain("not selected");
 		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
 		await bot.update(42, "/use other");
 		await bot.callback(42, "session:resume:sid", panelId);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"ordinary messages still target #other",
+			"обычные сообщения направляются в #other",
 		);
-		expect(bot.sent.at(-1)?.text).toContain("not selected");
+		expect(bot.sent.at(-1)?.text).toContain("не выбрана");
 		await adapter.stop();
 	});
 
@@ -2123,14 +2125,16 @@ describe("Telegram transport", () => {
 			"action:resume-select:",
 		);
 		const actionMessageId = bot.lastMessageId as number;
-		expect(bot.sent.at(-1)?.text).toContain("Resume and select it below");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Возобновите её кнопкой ниже с выбором",
+		);
 		await bot.callback(43, action, actionMessageId);
 		expect(
 			requests.filter((request) => request.kind === "resume"),
 		).toHaveLength(0);
 		const pinsBeforeAction = bot.pinned.length;
 		await bot.callback(42, action, actionMessageId);
-		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.sent.at(-1)?.text).toContain("возобновлена и выбрана");
 		expect(bot.edited.at(-1)?.messageId).toBe(panelMessageId);
 		expect(bot.pinned).toHaveLength(pinsBeforeAction);
 		const stateFile = (await readdir(directory)).find((name) =>
@@ -2173,9 +2177,9 @@ describe("Telegram transport", () => {
 		await mkdir(statePath);
 		await writeFile(path.join(statePath, "occupied"), "x");
 		await bot.callback(42, action, bot.lastMessageId as number);
-		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.sent.at(-1)?.text).toContain("возобновлена и выбрана");
 		expect(bot.sent.at(-1)?.text).toContain(
-			"could not be saved for the next restart",
+			"сохранить выбор для следующего запуска не удалось",
 		);
 		await bot.update(42, "still targets resumed session");
 		expect(
@@ -2204,11 +2208,11 @@ describe("Telegram transport", () => {
 		const actionMessageId = bot.lastMessageId as number;
 		await bot.callback(43, resume, actionMessageId);
 		await bot.callback(42, resume, actionMessageId);
-		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.sent.at(-1)?.text).toContain("возобновлена и выбрана");
 		expect(
 			requests.filter((request) => request.kind === "resume"),
 		).toHaveLength(1);
-		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.sent.at(-1)?.text).toContain("возобновлена и выбрана");
 		await adapter.stop();
 	});
 
@@ -2837,9 +2841,9 @@ describe("Telegram transport", () => {
 		const second = await startAdapter(secondBot, directory);
 		expect(second.requests).toEqual([]);
 		await secondBot.update(42, "/use");
-		expect(secondBot.sent.at(-1)?.text).toContain("Selected");
+		expect(secondBot.sent.at(-1)?.text).toContain("Выбрана");
 		expect(secondBot.sent.at(-1)?.text).toContain(
-			"A new message will resume it",
+			"Новое сообщение возобновит её",
 		);
 		await secondBot.update(42, "continue sid");
 		await secondBot.update(43, "continue other");
@@ -3288,7 +3292,7 @@ describe("Telegram transport", () => {
 		);
 		expect(cwd.length).toBeGreaterThan(4096);
 		expect(prompt?.text).toBe(
-			"Name this session (harnessd name prompt):\nThe exact folder is shown in the preceding messages. Reply with a name. Create unnamed and Cancel buttons are below.",
+			"Назовите сессию (запрос имени harnessd):\nТочная папка указана в предыдущих сообщениях. Ответьте названием. Ниже есть кнопки «Создать без имени» и «Отмена».",
 		);
 		await first.adapter.stop();
 
@@ -3342,10 +3346,10 @@ describe("Telegram transport", () => {
 					({ message_id }) => message_id === promptId,
 				);
 				const label = name ? `${name} · #sid` : "#sid";
-				expect(prompt?.text).toContain(`Rename ${label} (#sid)`);
+				expect(prompt?.text).toContain(`Переименовать ${label} (#sid)`);
 				if (cwdCase === "long fallback")
 					expect(prompt?.text).toContain(
-						"exact folder shown in the preceding messages",
+						"точной папке из предыдущих сообщений",
 					);
 				else expect(prompt?.text).toContain(cwd);
 				await first.adapter.stop();
@@ -3961,11 +3965,13 @@ describe("Telegram transport", () => {
 		await bot.update(100, "/start");
 		expect(bot.sent.at(-1)?.text).toContain("Добро пожаловать");
 		expect(bot.sendOptions.at(-1)).toMatchObject({
-			inline_keyboard: expect.arrayContaining([
-				expect.arrayContaining([
-					expect.objectContaining({ text: "Открыть панель" }),
+			reply_markup: {
+				inline_keyboard: expect.arrayContaining([
+					expect.arrayContaining([
+						expect.objectContaining({ text: "Открыть панель" }),
+					]),
 				]),
-			]),
+			},
 		});
 		await bot.update(100, "/help");
 		expect(bot.sent.at(-1)?.text).toContain("Как начать:");
@@ -4000,7 +4006,9 @@ describe("Telegram transport", () => {
 			kind: "delete",
 			sessionId: "other",
 		});
-		expect(bot.sent.at(-1)?.text).toContain("Deleted stopped session #other");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Запись остановленной сессии #other удалена из harnessd",
+		);
 		const submitsBeforeDeletedText = requests.filter(
 			({ kind }) => kind === "submit",
 		).length;
@@ -4009,11 +4017,76 @@ describe("Telegram transport", () => {
 			submitsBeforeDeletedText,
 		);
 		await bot.update(100, "/delete");
-		expect(bot.sent.at(-1)?.text).toBe(
-			"<pre><code>Usage: /delete &lt;sessionId&gt;</code></pre>",
-		);
+		expect(bot.sent.at(-1)?.text).toBe("Использование: /delete <sessionId>");
 		await adapter.stop();
 	});
+
+	for (const action of ["panel", "sessions", "new"] as const) {
+		for (const hasExistingPanel of [false, true]) {
+			it(`/start ${action} action is bound and preserves the stored panel (${hasExistingPanel ? "existing panel" : "no panel"})`, async () => {
+				const bot = new MockBot();
+				const stateDirectory = await temp();
+				const { adapter } = await startAdapter(bot, stateDirectory);
+				if (hasExistingPanel) await bot.update(42, "/menu");
+				const store = await TelegramPanelStore.open(
+					stateDirectory,
+					"secret-token",
+				);
+				const initialPanelId = store.get(42);
+				const initialPins = bot.pinned.length;
+				await bot.update(42, "/start");
+				const welcomeId = bot.lastMessageId;
+				const markup = bot.sendOptions.at(-1) as {
+					reply_markup: {
+						inline_keyboard: readonly (readonly {
+							text: string;
+							callback_data: string;
+						}[])[];
+					};
+				};
+				expect(bot.sendOptions.at(-1)).toHaveProperty("reply_markup");
+				const label =
+					action === "panel"
+						? "Открыть панель"
+						: action === "sessions"
+							? "Сессии"
+							: "Новая сессия";
+				const data = markup.reply_markup.inline_keyboard
+					.flat()
+					.find((button) => button.text === label)?.callback_data;
+				if (!data) throw new Error(`Missing /start ${label} callback`);
+				const sentBeforeStale = bot.sent.length;
+				const editedBeforeStale = bot.edited.length;
+				await bot.callback(42, data, (welcomeId ?? 0) + 1);
+				await bot.callback(43, data, welcomeId);
+				expect(bot.sent).toHaveLength(sentBeforeStale);
+				expect(bot.edited).toHaveLength(editedBeforeStale);
+				await bot.callback(42, data, welcomeId);
+				const panelId = (
+					await TelegramPanelStore.open(stateDirectory, "secret-token")
+				).get(42);
+				if (action === "new") {
+					expect(bot.sent.at(-1)?.text).toContain("Новая сессия будет создана");
+					expect(panelId).toBe(initialPanelId);
+					expect(bot.pinned).toHaveLength(initialPins);
+				} else {
+					expect(panelId).toBeDefined();
+					expect(panelId).not.toBe(welcomeId);
+					expect(bot.pinned.at(-1)?.messageId).toBe(panelId);
+					if (action === "sessions")
+						expect(bot.edited.at(-1)?.text).toContain("Сессии ·");
+				}
+				const sentAfterAction = bot.sent.length;
+				const editedAfterAction = bot.edited.length;
+				const pinsAfterAction = bot.pinned.length;
+				await bot.callback(42, data, welcomeId);
+				expect(bot.sent).toHaveLength(sentAfterAction);
+				expect(bot.edited).toHaveLength(editedAfterAction);
+				expect(bot.pinned).toHaveLength(pinsAfterAction);
+				await adapter.stop();
+			});
+		}
+	}
 
 	it("keeps chat selection unchanged when an explicit resume fails", async () => {
 		const bot = new MockBot();
@@ -4114,7 +4187,7 @@ describe("Telegram transport", () => {
 		expect(requests[12]).toMatchObject({ kind: "submit", sessionId: "other" });
 		expect(
 			bot.sent.some(
-				({ chatId, text }) => chatId === 100 && text.includes("Tokens: 1,234"),
+				({ chatId, text }) => chatId === 100 && text.includes("Токены: 1,234"),
 			),
 		).toBe(true);
 		expect(
@@ -4127,14 +4200,16 @@ describe("Telegram transport", () => {
 			bot.sent.some(
 				({ chatId, text }) =>
 					chatId === 100 &&
-					text.includes("Effort levels (current: medium): low, medium, high"),
+					text.includes("Уровни effort (текущий: medium): low, medium, high"),
 			),
 		).toBe(true);
 		expect(
 			bot.sent.some(
 				({ chatId, text }) =>
 					chatId === 101 &&
-					text.includes("Switched to openai/gpt-next; effort set to high."),
+					text.includes(
+						"Выбрана модель openai/gpt-next; effort установлен: high.",
+					),
 			),
 		).toBe(true);
 		await adapter.stop();
@@ -4183,16 +4258,16 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/status");
 		expect(
 			bot.sent.some(({ text }) =>
-				text.includes("Pi did not confirm effort high"),
+				text.includes("Pi не подтвердил effort high"),
 			),
 		).toBe(true);
 		expect(
 			bot.sent.some(
 				({ text }) =>
-					text.includes("Folder: /work") &&
-					text.includes("Status: stopped") &&
-					text.includes("Model: unavailable") &&
-					text.includes("Live Pi data: unavailable"),
+					text.includes("Рабочая папка: /work") &&
+					text.includes("Статус: остановлена (stopped)") &&
+					text.includes("Модель: недоступно") &&
+					text.includes("Данные Pi в реальном времени недоступны"),
 			),
 		).toBe(true);
 		await adapter.stop();
@@ -4275,7 +4350,7 @@ describe("Telegram transport", () => {
 			"/tmp/project with spaces",
 		]);
 		expect(bot.sent.at(-1)?.text).toBe(
-			"Use matching quotes around the entire path, or remove the quotes.",
+			"Возьмите весь путь в парные кавычки или уберите кавычки.",
 		);
 		await adapter.stop();
 	});
@@ -4307,7 +4382,7 @@ describe("Telegram transport", () => {
 
 		await bot.update(100, "/ls");
 		const firstListing = bot.sent.at(-1)?.text ?? "";
-		expect(firstListing).toContain(`Directory: ${initial}`);
+		expect(firstListing).toContain(`Папка: ${initial}`);
 		expect(firstListing).toContain("📄 visible.txt");
 		expect(firstListing).not.toContain(".hidden");
 		expect(firstListing).not.toContain("secret contents");
@@ -4331,7 +4406,7 @@ describe("Telegram transport", () => {
 			os.homedir(),
 		]);
 		expect(
-			bot.sent.some(({ text }) => text === `Working folder: ${outside}`),
+			bot.sent.some(({ text }) => text === `Рабочая папка: ${outside}`),
 		).toBe(true);
 		expect(
 			requests.filter(({ kind }) => kind !== "create" && kind !== "list"),
@@ -4347,7 +4422,7 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/cd missing-directory");
 		await bot.update(42, "/new relative");
-		expect(bot.sent[0]?.text).toContain("current folder unchanged");
+		expect(bot.sent[0]?.text).toContain("текущая папка не изменена");
 		expect(requests[0]).toMatchObject({
 			kind: "create",
 			cwd: path.join(initial, "relative"),
@@ -4427,9 +4502,9 @@ describe("Telegram transport", () => {
 		expect(
 			bot.sent.some(
 				({ text }) =>
-					text.includes(
-						`Input delivery is uncertain (Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred; InputId ${inputId})`,
-					) && text.startsWith("<pre><code>"),
+					text.includes("Pi мог принять ввод, но подтверждение не получено") &&
+					text.includes(`InputId ${inputId}`) &&
+					text.startsWith("<pre><code>"),
 			),
 		).toBe(true);
 		expect(bot.sent.some(({ text }) => text.includes("private prompt"))).toBe(
@@ -4469,7 +4544,7 @@ describe("Telegram transport", () => {
 			else await bot.update(42, "submit text");
 
 			const explanation =
-				"Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred";
+				"Pi мог принять ввод, но подтверждение не получено; автоматической повторной отправки не было";
 			expect(
 				bot.sent.some(
 					({ text }) =>
@@ -4528,7 +4603,7 @@ describe("Telegram transport", () => {
 		});
 		await vi.waitFor(() =>
 			expect(
-				bot.edited.some(({ text }) => text.includes("canceled by user")),
+				bot.edited.some(({ text }) => text.includes("отменён пользователем")),
 			).toBe(true),
 		);
 		expect(bot.edited.at(-1)?.text).toContain("Отменено пользователем");
@@ -4573,22 +4648,22 @@ describe("Telegram transport", () => {
 			({ chatId, text }) => chatId === 43 && hasSessionFooter(text, "other"),
 		);
 		const recoveryMessages = sidMessages.map(({ text }) => telegramBody(text));
-		expect(recoveryMessages).toContain("Harness is restarting.");
-		expect(recoveryMessages).toContain("Harness recovered.");
-		expect(recoveryMessages).toContain("Harness recovery failed.");
-		expect(recoveryMessages.indexOf("Harness is restarting.")).toBeLessThan(
-			recoveryMessages.indexOf("Harness recovered."),
+		expect(recoveryMessages).toContain("Супервизор перезапускается.");
+		expect(recoveryMessages).toContain("Супервизор восстановлен.");
+		expect(recoveryMessages).toContain("Не удалось восстановить супервизор.");
+		expect(
+			recoveryMessages.indexOf("Супервизор перезапускается."),
+		).toBeLessThan(recoveryMessages.indexOf("Супервизор восстановлен."));
+		expect(recoveryMessages.indexOf("Супервизор восстановлен.")).toBeLessThan(
+			recoveryMessages.indexOf("Не удалось восстановить супервизор."),
 		);
-		expect(recoveryMessages.indexOf("Harness recovered.")).toBeLessThan(
-			recoveryMessages.indexOf("Harness recovery failed."),
-		);
-		expect(recoveryMessages).toContain("Session status changed.");
+		expect(recoveryMessages).toContain("Статус сессии изменился.");
 		expect(
 			sidMessages.some(({ text }) => text.includes("raw-secret-error")),
 		).toBe(true);
 		expect(
 			sidMessages.some(({ text }) =>
-				text.includes("input-uncertain: uncertain (not resent)"),
+				text.includes("input-uncertain: uncertain (повторно не отправлялся)"),
 			),
 		).toBe(true);
 		expect(otherMessages).toHaveLength(1);
@@ -4634,7 +4709,7 @@ describe("Telegram transport", () => {
 		expect(
 			bot.sent.some(({ text }) =>
 				text.includes(
-					"Pi may have accepted the input, but its acknowledgement was lost; no automatic resend occurred",
+					"Pi мог принять ввод, но подтверждение не получено; автоматической повторной отправки не было",
 				),
 			),
 		).toBe(true);
@@ -4719,6 +4794,11 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42, { caption: "summarize this" });
 		await vi.waitFor(() => expect(bot.reactions).toHaveLength(1));
+		expect(
+			[...bot.sent, ...bot.edited].some(({ text }) =>
+				text.includes("Вложение сохранено и отправлено"),
+			),
+		).toBe(true);
 
 		const submission = requests.find((request) => request.kind === "submit");
 		expect(submission).toMatchObject({
@@ -4771,6 +4851,28 @@ describe("Telegram transport", () => {
 		);
 		await adapter.stop();
 		vi.useRealTimers();
+	});
+
+	it("does not save an incoming attachment when its selected session disappeared", async () => {
+		stubFileDownload();
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
+		await bot.update(42, "/use sid");
+		sessions.delete("sid");
+		await bot.updateDocument(42);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Сессия недоступна; вложение не отправлено. Выберите другую сессию",
+		);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(0);
+		await expect(
+			readdir(path.join(stateDirectory, "inbox")),
+		).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await adapter.stop();
 	});
 
 	it("does not submit oversized or failed incoming documents", async () => {
@@ -4916,8 +5018,12 @@ describe("Telegram transport", () => {
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(0);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Не удалось записать вложение в хранилище сессии",
+			"Не удалось записать вложение в хранилище сессии; оно не отправлено.",
 		);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Проверьте свободное место и доступ к хранилищу",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("повтор");
 		await adapter.stop();
 	});
 
@@ -4973,6 +5079,21 @@ describe("Telegram transport", () => {
 			expect(call[1]).toMatchObject({ filename: "report.txt" });
 			expect(call[2]).toEqual({ caption: "Requested file" });
 		}
+		const insideAliasDirectory = await temp();
+		let aliasAvailable = false;
+		try {
+			await symlink(file, path.join(insideAliasDirectory, "alias.txt"));
+			aliasAvailable = true;
+		} catch (error) {
+			if (process.platform !== "win32") throw error;
+		}
+		if (aliasAvailable) {
+			const aliasResult = await adapter.sendAgentFile({
+				sessionId: "sid" as SessionId,
+				path: path.join(insideAliasDirectory, "alias.txt"),
+			});
+			expect(aliasResult).toMatchObject({ delivered: 2, recipients: 2 });
+		}
 		const beforeOutside = bot.api.sendDocument.mock.calls.length;
 		const outside = await temp();
 		await writeFile(path.join(outside, "private.txt"), "private");
@@ -4982,6 +5103,24 @@ describe("Telegram transport", () => {
 		});
 		expect(result).toMatchObject({ delivered: 0, recipients: 2 });
 		expect(bot.api.sendDocument).toHaveBeenCalledTimes(beforeOutside);
+		let escapeAvailable = false;
+		try {
+			await symlink(
+				path.join(outside, "private.txt"),
+				path.join(directory, "agent-escape.txt"),
+			);
+			escapeAvailable = true;
+		} catch (error) {
+			if (process.platform !== "win32") throw error;
+		}
+		if (escapeAvailable) {
+			const escapeResult = await adapter.sendAgentFile({
+				sessionId: "sid" as SessionId,
+				path: "agent-escape.txt",
+			});
+			expect(escapeResult).toMatchObject({ delivered: 0, recipients: 2 });
+			expect(bot.api.sendDocument).toHaveBeenCalledTimes(beforeOutside);
+		}
 		await adapter.stop();
 	});
 
@@ -5021,9 +5160,24 @@ describe("Telegram transport", () => {
 		);
 		await bot.update(42, `/send ${outsideFile}`);
 		if (symlinkAvailable) await bot.update(42, "/send escape.txt");
+		const aliasDirectory = await temp();
+		let internalAliasAvailable = false;
+		try {
+			await symlink(file, path.join(aliasDirectory, "inside-alias.txt"));
+			internalAliasAvailable = true;
+		} catch (error) {
+			if (process.platform !== "win32") throw error;
+		}
+		if (internalAliasAvailable)
+			await bot.update(
+				42,
+				`/send ${path.join(aliasDirectory, "inside-alias.txt")}`,
+			);
 		await bot.update(42, "/send large.txt");
 		await bot.update(42, "/send folder");
-		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		expect(bot.api.sendDocument).toHaveBeenCalledTimes(
+			internalAliasAvailable ? 2 : 1,
+		);
 		await adapter.stop();
 	});
 
@@ -5071,7 +5225,10 @@ describe("Telegram transport", () => {
 			const { adapter } = await startAdapter(bot, await temp());
 			await bot.update(42, "/use sid");
 			await bot.update(42, "/send private.txt");
-			expect(bot.sent.at(-1)?.text).toContain("Файл недоступен для чтения");
+			expect(bot.sent.at(-1)?.text).toContain(
+				"Файл недоступен для чтения. Проверьте права доступа к файлу в рабочей папке.",
+			);
+			expect(bot.sent.at(-1)?.text).not.toContain("повтор");
 			expect(bot.api.sendDocument).not.toHaveBeenCalled();
 			await chmod(file, 0o600);
 			await adapter.stop();
@@ -5092,7 +5249,7 @@ describe("Telegram transport", () => {
 		await bot.update(100, '/send "report file.txt"');
 		expect(bot.api.sendDocument).not.toHaveBeenCalled();
 		expect(bot.sent.at(-1)?.text).toBe(
-			"No session is selected. Use /sessions to find one and /use <sessionId>, or open /menu.",
+			"Сессия не выбрана. Найдите её через /sessions и выберите командой /use <sessionId> или откройте /menu.",
 		);
 
 		await bot.update(100, "/use sid");
@@ -5111,9 +5268,7 @@ describe("Telegram transport", () => {
 
 		await bot.update(100, "/send ../outside.txt");
 		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
-		expect(bot.sent.at(-1)?.text).toContain(
-			"внутри рабочей папки выбранной сессии",
-		);
+		expect(bot.sent.at(-1)?.text).toContain("Файл не найден");
 		await adapter.stop();
 	});
 
@@ -5492,7 +5647,7 @@ describe("Telegram transport", () => {
 			),
 		).toBe(true);
 		const commandReplyIndex = bot.sent.findIndex(({ text }) =>
-			text.startsWith("Selected"),
+			text.startsWith("Выбрана"),
 		);
 		expect(commandReplyIndex).toBeGreaterThanOrEqual(0);
 		expect(bot.sendOptions[commandReplyIndex]).not.toMatchObject({
@@ -5587,8 +5742,8 @@ describe("Telegram transport", () => {
 				)
 				.map(({ text }) => telegramBody(text));
 		await vi.waitFor(() => expect(eventMessages()).toHaveLength(2));
-		expect(eventMessages()).toEqual(["answer", "Input input-X: completed"]);
-		expect(eventMessages()).not.toContain("Input input-X: accepted");
+		expect(eventMessages()).toEqual(["answer", "Ввод input-X: completed"]);
+		expect(eventMessages()).not.toContain("Ввод input-X: accepted");
 		await adapter.stop();
 	});
 
@@ -5759,7 +5914,7 @@ describe("Telegram transport", () => {
 			expect(
 				bot.api.sendMessage.mock.calls.some(
 					([chatId, text]) =>
-						chatId === 43 && telegramBody(text) === "Session status changed.",
+						chatId === 43 && telegramBody(text) === "Статус сессии изменился.",
 				),
 			).toBe(true),
 		);
@@ -5805,7 +5960,7 @@ describe("Telegram transport", () => {
 			expect(
 				bot.api.sendMessage.mock.calls.some(
 					([chatId, text]) =>
-						chatId === 42 && telegramBody(text) === "Session status changed.",
+						chatId === 42 && telegramBody(text) === "Статус сессии изменился.",
 				),
 			).toBe(true),
 		);
@@ -5980,7 +6135,9 @@ describe("Telegram transport", () => {
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(({ text }) =>
-					text.includes("uncertain-original-id: uncertain (not resent)"),
+					text.includes(
+						"uncertain-original-id: uncertain (повторно не отправлялся)",
+					),
 				),
 			).toBe(true),
 		);
