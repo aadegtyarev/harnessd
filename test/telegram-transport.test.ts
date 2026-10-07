@@ -1315,6 +1315,28 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("presents diagnostic-looking creation path chunks literally and creates the exact cwd", async () => {
+		const marker = "Invalid api_key=folder/";
+		const cwd = `/${"a".repeat(2999)}${marker}${"x".repeat(1000)}`;
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			initialCwd: cwd,
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelMessageId);
+		const pathChunks = bot.sent.slice(2, -1).map((message) => message.text);
+		expect(pathChunks[1]).toMatch(/^Invalid api_key=folder/);
+		expect(pathChunks.join("")).toBe(cwd);
+		await bot.update(42, "/skip", { replyToMessageId: bot.lastMessageId });
+		expect(requests.find((request) => request.kind === "create")).toMatchObject(
+			{
+				cwd,
+			},
+		);
+		await adapter.stop();
+	});
+
 	it("browses folders and creates a named session in the selected folder", async () => {
 		const directory = await temp();
 		const childDirectory = path.join(directory, "child folder");

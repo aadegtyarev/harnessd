@@ -2096,7 +2096,7 @@ export class TelegramTransportAdapter
 			"Точный путь папки создания (экранированы управляющие символы):",
 		);
 		for (const chunk of splitTelegramText(path))
-			await this.sendDirect(chatId, chunk);
+			await this.sendWithDeadline(chatId, chunk);
 		return this.promptForName(
 			chatId,
 			{ kind: "create", cwd },
