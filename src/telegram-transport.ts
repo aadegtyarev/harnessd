@@ -63,6 +63,8 @@ const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
 const INTERNAL_WIDGET_PREFIX = "PI_SUBAGENT_ASYNC_JSON:";
+const NAME_PROMPT_MARKER = "Name this session (harnessd name prompt):";
+const MAX_CORRELATED_MESSAGES_PER_CHAT = 128;
 type UpdateContext = {
 	from?: { id: number };
 	chat?: { id: number; type: string };
@@ -82,7 +84,7 @@ type UpdateContext = {
 			width: number;
 			height: number;
 		}[];
-		reply_to_message?: { message_id?: number };
+		reply_to_message?: { message_id?: number; text?: string };
 	};
 	callbackQuery?: {
 		id: string;
@@ -186,12 +188,27 @@ type PendingNameFlow =
 			readonly kind: "create";
 			readonly cwd: string;
 			readonly promptMessageId: number;
+			choiceMessageId?: number;
+			processing?: boolean;
 	  }
 	| {
 			readonly kind: "rename";
 			readonly sessionId: SessionId;
 			readonly promptMessageId: number;
+			choiceMessageId?: number;
+			processing?: boolean;
 	  };
+type ReplyRoute = { readonly sessionId: SessionId };
+type ReplyChoice = {
+	readonly chatId: number;
+	readonly sender: number;
+	readonly incomingMessageId: number;
+	choiceMessageId?: number;
+	readonly sourceSession: SessionId;
+	readonly selectedSession: SessionId;
+	readonly text?: string;
+	readonly message?: NonNullable<UpdateContext["message"]>;
+};
 type PendingNameRequest =
 	| { readonly kind: "create"; readonly cwd: string }
 	| { readonly kind: "rename"; readonly sessionId: SessionId };
@@ -957,10 +974,11 @@ export class TelegramTransportAdapter
 	private readonly liveActivities = new Map<string, LiveActivity>();
 	private readonly runningSessions = new Set<SessionId>();
 	private readonly previews = new Map<number, SessionId>();
-	private readonly pendingNames = new Map<
-		number,
-		Map<number, PendingNameFlow>
-	>();
+	private readonly pendingNames = new Map<number, PendingNameFlow>();
+	private readonly staleNamePrompts = new Map<number, Set<number>>();
+	private readonly namePromptVersions = new Map<number, number>();
+	private readonly replyRoutes = new Map<number, Map<number, ReplyRoute>>();
+	private readonly replyChoices = new Map<string, ReplyChoice>();
 	private readonly modelChoices = new Map<number, ModelChoices>();
 	private readonly effortChoices = new Map<number, EffortChoices>();
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
@@ -1373,7 +1391,10 @@ export class TelegramTransportAdapter
 		return true;
 	}
 
-	private async onText(ctx: UpdateContext): Promise<void> {
+	private async onText(
+		ctx: UpdateContext,
+		routedSessionId?: SessionId,
+	): Promise<void> {
 		const chatId = ctx.chat?.id;
 		const sender = ctx.from?.id;
 		const text = ctx.message?.text;
@@ -1384,23 +1405,39 @@ export class TelegramTransportAdapter
 		try {
 			const replyTo = ctx.message?.reply_to_message?.message_id;
 			const pending =
-				replyTo === undefined
-					? undefined
-					: this.pendingNames.get(chatId)?.get(replyTo);
-			if (pending) {
+				replyTo === undefined ? undefined : this.pendingNames.get(chatId);
+			if (pending && pending.promptMessageId === replyTo) {
 				await this.handleNameReply(chatId, sender, pending, text);
 				return;
 			}
-			if (ctx.message?.reply_to_message)
+			if (
+				replyTo !== undefined &&
+				(this.isStaleNamePrompt(chatId, replyTo) ||
+					ctx.message?.reply_to_message?.text?.includes(NAME_PROMPT_MARKER))
+			)
 				return this.sendDirect(
 					chatId,
-					"This reply does not match an active prompt. Send it as a new message if it is intended for the session.",
+					"This name prompt has expired. Start the naming action again.",
 				);
-			if (text.startsWith("/")) await this.command(chatId, sender, text);
-			else {
-				const sessionId = this.selected.get(chatId);
+			if (text.startsWith("/")) {
+				await this.command(chatId, sender, text);
+			} else {
+				const sessionId = routedSessionId ?? this.selected.get(chatId);
 				if (!sessionId)
 					return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+				const sourceSession =
+					routedSessionId !== undefined || replyTo === undefined
+						? undefined
+						: this.replyRoutes.get(chatId)?.get(replyTo)?.sessionId;
+				if (sourceSession && sourceSession !== sessionId)
+					return this.offerReplyRoutes(
+						chatId,
+						sender,
+						ctx.message?.message_id ?? 0,
+						sourceSession,
+						sessionId,
+						{ text },
+					);
 				activity = this.beginLiveActivity(
 					chatId,
 					sessionId,
@@ -1560,6 +1597,171 @@ export class TelegramTransportAdapter
 		}
 	}
 
+	private rememberStaleNamePrompt(chatId: number, messageId: number): void {
+		let stale = this.staleNamePrompts.get(chatId);
+		if (!stale) {
+			stale = new Set();
+			this.staleNamePrompts.set(chatId, stale);
+		}
+		stale.add(messageId);
+		while (stale.size > 16) stale.delete(stale.values().next().value as number);
+	}
+
+	private isStaleNamePrompt(chatId: number, messageId: number): boolean {
+		return this.staleNamePrompts.get(chatId)?.has(messageId) ?? false;
+	}
+
+	private isNamePromptReply(
+		chatId: number,
+		messageId: number,
+		text?: string,
+	): boolean {
+		return (
+			this.pendingNames.get(chatId)?.promptMessageId === messageId ||
+			this.isStaleNamePrompt(chatId, messageId) ||
+			text?.includes(NAME_PROMPT_MARKER) === true
+		);
+	}
+
+	private rememberReplyRoute(
+		chatId: number,
+		messageId: number,
+		sessionId: SessionId,
+	): void {
+		let routes = this.replyRoutes.get(chatId);
+		if (!routes) {
+			routes = new Map();
+			this.replyRoutes.set(chatId, routes);
+		}
+		routes.delete(messageId);
+		routes.set(messageId, { sessionId });
+		while (routes.size > MAX_CORRELATED_MESSAGES_PER_CHAT)
+			routes.delete(routes.keys().next().value as number);
+	}
+
+	private async offerReplyRoutes(
+		chatId: number,
+		sender: number,
+		incomingMessageId: number,
+		sourceSession: SessionId,
+		selectedSession: SessionId,
+		content:
+			| { readonly text: string }
+			| { readonly message: NonNullable<UpdateContext["message"]> },
+	): Promise<void> {
+		const token = randomUUID().replaceAll("-", "").slice(0, 12);
+		const choice: ReplyChoice = {
+			chatId,
+			sender,
+			incomingMessageId,
+			sourceSession,
+			selectedSession,
+			...content,
+		};
+		this.replyChoices.set(token, choice);
+		while (this.replyChoices.size > 128)
+			this.replyChoices.delete(this.replyChoices.keys().next().value as string);
+		const sent = await this.telegramCall((signal) =>
+			this.bot.api.sendMessage(
+				chatId,
+				`This message belongs to ${this.sessionFooter(sourceSession)}, but the selected session is ${this.sessionFooter(selectedSession)}. Choose where to send it:`,
+				{
+					reply_markup: keyboard([
+						[
+							inlineButton("Send to source", `reply:${token}:s`),
+							inlineButton("Send to selected", `reply:${token}:c`),
+							inlineButton("Cancel", `reply:${token}:x`),
+						],
+					]),
+				},
+				signal,
+			),
+		);
+		if (!sent.ok) this.replyChoices.delete(token);
+		else choice.choiceMessageId = messageIdFrom(sent.value);
+	}
+
+	private async dispatchNameChoice(
+		chatId: number,
+		sender: number,
+		data: string,
+		messageId: number,
+	): Promise<void> {
+		const flow = this.pendingNames.get(chatId);
+		if (
+			!flow ||
+			flow.choiceMessageId !== messageId ||
+			sender !== this.authorizedChatPrincipals.get(chatId)
+		) {
+			await this.sendDirect(
+				chatId,
+				"This naming choice expired. Start the naming action again.",
+			);
+			return;
+		}
+		if (data === "name:cancel") {
+			this.pendingNames.delete(chatId);
+			return this.sendDirect(chatId, "Name operation cancelled.");
+		}
+		if (data === "name:unnamed" && flow.kind === "create")
+			return this.handleNameReply(chatId, sender, flow, "/skip");
+	}
+
+	private async dispatchReplyChoice(
+		chatId: number,
+		sender: number,
+		data: string,
+		messageId: number,
+	): Promise<void> {
+		const match = /^reply:([a-f0-9]{12}):([scx])$/.exec(data);
+		const choice = match
+			? this.replyChoices.get(match[1] as string)
+			: undefined;
+		if (
+			!choice ||
+			choice.chatId !== chatId ||
+			choice.sender !== sender ||
+			choice.choiceMessageId !== messageId
+		) {
+			await this.sendDirect(
+				chatId,
+				"This reply choice expired. Send the message again if still needed.",
+			);
+			return;
+		}
+		this.replyChoices.delete(match?.[1] as string);
+		if (match?.[2] === "x")
+			return this.sendDirect(chatId, "Reply cancelled; nothing was sent.");
+		if (
+			match?.[2] === "c" &&
+			this.selected.get(chatId) !== choice.selectedSession
+		)
+			return this.sendDirect(
+				chatId,
+				"The selected session changed before confirmation. Nothing was sent; reply again to choose a current destination.",
+			);
+		const target =
+			match?.[2] === "s" ? choice.sourceSession : choice.selectedSession;
+		if (choice.text !== undefined)
+			return this.onText(
+				{
+					chat: { id: chatId, type: "private" },
+					from: { id: sender },
+					message: { text: choice.text, message_id: choice.incomingMessageId },
+				},
+				target,
+			);
+		if (choice.message)
+			return this.onMedia(
+				{
+					chat: { id: chatId, type: "private" },
+					from: { id: sender },
+					message: choice.message,
+				},
+				target,
+			);
+	}
+
 	private async onUnsupportedMedia(ctx: UpdateContext): Promise<void> {
 		const chatId = ctx.chat?.id;
 		if (chatId !== undefined)
@@ -1569,13 +1771,39 @@ export class TelegramTransportAdapter
 			);
 	}
 
-	private async onMedia(ctx: UpdateContext): Promise<void> {
+	private async onMedia(
+		ctx: UpdateContext,
+		routedSessionId?: SessionId,
+	): Promise<void> {
 		const chatId = ctx.chat?.id;
 		const sender = ctx.from?.id;
 		const message = ctx.message;
 		if (chatId === undefined || sender === undefined || !message) return;
-		const sessionId = this.selected.get(chatId);
+		const replyTo = message.reply_to_message?.message_id;
+		if (
+			replyTo !== undefined &&
+			this.isNamePromptReply(chatId, replyTo, message.reply_to_message?.text)
+		)
+			return this.sendDirect(
+				chatId,
+				"This name prompt has expired or requires text; the attachment was not submitted.",
+			);
+		const sessionId = routedSessionId ?? this.selected.get(chatId);
 		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+		if (routedSessionId === undefined && replyTo !== undefined) {
+			const sourceSession = this.replyRoutes
+				.get(chatId)
+				?.get(replyTo)?.sessionId;
+			if (sourceSession && sourceSession !== sessionId)
+				return this.offerReplyRoutes(
+					chatId,
+					sender,
+					message.message_id ?? 0,
+					sourceSession,
+					sessionId,
+					{ message },
+				);
+		}
 		const document = message.document;
 		const photo = largestPhoto(message.photo);
 		if (!document && !photo)
@@ -2126,6 +2354,28 @@ export class TelegramTransportAdapter
 		);
 	}
 
+	private async reissueNameFlow(
+		chatId: number,
+		sender: number,
+		flow: PendingNameFlow,
+	): Promise<void> {
+		if (flow.kind === "create")
+			return this.promptForCreation(chatId, flow.cwd, true);
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId: flow.sessionId,
+		});
+		const session = inspected.ok
+			? (inspected.value as SessionSummary)
+			: undefined;
+		if (session) this.rememberSession(session);
+		return this.promptForName(
+			chatId,
+			{ kind: "rename", sessionId: flow.sessionId },
+			`Rename ${session ? sessionLabel(session) : this.sessionFooter(flow.sessionId)} (${this.sessionFooter(flow.sessionId)}) in ${safePathPresentation(session?.cwd ?? this.sessionCwds.get(flow.sessionId) ?? "unknown cwd")}. Reply with a name; use Cancel below.`,
+		);
+	}
+
 	private async promptForCreation(
 		chatId: number,
 		cwd: string,
@@ -2133,9 +2383,9 @@ export class TelegramTransportAdapter
 	): Promise<void> {
 		const path = safePathPresentation(cwd);
 		const instructions = includeCancel
-			? "Ответьте именем или /skip, чтобы создать её без имени. Для отмены ответьте /cancel."
-			: "Ответьте именем или /skip. Для отмены — /cancel.";
-		const prefix = "Новая сессия будет создана в папке ";
+			? "Reply with a name. Create unnamed and Cancel buttons are below."
+			: "Reply with a name. Create unnamed and Cancel buttons are below.";
+		const prefix = "New session will be created in ";
 		if (`${prefix}${path}. ${instructions}`.length <= 3800) {
 			return this.promptForName(
 				chatId,
@@ -2145,14 +2395,14 @@ export class TelegramTransportAdapter
 		}
 		await this.sendDirect(
 			chatId,
-			"Точный путь папки создания (экранированы управляющие символы):",
+			"Exact session creation folder (control characters escaped):",
 		);
 		for (const chunk of splitTelegramText(path))
 			await this.sendWithDeadline(chatId, chunk);
 		return this.promptForName(
 			chatId,
 			{ kind: "create", cwd },
-			`Новая сессия будет создана в указанной выше папке. ${instructions}`,
+			`New session will be created in the exact folder shown above. ${instructions}`,
 		);
 	}
 
@@ -2161,10 +2411,42 @@ export class TelegramTransportAdapter
 		flow: PendingNameRequest,
 		text: string,
 	): Promise<void> {
+		const version = (this.namePromptVersions.get(chatId) ?? 0) + 1;
+		this.namePromptVersions.set(chatId, version);
+		const previous = this.pendingNames.get(chatId);
+		if (previous) {
+			this.pendingNames.delete(chatId);
+			this.rememberStaleNamePrompt(chatId, previous.promptMessageId);
+			await this.sendDirect(
+				chatId,
+				"The previous name prompt was superseded by a new naming action.",
+			);
+		}
+		const choices = await this.telegramCall((signal) =>
+			this.bot.api.sendMessage(
+				chatId,
+				flow.kind === "create"
+					? "Create unnamed session or cancel."
+					: "Cancel this rename prompt.",
+				{
+					reply_markup: keyboard(
+						flow.kind === "create"
+							? [
+									[
+										inlineButton("Create unnamed", "name:unnamed"),
+										inlineButton("Cancel", "name:cancel"),
+									],
+								]
+							: [[inlineButton("Cancel", "name:cancel")]],
+					),
+				},
+				signal,
+			),
+		);
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
-				text,
+				`${NAME_PROMPT_MARKER} ${text}`,
 				{ reply_markup: { force_reply: true, selective: true } },
 				signal,
 			),
@@ -2177,21 +2459,20 @@ export class TelegramTransportAdapter
 			);
 			return;
 		}
-		let pending = this.pendingNames.get(chatId);
-		if (!pending) {
-			pending = new Map();
-			this.pendingNames.set(chatId, pending);
+		if (this.namePromptVersions.get(chatId) !== version) {
+			this.rememberStaleNamePrompt(chatId, messageId);
+			await this.sendDirect(
+				chatId,
+				"This name prompt was superseded by a newer naming action.",
+			);
+			return;
 		}
-		const pendingFlow: PendingNameFlow =
-			flow.kind === "create"
-				? { ...flow, promptMessageId: messageId }
-				: { ...flow, promptMessageId: messageId };
-		pending.set(messageId, pendingFlow);
-		while (pending.size > 8) {
-			const oldest = pending.keys().next().value as number | undefined;
-			if (oldest === undefined) break;
-			pending.delete(oldest);
-		}
+		const pendingFlow: PendingNameFlow = {
+			...flow,
+			promptMessageId: messageId,
+			...(choices.ok ? { choiceMessageId: messageIdFrom(choices.value) } : {}),
+		};
+		this.pendingNames.set(chatId, pendingFlow);
 	}
 
 	private async handleNameReply(
@@ -2201,16 +2482,20 @@ export class TelegramTransportAdapter
 		text: string,
 	): Promise<void> {
 		const pending = this.pendingNames.get(chatId);
-		pending?.delete(flow.promptMessageId);
-		if (pending?.size === 0) this.pendingNames.delete(chatId);
+		if (pending !== flow || flow.processing) return;
+		flow.processing = true;
 		const reply = text.trim();
-		if (reply === "/cancel")
+		if (reply === "/cancel") {
+			this.pendingNames.delete(chatId);
 			return this.sendDirect(chatId, "Name operation cancelled.");
-		if (!reply || (flow.kind === "rename" && reply === "/skip"))
-			return this.sendDirect(
+		}
+		if (!reply || (flow.kind === "rename" && reply === "/skip")) {
+			await this.sendDirect(
 				chatId,
-				"Name was not changed; use /rename to retry.",
+				"Name cannot be empty. The same naming target is still active.",
 			);
+			return this.reissueNameFlow(chatId, sender, flow);
+		}
 		if (flow.kind === "create") {
 			const name = reply === "/skip" ? undefined : text;
 			const result = await this.request(sender, {
@@ -2219,7 +2504,11 @@ export class TelegramTransportAdapter
 				cwd: flow.cwd,
 				...(name !== undefined ? { name } : {}),
 			});
-			if (!result.ok) return this.sendDirect(chatId, result.error.message);
+			if (!result.ok) {
+				await this.sendDirect(chatId, result.error.message);
+				return this.reissueNameFlow(chatId, sender, flow);
+			}
+			this.pendingNames.delete(chatId);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
 			const selectionSaved = await this.setSelected(chatId, session.id);
@@ -2235,7 +2524,11 @@ export class TelegramTransportAdapter
 			sessionId: flow.sessionId,
 			name: text,
 		});
-		if (!result.ok) return this.sendDirect(chatId, result.error.message);
+		if (!result.ok) {
+			await this.sendDirect(chatId, result.error.message);
+			return this.reissueNameFlow(chatId, sender, flow);
+		}
+		this.pendingNames.delete(chatId);
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
 		await this.refreshExistingPanel(chatId, sender);
@@ -2650,8 +2943,16 @@ export class TelegramTransportAdapter
 		await this.telegramCall((signal) =>
 			this.bot.api.answerCallbackQuery(callback.id, {}, signal),
 		);
-		await this.savePanelReference(chatId, messageId);
 		if (!callback.data || callback.data.length > 64) return;
+		if (callback.data.startsWith("reply:")) {
+			await this.dispatchReplyChoice(chatId, sender, callback.data, messageId);
+			return;
+		}
+		if (callback.data.startsWith("name:")) {
+			await this.dispatchNameChoice(chatId, sender, callback.data, messageId);
+			return;
+		}
+		await this.savePanelReference(chatId, messageId);
 		try {
 			await this.dispatchCallback(chatId, sender, callback.data, messageId);
 		} catch (error) {
@@ -2994,6 +3295,12 @@ export class TelegramTransportAdapter
 						return;
 					}
 					activity.messageId = messageIdFrom(sent.value);
+					if (activity.messageId !== undefined)
+						this.rememberReplyRoute(
+							activity.chatId,
+							activity.messageId,
+							activity.sessionId,
+						);
 					activity.lastText = text;
 					return;
 				}
@@ -3862,7 +4169,7 @@ export class TelegramTransportAdapter
 		await this.promptForName(
 			chatId,
 			{ kind: "rename", sessionId },
-			`Ответьте новым именем для ${sessionLabel(session)}. Для отмены ответьте /cancel.`,
+			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)}) in ${safePathPresentation(session.cwd)}. Reply with a name; use Cancel below.`,
 		);
 	}
 
@@ -4496,6 +4803,7 @@ export class TelegramTransportAdapter
 				message.output
 					? { parse_mode: "HTML" }
 					: sessionIdEntity(message.text, message.sessionId),
+				message.output ? message.sessionId : undefined,
 			);
 			if (!delivered) {
 				queue.failed = true;
@@ -4509,6 +4817,7 @@ export class TelegramTransportAdapter
 		chatId: number,
 		text: string,
 		other?: unknown,
+		correlatedSessionId?: SessionId,
 	): Promise<boolean> {
 		return this.telegramCall((signal) =>
 			this.bot.api.sendMessage(chatId, text, other, signal),
@@ -4517,6 +4826,9 @@ export class TelegramTransportAdapter
 				this.reportError("Telegram message delivery failed", result.error);
 				return false;
 			}
+			const messageId = messageIdFrom(result.value);
+			if (correlatedSessionId && messageId !== undefined)
+				this.rememberReplyRoute(chatId, messageId, correlatedSessionId);
 			return true;
 		});
 	}

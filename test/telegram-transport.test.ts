@@ -83,7 +83,7 @@ type Context = {
 			height: number;
 		}[];
 		message_id?: number;
-		reply_to_message?: { message_id: number };
+		reply_to_message?: { message_id: number; text?: string };
 	};
 	callbackQuery?: {
 		id: string;
@@ -96,7 +96,15 @@ class MockBot {
 	handler?: (ctx: Context) => Promise<void>;
 	photoHandler?: (ctx: Context) => Promise<void>;
 	callbackHandler?: (ctx: Context) => Promise<void>;
-	sent: { chatId: number; text: string }[] = [];
+	sent: { chatId: number; text: string; message_id?: number }[] = [];
+	get lastForceReplyMessageId(): number | undefined {
+		const index = this.sendOptions.findLastIndex(
+			(option) =>
+				(option as { reply_markup?: { force_reply?: boolean } }).reply_markup
+					?.force_reply,
+		);
+		return index < 0 ? undefined : this.sent[index]?.message_id;
+	}
 	reactions: { chatId: number; messageId: number; reaction: unknown }[] = [];
 	setMessageReactionBehavior: () => Promise<unknown> = async () => true;
 	sendMessageBehavior: () => Promise<void> = async () => {};
@@ -138,9 +146,9 @@ class MockBot {
 			): Promise<unknown> => {
 				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
 				await this.sendMessageBehavior();
-				this.sent.push({ chatId, text });
-				this.sendOptions.push(_other);
 				const message_id = this.nextMessageId++;
+				this.sent.push({ chatId, text, message_id });
+				this.sendOptions.push(_other);
 				this.lastMessageId = message_id;
 				return { message_id };
 			},
@@ -247,6 +255,7 @@ class MockBot {
 			chatType?: string;
 			missingSender?: boolean;
 			replyToMessageId?: number;
+			replyToMessageText?: string;
 		} = {},
 	) {
 		const {
@@ -262,7 +271,12 @@ class MockBot {
 				message_id: this.nextMessageId++,
 				...(options.replyToMessageId === undefined
 					? {}
-					: { reply_to_message: { message_id: options.replyToMessageId } }),
+					: {
+							reply_to_message: {
+								message_id: options.replyToMessageId,
+								text: options.replyToMessageText,
+							},
+						}),
 			},
 		};
 		await this.middleware?.(ctx, async () => this.handler?.(ctx));
@@ -275,6 +289,8 @@ class MockBot {
 			fileName?: string;
 			fileSize?: number;
 			userId?: number;
+			replyToMessageId?: number;
+			replyToMessageText?: string;
 		} = {},
 	) {
 		const ctx: Context = {
@@ -290,11 +306,25 @@ class MockBot {
 						: { file_size: options.fileSize }),
 				},
 				...(options.caption ? { caption: options.caption } : {}),
+				...(options.replyToMessageId === undefined
+					? {}
+					: {
+							reply_to_message: {
+								message_id: options.replyToMessageId,
+								text: options.replyToMessageText,
+							},
+						}),
 			},
 		};
 		await this.middleware?.(ctx, async () => this.photoHandler?.(ctx));
 	}
-	async updatePhoto(chatId: number, caption?: string, userId = 42) {
+	async updatePhoto(
+		chatId: number,
+		caption?: string,
+		userId = 42,
+		replyToMessageId?: number,
+		replyToMessageText?: string,
+	) {
 		const ctx: Context = {
 			from: { id: userId },
 			chat: { id: chatId, type: "private" },
@@ -315,6 +345,14 @@ class MockBot {
 					},
 				],
 				...(caption ? { caption } : {}),
+				...(replyToMessageId === undefined
+					? {}
+					: {
+							reply_to_message: {
+								message_id: replyToMessageId,
+								text: replyToMessageText,
+							},
+						}),
 			},
 		};
 		await this.middleware?.(ctx, async () => this.photoHandler?.(ctx));
@@ -1288,7 +1326,9 @@ describe("Telegram transport", () => {
 		const panelMessageId = bot.lastMessageId;
 		expect(bot.sent.at(-1)?.text).toContain(`папка создания: ${directory}`);
 		await bot.callback(42, "menu:new", panelMessageId);
-		expect(bot.sent.at(-1)?.text).toContain(`создана в папке ${directory}`);
+		expect(bot.sent.at(-1)?.text).toContain(
+			`New session will be created in ${directory}`,
+		);
 		await adapter.stop();
 	});
 
@@ -1346,7 +1386,12 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/menu");
 		const panelMessageId = bot.lastMessageId;
 		await bot.callback(42, "menu:new", panelMessageId);
-		const pathChunks = bot.sent.slice(2, -1).map((message) => message.text);
+		const pathChunks = bot.sent
+			.map((message) => message.text)
+			.filter(
+				(text) =>
+					text.startsWith("/") || text.startsWith("Invalid api_key=folder"),
+			);
 		expect(pathChunks[1]).toMatch(/^Invalid api_key=folder/);
 		expect(pathChunks.join("")).toBe(cwd);
 		await bot.update(42, "/skip", { replyToMessageId: bot.lastMessageId });
@@ -1387,7 +1432,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("/work");
 		await bot.callback(42, "folder:new", panelMessageId);
 		expect(bot.sent.at(-1)?.text).toContain(
-			`Новая сессия будет создана в папке ${childDirectory}`,
+			`New session will be created in ${childDirectory}`,
 		);
 		const promptMessageId = bot.lastMessageId;
 		await bot.update(42, "nested task", { replyToMessageId: promptMessageId });
@@ -1907,6 +1952,198 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("routes correlated text and media replies safely across selected sessions", async () => {
+		stubFileDownload();
+		const bot = new MockBot();
+		const cwd = await temp();
+		const otherCwd = await temp();
+		sessions.set("sid", { ...(sessions.get("sid") as SessionSummary), cwd });
+		sessions.set("other", {
+			...(sessions.get("other") as SessionSummary),
+			cwd: otherCwd,
+		});
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "create a reply target");
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
+				true,
+			),
+		);
+		const sourceId = bot.sent.find(({ text }) =>
+			text.includes("Pi activity"),
+		)?.message_id;
+		expect(sourceId).toBeDefined();
+		await bot.updateDocument(42, { replyToMessageId: sourceId });
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(2),
+		);
+		expect(
+			requests.filter(({ kind }) => kind === "submit").at(-1),
+		).toMatchObject({ sessionId: "sid" });
+		await bot.update(42, "text reply stays on source", {
+			replyToMessageId: sourceId,
+		});
+		expect(
+			requests.filter(({ kind }) => kind === "submit").at(-1),
+		).toMatchObject({ sessionId: "sid" });
+
+		await bot.update(42, "/use other");
+		await bot.update(42, "text reply needs a choice", {
+			replyToMessageId: sourceId,
+		});
+		const textChoice = bot.sent.at(-1);
+		const selectedChoiceData = callbackData(
+			bot.sendOptions.at(-1),
+			"reply:",
+		).replace(/:s$/, ":c");
+		await bot.update(42, "/use sid");
+		await bot.callback(42, selectedChoiceData, textChoice?.message_id);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(3);
+		await bot.update(42, "/use other");
+
+		await bot.updatePhoto(42, undefined, 42, sourceId);
+		const choice = bot.sent.at(-1);
+		const choiceData = (
+			bot.sendOptions.at(-1) as {
+				reply_markup: { inline_keyboard: { callback_data: string }[][] };
+			}
+		).reply_markup.inline_keyboard[0]?.[0]?.callback_data;
+		expect(choice?.text).toContain("selected session is");
+		expect(choiceData).toMatch(/^reply:[a-f0-9]{12}:s$/);
+		await bot.callback(42, choiceData as string, choice?.message_id);
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(4),
+		);
+		expect(
+			requests.filter(({ kind }) => kind === "submit").at(-1),
+		).toMatchObject({ sessionId: "sid" });
+
+		await bot.updateDocument(42, { replyToMessageId: 999999 });
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(5),
+		);
+		expect(
+			requests.filter(({ kind }) => kind === "submit").at(-1),
+		).toMatchObject({ sessionId: "other" });
+		emit(harnessEvent("other", "status", "agent_settled"));
+		await adapter.stop();
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: "/work",
+		});
+		sessions.set("other", {
+			...(sessions.get("other") as SessionSummary),
+			cwd: "/other",
+		});
+	});
+
+	it("supersedes one name prompt per chat, expires stale media, and restores no prompt after restart", async () => {
+		stubFileDownload();
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelId);
+		const firstPrompt = bot.lastForceReplyMessageId;
+		await bot.callback(42, "menu:new", panelId);
+		const currentPrompt = bot.lastForceReplyMessageId;
+		expect(currentPrompt).not.toBe(firstPrompt);
+		await bot.update(42, "stale name", {
+			replyToMessageId: firstPrompt,
+			replyToMessageText: "Name this session (harnessd name prompt): old",
+		});
+		await bot.updateDocument(42, {
+			replyToMessageId: firstPrompt,
+			replyToMessageText: "Name this session (harnessd name prompt): old",
+		});
+		expect(
+			requests.some(({ kind }) => kind === "submit" || kind === "create"),
+		).toBe(false);
+		await bot.update(42, "current name", { replyToMessageId: currentPrompt });
+		expect(requests.some(({ kind }) => kind === "create")).toBe(true);
+		await adapter.stop();
+
+		const restartedBot = new MockBot();
+		const restarted = await startAdapter(restartedBot, stateDirectory);
+		await restartedBot.update(42, "reply to expired prompt", {
+			replyToMessageId: currentPrompt,
+			replyToMessageText:
+				"Name this session (harnessd name prompt): expired by restart",
+		});
+		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+			false,
+		);
+		await restarted.adapter.stop();
+	});
+
+	it("keeps naming prompts isolated between authorized chats", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panel42 = bot.lastMessageId;
+		await bot.update(43, "/menu");
+		const panel43 = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panel42);
+		const prompt42 = bot.lastForceReplyMessageId;
+		await bot.callback(43, "menu:new", panel43);
+		const prompt43 = bot.lastForceReplyMessageId;
+		await bot.update(43, "chat forty-three", { replyToMessageId: prompt43 });
+		await bot.update(42, "chat forty-two", { replyToMessageId: prompt42 });
+		expect(requests.filter(({ kind }) => kind === "create")).toMatchObject([
+			{ kind: "create", name: "chat forty-three" },
+			{ kind: "create", name: "chat forty-two" },
+		]);
+		await adapter.stop();
+	});
+
+	it("reissues invalid name flows and provides unnamed and cancel buttons", async () => {
+		const bot = new MockBot();
+		let rejectFirstName = true;
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "create" && request.name && rejectFirstName) {
+					rejectFirstName = false;
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: { code: "VALIDATION", message: "Name is too long" },
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelId);
+		const firstPrompt = bot.lastForceReplyMessageId;
+		await bot.update(42, "invalid name", { replyToMessageId: firstPrompt });
+		const retryPrompt = bot.lastForceReplyMessageId;
+		expect(retryPrompt).not.toBe(firstPrompt);
+		await bot.update(42, "corrected name", { replyToMessageId: retryPrompt });
+		expect(requests.filter(({ kind }) => kind === "create")).toHaveLength(2);
+
+		await bot.callback(42, "menu:new", panelId);
+		const unnamedChoice = callbackData(bot.sendOptions.at(-2), "name:unnamed");
+		const unnamedChoiceId = bot.sent.at(-2)?.message_id;
+		await bot.callback(42, unnamedChoice, unnamedChoiceId);
+		const unnamedRequest = requests
+			.filter(({ kind }) => kind === "create")
+			.at(-1);
+		expect(unnamedRequest).toMatchObject({ kind: "create", cwd: "/work" });
+		expect(unnamedRequest).not.toHaveProperty("name");
+		await bot.callback(42, "menu:new", panelId);
+		const cancelData = callbackData(bot.sendOptions.at(-2), "name:cancel");
+		const cancelId = bot.sent.at(-2)?.message_id;
+		const creates = requests.filter(({ kind }) => kind === "create").length;
+		await bot.callback(42, cancelData, cancelId);
+		expect(requests.filter(({ kind }) => kind === "create")).toHaveLength(
+			creates,
+		);
+		await adapter.stop();
+	});
+
 	it("uses ForceReply to create named sessions and consumes only replies to its prompt", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
@@ -1926,7 +2163,14 @@ describe("Telegram transport", () => {
 		);
 		expect(requests.some((request) => request.kind === "submit")).toBe(false);
 		await bot.update(42, "stale prompt response", { replyToMessageId: 999999 });
-		expect(requests.some((request) => request.kind === "submit")).toBe(false);
+		expect(requests.some((request) => request.kind === "submit")).toBe(true);
+		await bot.update(42, "old name reply", {
+			replyToMessageId: 999998,
+			replyToMessageText: "Name this session (harnessd name prompt): expired",
+		});
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(1);
 		await adapter.stop();
 	});
 
