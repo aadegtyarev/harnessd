@@ -84,6 +84,18 @@ export class InvalidSessionNameError extends Error {
 	}
 }
 
+export type ReloadErrorCode =
+	| "RELOAD_ALREADY_RUNNING"
+	| "RELOAD_BUSY"
+	| "RELOAD_SELECTION_CHANGED";
+
+export class ReloadError extends Error {
+	constructor(readonly code: ReloadErrorCode) {
+		super(code);
+		this.name = "ReloadError";
+	}
+}
+
 export class SessionNotFoundError extends Error {
 	readonly code = "SESSION_NOT_FOUND";
 

@@ -6,6 +6,7 @@ import {
 	DuplicateSessionIdError,
 	InvalidSessionNameError,
 	InvalidWorkingDirectoryError,
+	ReloadError,
 	requireCapability,
 	SessionNotFoundError,
 	SessionNotResumableError,
@@ -609,7 +610,7 @@ export class SessionManager {
 	}
 
 	async reload(id: SessionId, beforeDispatch: () => boolean): Promise<void> {
-		if (this.reloads.has(id)) throw new Error("RELOAD_ALREADY_RUNNING");
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_ALREADY_RUNNING");
 		this.reloads.add(id);
 		try {
 			const { control } = await this.requireControl(id, "harness.reload");
@@ -624,7 +625,7 @@ export class SessionManager {
 				this.recovery.has(id) ||
 				(this.unsettledInputs.get(id)?.size ?? 0) > 0
 			)
-				throw new Error("RELOAD_BUSY");
+				throw new ReloadError("RELOAD_BUSY");
 			if (!control.reload)
 				throw new UnsupportedCapabilityError("harness.reload", id);
 			if (
@@ -632,8 +633,8 @@ export class SessionManager {
 				this.recovery.has(id) ||
 				this.stopping.has(id)
 			)
-				throw new Error("RELOAD_BUSY");
-			if (!beforeDispatch()) throw new Error("RELOAD_SELECTION_CHANGED");
+				throw new ReloadError("RELOAD_BUSY");
+			if (!beforeDispatch()) throw new ReloadError("RELOAD_SELECTION_CHANGED");
 			await control.reload();
 		} finally {
 			this.reloads.delete(id);

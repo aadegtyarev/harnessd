@@ -54,6 +54,8 @@ export interface PiRpcHarnessOptions {
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
+const RELOAD_COMMAND_ENV = "HARNESSD_PI_RELOAD_COMMAND";
+const RELOAD_COMMAND_DESCRIPTION = "harnessd internal reload command";
 
 export class UncertainInputDeliveryError extends Error {
 	readonly code = "UNCERTAIN_INPUT_DELIVERY";
@@ -86,7 +88,8 @@ export class PiStartupError extends Error {
 export type PiControlErrorCode =
 	| "PI_CONTROL_FAILED"
 	| "MODEL_NOT_AVAILABLE"
-	| "EFFORT_NOT_SUPPORTED";
+	| "EFFORT_NOT_SUPPORTED"
+	| "RELOAD_BUSY";
 
 export class PiControlError extends Error {
 	constructor(
@@ -319,6 +322,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 		let fileSendBridge:
 			| Awaited<ReturnType<typeof startAgentFileSendBridge>>
 			| undefined;
+		const reloadCommand = `harnessd-reload-${randomUUID()}`;
 		let child: ManagedProcess;
 		try {
 			const adapterPath = fileURLToPath(import.meta.url);
@@ -346,13 +350,16 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 				executable: launch?.executable ?? this.options.executable,
 				args: [...(launch?.argsPrefix ?? []), ...args],
 				cwd: request.cwd,
-				env: fileSendBridge
-					? {
-							...(this.options.env ?? {}),
-							[AGENT_FILE_SEND_URL_ENV]: fileSendBridge.url,
-							[AGENT_FILE_SEND_TOKEN_ENV]: fileSendBridge.token,
-						}
-					: this.options.env,
+				env: {
+					...(this.options.env ?? {}),
+					[RELOAD_COMMAND_ENV]: reloadCommand,
+					...(fileSendBridge
+						? {
+								[AGENT_FILE_SEND_URL_ENV]: fileSendBridge.url,
+								[AGENT_FILE_SEND_TOKEN_ENV]: fileSendBridge.token,
+							}
+						: {}),
+				},
 				stdio: "pipe",
 			});
 		} catch (error) {
@@ -368,6 +375,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			child,
 			request.sessionId,
 			this.options,
+			reloadCommand,
 			fileSendBridge,
 		);
 		try {
@@ -415,6 +423,8 @@ interface PendingCommand {
 	resolve(value: Record<string, unknown>): void;
 	reject(error: Error): void;
 	timer?: ReturnType<typeof setTimeout>;
+	retainAfterTimeout?: boolean;
+	isReload?: boolean;
 }
 interface AbortGate {
 	promise: Promise<void>;
@@ -548,6 +558,7 @@ class PiRpcInstance implements HarnessInstance {
 	private compacting = false;
 	private reloadExtensionError = false;
 	private reloadPending = false;
+	private reloadTimedOut = false;
 	private eventsClosed = false;
 	private childExited = false;
 	private stdoutEnded = false;
@@ -563,6 +574,7 @@ class PiRpcInstance implements HarnessInstance {
 		private readonly child: ManagedProcess,
 		private readonly sessionId: SessionId,
 		private readonly options: PiRpcHarnessOptions,
+		private readonly reloadCommand: string,
 		private readonly fileSendBridge?: AgentFileSendBridge,
 	) {
 		this.processId = child.id;
@@ -683,22 +695,41 @@ class PiRpcInstance implements HarnessInstance {
 	}
 	private async reload(): Promise<void> {
 		if (
+			this.reloadPending ||
 			this.agentRunning ||
 			this.compacting ||
 			this.activeInputs.size > 0 ||
 			this.abortInFlight
 		)
-			throw new PiControlError("PI_CONTROL_FAILED");
-		this.reloadExtensionError = false;
+			throw new PiControlError("RELOAD_BUSY");
 		this.reloadPending = true;
+		this.reloadTimedOut = false;
 		try {
-			const response = await this.command("prompt", {
-				message: "/harnessd-reload",
+			const listed = await this.command("get_commands");
+			const data = recordValue(listed.data);
+			const commands = Array.isArray(data?.commands) ? data.commands : [];
+			const matches = commands.filter((entry) => {
+				const command = recordValue(entry);
+				return (
+					command?.invocationName === this.reloadCommand &&
+					command.source === "extension" &&
+					command.description === RELOAD_COMMAND_DESCRIPTION
+				);
 			});
-			const data = recordValue(response.data);
+			if (listed.success !== true || matches.length !== 1)
+				throw new PiControlError("PI_CONTROL_FAILED");
+			this.reloadExtensionError = false;
+			const response = await this.command(
+				"prompt",
+				{ message: `/${this.reloadCommand}` },
+				undefined,
+				true,
+				true,
+			);
+			const responseData = recordValue(response.data);
 			if (
 				response.success !== true ||
-				data?.disposition !== "handled" ||
+				responseData?.disposition !== "handled" ||
 				this.reloadExtensionError
 			)
 				throw new PiControlError("PI_CONTROL_FAILED");
@@ -706,7 +737,7 @@ class PiRpcInstance implements HarnessInstance {
 			if (error instanceof PiControlError) throw error;
 			throw new PiControlError("PI_CONTROL_FAILED", { cause: error });
 		} finally {
-			this.reloadPending = false;
+			if (!this.reloadTimedOut) this.reloadPending = false;
 		}
 	}
 	get events(): AsyncIterable<HarnessEvent> {
@@ -834,6 +865,7 @@ class PiRpcInstance implements HarnessInstance {
 			}
 			this.pending.delete(record.id);
 			if (item.timer) clearTimeout(item.timer);
+			if (item.isReload) this.reloadPending = false;
 			if (item.command === "prompt")
 				this.applyPromptResponse(record, item.inputId);
 			else if (item.command === "abort")
@@ -844,10 +876,12 @@ class PiRpcInstance implements HarnessInstance {
 		if (record.type === "extension_error") {
 			if (
 				this.reloadPending &&
-				record.extensionPath === "command:harnessd-reload" &&
+				record.extensionPath === `command:${this.reloadCommand}` &&
 				record.event === "command"
-			)
+			) {
 				this.reloadExtensionError = true;
+				return;
+			}
 			const extensionPath =
 				typeof record.extensionPath === "string"
 					? path.basename(record.extensionPath)
@@ -1084,6 +1118,8 @@ class PiRpcInstance implements HarnessInstance {
 		command: string,
 		extra: Record<string, unknown> = {},
 		inputId?: InputId,
+		retainAfterTimeout = false,
+		isReload = false,
 	): Promise<Record<string, unknown>> {
 		if (this.eventsClosed) throw new Error("Pi process is closed");
 		const id = randomUUID();
@@ -1096,11 +1132,14 @@ class PiRpcInstance implements HarnessInstance {
 		const pending: PendingCommand = {
 			command,
 			...(inputId !== undefined ? { inputId } : {}),
+			...(retainAfterTimeout ? { retainAfterTimeout } : {}),
+			...(isReload ? { isReload } : {}),
 			resolve: resolveResponse,
 			reject: rejectResponse,
 		};
 		pending.timer = setTimeout(() => {
-			this.pending.delete(id);
+			if (!pending.retainAfterTimeout) this.pending.delete(id);
+			if (pending.isReload) this.reloadTimedOut = true;
 			rejectResponse(new Error(`Pi RPC ${command} timed out`));
 		}, this.options.commandTimeoutMs ?? 30_000);
 		this.pending.set(id, pending);
@@ -1112,8 +1151,9 @@ class PiRpcInstance implements HarnessInstance {
 				`Pi RPC ${command} write timed out`,
 			);
 		} catch (error) {
-			this.pending.delete(id);
+			if (!pending.retainAfterTimeout) this.pending.delete(id);
 			if (pending.timer) clearTimeout(pending.timer);
+			if (pending.isReload) this.reloadTimedOut = true;
 			rejectResponse(error as Error);
 			throw error;
 		}
@@ -1304,6 +1344,8 @@ class PiRpcInstance implements HarnessInstance {
 	private closeEvents(detail: string): void {
 		if (this.eventsClosed) return;
 		this.eventsClosed = true;
+		this.reloadPending = false;
+		this.reloadTimedOut = false;
 		this.releaseAbortGate();
 		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
 		this.exitDrainTimer = undefined;

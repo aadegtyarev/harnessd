@@ -46,6 +46,7 @@ interface FakeOptions {
 	readonly abortSuccess?: boolean;
 	readonly exitOnTerm?: boolean;
 	readonly missingStream?: "stdin" | "stdout" | "stderr";
+	readonly commandListing?: (name: string) => unknown;
 	readonly rpcResponses?: Readonly<
 		Record<
 			string,
@@ -152,13 +153,18 @@ function fakeProvider(options: FakeOptions = {}) {
 			}
 			if (
 				command.type === "prompt" &&
-				command.message === "/harnessd-reload" &&
+				command.message ===
+					`/${String(launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND)}` &&
 				options.reloadExtensionError
 			) {
 				stdout.write(
 					`${JSON.stringify({
 						type: "extension_error",
 						...options.reloadExtensionError,
+						extensionPath:
+							options.reloadExtensionError.extensionPath === "$reload"
+								? `command:${String(launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND)}`
+								: options.reloadExtensionError.extensionPath,
 						error: "reload failed",
 					})}\n`,
 				);
@@ -217,20 +223,40 @@ function fakeProvider(options: FakeOptions = {}) {
 							success: true,
 							data: { sessionId: options.sessionId ?? "native-exact" },
 						}
-					: {
-							type: "response",
-							id: command.id,
-							command: command.type,
-							success:
-								command.type === "prompt"
-									? (options.promptSuccess ?? true)
-									: command.type === "abort"
-										? (options.abortSuccess ?? true)
-										: true,
-							...(command.type === "prompt" && options.promptDisposition
-								? { data: { disposition: options.promptDisposition } }
-								: {}),
-						};
+					: command.type === "get_commands"
+						? {
+								type: "response",
+								id: command.id,
+								command: command.type,
+								success: true,
+								data: {
+									commands: options.commandListing?.(
+										String(launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND),
+									) ?? [
+										{
+											invocationName: String(
+												launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND,
+											),
+											source: "extension",
+											description: "harnessd internal reload command",
+										},
+									],
+								},
+							}
+						: {
+								type: "response",
+								id: command.id,
+								command: command.type,
+								success:
+									command.type === "prompt"
+										? (options.promptSuccess ?? true)
+										: command.type === "abort"
+											? (options.abortSuccess ?? true)
+											: true,
+								...(command.type === "prompt" && options.promptDisposition
+									? { data: { disposition: options.promptDisposition } }
+									: {}),
+							};
 			const override = options.rpcResponses?.[String(command.type)];
 			stdout.write(
 				`${JSON.stringify(override ? { ...response, ...override } : response)}\r\n`,
@@ -330,7 +356,12 @@ describe("PiRpcHarnessAdapter", () => {
 				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
 			],
 			cwd: request.cwd,
-			env: options.env,
+			env: {
+				...options.env,
+				HARNESSD_PI_RELOAD_COMMAND: expect.stringMatching(
+					/^harnessd-reload-[a-f0-9-]{36}$/,
+				),
+			},
 			stdio: "pipe",
 		});
 		expect(instance.nativeSessionId).toBe("native-exact");
@@ -367,7 +398,11 @@ describe("PiRpcHarnessAdapter", () => {
 		const url = env[AGENT_FILE_SEND_URL_ENV];
 		const token = env[AGENT_FILE_SEND_TOKEN_ENV];
 		expect(Object.keys(env).sort()).toEqual(
-			[AGENT_FILE_SEND_TOKEN_ENV, AGENT_FILE_SEND_URL_ENV].sort(),
+			[
+				AGENT_FILE_SEND_TOKEN_ENV,
+				AGENT_FILE_SEND_URL_ENV,
+				"HARNESSD_PI_RELOAD_COMMAND",
+			].sort(),
 		);
 		const response = await fetch(url as string, {
 			method: "POST",
@@ -564,7 +599,11 @@ describe("PiRpcHarnessAdapter", () => {
 					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
 				],
 				cwd: request.cwd,
-				env: undefined,
+				env: {
+					HARNESSD_PI_RELOAD_COMMAND: expect.stringMatching(
+						/^harnessd-reload-[a-f0-9-]{36}$/,
+					),
+				},
 				stdio: "pipe",
 			});
 			await instance.shutdown();
@@ -642,7 +681,7 @@ describe("PiRpcHarnessAdapter", () => {
 			).launch({ ...request, cwd });
 			expect(JSON.parse(instance.nativeSessionId ?? "null")).toEqual({
 				version: process.version,
-				env: [],
+				env: ["HARNESSD_PI_RELOAD_COMMAND"],
 			});
 			await instance.shutdown();
 		} finally {
@@ -763,14 +802,17 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(
 			fake.commands.filter((command) => command.type === "prompt"),
 		).toEqual([
-			expect.objectContaining({ type: "prompt", message: "/harnessd-reload" }),
+			expect.objectContaining({
+				type: "prompt",
+				message: `/${String(fake.launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND)}`,
+			}),
 		]);
 		await instance.shutdown();
 
 		const correlated = fakeProvider({
 			promptDisposition: "handled",
 			reloadExtensionError: {
-				extensionPath: "command:harnessd-reload",
+				extensionPath: "$reload",
 				event: "command",
 			},
 		});
@@ -778,10 +820,108 @@ describe("PiRpcHarnessAdapter", () => {
 			executable: "pi",
 			startupTimeoutMs: 100,
 		}).launch(request);
+		const events = failedInstance.events[Symbol.asyncIterator]();
 		await expect(failedInstance.control?.reload?.()).rejects.toBeInstanceOf(
 			PiControlError,
 		);
+		const event = await Promise.race([
+			events.next(),
+			new Promise<undefined>((resolve) => setTimeout(resolve, 10)),
+		]);
+		expect(event).toBeUndefined();
 		await failedInstance.shutdown();
+	});
+
+	it.each([
+		["missing command", () => []],
+		[
+			"collision-renamed command",
+			(name: string) => [
+				{
+					invocationName: `${name}:1`,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+			],
+		],
+		[
+			"wrong source",
+			(name: string) => [
+				{
+					invocationName: name,
+					source: "built-in",
+					description: "harnessd internal reload command",
+				},
+			],
+		],
+		[
+			"wrong description",
+			(name: string) => [
+				{
+					invocationName: name,
+					source: "extension",
+					description: "unrelated command",
+				},
+			],
+		],
+	])(
+		"refuses %s before model-capable prompt dispatch",
+		async (_case, commandListing) => {
+			const fake = fakeProvider({ commandListing });
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable: "/bin/pi",
+				startupTimeoutMs: 100,
+			}).launch(request);
+			await expect(instance.control?.reload?.()).rejects.toMatchObject({
+				code: "PI_CONTROL_FAILED",
+			});
+			expect(
+				fake.commands.filter((command) => command.type === "prompt"),
+			).toEqual([]);
+			await instance.shutdown();
+		},
+	);
+
+	it("retains timed-out reload ownership until the correlated acknowledgement", async () => {
+		const fake = fakeProvider({ holdPrompt: true });
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "/bin/pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 15,
+		}).launch(request);
+		const events = instance.events[Symbol.asyncIterator]();
+		await expect(instance.control?.reload?.()).rejects.toBeInstanceOf(
+			PiControlError,
+		);
+		await expect(instance.control?.reload?.()).rejects.toMatchObject({
+			code: "RELOAD_BUSY",
+		});
+		const prompt = fake.commands.find((command) => command.type === "prompt");
+		expect(prompt).toBeDefined();
+		const reloadCommand = String(
+			fake.launchRequest?.env?.HARNESSD_PI_RELOAD_COMMAND,
+		);
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "extension_error",
+				extensionPath: `command:${reloadCommand}`,
+				event: "command",
+				error: "late private detail",
+			})}\n${JSON.stringify({
+				type: "response",
+				id: prompt?.id,
+				command: "prompt",
+				success: true,
+				data: { disposition: "handled" },
+			})}\n`,
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		const event = await Promise.race([
+			events.next(),
+			new Promise<undefined>((resolve) => setTimeout(resolve, 10)),
+		]);
+		expect(event).toBeUndefined();
+		await instance.shutdown();
 	});
 
 	it("does not treat a similarly named extension error as the reload command error", async () => {

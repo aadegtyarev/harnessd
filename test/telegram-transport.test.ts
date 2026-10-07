@@ -657,7 +657,7 @@ describe("Telegram transport", () => {
 		expect(reload).toMatchObject({ kind: "reload", sessionId: "sid" });
 		if (reload?.kind === "reload") expect(reload.beforeDispatch()).toBe(true);
 		expect(bot.sent.at(-1)?.text).toContain("Focused task · #sid");
-		expect(bot.sent.at(-1)?.text).toContain("Выбор не изменён");
+		expect(bot.sent.at(-1)?.text).toContain("Выбор не изменился");
 		await adapter.stop();
 
 		const failedBot = new MockBot();
@@ -676,6 +676,40 @@ describe("Telegram transport", () => {
 		expect(failedBot.sent.at(-1)?.text).toContain("Результат неизвестен");
 		expect(failedBot.sent.at(-1)?.text).not.toContain("secret detail");
 		await failed.adapter.stop();
+	});
+
+	it("reports the current message destination if selection changes during reload", async () => {
+		sessions.set("sid", sessionWith("sid", { name: "Original" }));
+		sessions.set("sid2", {
+			...sessionWith("sid", { name: "New target" }),
+			id: "sid2" as SessionSummary["id"],
+		});
+		const bot = new MockBot();
+		let started!: () => void;
+		let finish!: () => void;
+		const reloadStarted = new Promise<void>((resolve) => (started = resolve));
+		const reloadFinished = new Promise<void>((resolve) => (finish = resolve));
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "reload") {
+					started();
+					await reloadFinished;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		const reload = bot.update(42, "/reload");
+		await reloadStarted;
+		await bot.update(42, "/use sid2");
+		finish();
+		await reload;
+		const text = bot.sent.at(-1)?.text ?? "";
+		expect(text).toContain("Перезагружена исходная сессия");
+		expect(text).toContain(
+			"Обычные сообщения направляются в New target · #sid2",
+		);
+		await adapter.stop();
 	});
 
 	it("labels an input sent during an active run as queued rather than started", async () => {

@@ -2533,9 +2533,20 @@ export class TelegramTransportAdapter
 			});
 			if (result.ok) {
 				const name = this.sessionNames.get(sessionId);
+				const currentSelection = this.selected.get(chatId);
+				const destinationName = currentSelection
+					? this.sessionNames.get(currentSelection)
+					: undefined;
+				const destination = currentSelection
+					? `${destinationName ? `${oneLine(destinationName)} · ` : ""}#${currentSelection}`
+					: "не выбрана";
+				const selectionText =
+					currentSelection === sessionId
+						? "Выбор не изменился; обычные сообщения направляются в эту сессию."
+						: `Перезагружена исходная сессия; текущий выбор не изменён. Обычные сообщения направляются в ${destination}.`;
 				return this.sendDirect(
 					chatId,
-					`Ресурсы Pi перезагружены для ${name ? `${oneLine(name)} · ` : ""}#${sessionId}. Выбор не изменён; обычные сообщения по-прежнему направляются в эту сессию.`,
+					`Ресурсы Pi перезагружены для ${name ? `${oneLine(name)} · ` : ""}#${sessionId}. ${selectionText}`,
 				);
 			}
 			const messages: Record<string, string> = {

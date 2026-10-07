@@ -893,15 +893,15 @@ describe("SQLite session management", () => {
 			cwd: os.homedir(),
 		});
 		try {
-			await expect(manager.reload(session.id, () => false)).rejects.toThrow(
-				"RELOAD_SELECTION_CHANGED",
-			);
+			await expect(
+				manager.reload(session.id, () => false),
+			).rejects.toMatchObject({ code: "RELOAD_SELECTION_CHANGED" });
 			expect(calls).toBe(0);
 			const first = manager.reload(session.id, () => true);
 			await started.promise;
-			await expect(manager.reload(session.id, () => true)).rejects.toThrow(
-				"RELOAD_ALREADY_RUNNING",
-			);
+			await expect(
+				manager.reload(session.id, () => true),
+			).rejects.toMatchObject({ code: "RELOAD_ALREADY_RUNNING" });
 			expect(calls).toBe(1);
 			complete.resolve();
 			await first;

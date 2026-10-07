@@ -103,7 +103,11 @@ describe("application runtime", () => {
 					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
 				],
 				cwd: await realpath(os.tmpdir()),
-				env: undefined,
+				env: {
+					HARNESSD_PI_RELOAD_COMMAND: expect.stringMatching(
+						/^harnessd-reload-[a-f0-9-]{36}$/,
+					),
+				},
 				stdio: "pipe",
 			});
 			await runtime.close();
@@ -159,6 +163,77 @@ describe("application runtime", () => {
 			sessionId: session.id,
 		});
 		expect(sessionFrom(cleared)).not.toHaveProperty("name");
+		await runtime.close();
+	});
+
+	it("allowlists typed reload busy errors through the application boundary", async () => {
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [],
+			harnesses: [
+				{
+					descriptor: {
+						id: "reload-runtime" as never,
+						capabilities: ["harness.launch", "harness.stop", "harness.reload"],
+					},
+					async launch() {
+						return {
+							processId: "reload-runtime-process" as never,
+							exit: new Promise(() => {}),
+							events: (async function* () {})(),
+							async send() {},
+							async cancel() {},
+							async shutdown() {},
+							control: {
+								async getSelection() {
+									return {};
+								},
+								async getStatus() {
+									return {};
+								},
+								async listModels() {
+									return [];
+								},
+								async listEfforts() {
+									return [];
+								},
+								async setModel() {
+									return { provider: "test", id: "test", name: "test" };
+								},
+								async setEffort() {},
+								async reload() {
+									throw new PiControlError("RELOAD_BUSY");
+								},
+							},
+						};
+					},
+				},
+			],
+		});
+		const session = sessionFrom(
+			await runtime.dispatch({
+				requestId: "reload-create",
+				principalId: "test",
+				kind: "create",
+				harnessId: "reload-runtime" as never,
+				cwd: os.tmpdir(),
+			}),
+		);
+		const result = await runtime.dispatch({
+			requestId: "reload-busy",
+			principalId: "test",
+			kind: "reload",
+			sessionId: session.id,
+			beforeDispatch: () => true,
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			error: {
+				code: "RELOAD_BUSY",
+				message: expect.stringContaining("session is busy"),
+			},
+		});
 		await runtime.close();
 	});
 

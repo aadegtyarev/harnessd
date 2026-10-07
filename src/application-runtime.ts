@@ -94,6 +94,9 @@ const safeErrorMessages = new Map([
 		"PI_CONTROL_FAILED",
 		"Pi did not confirm this control request; check /status before retrying.",
 	],
+	["RELOAD_BUSY", "The session is busy; wait for Pi to become idle."],
+	["RELOAD_ALREADY_RUNNING", "A reload is already in progress."],
+	["RELOAD_SELECTION_CHANGED", "The selected session changed before reload."],
 	["MODEL_NOT_AVAILABLE", "Model is not available; use /model to see choices."],
 	[
 		"EFFORT_NOT_SUPPORTED",
