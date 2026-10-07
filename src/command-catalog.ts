@@ -48,31 +48,41 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		cliDescription: "Stop, disable, and remove the user service.",
 	},
 	{
+		visibility: "telegram-only",
+		section: "private-chat",
+		usage: "/start",
+		telegram: { command: "start", description: "Начало работы с ботом." },
+	},
+	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/help",
-		telegram: { command: "help", description: "Show available commands." },
+		telegram: { command: "help", description: "Показать справку." },
 	},
+
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
 		usage: "/menu",
 		telegram: {
 			command: "menu",
-			description: "Open the session control panel.",
+			description: "Открыть панель сессий.",
 		},
 	},
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
 		usage: "/rename [sessionId] <name|--clear>",
-		telegram: { command: "rename", description: "Name or rename a session." },
+		telegram: {
+			command: "rename",
+			description: "Задать или изменить имя сессии.",
+		},
 	},
 	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/sessions",
-		telegram: { command: "sessions", description: "List saved sessions." },
+		telegram: { command: "sessions", description: "Показать список сессий." },
 	},
 	{
 		visibility: "both",
@@ -80,26 +90,29 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		usage: "/new [cwd]",
 		telegram: {
 			command: "new",
-			description: "Create a session, optionally in a folder.",
+			description: "Создать сессию, при необходимости в папке.",
 		},
 	},
 	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/ls [path]",
-		telegram: { command: "ls", description: "List files and folders." },
+		telegram: { command: "ls", description: "Показать файлы и папки." },
 	},
 	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/cd [path]",
-		telegram: { command: "cd", description: "Change the working folder." },
+		telegram: { command: "cd", description: "Перейти в папку." },
 	},
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
 		usage: "/send <path>",
-		telegram: { command: "send", description: "Send a session file." },
+		telegram: {
+			command: "send",
+			description: "Отправить файл из рабочей папки сессии.",
+		},
 	},
 	{
 		visibility: "both",
@@ -107,20 +120,26 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		usage: "/use [sessionId]",
 		telegram: {
 			command: "use",
-			description: "Select a session or reuse this chat's remembered one.",
+			description: "Выбрать сессию или подтвердить сохранённый выбор.",
 		},
 	},
 	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/resume [sessionId]",
-		telegram: { command: "resume", description: "Resume a stopped session." },
+		telegram: {
+			command: "resume",
+			description: "Возобновить остановленную сессию.",
+		},
 	},
 	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/inspect [sessionId]",
-		telegram: { command: "inspect", description: "Show a session's details." },
+		telegram: {
+			command: "inspect",
+			description: "Показать сведения о сессии.",
+		},
 	},
 	{
 		visibility: "telegram-only",
@@ -128,26 +147,29 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		usage: "/status",
 		telegram: {
 			command: "status",
-			description: "Show the selected session's status.",
+			description: "Показать статус выбранной сессии.",
 		},
 	},
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
 		usage: "/model [provider/modelId [effort]]",
-		telegram: { command: "model", description: "List or select a model." },
+		telegram: { command: "model", description: "Показать или выбрать модель." },
 	},
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
 		usage: "/effort [level]",
-		telegram: { command: "effort", description: "List or set model effort." },
+		telegram: {
+			command: "effort",
+			description: "Показать или задать effort модели.",
+		},
 	},
 	{
 		visibility: "both",
 		section: "private-chat",
 		usage: "/stop [sessionId]",
-		telegram: { command: "stop", description: "Stop a session." },
+		telegram: { command: "stop", description: "Остановить сессию." },
 	},
 	{
 		visibility: "telegram-only",
@@ -155,7 +177,7 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		usage: "/delete <sessionId>",
 		telegram: {
 			command: "delete",
-			description: "Delete a stopped session record.",
+			description: "Удалить запись остановленной сессии.",
 		},
 	},
 	{
@@ -164,7 +186,7 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 		usage: "/cancel <inputId>",
 		telegram: {
 			command: "cancel",
-			description: "Cancel an input in the selected session.",
+			description: "Отменить ввод в выбранной сессии.",
 		},
 	},
 ];
@@ -204,5 +226,13 @@ export function getTelegramCommands(): readonly {
 export function getTelegramHelpUsages(): readonly string[] {
 	return COMMAND_CATALOG.flatMap((command) =>
 		command.visibility === "cli-only" ? [] : [command.usage],
+	);
+}
+
+export function getTelegramHelpLines(): readonly string[] {
+	return COMMAND_CATALOG.flatMap((command) =>
+		command.visibility === "cli-only"
+			? []
+			: [`${command.usage} — ${command.telegram.description}`],
 	);
 }

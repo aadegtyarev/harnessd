@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	DirectoryResolutionError,
+	listDirectories,
 	listDirectoryEntries,
 	parsePathArgument,
 	resolveExistingDirectory,
@@ -102,6 +103,22 @@ describe("Telegram filesystem paths", () => {
 		expect(
 			listing.entries.find((entry) => entry.name === "visible.txt"),
 		).toEqual({ name: "visible.txt", kind: "file" });
+	});
+
+	it("lists directories independently of mixed entries and caps them at 100", async () => {
+		const root = await temp();
+		for (let index = 0; index < 105; index++) {
+			await writeFile(path.join(root, `a-file-${index}.txt`), "");
+			await mkdir(path.join(root, `z-folder-${index}`));
+		}
+
+		const mixed = await listDirectoryEntries(root);
+		expect(mixed.entries.every((entry) => entry.kind === "file")).toBe(true);
+		const listing = await listDirectories(root);
+		expect(listing.directories).toHaveLength(100);
+		expect(listing.directories[0]).toBe("z-folder-0");
+		expect(listing.total).toBe(105);
+		expect(listing.truncated).toBe(true);
 	});
 
 	it("rejects missing and non-directory paths with a safe error", async () => {

@@ -6,7 +6,7 @@ import path from "node:path";
 import { Bot, InputFile } from "grammy";
 import {
 	getTelegramCommands,
-	getTelegramHelpUsages,
+	getTelegramHelpLines,
 } from "./command-catalog.js";
 import type {
 	AgentFileSendRequest,
@@ -38,13 +38,20 @@ import {
 	truncateDiagnostic,
 } from "./error-diagnostics.js";
 import {
+	listDirectories,
 	listDirectoryEntries,
+	MAX_LIST_ENTRIES,
 	parsePathArgument,
 	resolveExistingDirectory,
 	resolvePathFrom,
 	safeAttachmentName,
 } from "./telegram-filesystem.js";
-import { TelegramInbox, TelegramInboxQuotaError } from "./telegram-inbox.js";
+import {
+	TelegramInbox,
+	TelegramInboxError,
+	TelegramInboxQuotaError,
+	TelegramInboxWorkspaceError,
+} from "./telegram-inbox.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
 import { SubagentTextStream } from "./telegram-subagent-stream.js";
 
@@ -1675,12 +1682,12 @@ export class TelegramTransportAdapter
 		let delivered = 0;
 		for (const chatId of recipients) {
 			if (
-				await this.sendFileToChat(
+				(await this.sendFileToChat(
 					request.sessionId,
 					request.path,
 					chatId,
 					request.caption,
-				)
+				)) === "sent"
 			)
 				delivered += 1;
 		}
@@ -1696,17 +1703,34 @@ export class TelegramTransportAdapter
 		filePath: string,
 		chatId: number,
 		caption?: string,
-	): Promise<boolean> {
+	): Promise<
+		| "sent"
+		| "missing"
+		| "inaccessible"
+		| "outside"
+		| "nonregular"
+		| "size"
+		| "session"
+		| "telegram"
+	> {
 		const cwd = this.sessionCwds.get(sessionId);
-		if (!cwd) return false;
+		if (!cwd) return "inaccessible";
 		if (
 			!Number.isSafeInteger(chatId) ||
 			!this.authorized.has(this.authorizedChatPrincipals.get(chatId) ?? -1) ||
 			this.selected.get(chatId) !== sessionId
 		)
-			return false;
+			return "session";
 		try {
 			const candidate = path.resolve(cwd, filePath);
+			const lexicalRelative = path.relative(path.resolve(cwd), candidate);
+			if (
+				!lexicalRelative ||
+				lexicalRelative === ".." ||
+				lexicalRelative.startsWith(`..${path.sep}`) ||
+				path.isAbsolute(lexicalRelative)
+			)
+				return "outside";
 			const canonicalRoot = await realpath(cwd);
 			const canonicalFile = await realpath(candidate);
 			const relative = path.relative(canonicalRoot, canonicalFile);
@@ -1716,10 +1740,10 @@ export class TelegramTransportAdapter
 				relative.startsWith(`..${path.sep}`) ||
 				path.isAbsolute(relative)
 			)
-				return false;
+				return "outside";
 			const data = await readBoundedFile(canonicalRoot, canonicalFile);
 			if (this.stopping || this.selected.get(chatId) !== sessionId)
-				return false;
+				return "session";
 			const sent = await this.telegramCall((signal) =>
 				this.bot.api.sendDocument(
 					chatId,
@@ -1733,15 +1757,24 @@ export class TelegramTransportAdapter
 					filePath,
 					caption,
 				]);
-				return false;
+				return "telegram";
 			}
-			return true;
+			return "sent";
 		} catch (error) {
 			this.reportError("Telegram agent file preparation failed", error, [
 				filePath,
 				caption,
 			]);
-			return false;
+			if (error instanceof TelegramAttachmentTooLargeError) return "size";
+			if (error instanceof Error && error.message === "not a regular file")
+				return "nonregular";
+			if (
+				error instanceof Error &&
+				error.message === "file is outside session cwd"
+			)
+				return "outside";
+			if (isCode(error, "ENOENT")) return "missing";
+			return "inaccessible";
 		}
 	}
 
@@ -2040,10 +2073,10 @@ export class TelegramTransportAdapter
 		const document = message.document;
 		const photo = largestPhoto(message.photo);
 		if (!document && !photo)
-			return this.sendDirect(chatId, "Unsupported attachment type.");
+			return this.sendDirect(chatId, "Этот тип вложения не поддерживается.");
 		const fileId = document?.file_id ?? photo?.file_id;
 		if (!fileId)
-			return this.sendDirect(chatId, "Could not identify the attachment.");
+			return this.sendDirect(chatId, "Не удалось определить вложение.");
 		const declaredSize = document?.file_size ?? photo?.file_size;
 		if (
 			declaredSize !== undefined &&
@@ -2051,11 +2084,11 @@ export class TelegramTransportAdapter
 		)
 			return this.sendDirect(
 				chatId,
-				"Attachment exceeds Telegram's 20 MB download limit.",
+				"Вложение превышает лимит загрузки Telegram 20 MB.",
 			);
 		const inbox = this.inbox;
 		if (!inbox)
-			return this.sendDirect(chatId, "The session inbox is unavailable.");
+			return this.sendDirect(chatId, "Хранилище вложений сессии недоступно.");
 		const explicitlyRouted = Boolean(
 			knownReplyRoute ||
 				footerSession ||
@@ -2095,14 +2128,14 @@ export class TelegramTransportAdapter
 			if (error instanceof TelegramAttachmentTooLargeError)
 				return this.sendDirect(
 					chatId,
-					"Attachment exceeds Telegram's 20 MB download limit.",
+					"Вложение превышает лимит загрузки Telegram 20 MB.",
 				);
 			return this.sendDirect(
 				chatId,
 				error instanceof Error &&
 					(error.message.includes("timed out") || error.message === "deadline")
-					? "Attachment download timed out after 60 seconds; it was not submitted. Send it again if still needed."
-					: "Could not safely download or save this attachment. It was not submitted.",
+					? "Загрузка вложения превысила 60 секунд; оно не отправлено. Автоматической повторной загрузки нет."
+					: "Не удалось загрузить вложение из Telegram; оно не отправлено. Автоматической повторной загрузки нет.",
 			);
 		}
 		await inbox.withSessionLock(sessionId, async () => {
@@ -2250,11 +2283,21 @@ export class TelegramTransportAdapter
 				if (error instanceof TelegramInboxQuotaError)
 					return this.sendDirect(
 						chatId,
-						"Session inbox quota reached (10 files or 100 MiB). Remove files or wait for expired files to be cleaned.",
+						"Достигнут лимит хранилища сессии: 10 файлов или 100 MiB. Удалите ненужные файлы; очистка пропускает работающие сессии.",
+					);
+				if (error instanceof TelegramInboxWorkspaceError)
+					return this.sendDirect(
+						chatId,
+						"Папка вложений находится внутри рабочей папки сессии; вложение не сохранено.",
+					);
+				if (error instanceof TelegramInboxError)
+					return this.sendDirect(
+						chatId,
+						"Не удалось записать вложение в хранилище сессии; оно не отправлено.",
 					);
 				return this.sendDirect(
 					chatId,
-					"Could not safely download or save this attachment. Please try again later.",
+					"Не удалось обработать вложение; оно не отправлено. Автоматической повторной отправки нет.",
 				);
 			}
 		});
@@ -2265,6 +2308,20 @@ export class TelegramTransportAdapter
 		sender: number,
 		raw: string,
 	): Promise<void> {
+		if (/^\/start(?:@[^\s]+)?$/.test(raw)) {
+			await this.sendWithDeadline(
+				chatId,
+				"Добро пожаловать! Откройте панель, выберите или создайте сессию. Обычные сообщения и вложения отправляются в выбранную сессию; файл из рабочей папки сессии можно отправить командой /send <путь>.",
+				keyboard([
+					[inlineButton("Открыть панель", "menu:home")],
+					[
+						inlineButton("Сессии", "menu:sessions"),
+						inlineButton("Новая сессия", "menu:new"),
+					],
+				]),
+			);
+			return;
+		}
 		if (/^\/menu(?:@[^\s]+)?$/.test(raw))
 			return this.renderPanel(chatId, sender);
 		const renameCommand = /^\/rename(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
@@ -2312,12 +2369,20 @@ export class TelegramTransportAdapter
 				parsedPath.path,
 				chatId,
 			);
-			return this.sendDirect(
-				chatId,
-				sent
-					? "File sent."
-					: "Could not send file. Use a regular file inside the selected session folder, no larger than 20 MiB.",
-			);
+			const messages = {
+				sent: "Файл отправлен.",
+				missing: "Файл не найден в рабочей папке выбранной сессии.",
+				inaccessible: "Файл недоступен для чтения.",
+				outside:
+					"Файл должен находиться внутри рабочей папки выбранной сессии.",
+				nonregular:
+					"Можно отправить только обычный файл, не папку или ссылку на другой объект.",
+				size: "Файл превышает лимит Telegram 20 MiB.",
+				session: "Выбранная сессия изменилась; файл не отправлен.",
+				telegram:
+					"Telegram не доставил файл. Автоматической повторной отправки не будет.",
+			};
+			return this.sendDirect(chatId, messages[sent]);
 		}
 		const pathCommand = /^\/(ls|cd)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (pathCommand) {
@@ -2374,7 +2439,14 @@ export class TelegramTransportAdapter
 		const [command, ...args] = raw.trim().split(/\s+/);
 		const name = command.split("@")[0];
 		if (name === "/help" && args.length === 0)
-			return this.sendDirect(chatId, getTelegramHelpUsages().join("\n"));
+			return this.sendDirect(
+				chatId,
+				[
+					"Как начать: откройте /menu, выберите сессию или создайте новую. Обычные сообщения и вложения отправляются в выбранную сессию; /send <путь> отправляет файл из её рабочей папки.",
+					"Команды:",
+					...getTelegramHelpLines(),
+				].join("\n"),
+			);
 		if (name === "/status" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
@@ -4479,30 +4551,33 @@ export class TelegramTransportAdapter
 		const directory =
 			this.currentDirectories.get(chatId) ?? this.options.initialCwd;
 		try {
-			const listing = await listDirectoryEntries(directory);
-			const folders = listing.entries
-				.map((entry, index) => ({ entry, index }))
-				.filter(({ entry }) => entry.kind === "directory");
+			const listing = await listDirectories(directory);
 			const pageSize = 8;
-			const lastPage = Math.max(0, Math.ceil(folders.length / pageSize) - 1);
+			const lastPage = Math.max(
+				0,
+				Math.ceil(listing.directories.length / pageSize) - 1,
+			);
 			const page = Math.min(
 				Math.max(0, this.folderPages.get(chatId) ?? 0),
 				lastPage,
 			);
 			this.folderPages.set(chatId, page);
-			const visible = folders.slice(page * pageSize, (page + 1) * pageSize);
+			const visible = listing.directories.slice(
+				page * pageSize,
+				(page + 1) * pageSize,
+			);
 			const generation = this.nextPanelGeneration(chatId);
-			const rows: InlineButton[][] = visible.map(({ entry }) => {
+			const rows: InlineButton[][] = visible.map((name) => {
 				const token = this.makeIntentToken();
 				this.folderIntents.set(token, {
 					chatId,
 					messageId,
 					generation,
 					parent: listing.cwd,
-					target: path.join(listing.cwd, entry.name),
+					target: path.join(listing.cwd, name),
 				});
 				return [
-					inlineButton(`📁 ${buttonLabel(entry.name, 48)}/`, `folder:${token}`),
+					inlineButton(`📁 ${buttonLabel(name, 48)}/`, `folder:${token}`),
 				];
 			});
 			rows.push([
@@ -4518,7 +4593,7 @@ export class TelegramTransportAdapter
 			rows.push([inlineButton("Назад", "menu:home")]);
 			await this.updatePanel(
 				chatId,
-				`Папки\n${panelPath(listing.cwd)}${listing.truncated ? `\nПоказаны первые ${listing.entries.length} элементов.` : ""}`,
+				`Папки\n${panelPath(listing.cwd)}${listing.truncated ? `\nПоказаны первые ${MAX_LIST_ENTRIES} папок из ${listing.total}. Чтобы открыть другую папку, используйте /cd <путь>.` : ""}`,
 				keyboard(rows),
 				messageId,
 			);

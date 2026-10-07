@@ -95,6 +95,43 @@ export function safeAttachmentName(value: string): string {
 		: "attachment";
 }
 
+export async function listDirectories(candidate: string): Promise<{
+	readonly cwd: string;
+	readonly directories: readonly string[];
+	readonly total: number;
+	readonly truncated: boolean;
+}> {
+	const cwd = await resolveExistingDirectory(candidate);
+	try {
+		const entries = (await readdir(cwd, { withFileTypes: true }))
+			.filter((entry) => !entry.name.startsWith("."))
+			.sort((left, right) => left.name.localeCompare(right.name));
+		const directories: string[] = [];
+		let total = 0;
+		for (const entry of entries) {
+			let isDirectory = entry.isDirectory();
+			if (entry.isSymbolicLink()) {
+				try {
+					isDirectory = (await stat(path.join(cwd, entry.name))).isDirectory();
+				} catch {
+					isDirectory = false;
+				}
+			}
+			if (!isDirectory) continue;
+			total += 1;
+			if (directories.length < MAX_LIST_ENTRIES) directories.push(entry.name);
+		}
+		return {
+			cwd,
+			directories,
+			total,
+			truncated: total > MAX_LIST_ENTRIES,
+		};
+	} catch {
+		throw new DirectoryResolutionError();
+	}
+}
+
 export async function listDirectoryEntries(
 	candidate: string,
 ): Promise<ListedDirectory> {

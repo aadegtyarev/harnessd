@@ -3916,6 +3916,7 @@ describe("Telegram transport", () => {
 		expect(
 			bot.commandRegistrations[0]?.commands.map(({ command }) => command),
 		).toEqual([
+			"start",
 			"help",
 			"menu",
 			"rename",
@@ -3935,8 +3936,18 @@ describe("Telegram transport", () => {
 			"cancel",
 		]);
 
+		await bot.update(100, "/start");
+		expect(bot.sent.at(-1)?.text).toContain("Добро пожаловать");
+		expect(bot.sendOptions.at(-1)).toMatchObject({
+			inline_keyboard: expect.arrayContaining([
+				expect.arrayContaining([
+					expect.objectContaining({ text: "Открыть панель" }),
+				]),
+			]),
+		});
 		await bot.update(100, "/help");
-		expect(bot.sent.at(-1)?.text).toContain("/delete <sessionId>");
+		expect(bot.sent.at(-1)?.text).toContain("Как начать:");
+		expect(bot.sent.at(-1)?.text).toContain("/delete <sessionId> —");
 		expect(bot.sent.at(-1)?.text).toContain("/resume [sessionId]");
 		expect(bot.sent.at(-1)?.text).toContain("/ls [path]");
 		expect(bot.sent.at(-1)?.text).toContain("/cd [path]");
@@ -4720,7 +4731,10 @@ describe("Telegram transport", () => {
 		await vi.advanceTimersByTimeAsync(60_000);
 		await update;
 		expect(requests.some((request) => request.kind === "submit")).toBe(false);
-		expect(bot.sent.at(-1)?.text).toContain("timed out after 60 seconds");
+		expect(bot.sent.at(-1)?.text).toContain("превысила 60 секунд");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Автоматической повторной загрузки нет",
+		);
 		await adapter.stop();
 		vi.useRealTimers();
 	});
@@ -4738,7 +4752,7 @@ describe("Telegram transport", () => {
 		const submissions = () =>
 			requests.filter((request) => request.kind === "submit");
 		expect(submissions()).toHaveLength(0);
-		expect(bot.sent.at(-1)?.text).toContain("20 MB download limit");
+		expect(bot.sent.at(-1)?.text).toContain("лимит загрузки Telegram 20 MB");
 
 		bot.api.getFile = vi.fn(async () => {
 			throw new Error("secret download failure");
@@ -4746,7 +4760,7 @@ describe("Telegram transport", () => {
 		await bot.updateDocument(42);
 		expect(submissions()).toHaveLength(0);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Could not safely download or save",
+			"Не удалось загрузить вложение из Telegram",
 		);
 		expect(bot.sent.at(-1)?.text).not.toContain("smaller file");
 		expect(bot.sent.at(-1)?.text).not.toContain("secret");
@@ -4766,7 +4780,7 @@ describe("Telegram transport", () => {
 		bot.api.getFile = vi.fn(async () => ({ file_size: 5 }));
 		await bot.updateDocument(42);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Could not safely download or save",
+			"Не удалось загрузить вложение из Telegram",
 		);
 		expect(
 			requests.filter((request) => request.kind === "submit"),
@@ -4783,7 +4797,7 @@ describe("Telegram transport", () => {
 		await bot.updateDocument(42);
 		expect(fetchFile).toHaveBeenCalledTimes(1);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Could not safely download or save",
+			"Не удалось загрузить вложение из Telegram",
 		);
 		expect(bot.sent.at(-1)?.text).not.toContain("secret-token");
 		expect(
@@ -4829,7 +4843,7 @@ describe("Telegram transport", () => {
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(0);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Could not safely download or save",
+			"Не удалось записать вложение в хранилище сессии",
 		);
 		await adapter.stop();
 	});
@@ -4960,12 +4974,21 @@ describe("Telegram transport", () => {
 		await bot.update(100, "/use sid");
 		await bot.update(100, '/send "report file.txt"');
 		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
-		expect(bot.sent.at(-1)?.text).toBe("File sent.");
+		expect(bot.sent.at(-1)?.text).toBe("Файл отправлен.");
+
+		bot.api.sendDocument = vi.fn(async () => {
+			throw new Error("telegram unavailable");
+		});
+		await bot.update(100, '/send "report file.txt"');
+		expect(bot.sent.at(-1)?.text).toContain("Telegram не доставил файл");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Автоматической повторной отправки не будет",
+		);
 
 		await bot.update(100, "/send ../outside.txt");
 		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
 		expect(bot.sent.at(-1)?.text).toContain(
-			"inside the selected session folder",
+			"внутри рабочей папки выбранной сессии",
 		);
 		await adapter.stop();
 	});
