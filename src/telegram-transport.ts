@@ -46,7 +46,10 @@ import {
 } from "./telegram-filesystem.js";
 import { TelegramInbox, TelegramInboxQuotaError } from "./telegram-inbox.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
-import { parseSubagentWidgetLine } from "./telegram-subagent-status.js";
+import {
+	parseNotificationText,
+	SubagentTextStream,
+} from "./telegram-subagent-stream.js";
 
 const TELEGRAM_LIMIT = 4096;
 const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
@@ -260,7 +263,7 @@ type ChatQueue = {
 };
 type TurnBuffer = {
 	readonly chunks: string[];
-	lineRemainder: string;
+	readonly subagentStream: SubagentTextStream;
 	subagentStatus?: string;
 	readonly recipients: Set<number>;
 	readonly statusRecipients: Set<number>;
@@ -5420,7 +5423,7 @@ export class TelegramTransportAdapter
 				this.startTyping(event.sessionId);
 				const turn: TurnBuffer = {
 					chunks: [],
-					lineRemainder: "",
+					subagentStream: new SubagentTextStream(),
 					recipients: new Set(),
 					statusRecipients: new Set(),
 					pendingInputs: new Set(),
@@ -5438,6 +5441,7 @@ export class TelegramTransportAdapter
 					)
 						this.associateInputWithTurn(record, turn);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
+					activity.subagentStatus = undefined;
 					activity.status = "Pi выполняет ход сессии";
 					activity.thinking = false;
 					this.renderLiveActivity(activity);
@@ -5539,14 +5543,27 @@ export class TelegramTransportAdapter
 		event: HarnessActivityEvent,
 	): void {
 		const activities = this.activitiesForSession(sessionId);
-		if (activities.length === 0) {
-			if (event.type === "notification")
+		const notification =
+			event.type === "notification"
+				? parseNotificationText(event.text)
+				: undefined;
+		if (notification) {
+			const turn = this.turnBuffers.get(sessionId);
+			if (turn)
+				for (const status of notification.statuses) {
+					turn.subagentStatus = status;
+					this.applySubagentStatus(sessionId, turn.statusRecipients, status);
+				}
+			if (!notification.visibleText.trim()) return;
+			if (activities.length === 0) {
 				this.enqueueForSelected(
 					sessionId,
-					`Pi: ${redactDiagnosticText(event.text, [this.options.token])}`,
+					`Pi: ${redactDiagnosticText(notification.visibleText, [this.options.token])}`,
 				);
-			return;
+				return;
+			}
 		}
+		if (activities.length === 0) return;
 		for (const activity of activities) {
 			switch (event.type) {
 				case "thinking":
@@ -5589,10 +5606,14 @@ export class TelegramTransportAdapter
 					break;
 				}
 				case "notification":
-					activity.notices.push(
-						redactDiagnosticText(event.text, [this.options.token]),
-					);
-					if (activity.notices.length > 12) activity.notices.shift();
+					if (notification?.visibleText.trim()) {
+						activity.notices.push(
+							redactDiagnosticText(notification.visibleText, [
+								this.options.token,
+							]),
+						);
+						if (activity.notices.length > 12) activity.notices.shift();
+					}
 					break;
 			}
 			this.renderLiveActivity(activity);
@@ -5777,7 +5798,7 @@ export class TelegramTransportAdapter
 		if (!buffer) {
 			buffer = {
 				chunks: [],
-				lineRemainder: "",
+				subagentStream: new SubagentTextStream(),
 				recipients: new Set(),
 				statusRecipients: new Set(),
 				pendingInputs: new Set(),
@@ -5788,35 +5809,40 @@ export class TelegramTransportAdapter
 			};
 			this.turnBuffers.set(sessionId, buffer);
 		}
-		const lines = `${buffer.lineRemainder}${text}`.split("\n");
-		buffer.lineRemainder = lines.pop() ?? "";
-		for (const line of lines)
-			this.consumeTurnLine(sessionId, buffer, `${line}\n`);
+		this.appendSubagentResult(
+			sessionId,
+			buffer,
+			buffer.subagentStream.consume(text),
+		);
 	}
 
-	private consumeTurnLine(
+	private appendSubagentResult(
 		sessionId: SessionId,
 		buffer: TurnBuffer,
-		line: string,
+		result: {
+			readonly visibleText: string;
+			readonly statuses: readonly string[];
+		},
 	): void {
-		const parsed = parseSubagentWidgetLine(line.replace(/\n$/, ""));
-		if (parsed.status) {
-			buffer.subagentStatus = parsed.status;
-			for (const chatId of buffer.statusRecipients) {
-				const activity = this.liveActivities.get(
-					activityKey(chatId, sessionId),
-				);
-				if (activity && activity.subagentStatus !== parsed.status) {
-					activity.subagentStatus = parsed.status;
-					this.renderLiveActivity(activity);
-				}
+		if (result.visibleText) this.appendTurnVisible(buffer, result.visibleText);
+		for (const status of result.statuses) {
+			buffer.subagentStatus = status;
+			this.applySubagentStatus(sessionId, buffer.statusRecipients, status);
+		}
+	}
+
+	private applySubagentStatus(
+		sessionId: SessionId,
+		chats: ReadonlySet<number>,
+		status: string,
+	): void {
+		for (const chatId of chats) {
+			const activity = this.liveActivities.get(activityKey(chatId, sessionId));
+			if (activity && activity.subagentStatus !== status) {
+				activity.subagentStatus = status;
+				this.renderLiveActivity(activity);
 			}
 		}
-		if (parsed.visibleText)
-			this.appendTurnVisible(
-				buffer,
-				parsed.visibleText + (line.endsWith("\n") ? "\n" : ""),
-			);
 	}
 
 	private appendTurnVisible(buffer: TurnBuffer, text: string): void {
@@ -5846,10 +5872,11 @@ export class TelegramTransportAdapter
 		if (!buffer) return;
 		buffer.settled = true;
 		buffer.interrupted ||= interrupted;
-		if (buffer.lineRemainder) {
-			this.consumeTurnLine(sessionId, buffer, buffer.lineRemainder);
-			buffer.lineRemainder = "";
-		}
+		this.appendSubagentResult(
+			sessionId,
+			buffer,
+			buffer.subagentStream.consume("", true),
+		);
 		if (buffer.pendingInputs.size > 0) return;
 		if (this.turnBuffers.get(sessionId) === buffer)
 			this.turnBuffers.delete(sessionId);

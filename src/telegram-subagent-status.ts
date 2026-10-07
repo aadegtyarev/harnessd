@@ -1,58 +1,57 @@
-export type SubagentStatus = string;
+export const MAX_SUBAGENT_ENVELOPE_CHARS = 32_768;
 
 export type SubagentLineResult = {
-	readonly visibleText: string;
-	readonly status?: SubagentStatus;
+	readonly matched: boolean;
+	readonly status?: string;
 };
 
 const MARKER = "PI_SUBAGENT_ASYNC_JSON:";
-const ROLES = new Map([
-	["scout", "Scout"],
-	["worker", "Worker"],
-	["reviewer", "Reviewer"],
-	["researcher", "Researcher"],
-]);
-const STATES = new Map([
-	["pending", "ожидает"],
-	["queued", "ожидает"],
-	["running", "выполняется"],
-	["active", "выполняется"],
-	["completed", "завершён"],
-	["succeeded", "завершён"],
-	["failed", "ошибка"],
-	["error", "ошибка"],
-	["stopped", "ошибка"],
-]);
+const ROLES: Readonly<Record<string, string>> = {
+	scout: "Scout",
+	worker: "Worker",
+	reviewer: "Reviewer",
+	researcher: "Researcher",
+};
+const STATES: Readonly<Record<string, string>> = {
+	pending: "ожидает",
+	queued: "ожидает",
+	running: "выполняется",
+	active: "выполняется",
+	completed: "завершён",
+	succeeded: "завершён",
+	failed: "ошибка",
+	error: "ошибка",
+	stopped: "ошибка",
+};
 
 export function parseSubagentWidgetLine(line: string): SubagentLineResult {
 	const candidate = line.trim().replace(/^Pi:\s*/, "");
-	if (!candidate.startsWith(MARKER)) return { visibleText: line };
+	if (!candidate.startsWith(MARKER)) return { matched: false };
 	try {
 		const envelope: unknown = JSON.parse(candidate.slice(MARKER.length));
 		if (
 			!isRecord(envelope) ||
-			envelope.kind !== "pi-subagents.async-status-snapshot"
+			envelope.kind !== "pi-subagents.async-status-snapshot" ||
+			!Array.isArray(envelope.runs)
 		)
-			return { visibleText: "" };
-		if (!Array.isArray(envelope.runs)) return { visibleText: "" };
+			return { matched: true };
 		const run = envelope.runs
 			.filter((value) => isRecord(value) && value.kind === "subagent")
 			.at(-1);
-		if (!isRecord(run)) return { visibleText: "" };
+		if (!isRecord(run)) return { matched: true };
 		const label = typeof run.label === "string" ? run.label.toLowerCase() : "";
-		const role = ROLES.get(label) ?? "Помощник";
 		const state =
 			typeof run.state === "string"
-				? STATES.get(run.state.toLowerCase())
+				? STATES[run.state.toLowerCase()]
 				: undefined;
 		return {
-			visibleText: "",
+			matched: true,
 			status: state
-				? `Задача ${role}: ${state}`
+				? `Задача ${ROLES[label] ?? "Помощник"}: ${state}`
 				: "Задача помощника: обновляется",
 		};
 	} catch {
-		return { visibleText: "" };
+		return { matched: true };
 	}
 }
 

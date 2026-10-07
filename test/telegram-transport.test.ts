@@ -5079,7 +5079,17 @@ describe("Telegram transport", () => {
 			generatedAt: "SENTINEL_TIMESTAMP",
 		})}`;
 		emit(harnessEvent("sid", "output", widget.slice(0, 24)));
-		emit(harnessEvent("sid", "output", `${widget.slice(24)}\nVisible answer.`));
+		emit(harnessEvent("sid", "output", widget.slice(24)));
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) =>
+					text.includes("Задача Scout: выполняется"),
+				),
+			).toBe(true),
+		);
+		emit(
+			harnessEvent("sid", "output", "\nVisible answer.\n\nNext paragraph.\n"),
+		);
 		for (let index = 0; index < 100; index++)
 			emit(harnessEvent("sid", "output", `${widget}\n`));
 		emit({
@@ -5088,13 +5098,6 @@ describe("Telegram transport", () => {
 			inputEvent: { inputId: "input-1" as never, state: "completed" },
 		});
 		emit(harnessEvent("sid", "status", "agent_settled"));
-		await vi.waitFor(() =>
-			expect(
-				bot.edited.some(({ text }) =>
-					text.includes("Задача Scout: выполняется"),
-				),
-			).toBe(true),
-		);
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(({ text }) => text.includes("Visible answer.")),
@@ -5112,9 +5115,108 @@ describe("Telegram transport", () => {
 				([, messageId]) => messageId === bubbleId,
 			).length,
 		).toBeLessThan(10);
-		expect(bot.sent.some(({ text }) => text.includes("Visible answer."))).toBe(
-			true,
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Visible answer.\n\nNext paragraph."),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("resets subagent status at each new agent run", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track status");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
 		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"scout","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Scout: выполняется"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Pi выполняет ход сессии"),
+		);
+		expect(bot.edited.at(-1)?.text).not.toContain("Задача Scout: выполняется");
+		await adapter.stop();
+	});
+
+	it("redacts subagent status notifications into the attributed bubble only", async () => {
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "attribute notification");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const bubbleId = bot.lastMessageId;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const secret = "NOTIFICATION_SENTINEL_9274";
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: `Pi: PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+					kind: "pi-subagents.async-status-snapshot",
+					runs: [
+						{ kind: "subagent", label: "worker", state: "queued", id: secret },
+					],
+				})}`,
+			},
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("Задача Worker: ожидает")),
+			).toBe(true),
+		);
+		const payloads = [
+			...bot.api.sendMessage.mock.calls.map(([, text]) => String(text)),
+			...bot.api.editMessageText.mock.calls.map(([, , text]) => String(text)),
+		];
+		expect(payloads.join("\n")).not.toContain(secret);
+		expect(log.mock.calls.flat().join(" ")).not.toContain(secret);
+		expect(
+			bot.api.sendMessage.mock.calls.some(([, text]) =>
+				String(text).startsWith("Pi: "),
+			),
+		).toBe(false);
+		expect(
+			bot.api.editMessageText.mock.calls.some(([, id]) => id !== bubbleId),
+		).toBe(false);
+		await adapter.stop();
+		log.mockRestore();
+	});
+
+	it("hides an un-attributed status notification without creating a message or bubble", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const sends = bot.api.sendMessage.mock.calls.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: 'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"scout","state":"running","id":"BACKGROUND_SENTINEL"}]}',
+			},
+		});
+		expect(bot.api.sendMessage.mock.calls).toHaveLength(sends);
+		expect(bot.api.editMessageText).not.toHaveBeenCalled();
+		expect(
+			bot.sent.some(({ text }) => text.includes("BACKGROUND_SENTINEL")),
+		).toBe(false);
 		await adapter.stop();
 	});
 
