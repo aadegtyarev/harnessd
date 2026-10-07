@@ -95,7 +95,16 @@ type UpdateContext = {
 			width: number;
 			height: number;
 		}[];
-		reply_to_message?: { message_id?: number; text?: string };
+		reply_to_message?: {
+			message_id?: number;
+			text?: string;
+			from?: { id: number; is_bot?: boolean };
+			entities?: readonly {
+				type: string;
+				offset: number;
+				length: number;
+			}[];
+		};
 	};
 	callbackQuery?: {
 		id: string;
@@ -248,6 +257,9 @@ type TurnBuffer = {
 	readonly chunks: string[];
 	readonly recipients: Set<number>;
 	characters: number;
+	pendingSubmissions: number;
+	settled: boolean;
+	interrupted: boolean;
 	overflow: boolean;
 };
 type FolderIntent = {
@@ -307,6 +319,8 @@ type LiveActivity = {
 	statsTimer?: NodeJS.Timeout;
 	statsInFlight: boolean;
 	pendingSubmissions: number;
+	submittedRunSequence: number;
+	submissionTurn?: TurnBuffer;
 	turnGeneration: number;
 	finishTimer?: ReturnType<typeof setTimeout>;
 	finishing: boolean;
@@ -1049,6 +1063,12 @@ export class TelegramTransportAdapter
 	private readonly modelChoices = new Map<number, ModelChoices>();
 	private readonly effortChoices = new Map<number, EffortChoices>();
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
+	private readonly pendingTurnRecipients = new Map<SessionId, Set<number>>();
+	private readonly pendingTurnSubmissions = new Map<
+		SessionId,
+		Set<LiveActivity>
+	>();
+	private readonly turnSequences = new Map<SessionId, number>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
 	private readonly panelStaleChats = new Set<number>();
@@ -1358,6 +1378,10 @@ export class TelegramTransportAdapter
 			if (activity.finishTimer) clearTimeout(activity.finishTimer);
 		}
 		this.liveActivities.clear();
+		this.turnBuffers.clear();
+		this.pendingTurnRecipients.clear();
+		this.pendingTurnSubmissions.clear();
+		this.turnSequences.clear();
 		try {
 			if (this.initializationPromise)
 				await withDeadline(this.initializationPromise, STOP_TIMEOUT_MS);
@@ -1464,6 +1488,7 @@ export class TelegramTransportAdapter
 	private async onText(
 		ctx: UpdateContext,
 		routedSessionId?: SessionId,
+		confirmedCurrentSession?: SessionId,
 	): Promise<void> {
 		const chatId = ctx.chat?.id;
 		const sender = ctx.from?.id;
@@ -1486,7 +1511,7 @@ export class TelegramTransportAdapter
 					: this.replyRoutes.get(chatId)?.get(replyTo);
 			const footerSession =
 				knownReplyRoute === undefined
-					? this.sessionFromReplyFooter(ctx.message?.reply_to_message?.text)
+					? this.sessionFromReplyFooter(ctx.message?.reply_to_message)
 					: undefined;
 			const sourceSession = knownReplyRoute?.sessionId ?? footerSession;
 			if (
@@ -1527,11 +1552,18 @@ export class TelegramTransportAdapter
 					ctx.message?.message_id,
 				);
 				submissionPending = true;
-				const result = await this.request(sender, {
-					kind: "submit",
-					sessionId,
-					text,
-				});
+				const result = await this.submitFromChat(
+					chatId,
+					sender,
+					{ kind: "submit", sessionId, text },
+					confirmedCurrentSession,
+					activity,
+				);
+				if (!result) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					return;
+				}
 				if (result.ok) {
 					submissionPending = false;
 					await this.confirmInputAccepted(
@@ -1542,6 +1574,8 @@ export class TelegramTransportAdapter
 					);
 				} else {
 					submissionPending = false;
+					if (result.error.code === "UNCERTAIN_INPUT_DELIVERY")
+						this.attributeAcceptedSubmission(activity);
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
@@ -1729,17 +1763,57 @@ export class TelegramTransportAdapter
 			routes.delete(routes.keys().next().value as number);
 	}
 
-	private sessionFromReplyFooter(text?: string): SessionId | undefined {
-		if (!text) return undefined;
-		const plainText = text.replace(/<\/?code>/g, "").replace(/&middot;/g, "·");
+	private sessionFromReplyFooter(
+		reply: NonNullable<UpdateContext["message"]>["reply_to_message"],
+	): SessionId | undefined {
+		if (!reply) return undefined;
+		const text = reply.text;
+		const botId = (this.bot as TelegramBot & { botInfo?: { id: number } })
+			.botInfo?.id;
+		if (
+			!text ||
+			botId === undefined ||
+			!reply.from?.is_bot ||
+			reply.from.id !== botId
+		)
+			return undefined;
 		const match =
-			/\n\n(?:[^\n]* · )?([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*$/.exec(
-				plainText,
+			/\n\n(?:(.+) · )?([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?: · (\d+)\/(\d+))?$/.exec(
+				text,
 			);
-		const id = match?.[1];
-		return id && this.knownSessions.has(id as SessionId)
-			? (id as SessionId)
-			: undefined;
+		const id = match?.[2];
+		if (!id || !this.knownSessions.has(id as SessionId)) return undefined;
+		const expectedName = this.sessionNames.get(id as SessionId);
+		if (
+			(match[1] ?? undefined) !==
+			(expectedName ? oneLine(expectedName) : undefined)
+		)
+			return undefined;
+		if (match[3] !== undefined) {
+			const part = Number(match[3]);
+			const total = Number(match[4]);
+			if (
+				!Number.isSafeInteger(part) ||
+				!Number.isSafeInteger(total) ||
+				part < 1 ||
+				total < 2 ||
+				part > total
+			)
+				return undefined;
+		}
+		const entities = reply.entities ?? [];
+		const expectedOffset = text.lastIndexOf(id);
+		const footerEntities = entities.filter(
+			(entity) => entity.offset + entity.length > expectedOffset,
+		);
+		if (
+			footerEntities.length !== 1 ||
+			footerEntities[0]?.type !== "code" ||
+			footerEntities[0]?.offset !== expectedOffset ||
+			footerEntities[0]?.length !== id.length
+		)
+			return undefined;
+		return id as SessionId;
 	}
 
 	private async offerReplyRoutes(
@@ -1859,6 +1933,7 @@ export class TelegramTransportAdapter
 					message: { text: choice.text, message_id: choice.incomingMessageId },
 				},
 				target,
+				match?.[2] === "c" ? choice.selectedSession : undefined,
 			);
 		if (choice.message)
 			return this.onMedia(
@@ -1868,6 +1943,7 @@ export class TelegramTransportAdapter
 					message: choice.message,
 				},
 				target,
+				match?.[2] === "c" ? choice.selectedSession : undefined,
 			);
 	}
 
@@ -1883,6 +1959,7 @@ export class TelegramTransportAdapter
 	private async onMedia(
 		ctx: UpdateContext,
 		routedSessionId?: SessionId,
+		confirmedCurrentSession?: SessionId,
 	): Promise<void> {
 		const chatId = ctx.chat?.id;
 		const sender = ctx.from?.id;
@@ -1900,7 +1977,7 @@ export class TelegramTransportAdapter
 				: undefined;
 		const footerSession =
 			knownReplyRoute === undefined
-				? this.sessionFromReplyFooter(message.reply_to_message?.text)
+				? this.sessionFromReplyFooter(message.reply_to_message)
 				: undefined;
 		if (
 			routedSessionId === undefined &&
@@ -1952,9 +2029,12 @@ export class TelegramTransportAdapter
 		if (!inbox)
 			return this.sendDirect(chatId, "The session inbox is unavailable.");
 		const explicitlyRouted = Boolean(
-			knownReplyRoute || footerSession || routedSessionId,
+			knownReplyRoute ||
+				footerSession ||
+				(routedSessionId && !confirmedCurrentSession),
 		);
-		const selectedAtDownload = this.selected.get(chatId);
+		const selectedAtDownload =
+			confirmedCurrentSession ?? this.selected.get(chatId);
 		await this.sendDirect(chatId, "Получаю вложение…");
 		let downloaded: Buffer;
 		try {
@@ -1999,7 +2079,7 @@ export class TelegramTransportAdapter
 		}
 		await inbox.withSessionLock(sessionId, async () => {
 			if (
-				!explicitlyRouted &&
+				(!explicitlyRouted || confirmedCurrentSession !== undefined) &&
 				this.selected.get(chatId) !== selectedAtDownload
 			) {
 				await this.sendDirect(
@@ -2040,6 +2120,18 @@ export class TelegramTransportAdapter
 					message.message_id,
 				);
 				submissionPending = true;
+				if (this.eventChannelDisabled(chatId)) {
+					submissionPending = false;
+					this.finishActivitySubmission(activity);
+					await this.sendDirect(
+						chatId,
+						"Канал событий отключён: вложение не отправлено. Откройте /menu и включите канал для новых событий.",
+					);
+					return;
+				}
+				activity.submittedWhileRunning = this.runningSessions.has(sessionId);
+				activity.submittedRunSequence = this.turnSequences.get(sessionId) ?? 0;
+				this.captureSubmissionTurn(activity);
 				const submitted = await this.dispatchRequest(sender, {
 					kind: "submit",
 					sessionId,
@@ -2048,6 +2140,8 @@ export class TelegramTransportAdapter
 				});
 				if (!submitted.ok) {
 					submissionPending = false;
+					if (submitted.error.code === "UNCERTAIN_INPUT_DELIVERY")
+						this.attributeAcceptedSubmission(activity);
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
@@ -2894,6 +2988,43 @@ export class TelegramTransportAdapter
 			: operation();
 	}
 
+	private submitFromChat(
+		chatId: number,
+		sender: number,
+		request: Extract<TelegramRequest, { kind: "submit" }>,
+		expectedSelection?: SessionId,
+		activity?: LiveActivity,
+	): Promise<TransportResult | undefined> {
+		return this.withSessionRequestLock(request.sessionId, async () => {
+			if (
+				expectedSelection !== undefined &&
+				this.selected.get(chatId) !== expectedSelection
+			) {
+				await this.sendDirect(
+					chatId,
+					"The selected session changed before dispatch; nothing was sent.",
+				);
+				return undefined;
+			}
+			if (this.eventChannelDisabled(chatId)) {
+				await this.sendDirect(
+					chatId,
+					"Канал событий отключён: новое сообщение не отправлено. Откройте /menu и включите канал для новых событий.",
+				);
+				return undefined;
+			}
+			if (activity) {
+				activity.submittedWhileRunning = this.runningSessions.has(
+					request.sessionId,
+				);
+				activity.submittedRunSequence =
+					this.turnSequences.get(request.sessionId) ?? 0;
+				this.captureSubmissionTurn(activity);
+			}
+			return this.dispatchRequest(sender, request);
+		});
+	}
+
 	private request(
 		sender: number,
 		request: TelegramRequest,
@@ -2920,6 +3051,7 @@ export class TelegramTransportAdapter
 		chatId: number,
 		sender: number,
 		messageId?: number,
+		hideStaleAction = false,
 	): Promise<void> {
 		const listed = await this.request(sender, { kind: "list" });
 		const sessions = listed.ok
@@ -3017,7 +3149,7 @@ export class TelegramTransportAdapter
 			inlineButton("Папки", "menu:folders"),
 		]);
 		rows.push([inlineButton("Новая сессия", "menu:new")]);
-		if (this.panelStaleChats.has(chatId))
+		if (this.panelStaleChats.has(chatId) && !hideStaleAction)
 			rows.push([inlineButton("Обновить панель", "panel:refresh")]);
 		if (this.eventChannelDisabled(chatId))
 			rows.push([
@@ -3063,11 +3195,12 @@ export class TelegramTransportAdapter
 	private async refreshExistingPanel(
 		chatId: number,
 		sender: number,
+		hideStaleAction = false,
 	): Promise<void> {
 		const messageId =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
 		if (messageId !== undefined)
-			await this.renderPanel(chatId, sender, messageId);
+			await this.renderPanel(chatId, sender, messageId, hideStaleAction);
 	}
 
 	private async notifyPanelStale(chatId: number): Promise<void> {
@@ -3121,6 +3254,7 @@ export class TelegramTransportAdapter
 			);
 			if (edited.ok || isMessageNotModified(edited.error)) {
 				await this.savePanelReference(chatId, existing);
+				this.panelStaleChats.delete(chatId);
 				return true;
 			}
 			if (!isMessageNotFound(edited.error)) {
@@ -3306,7 +3440,8 @@ export class TelegramTransportAdapter
 		}
 		const directAction =
 			callback.data.startsWith("action:resume-select:") ||
-			callback.data.startsWith("action:select:");
+			callback.data.startsWith("action:select:") ||
+			callback.data === "panel:refresh";
 		if (!directAction) await this.savePanelReference(chatId, messageId);
 		try {
 			await this.dispatchCallback(chatId, sender, callback.data, messageId);
@@ -3328,10 +3463,10 @@ export class TelegramTransportAdapter
 		data: string,
 		messageId: number,
 	): Promise<void> {
-		if (data === "menu:home" || data === "panel:refresh") {
-			this.panelStaleChats.delete(chatId);
+		if (data === "menu:home")
 			return this.renderPanel(chatId, sender, messageId);
-		}
+		if (data === "panel:refresh")
+			return this.refreshExistingPanel(chatId, sender, true);
 		if (data === "events:enable") {
 			const queue = this.queues.get(chatId);
 			if (queue) {
@@ -3545,9 +3680,6 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		sourceMessageId: number | undefined,
 	): LiveActivity {
-		const currentTurn = this.turnBuffers.get(sessionId);
-		if (currentTurn && currentTurn.recipients.size < 128)
-			currentTurn.recipients.add(chatId);
 		let activity = this.liveActivities.get(activityKey(chatId, sessionId));
 		if (activity && activity.sessionId === sessionId) {
 			const current = activity;
@@ -3559,6 +3691,7 @@ export class TelegramTransportAdapter
 			if (current.finishTimer) clearTimeout(current.finishTimer);
 			current.finishTimer = undefined;
 			current.submittedWhileRunning = this.runningSessions.has(sessionId);
+			current.submittedRunSequence = this.turnSequences.get(sessionId) ?? 0;
 			if (startsIndependentTurn) {
 				current.queuedInputs.splice(0, current.queuedInputs.length);
 				current.overflowInputIds.clear();
@@ -3600,6 +3733,7 @@ export class TelegramTransportAdapter
 			renderQueue: Promise.resolve(),
 			statsInFlight: false,
 			pendingSubmissions: 1,
+			submittedRunSequence: this.turnSequences.get(sessionId) ?? 0,
 			turnGeneration: 1,
 			finishing: false,
 		};
@@ -3759,6 +3893,14 @@ export class TelegramTransportAdapter
 
 	private finishActivitySubmission(activity: LiveActivity): void {
 		if (activity.pendingSubmissions > 0) activity.pendingSubmissions--;
+		if (!activity.submissionTurn) this.removePendingTurnSubmission(activity);
+		const turn = activity.submissionTurn;
+		activity.submissionTurn = undefined;
+		if (turn) {
+			turn.pendingSubmissions = Math.max(0, turn.pendingSubmissions - 1);
+			if (turn.settled && turn.pendingSubmissions === 0)
+				this.flushTurn(activity.sessionId, turn.interrupted, turn);
+		}
 	}
 
 	private updateLiveActivity(
@@ -3974,6 +4116,62 @@ export class TelegramTransportAdapter
 		}
 	}
 
+	private attributeAcceptedSubmission(activity: LiveActivity): void {
+		const sessionId = activity.sessionId;
+		const turn = this.turnBuffers.get(sessionId);
+		const sequence = this.turnSequences.get(sessionId) ?? 0;
+		const submittedTurn = activity.submissionTurn;
+		if (submittedTurn) {
+			if (submittedTurn.recipients.size < 128)
+				submittedTurn.recipients.add(activity.chatId);
+			return;
+		}
+		this.removePendingTurnSubmission(activity);
+		if (activity.submittedWhileRunning) {
+			if (turn && turn.recipients.size < 128)
+				turn.recipients.add(activity.chatId);
+			return;
+		}
+		if (turn && sequence > activity.submittedRunSequence) {
+			if (turn.recipients.size < 128) turn.recipients.add(activity.chatId);
+			return;
+		}
+		if (sequence !== activity.submittedRunSequence) return;
+		const pending = this.pendingTurnRecipients.get(sessionId);
+		if (!pending && this.pendingTurnRecipients.size >= 128) return;
+		const recipients = pending ?? new Set<number>();
+		if (recipients.size >= 128) return;
+		recipients.add(activity.chatId);
+		this.pendingTurnRecipients.set(sessionId, recipients);
+	}
+
+	private captureSubmissionTurn(activity: LiveActivity): void {
+		const turn = this.turnBuffers.get(activity.sessionId);
+		if (turn && activity.submittedWhileRunning) {
+			turn.pendingSubmissions++;
+			activity.submissionTurn = turn;
+			return;
+		}
+		if (
+			this.pendingTurnSubmissions.size >= 128 &&
+			!this.pendingTurnSubmissions.has(activity.sessionId)
+		)
+			return;
+		const pending =
+			this.pendingTurnSubmissions.get(activity.sessionId) ??
+			new Set<LiveActivity>();
+		if (pending.size >= 128) return;
+		pending.add(activity);
+		this.pendingTurnSubmissions.set(activity.sessionId, pending);
+	}
+
+	private removePendingTurnSubmission(activity: LiveActivity): void {
+		const pending = this.pendingTurnSubmissions.get(activity.sessionId);
+		pending?.delete(activity);
+		if (pending?.size === 0)
+			this.pendingTurnSubmissions.delete(activity.sessionId);
+	}
+
 	private async confirmInputAccepted(
 		chatId: number,
 		messageId: number | undefined,
@@ -3981,6 +4179,7 @@ export class TelegramTransportAdapter
 		activity: LiveActivity,
 		acknowledgement?: string,
 	): Promise<void> {
+		this.attributeAcceptedSubmission(activity);
 		this.finishActivitySubmission(activity);
 		if (messageId !== undefined)
 			void this.reactToAcceptedInput(chatId, messageId, inputId);
@@ -5190,19 +5389,37 @@ export class TelegramTransportAdapter
 				this.stopTyping(event.sessionId);
 			}
 			if (event.text === "agent_start") {
+				this.turnSequences.set(
+					event.sessionId,
+					(this.turnSequences.get(event.sessionId) ?? 0) + 1,
+				);
+				while (this.turnSequences.size > 128)
+					this.turnSequences.delete(
+						this.turnSequences.keys().next().value as SessionId,
+					);
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.add(event.sessionId);
 				this.startTyping(event.sessionId);
-				this.turnBuffers.set(event.sessionId, {
+				const recipients =
+					this.pendingTurnRecipients.get(event.sessionId) ?? new Set();
+				this.pendingTurnRecipients.delete(event.sessionId);
+				const turn: TurnBuffer = {
 					chunks: [],
-					recipients: new Set(
-						this.activitiesForSession(event.sessionId)
-							.slice(0, 128)
-							.map((activity) => activity.chatId),
-					),
+					recipients,
 					characters: 0,
+					pendingSubmissions: 0,
+					settled: false,
+					interrupted: false,
 					overflow: false,
-				});
+				};
+				for (const activity of this.pendingTurnSubmissions.get(
+					event.sessionId,
+				) ?? []) {
+					activity.submissionTurn = turn;
+					turn.pendingSubmissions++;
+				}
+				this.pendingTurnSubmissions.delete(event.sessionId);
+				this.turnBuffers.set(event.sessionId, turn);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
 					activity.status = "Pi выполняет ход сессии";
 					activity.thinking = false;
@@ -5217,6 +5434,7 @@ export class TelegramTransportAdapter
 				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
 				this.flushTurn(event.sessionId);
+				this.pendingTurnRecipients.delete(event.sessionId);
 				this.reconcileOverflowAtRunSettlement(event.sessionId);
 				this.scheduleLiveActivityFinish(event.sessionId, true);
 				return;
@@ -5369,6 +5587,9 @@ export class TelegramTransportAdapter
 				chunks: [],
 				recipients: new Set(),
 				characters: 0,
+				pendingSubmissions: 0,
+				settled: false,
+				interrupted: false,
 				overflow: false,
 			};
 			this.turnBuffers.set(sessionId, buffer);
@@ -5390,33 +5611,49 @@ export class TelegramTransportAdapter
 		}
 	}
 
-	private flushTurn(sessionId: SessionId, interrupted = false): void {
-		const buffer = this.turnBuffers.get(sessionId);
-		this.turnBuffers.delete(sessionId);
-		if (!buffer || (buffer.characters === 0 && !buffer.overflow)) return;
+	private flushTurn(
+		sessionId: SessionId,
+		interrupted = false,
+		target?: TurnBuffer,
+	): void {
+		const buffer = target ?? this.turnBuffers.get(sessionId);
+		if (!buffer) return;
+		buffer.settled = true;
+		buffer.interrupted ||= interrupted;
+		if (buffer.pendingSubmissions > 0) return;
+		if (this.turnBuffers.get(sessionId) === buffer)
+			this.turnBuffers.delete(sessionId);
+		if (buffer.characters === 0 && !buffer.overflow) return;
 		let text = buffer.chunks.join("");
 		text = text
 			.split(/\r?\n/)
 			.filter((line) => !line.trimStart().startsWith(INTERNAL_WIDGET_PREFIX))
 			.join("\n");
 		if (!text.trim()) return;
-		if (interrupted) text += "\n\n[Response interrupted before completion.]";
+		if (buffer.interrupted)
+			text += "\n\n[Response interrupted before completion.]";
 		if (buffer.overflow)
 			text +=
 				"\n\n[Additional output omitted because the response reached the queue limit.]";
 		const selectedChats = new Set<number>();
 		for (const [chatId, selectedId] of this.selected)
 			if (selectedId === sessionId) selectedChats.add(chatId);
-		const recipients = new Set([...buffer.recipients, ...selectedChats]);
-		for (const chatId of recipients)
+		const recipients = buffer.recipients.size
+			? buffer.recipients
+			: selectedChats;
+		for (const chatId of recipients) {
+			const attributed = buffer.recipients.has(chatId);
 			this.enqueue(
 				chatId,
 				sessionId,
-				`Фоновая сессия · ${this.eventFooter(sessionId)}\n\n${text}`,
+				attributed
+					? `Фоновая сессия · ${this.eventFooter(sessionId)}\n\n${text}`
+					: text,
 				undefined,
 				true,
-				true,
+				attributed,
 			);
+		}
 	}
 
 	private eventChannelDisabled(chatId: number): boolean {
@@ -5446,6 +5683,9 @@ export class TelegramTransportAdapter
 	}
 
 	private invalidateSession(sessionId: SessionId): void {
+		this.pendingTurnRecipients.delete(sessionId);
+		this.pendingTurnSubmissions.delete(sessionId);
+		this.turnBuffers.delete(sessionId);
 		this.knownSessions.delete(sessionId);
 		this.sessionNames.delete(sessionId);
 		this.sessionCwds.delete(sessionId);

@@ -83,7 +83,12 @@ type Context = {
 			height: number;
 		}[];
 		message_id?: number;
-		reply_to_message?: { message_id: number; text?: string };
+		reply_to_message?: {
+			message_id: number;
+			text?: string;
+			from?: { id: number; is_bot?: boolean };
+			entities?: readonly { type: string; offset: number; length: number }[];
+		};
 	};
 	callbackQuery?: {
 		id: string;
@@ -91,7 +96,18 @@ type Context = {
 		message?: { message_id: number };
 	};
 };
+function replyPlainText(text?: string): string | undefined {
+	return text?.replace(/<code>(.*?)<\/code>/g, "$1");
+}
+function replyCodeEntities(text?: string) {
+	if (!text) return [];
+	const match = /<code>(.*?)<\/code>/.exec(text);
+	if (!match) return [];
+	const offset = text.slice(0, match.index).replace(/<[^>]+>/g, "").length;
+	return [{ type: "code", offset, length: (match[1] ?? "").length }];
+}
 class MockBot {
+	botInfo = { id: 999 };
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
 	handler?: (ctx: Context) => Promise<void>;
 	photoHandler?: (ctx: Context) => Promise<void>;
@@ -144,7 +160,8 @@ class MockBot {
 				_other?: unknown,
 				_signal?: AbortSignal,
 			): Promise<unknown> => {
-				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
+				if (telegramVisibleText(text).length > 4096)
+					throw new Error("Telegram text limit exceeded");
 				await this.sendMessageBehavior();
 				const message_id = this.nextMessageId++;
 				this.sent.push({ chatId, text, message_id });
@@ -160,7 +177,8 @@ class MockBot {
 				text: string,
 				options?: unknown,
 			) => {
-				if (text.length > 4096) throw new Error("Telegram text limit exceeded");
+				if (telegramVisibleText(text).length > 4096)
+					throw new Error("Telegram text limit exceeded");
 				await this.editMessageBehavior();
 				this.edited.push({ chatId, messageId, text, options });
 				return { message_id: messageId };
@@ -256,6 +274,8 @@ class MockBot {
 			missingSender?: boolean;
 			replyToMessageId?: number;
 			replyToMessageText?: string;
+			replySenderIsBot?: boolean;
+			replySenderId?: number;
 		} = {},
 	) {
 		const {
@@ -274,7 +294,14 @@ class MockBot {
 					: {
 							reply_to_message: {
 								message_id: options.replyToMessageId,
-								text: options.replyToMessageText,
+								text: replyPlainText(options.replyToMessageText),
+								from: {
+									id:
+										options.replySenderId ??
+										(options.replySenderIsBot === false ? 42 : this.botInfo.id),
+									is_bot: options.replySenderIsBot !== false,
+								},
+								entities: replyCodeEntities(options.replyToMessageText),
 							},
 						}),
 			},
@@ -311,7 +338,9 @@ class MockBot {
 					: {
 							reply_to_message: {
 								message_id: options.replyToMessageId,
-								text: options.replyToMessageText,
+								text: replyPlainText(options.replyToMessageText),
+								from: { id: this.botInfo.id, is_bot: true },
+								entities: replyCodeEntities(options.replyToMessageText),
 							},
 						}),
 			},
@@ -893,6 +922,131 @@ describe("Telegram transport", () => {
 				"action:select:",
 			),
 		).toMatch(/^action:select:/);
+		await adapter.stop();
+	});
+
+	it("attributes only accepted submissions to a turn and retires recipients at settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit" && request.text.includes("reject me")
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: { code: "INVALID_INPUT", message: "rejected" },
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(42, "accepted message");
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1),
+		);
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "owned by chat 42"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("owned by chat 42")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.filter(
+				({ chatId, text }) =>
+					chatId === 43 && text.includes("owned by chat 42"),
+			),
+		).toHaveLength(0);
+
+		await bot.update(43, "reject me");
+		await bot.update(43, "/use other");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "rejected input has no ownership"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("rejected input has no ownership"),
+			),
+		).toBe(false);
+		expect(
+			(
+				adapter as unknown as {
+					pendingTurnRecipients: Map<SessionId, Set<number>>;
+				}
+			).pendingTurnRecipients.size,
+		).toBe(0);
+		await adapter.stop();
+	});
+
+	it("retains run ownership when settlement races an accepted submission reply", async () => {
+		let accept!: (value: TransportResult) => void;
+		let submitRequest: TransportEvent | undefined;
+		const gate = new Promise<TransportResult>((resolve) => (accept = resolve));
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") {
+					submitRequest = request;
+					return gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		const sending = bot.update(42, "racing accepted input");
+		await vi.waitFor(() => expect(submitRequest).toBeDefined());
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "answer settled before ack"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await bot.update(42, "/use other");
+		if (!submitRequest) throw new Error("missing submit request");
+		accept(result(submitRequest));
+		await sending;
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("answer settled before ack")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.find(({ text }) => text.includes("answer settled before ack"))
+				?.text,
+		).toContain("Фоновая сессия");
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("attributes uncertain submissions to the active queued turn", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "UNCERTAIN_INPUT_DELIVERY",
+								message: "ack lost",
+								inputId: "input-uncertain" as never,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(42, "queued uncertain message");
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "output", "uncertain run answer"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("uncertain run answer")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.find(({ text }) => text.includes("uncertain run answer"))?.text,
+		).toContain("Фоновая сессия");
 		await adapter.stop();
 	});
 
@@ -2118,10 +2272,10 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("retires epochs for lifecycle churn without confirmation references", async () => {
+	it("retires volatile turn and confirmation state during lifecycle churn", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
-		for (let index = 0; index < 100; index++) {
+		for (let index = 0; index < 200; index++) {
 			emit(harnessEvent(`churn-${index}`, "status", "agent_start"));
 			emit(harnessEvent(`churn-${index}`, "status", "agent_settled"));
 		}
@@ -2129,6 +2283,24 @@ describe("Telegram transport", () => {
 		expect(
 			(adapter as unknown as { confirmationEpochs: Map<SessionId, number> })
 				.confirmationEpochs.size,
+		).toBe(0);
+		expect(
+			(
+				adapter as unknown as {
+					pendingTurnRecipients: Map<SessionId, Set<number>>;
+				}
+			).pendingTurnRecipients.size,
+		).toBe(0);
+		expect(
+			(adapter as unknown as { turnSequences: Map<SessionId, number> })
+				.turnSequences.size,
+		).toBeLessThanOrEqual(128);
+		expect(
+			(
+				adapter as unknown as {
+					pendingTurnSubmissions: Map<SessionId, Set<unknown>>;
+				}
+			).pendingTurnSubmissions.size,
 		).toBe(0);
 		await adapter.stop();
 	});
@@ -2158,6 +2330,31 @@ describe("Telegram transport", () => {
 		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(2);
 		await bot.update(42, "/sessions");
 		expect(bot.sent.at(-1)?.text).toContain("#sid");
+		await adapter.stop();
+	});
+
+	it("refreshes a stale panel from its notice without adopting or repinning the notice", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelId = (
+			adapter as unknown as { panelMessageIds: Map<number, number> }
+		).panelMessageIds.get(42);
+		const pinCount = bot.pinned.length;
+		bot.api.editMessageText.mockRejectedValueOnce(
+			new Error("temporary failure"),
+		);
+		await bot.update(42, "/menu");
+		const noticeId = bot.lastMessageId;
+		expect(noticeId).not.toBe(panelId);
+		const sentBeforeRefresh = bot.api.sendMessage.mock.calls.length;
+		await bot.callback(42, "panel:refresh", noticeId);
+		expect(bot.edited.at(-1)?.messageId).toBe(panelId);
+		expect(bot.pinned).toHaveLength(pinCount);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sentBeforeRefresh);
+		expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain(
+			"panel:refresh",
+		);
 		await adapter.stop();
 	});
 
@@ -2626,6 +2823,23 @@ describe("Telegram transport", () => {
 
 		const restartedBot = new MockBot();
 		const restarted = await startAdapter(restartedBot, stateDirectory);
+		await restartedBot.update(42, "spoofed text", {
+			replyToMessageId: output?.message_id,
+			replyToMessageText: output?.text,
+			replySenderIsBot: false,
+		});
+		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+			false,
+		);
+		expect(restartedBot.sent.at(-1)?.text).toContain("Reply source is unknown");
+		await restartedBot.update(42, "spoofed bot text", {
+			replyToMessageId: output?.message_id,
+			replyToMessageText: output?.text,
+			replySenderId: 998,
+		});
+		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+			false,
+		);
 		await restartedBot.update(42, "text after restart", {
 			replyToMessageId: output?.message_id,
 			replyToMessageText: output?.text,
@@ -2647,6 +2861,47 @@ describe("Telegram transport", () => {
 		await restarted.adapter.stop();
 		if (previousSession) sessions.set("sid", previousSession);
 	});
+
+	it.each([undefined, "Named session"])(
+		"routes %s multipart assistant footers after restart",
+		async (name) => {
+			const previous = sessions.get("sid");
+			if (!previous) throw new Error("missing session fixture");
+			sessions.set("sid", {
+				...previous,
+				...(name ? { name } : { name: undefined }),
+			});
+			const stateDirectory = await temp();
+			const firstBot = new MockBot();
+			const first = await startAdapter(firstBot, stateDirectory);
+			await firstBot.update(42, "/use sid");
+			first.emit(harnessEvent("sid", "status", "agent_start"));
+			first.emit(
+				harnessEvent("sid", "output", `Large answer ${"x".repeat(10_000)}`),
+			);
+			first.emit(harnessEvent("sid", "status", "agent_settled"));
+			await vi.waitFor(() =>
+				expect(firstBot.sent.some(({ text }) => / · 1\/\d+$/.test(text))).toBe(
+					true,
+				),
+			);
+			const part = firstBot.sent.find(({ text }) => / · 1\/\d+$/.test(text));
+			expect(part).toBeDefined();
+			await first.adapter.stop();
+
+			const restartedBot = new MockBot();
+			const restarted = await startAdapter(restartedBot, stateDirectory);
+			await restartedBot.update(42, "reply to first part", {
+				replyToMessageId: part?.message_id,
+				replyToMessageText: part?.text,
+			});
+			expect(
+				restarted.requests.filter(({ kind }) => kind === "submit"),
+			).toHaveLength(1);
+			await restarted.adapter.stop();
+			sessions.set("sid", previous);
+		},
+	);
 
 	it("rejects restarted text and media replies to the generated long-path create prompt", async () => {
 		const cwd = `/workspace/${"long".repeat(1100)}`;
@@ -2958,6 +3213,211 @@ describe("Telegram transport", () => {
 		expect(
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("revalidates a confirmed-current media route after its download", async () => {
+		let finishDownload!: (response: Response) => void;
+		const fetchGate = new Promise<Response>(
+			(resolve) => (finishDownload = resolve),
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(() => fetchGate),
+		);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.updateDocument(42, {
+			replyToMessageId: 777,
+			replyToMessageText: "unknown user-authored message",
+		});
+		const notice = bot.sent.at(-1);
+		const currentChoice = callbackData(
+			bot.sendOptions.at(-1),
+			"reply:",
+		).replace(/:[sx]$/, ":c");
+		const choice = bot.callback(42, currentChoice, notice?.message_id);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+		await bot.update(42, "/use other");
+		finishDownload(new Response(Buffer.from("media")));
+		await choice;
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("selected session changed while receiving"),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("keeps a reliable media reply on its source session after selection changes", async () => {
+		let finishDownload!: (response: Response) => void;
+		const fetchGate = new Promise<Response>(
+			(resolve) => (finishDownload = resolve),
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(() => fetchGate),
+		);
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "create reply route");
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
+				true,
+			),
+		);
+		const source = bot.sent.find(({ text }) => text.includes("Pi activity"));
+		await bot.update(42, "/use other");
+		const upload = bot.updateDocument(42, {
+			replyToMessageId: source?.message_id,
+			replyToMessageText: source?.text,
+		});
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+		finishDownload(new Response(Buffer.from("media")));
+		await upload;
+		expect(requests.findLast(({ kind }) => kind === "submit")).toMatchObject({
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("rechecks a disabled event channel at text dispatch after waiting for the inbox lock", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "initialize queue"));
+		await vi.waitFor(() =>
+			expect(
+				(adapter as unknown as { queues: Map<number, unknown> }).queues.has(42),
+			).toBe(true),
+		);
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		let release!: () => void;
+		let announce!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		const started = new Promise<void>((resolve) => (announce = resolve));
+		const lock = withSessionLock("sid" as SessionId, async () => {
+			announce();
+			await gate;
+		});
+		await started;
+		let queued!: () => void;
+		const queuedWait = new Promise<void>((resolve) => (queued = resolve));
+		inbox.withSessionLock = (id, operation) => {
+			const result = withSessionLock(id, operation);
+			if (id === "sid") queued();
+			return result;
+		};
+		const message = bot.update(42, "wait behind lock");
+		await queuedWait;
+		const queues = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues;
+		const queue = queues.get(42);
+		if (!queue) throw new Error("missing chat event queue");
+		queue.failed = true;
+		await bot.update(42, "/menu");
+		const reset = callbackData(bot.sendOptions.at(-1), "events:enable");
+		await bot.callback(42, reset, bot.lastMessageId);
+		release();
+		await Promise.all([lock, message]);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("blocks text dispatch when the event channel stays disabled through the lock boundary", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "initialize queue"));
+		await vi.waitFor(() =>
+			expect(
+				(adapter as unknown as { queues: Map<number, unknown> }).queues.has(42),
+			).toBe(true),
+		);
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const withSessionLock = inbox.withSessionLock.bind(inbox);
+		let release!: () => void;
+		let started!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		const heldStarted = new Promise<void>((resolve) => (started = resolve));
+		const held = withSessionLock("sid" as SessionId, async () => {
+			started();
+			await gate;
+		});
+		await heldStarted;
+		let queued!: () => void;
+		const queuedWait = new Promise<void>((resolve) => (queued = resolve));
+		inbox.withSessionLock = (id, operation) => {
+			const pending = withSessionLock(id, operation);
+			if (id === "sid") queued();
+			return pending;
+		};
+		const submission = bot.update(42, "blocked at final boundary");
+		await queuedWait;
+		const queues = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues;
+		const queue = queues.get(42);
+		if (!queue) throw new Error("missing event queue");
+		queue.failed = true;
+		release();
+		await Promise.all([held, submission]);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
+		await adapter.stop();
+	});
+
+	it("blocks media dispatch when the channel is disabled during download", async () => {
+		let finishDownload!: (response: Response) => void;
+		const fetchGate = new Promise<Response>(
+			(resolve) => (finishDownload = resolve),
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(() => fetchGate),
+		);
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "initialize queue"));
+		await vi.waitFor(() =>
+			expect(
+				(adapter as unknown as { queues: Map<number, unknown> }).queues.has(42),
+			).toBe(true),
+		);
+		const upload = bot.updateDocument(42);
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+		const queues = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues;
+		const queue = queues.get(42);
+		if (!queue) throw new Error("missing chat event queue");
+		queue.failed = true;
+		finishDownload(new Response(Buffer.from("media")));
+		await upload;
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(0);
 		await adapter.stop();
 	});
 
