@@ -2488,7 +2488,7 @@ export class TelegramTransportAdapter
 			await this.sendWithDeadline(chatId, chunk);
 		const identity = fallbackIdentity
 			? `${fallbackIdentity} ${RENAME_NAME_FALLBACK}.`
-			: `${CREATE_NAME_FALLBACK}.`;
+			: CREATE_NAME_FALLBACK;
 		return this.promptForName(chatId, flow, `${identity} ${instructions}`);
 	}
 

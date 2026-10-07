@@ -2153,6 +2153,48 @@ describe("Telegram transport", () => {
 		if (previousSession) sessions.set("sid", previousSession);
 	});
 
+	it("rejects restarted text and media replies to the generated long-path create prompt", async () => {
+		const cwd = `/workspace/${"long".repeat(1100)}`;
+		const stateDirectory = await temp();
+		const fetchFile = stubFileDownload();
+		const firstBot = new MockBot();
+		const first = await startAdapter(firstBot, stateDirectory, {
+			initialCwd: cwd,
+		});
+		await firstBot.update(42, "/menu");
+		await firstBot.callback(42, "menu:new", firstBot.lastMessageId);
+		const promptId = firstBot.lastForceReplyMessageId;
+		const prompt = firstBot.sent.find(
+			({ message_id }) => message_id === promptId,
+		);
+		expect(cwd.length).toBeGreaterThan(4096);
+		expect(prompt?.text).toBe(
+			"Name this session (harnessd name prompt):\nThe exact folder is shown in the preceding messages. Reply with a name. Create unnamed and Cancel buttons are below.",
+		);
+		await first.adapter.stop();
+
+		const restartedBot = new MockBot();
+		const restarted = await startAdapter(restartedBot, stateDirectory);
+		await restartedBot.update(42, "stale text", {
+			replyToMessageId: promptId,
+			replyToMessageText: prompt?.text,
+		});
+		await restartedBot.updateDocument(42, {
+			replyToMessageId: promptId,
+			replyToMessageText: prompt?.text,
+		});
+		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+			false,
+		);
+		expect(fetchFile).not.toHaveBeenCalled();
+		expect(
+			restartedBot.sent.some(({ text }) =>
+				text.includes("name prompt has expired"),
+			),
+		).toBe(true);
+		await restarted.adapter.stop();
+	});
+
 	it.each([
 		{ label: "unnamed", name: undefined },
 		{ label: "named", name: "A named session" },
