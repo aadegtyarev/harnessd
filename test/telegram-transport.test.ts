@@ -4891,6 +4891,10 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, workspace);
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42);
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Папка вложений находится внутри рабочей папки сессии; вложение не сохранено.",
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("повтор");
 		expect(
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(0);
