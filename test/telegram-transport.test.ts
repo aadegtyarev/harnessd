@@ -5873,6 +5873,79 @@ describe("Telegram transport", () => {
 		expect(after.match(/^Обновлено: .*$/m)?.[0]).toBe(
 			before.match(/^Обновлено: .*$/m)?.[0],
 		);
+		const edits = bot.edited.length;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "worker-over-cap-duplicate",
+				summary: "subagent · worker · task",
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(bot.edited).toHaveLength(edits);
+		await adapter.stop();
+	});
+
+	it("advances activity time when thinking joins a queued child overflow warning", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `t${date.getTime()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track coalesced worker thinking");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
+		);
+		for (let index = 0; index < 256; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `thinking-cap-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 251"),
+		);
+		const beforeTime = bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "thinking-over-cap",
+				summary: "subagent · worker · task",
+			},
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thinking", active: true },
+		});
+		await vi.waitFor(() => {
+			const text = bot.edited.at(-1)?.text ?? "";
+			expect(text).toContain("Дополнительные операции не отслеживаются");
+			expect(text).toContain("• Думаю…");
+		});
+		const afterTime = bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
+		expect(afterTime).not.toBe(beforeTime);
 		await adapter.stop();
 	});
 

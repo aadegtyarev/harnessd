@@ -4100,10 +4100,7 @@ export class TelegramTransportAdapter
 		return activity;
 	}
 
-	private liveActivityText(
-		activity: LiveActivity,
-		preserveUpdatedAt = false,
-	): string {
+	private liveActivityModel(activity: LiveActivity): string {
 		const name = this.sessionNames.get(activity.sessionId);
 		const lines = [
 			`🔧 Pi activity · ${activitySessionLabel(activity.sessionId, name)}`,
@@ -4138,10 +4135,17 @@ export class TelegramTransportAdapter
 		lines.push(
 			`⏳ ${activity.status} · ${compactUsage(live?.usage)} · ${model} · ${effort}`,
 		);
-		const visibleModel = truncateActivityText(lines.join("\n"));
+		return truncateActivityText(lines.join("\n"));
+	}
+
+	private liveActivityText(
+		activity: LiveActivity,
+		preserveUpdatedAtFor?: string,
+	): string {
+		const visibleModel = this.liveActivityModel(activity);
 		if (activity.visibleModel !== visibleModel) {
 			activity.visibleModel = visibleModel;
-			if (!preserveUpdatedAt) {
+			if (visibleModel !== preserveUpdatedAtFor) {
 				const now = this.options.activityClock?.() ?? new Date();
 				activity.updatedAt = (
 					this.options.activityTimeFormatter ?? localActivityTime
@@ -4155,7 +4159,7 @@ export class TelegramTransportAdapter
 
 	private renderLiveActivity(
 		activity: LiveActivity,
-		preserveUpdatedAt = false,
+		preserveUpdatedAtFor?: string,
 	): void {
 		activity.renderQueue = activity.renderQueue
 			.then(async () => {
@@ -4167,7 +4171,7 @@ export class TelegramTransportAdapter
 					) !== activity
 				)
 					return;
-				const text = this.liveActivityText(activity, preserveUpdatedAt);
+				const text = this.liveActivityText(activity, preserveUpdatedAtFor);
 				if (activity.messageId === undefined) {
 					const sent = await this.telegramCall((signal) =>
 						this.bot.api.sendMessage(
@@ -5843,7 +5847,7 @@ export class TelegramTransportAdapter
 		}
 		if (activities.length === 0) return;
 		for (const activity of activities) {
-			let preserveUpdatedAt = false;
+			let preserveUpdatedAtFor: string | undefined;
 			switch (event.type) {
 				case "thinking":
 					if (activity.thinking === event.active) continue;
@@ -5865,7 +5869,7 @@ export class TelegramTransportAdapter
 							!overflowAlreadyVisible &&
 							activity.tools.some((row) => row.id === OVERFLOW_ID)
 						) {
-							preserveUpdatedAt = true;
+							preserveUpdatedAtFor = this.liveActivityModel(activity);
 							break;
 						}
 						continue;
@@ -5905,7 +5909,7 @@ export class TelegramTransportAdapter
 					}
 					break;
 			}
-			this.renderLiveActivity(activity, preserveUpdatedAt);
+			this.renderLiveActivity(activity, preserveUpdatedAtFor);
 		}
 	}
 
