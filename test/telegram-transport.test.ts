@@ -1779,6 +1779,110 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("does not dispatch resume when stop invalidates it while waiting for the inbox lock", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		let releaseLock!: () => void;
+		let announceLock!: () => void;
+		const lockStarted = new Promise<void>(
+			(resolve) => (announceLock = resolve),
+		);
+		const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const heldLock = inbox.withSessionLock("sid" as SessionId, async () => {
+			announceLock();
+			await lockGate;
+		});
+		await lockStarted;
+		const callback = bot.callback(42, action, bot.lastMessageId as number);
+		await vi.waitFor(() =>
+			expect(
+				requests.filter((request) => request.kind === "inspect"),
+			).toHaveLength(1),
+		);
+		await bot.update(42, "/stop sid");
+		releaseLock();
+		await Promise.all([heldLock, callback]);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		await bot.update(42, "still targets other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			sessionId: "other",
+		});
+		await adapter.stop();
+	});
+
+	it("does not dispatch resume if lifecycle state changes while waiting for the inbox lock", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		let releaseLock!: () => void;
+		let announceLock!: () => void;
+		const lockStarted = new Promise<void>(
+			(resolve) => (announceLock = resolve),
+		);
+		const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
+		const inbox = (
+			adapter as unknown as {
+				inbox: {
+					withSessionLock: (
+						id: SessionId,
+						fn: () => Promise<void>,
+					) => Promise<void>;
+				};
+			}
+		).inbox;
+		const heldLock = inbox.withSessionLock("sid" as SessionId, async () => {
+			announceLock();
+			await lockGate;
+		});
+		await lockStarted;
+		const callback = bot.callback(42, action, bot.lastMessageId as number);
+		await vi.waitFor(() =>
+			expect(
+				requests.filter((request) => request.kind === "inspect"),
+			).toHaveLength(1),
+		);
+		const current = sessions.get("sid");
+		if (!current) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...current, status: "running" });
+		releaseLock();
+		await Promise.all([heldLock, callback]);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		await bot.update(42, "still targets other");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			sessionId: "other",
+		});
+		await adapter.stop();
+	});
+
 	it("rejects a stopped-session resume action after the session state changes", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());

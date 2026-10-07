@@ -2797,13 +2797,22 @@ export class TelegramTransportAdapter
 		return false;
 	}
 
+	private withSessionRequestLock<T>(
+		sessionId: SessionId,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		return this.inbox
+			? this.inbox.withSessionLock(sessionId, operation)
+			: operation();
+	}
+
 	private request(
 		sender: number,
 		request: TelegramRequest,
 	): Promise<TransportResult> {
 		const operation = () => this.dispatchRequest(sender, request);
-		if (this.inbox && (request.kind === "resume" || request.kind === "submit"))
-			return this.inbox.withSessionLock(request.sessionId, operation);
+		if (request.kind === "resume" || request.kind === "submit")
+			return this.withSessionRequestLock(request.sessionId, operation);
 		return operation();
 	}
 
@@ -4622,10 +4631,36 @@ export class TelegramTransportAdapter
 				);
 				return;
 			}
-			const resumed = await this.request(sender, {
-				kind: "resume",
-				sessionId: intent.sessionId,
-			});
+			const resumed = await this.withSessionRequestLock(
+				intent.sessionId,
+				async () => {
+					if (!isCurrent()) return undefined;
+					const current = await this.dispatchRequest(sender, {
+						kind: "inspect",
+						sessionId: intent.sessionId,
+					});
+					if (
+						!isCurrent() ||
+						!current.ok ||
+						(current.value as SessionSummary).status !== "stopped"
+					)
+						return undefined;
+					if (!isCurrent()) return undefined;
+					return this.dispatchRequest(sender, {
+						kind: "resume",
+						sessionId: intent.sessionId,
+					});
+				},
+			);
+			if (!resumed) {
+				await this.sendDirect(
+					chatId,
+					isCurrent()
+						? "This session is no longer stopped. No action was taken; inspect /menu."
+						: "This action is stale; inspect the current session in /menu.",
+				);
+				return;
+			}
 			if (!resumed.ok) {
 				await this.sendDirect(
 					chatId,
