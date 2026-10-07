@@ -220,6 +220,22 @@ type TurnBuffer = {
 	characters: number;
 	overflow: boolean;
 };
+type FolderIntent = {
+	readonly chatId: number;
+	messageId: number;
+	readonly generation: number;
+	readonly parent: string;
+	readonly target: string;
+};
+type ConfirmationIntent = {
+	readonly chatId: number;
+	messageId: number;
+	readonly generation: number;
+	readonly invalidationEpoch: number;
+	readonly sessionId: SessionId;
+	readonly action: "stop" | "delete";
+	readonly expectedStatus: SessionSummary["status"];
+};
 type ActivityTool = {
 	readonly id: string;
 	readonly summary: string;
@@ -950,6 +966,11 @@ export class TelegramTransportAdapter
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
+	private readonly panelGenerations = new Map<number, number>();
+	private readonly folderIntents = new Map<string, FolderIntent>();
+	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
+	private readonly confirmationEpochs = new Map<SessionId, number>();
+	private readonly inFlightConfirmationRefs = new Map<SessionId, number>();
 	private readonly sessionPages = new Map<number, number>();
 	private readonly folderPages = new Map<number, number>();
 	private readonly modelPages = new Map<number, number>();
@@ -1165,17 +1186,46 @@ export class TelegramTransportAdapter
 	private async deleteSessionAndInbox(
 		sender: number,
 		sessionId: SessionId,
+		beforeDelete?: () => boolean,
 	): Promise<{
 		readonly result: TransportResult;
 		readonly cleanupPending: boolean;
+		readonly invalidated?: boolean;
 	}> {
 		const inbox = this.inbox;
-		if (!inbox)
+		if (!inbox) {
+			if (beforeDelete && !beforeDelete())
+				return {
+					result: {
+						requestId: randomUUID(),
+						ok: false,
+						error: {
+							code: "confirmation_expired",
+							message: "Confirmation expired.",
+						},
+					},
+					cleanupPending: false,
+					invalidated: true,
+				};
 			return {
 				result: await this.request(sender, { kind: "delete", sessionId }),
 				cleanupPending: false,
 			};
+		}
 		return inbox.withSessionLock(sessionId, async () => {
+			if (beforeDelete && !beforeDelete())
+				return {
+					result: {
+						requestId: randomUUID(),
+						ok: false,
+						error: {
+							code: "confirmation_expired",
+							message: "Confirmation expired.",
+						},
+					},
+					cleanupPending: false,
+					invalidated: true,
+				};
 			const result = await this.request(sender, { kind: "delete", sessionId });
 			if (!result.ok) return { result, cleanupPending: false };
 			try {
@@ -1923,6 +1973,7 @@ export class TelegramTransportAdapter
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "resume", sessionId });
 			if (result.ok) {
+				this.invalidateSessionConfirmations(sessionId);
 				this.rememberSession(result.value as SessionSummary);
 				await this.refreshExistingPanel(chatId, sender);
 			}
@@ -1953,6 +2004,7 @@ export class TelegramTransportAdapter
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "stop", sessionId });
+			if (result.ok) this.invalidateSessionConfirmations(sessionId);
 			let selectionCleared = true;
 			if (result.ok && this.selected.get(chatId) === sessionId) {
 				selectionCleared = await this.clearSelected(chatId);
@@ -2404,6 +2456,20 @@ export class TelegramTransportAdapter
 		replyMarkup: unknown,
 		messageId?: number,
 	): Promise<boolean> {
+		const generation = this.nextPanelGeneration(chatId);
+		this.panelGenerations.set(chatId, generation);
+		for (const [token, intent] of this.folderIntents)
+			if (intent.chatId === chatId && intent.generation !== generation)
+				this.folderIntents.delete(token);
+		const retiredSessions = new Set<SessionId>();
+		for (const [token, intent] of this.confirmationIntents) {
+			if (intent.chatId === chatId && intent.generation !== generation) {
+				retiredSessions.add(intent.sessionId);
+				this.confirmationIntents.delete(token);
+			}
+		}
+		for (const sessionId of retiredSessions)
+			this.retireConfirmationEpochIfUnused(sessionId);
 		const existing =
 			messageId ??
 			this.panelMessageIds.get(chatId) ??
@@ -2422,20 +2488,60 @@ export class TelegramTransportAdapter
 				await this.savePanelReference(chatId, existing);
 				return true;
 			}
-			if (!isMessageNotFound(edited.error)) return false;
+			if (!isMessageNotFound(edited.error)) {
+				this.dropPanelGenerationIntents(chatId, generation);
+				return false;
+			}
 		}
+		const intentGeneration = this.panelGenerations.get(chatId);
+		const hasBoundIntents =
+			[...this.folderIntents.values()].some(
+				(intent) =>
+					intent.chatId === chatId && intent.generation === intentGeneration,
+			) ||
+			[...this.confirmationIntents.values()].some(
+				(intent) =>
+					intent.chatId === chatId && intent.generation === intentGeneration,
+			);
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
 				text,
-				{ reply_markup: replyMarkup },
+				hasBoundIntents ? {} : { reply_markup: replyMarkup },
 				signal,
 			),
 		);
-		if (!sent.ok) return false;
+		if (!sent.ok) {
+			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			return false;
+		}
 		const createdMessageId = messageIdFrom(sent.value);
-		if (createdMessageId === undefined) return false;
+		if (createdMessageId === undefined) {
+			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			return false;
+		}
 		await this.savePanelReference(chatId, createdMessageId);
+		if (hasBoundIntents) {
+			for (const intent of this.folderIntents.values())
+				if (intent.chatId === chatId && intent.generation === intentGeneration)
+					intent.messageId = createdMessageId;
+			for (const intent of this.confirmationIntents.values())
+				if (intent.chatId === chatId && intent.generation === intentGeneration)
+					intent.messageId = createdMessageId;
+			const published = await this.telegramCall((signal) =>
+				this.bot.api.editMessageText(
+					chatId,
+					createdMessageId,
+					text,
+					{ reply_markup: replyMarkup },
+					signal,
+				),
+			);
+			if (!published.ok && !isMessageNotModified(published.error)) {
+				this.dropPanelGenerationIntents(chatId, intentGeneration);
+				return false;
+			}
+		}
 		const pinned = await this.telegramCall((signal) =>
 			this.bot.api.pinChatMessage(chatId, createdMessageId, {}, signal),
 		);
@@ -2450,6 +2556,70 @@ export class TelegramTransportAdapter
 			);
 		}
 		return true;
+	}
+
+	private dropPanelGenerationIntents(
+		chatId: number,
+		generation: number | undefined,
+	): void {
+		if (generation === undefined) return;
+		for (const [token, intent] of this.folderIntents)
+			if (intent.chatId === chatId && intent.generation === generation)
+				this.folderIntents.delete(token);
+		const affected = new Set<SessionId>();
+		for (const [token, intent] of this.confirmationIntents) {
+			if (intent.chatId === chatId && intent.generation === generation) {
+				affected.add(intent.sessionId);
+				this.confirmationIntents.delete(token);
+			}
+		}
+		for (const sessionId of affected)
+			this.retireConfirmationEpochIfUnused(sessionId);
+	}
+
+	private nextPanelGeneration(chatId: number): number {
+		return (this.panelGenerations.get(chatId) ?? 0) + 1;
+	}
+
+	private makeIntentToken(): string {
+		return randomUUID().replaceAll("-", "");
+	}
+
+	private invalidateChatConfirmations(chatId: number): void {
+		const affected = new Set<SessionId>();
+		for (const [token, intent] of this.confirmationIntents) {
+			if (intent.chatId === chatId) {
+				affected.add(intent.sessionId);
+				this.confirmationIntents.delete(token);
+			}
+		}
+		for (const sessionId of affected)
+			this.retireConfirmationEpochIfUnused(sessionId);
+	}
+
+	private invalidateSessionConfirmations(sessionId: SessionId): void {
+		this.confirmationEpochs.set(
+			sessionId,
+			(this.confirmationEpochs.get(sessionId) ?? 0) + 1,
+		);
+		for (const [token, intent] of this.confirmationIntents)
+			if (intent.sessionId === sessionId)
+				this.confirmationIntents.delete(token);
+		this.retireConfirmationEpochIfUnused(sessionId);
+	}
+
+	private retireConfirmationEpochIfUnused(sessionId: SessionId): void {
+		if (this.inFlightConfirmationRefs.has(sessionId)) return;
+		for (const intent of this.confirmationIntents.values())
+			if (intent.sessionId === sessionId) return;
+		this.confirmationEpochs.delete(sessionId);
+	}
+
+	private releaseInFlightConfirmation(sessionId: SessionId): void {
+		const remaining = (this.inFlightConfirmationRefs.get(sessionId) ?? 1) - 1;
+		if (remaining > 0) this.inFlightConfirmationRefs.set(sessionId, remaining);
+		else this.inFlightConfirmationRefs.delete(sessionId);
+		this.retireConfirmationEpochIfUnused(sessionId);
 	}
 
 	private async savePanelReference(
@@ -2537,8 +2707,8 @@ export class TelegramTransportAdapter
 				data.slice(12),
 				messageId,
 			);
-		if (data.startsWith("folder:open:"))
-			return this.openFolder(chatId, sender, data.slice(12), messageId);
+		if (data.startsWith("folder:") && data.length === 39)
+			return this.openFolder(chatId, sender, data.slice(7), messageId);
 		if (data.startsWith("sessions:page:"))
 			return this.setPageAndRender(
 				chatId,
@@ -2589,20 +2759,17 @@ export class TelegramTransportAdapter
 				? this.confirmSessionAction(chatId, sender, "delete", id, messageId)
 				: this.showStaleCallback(chatId, messageId);
 		}
-		if (data.startsWith("action:confirm-stop:")) {
-			const id = this.sessionCallbackId(data.slice(20));
-			return id
-				? this.performSessionAction(chatId, sender, "stop", id, messageId)
-				: this.showStaleCallback(chatId, messageId);
-		}
-		if (data.startsWith("action:confirm-delete:")) {
-			const id = this.sessionCallbackId(data.slice(22));
-			return id
-				? this.performSessionAction(chatId, sender, "delete", id, messageId)
-				: this.showStaleCallback(chatId, messageId);
-		}
-		if (data === "action:cancel")
+		if (data.startsWith("action:confirm:"))
+			return this.performSessionAction(
+				chatId,
+				sender,
+				data.slice(15),
+				messageId,
+			);
+		if (data === "action:cancel") {
+			this.invalidateChatConfirmations(chatId);
 			return this.renderSessions(chatId, sender, messageId);
+		}
 		if (data === "menu:models")
 			return this.renderModels(chatId, sender, messageId);
 		if (data.startsWith("models:page:"))
@@ -2643,8 +2810,8 @@ export class TelegramTransportAdapter
 	): Promise<void> {
 		await this.updatePanel(
 			chatId,
-			"Это действие устарело. Откройте /menu и выберите ещё раз.",
-			keyboard([[inlineButton("В меню", "menu:home")]]),
+			"Это действие устарело и не выполнено. Обновите панель и выберите действие ещё раз.",
+			keyboard([[inlineButton("Обновить панель", "menu:home")]]),
 			messageId,
 		);
 	}
@@ -3383,12 +3550,20 @@ export class TelegramTransportAdapter
 			);
 			this.folderPages.set(chatId, page);
 			const visible = folders.slice(page * pageSize, (page + 1) * pageSize);
-			const rows: InlineButton[][] = visible.map(({ entry, index }) => [
-				inlineButton(
-					`📁 ${buttonLabel(entry.name, 48)}/`,
-					`folder:open:${index}`,
-				),
-			]);
+			const generation = this.nextPanelGeneration(chatId);
+			const rows: InlineButton[][] = visible.map(({ entry }) => {
+				const token = this.makeIntentToken();
+				this.folderIntents.set(token, {
+					chatId,
+					messageId,
+					generation,
+					parent: listing.cwd,
+					target: path.join(listing.cwd, entry.name),
+				});
+				return [
+					inlineButton(`📁 ${buttonLabel(entry.name, 48)}/`, `folder:${token}`),
+				];
+			});
 			rows.push([
 				inlineButton("Наверх", "folder:parent"),
 				inlineButton("Создать здесь", "folder:new"),
@@ -3439,26 +3614,28 @@ export class TelegramTransportAdapter
 	private async openFolder(
 		chatId: number,
 		sender: number,
-		rawIndex: string,
+		token: string,
 		messageId: number,
 	): Promise<void> {
-		const index = Number(rawIndex);
-		if (!Number.isSafeInteger(index) || index < 0)
-			return this.renderFolders(chatId, sender, messageId);
-		const directory =
-			this.currentDirectories.get(chatId) ?? this.options.initialCwd;
+		const intent = this.folderIntents.get(token);
+		if (
+			!intent ||
+			intent.chatId !== chatId ||
+			intent.messageId !== messageId ||
+			intent.generation !== this.panelGenerations.get(chatId) ||
+			intent.parent !==
+				(this.currentDirectories.get(chatId) ?? this.options.initialCwd)
+		)
+			return this.showStaleCallback(chatId, messageId);
+		this.folderIntents.delete(token);
 		try {
-			const listing = await listDirectoryEntries(directory);
-			const entry = listing.entries[index];
-			if (entry?.kind !== "directory")
-				return this.renderFolders(chatId, sender, messageId);
 			this.currentDirectories.set(
 				chatId,
-				await resolveExistingDirectory(path.join(listing.cwd, entry.name)),
+				await resolveExistingDirectory(intent.target),
 			);
 			this.folderPages.set(chatId, 0);
 		} catch {
-			return this.renderFolders(chatId, sender, messageId);
+			return this.showStaleCallback(chatId, messageId);
 		}
 		await this.renderFolders(chatId, sender, messageId);
 	}
@@ -3666,7 +3843,10 @@ export class TelegramTransportAdapter
 	): Promise<void> {
 		const result = await this.request(sender, { kind: "resume", sessionId });
 		if (!result.ok) await this.sendDirect(chatId, result.error.message);
-		else this.rememberSession(result.value as SessionSummary);
+		else {
+			this.invalidateSessionConfirmations(sessionId);
+			this.rememberSession(result.value as SessionSummary);
+		}
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
@@ -3720,16 +3900,24 @@ export class TelegramTransportAdapter
 			action === "stop"
 				? `Остановить ${sessionLabel(session)}?`
 				: `Удалить запись ${sessionLabel(session)}? Будут удалены запись harnessd и полученные вложения во входящих; файлы в рабочей папке и файлы Pi останутся.`;
-		const confirmData =
-			action === "stop"
-				? `action:confirm-stop:${sessionId}`
-				: `action:confirm-delete:${sessionId}`;
+		this.invalidateChatConfirmations(chatId);
+		const token = this.makeIntentToken();
+		const generation = this.nextPanelGeneration(chatId);
+		this.confirmationIntents.set(token, {
+			chatId,
+			messageId,
+			generation,
+			invalidationEpoch: this.confirmationEpochs.get(sessionId) ?? 0,
+			sessionId,
+			action,
+			expectedStatus: session.status,
+		});
 		await this.updatePanel(
 			chatId,
 			prompt,
 			keyboard([
 				[
-					inlineButton("Подтвердить", confirmData),
+					inlineButton("Подтвердить", `action:confirm:${token}`),
 					inlineButton("Отмена", "action:cancel"),
 				],
 			]),
@@ -3740,52 +3928,95 @@ export class TelegramTransportAdapter
 	private async performSessionAction(
 		chatId: number,
 		sender: number,
-		action: "stop" | "delete",
-		sessionId: SessionId,
+		token: string,
 		messageId: number,
 	): Promise<void> {
-		const { result, cleanupPending } =
-			action === "delete"
-				? await this.deleteSessionAndInbox(sender, sessionId)
-				: {
-						result: await this.request(sender, {
-							kind: action,
-							sessionId,
-						} as TelegramRequest),
-						cleanupPending: false,
-					};
-		if (!result.ok) {
-			await this.sendDirect(chatId, result.error.message);
-			return this.renderPanel(chatId, sender, messageId);
-		}
-		let selectionPersistenceWarning = false;
-		if (action === "stop") {
-			if (this.selected.get(chatId) === sessionId) {
-				selectionPersistenceWarning = !(await this.clearSelected(chatId));
-				this.previews.delete(chatId);
+		const intent = this.confirmationIntents.get(token);
+		if (
+			!intent ||
+			intent.chatId !== chatId ||
+			intent.messageId !== messageId ||
+			intent.generation !== this.panelGenerations.get(chatId)
+		)
+			return this.showStaleCallback(chatId, messageId);
+		const { action, sessionId } = intent;
+		this.inFlightConfirmationRefs.set(
+			sessionId,
+			(this.inFlightConfirmationRefs.get(sessionId) ?? 0) + 1,
+		);
+		this.confirmationIntents.delete(token);
+		try {
+			const inspected = await this.request(sender, {
+				kind: "inspect",
+				sessionId,
+			});
+			if (!inspected.ok) {
+				await this.sendDirect(chatId, inspected.error.message);
+				return this.renderSessions(chatId, sender, messageId);
 			}
-		} else {
-			this.invalidateSession(sessionId);
-			if (cleanupPending)
-				await this.sendDirect(
-					chatId,
-					"Session deleted; inbox cleanup is pending.",
-				);
-			for (const [selectedChat, selectedId] of this.selected) {
-				if (selectedId === sessionId) {
-					selectionPersistenceWarning =
-						!(await this.clearSelected(selectedChat)) ||
-						selectionPersistenceWarning;
-					this.previews.delete(selectedChat);
+			const current = inspected.value as SessionSummary;
+			this.rememberSession(current);
+			const stillValid = () =>
+				(this.confirmationEpochs.get(sessionId) ?? 0) ===
+				intent.invalidationEpoch;
+			if (current.status !== intent.expectedStatus || !stillValid())
+				return this.showStaleCallback(chatId, messageId);
+			const { result, cleanupPending, invalidated } =
+				action === "delete"
+					? await this.deleteSessionAndInbox(sender, sessionId, stillValid)
+					: {
+							result: stillValid()
+								? await this.request(sender, {
+										kind: action,
+										sessionId,
+									} as TelegramRequest)
+								: {
+										requestId: randomUUID(),
+										ok: false as const,
+										error: {
+											code: "confirmation_expired",
+											message: "Confirmation expired.",
+										},
+									},
+							cleanupPending: false,
+						};
+			if (invalidated) return this.showStaleCallback(chatId, messageId);
+			if (!result.ok) {
+				await this.sendDirect(chatId, result.error.message);
+				return this.renderPanel(chatId, sender, messageId);
+			}
+			let selectionPersistenceWarning = false;
+			this.invalidateSessionConfirmations(sessionId);
+			if (action === "stop") {
+				if (this.selected.get(chatId) === sessionId) {
+					selectionPersistenceWarning = !(await this.clearSelected(chatId));
+					this.previews.delete(chatId);
+				}
+			} else {
+				this.invalidateSession(sessionId);
+				if (cleanupPending)
+					await this.sendDirect(
+						chatId,
+						"Session deleted; inbox cleanup is pending.",
+					);
+				for (const [selectedChat, selectedId] of this.selected) {
+					if (selectedId === sessionId) {
+						selectionPersistenceWarning =
+							!(await this.clearSelected(selectedChat)) ||
+							selectionPersistenceWarning;
+						this.previews.delete(selectedChat);
+					}
 				}
 			}
+			if (selectionPersistenceWarning)
+				await this.sendDirect(
+					chatId,
+					"The session action succeeded, but a saved chat selection could not be cleared and may return after restart.",
+				);
+			await this.renderPanel(chatId, sender, messageId);
+		} finally {
+			this.releaseInFlightConfirmation(sessionId);
 		}
-		if (selectionPersistenceWarning)
-			await this.sendDirect(
-				chatId,
-				"The session action succeeded, but a saved chat selection could not be cleared and may return after restart.",
-			);
-		await this.renderPanel(chatId, sender, messageId);
 	}
 
 	private async sendDirectHtml(chatId: number, text: string): Promise<void> {
@@ -3847,10 +4078,12 @@ export class TelegramTransportAdapter
 				event.text === "harness_recovered" ||
 				event.text === "harness_recovery_failed"
 			) {
+				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
 			}
 			if (event.text === "agent_start") {
+				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.add(event.sessionId);
 				this.startTyping(event.sessionId);
 				this.turnBuffers.set(event.sessionId, {
@@ -3868,6 +4101,7 @@ export class TelegramTransportAdapter
 			}
 			if (event.text === "agent_end") return;
 			if (event.text === "agent_settled") {
+				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
 				this.flushTurn(event.sessionId);

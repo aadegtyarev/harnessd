@@ -535,6 +535,19 @@ async function startAdapter(
 	};
 }
 
+function callbackData(options: unknown, prefix: string): string {
+	const markup = options as {
+		reply_markup?: {
+			inline_keyboard?: readonly (readonly { callback_data?: string }[])[];
+		};
+	};
+	const found = markup.reply_markup?.inline_keyboard
+		?.flat()
+		.find((button) => button.callback_data?.startsWith(prefix))?.callback_data;
+	if (!found) throw new Error(`Missing callback data with prefix ${prefix}`);
+	return found;
+}
+
 describe("Telegram transport", () => {
 	it("shows session name and full identity with Pi-reported context in status", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Focused task" }));
@@ -1208,13 +1221,21 @@ describe("Telegram transport", () => {
 		});
 		await bot.callback(42, "session:stop:other", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Остановить #other?");
-		await bot.callback(42, "action:confirm-stop:other", panelMessageId);
+		const stopConfirm = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, stopConfirm, panelMessageId);
 		expect(
 			requests.findLast((request) => request.kind === "stop"),
 		).toMatchObject({ kind: "stop", sessionId: "other" });
 		await bot.callback(42, "session:delete:other", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Удалить запись #other?");
-		await bot.callback(42, "action:confirm-delete:other", panelMessageId);
+		const deleteConfirm = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, deleteConfirm, panelMessageId);
 		expect(
 			requests.findLast((request) => request.kind === "delete"),
 		).toMatchObject({
@@ -1350,8 +1371,14 @@ describe("Telegram transport", () => {
 		const panelMessageId = bot.lastMessageId;
 		await bot.callback(42, "menu:folders", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain(directory);
-		await bot.callback(42, "folder:open:0", panelMessageId);
+		const folderCallback = callbackData(bot.edited.at(-1)?.options, "folder:");
+		expect(folderCallback.length).toBeLessThanOrEqual(64);
+		await mkdir(path.join(directory, "a inserted later"));
+		await bot.callback(42, folderCallback, panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain(childDirectory);
+		await bot.callback(42, folderCallback, panelMessageId);
+		expect(bot.edited.at(-1)?.text).toContain("действие устарело");
+		expect(bot.edited.at(-1)?.text).not.toContain("Папки\n");
 		await bot.update(42, "/inspect");
 		expect(requests.at(-1)).toMatchObject({
 			kind: "inspect",
@@ -1395,6 +1422,29 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("invalidates stop confirmation across stop and resume", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:sessions", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:stop:sid", panelMessageId);
+		const confirm = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.update(42, "/stop sid");
+		await bot.update(42, "/resume sid");
+		const stopsBeforeStaleTap = requests.filter(
+			(request) => request.kind === "stop",
+		).length;
+		await bot.callback(42, confirm, panelMessageId);
+		expect(requests.filter((request) => request.kind === "stop")).toHaveLength(
+			stopsBeforeStaleTap,
+		);
+		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		await adapter.stop();
+	});
+
 	it("requires confirmation before callback stop and delete operations", async () => {
 		const bot = new MockBot();
 		const { adapter, requests, emit } = await startAdapter(bot, await temp());
@@ -1416,14 +1466,125 @@ describe("Telegram transport", () => {
 		);
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
 		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
-		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		const canceledToken = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, "action:cancel", panelMessageId);
+		await bot.callback(42, canceledToken, panelMessageId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:delete:sid", panelMessageId);
+		const deleteToken = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(43, deleteToken, panelMessageId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await bot.callback(42, deleteToken, panelMessageId);
 		expect(clearIntervalSpy).toHaveBeenCalled();
 		clearIntervalSpy.mockRestore();
 		expect(requests.some((request) => request.kind === "delete")).toBe(true);
 		const requestsAfterDelete = requests.length;
-		await bot.callback(42, "action:confirm-delete:sid", panelMessageId);
+		await bot.callback(42, deleteToken, panelMessageId);
 		await bot.callback(42, "session:details:sid", panelMessageId);
 		expect(requests).toHaveLength(requestsAfterDelete);
+		await adapter.stop();
+	});
+
+	it("does not dispatch a stop when a lifecycle event invalidates an in-flight confirmation", async () => {
+		const bot = new MockBot();
+		let deferInspect = false;
+		let releaseInspect!: () => void;
+		let inspectStarted!: () => void;
+		const started = new Promise<void>((resolve) => (inspectStarted = resolve));
+		const gate = new Promise<void>((resolve) => (releaseInspect = resolve));
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (deferInspect && request.kind === "inspect") {
+					inspectStarted();
+					await gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:sessions", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:stop:sid", panelMessageId);
+		const token = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		deferInspect = true;
+		const confirmation = bot.callback(42, token, panelMessageId);
+		await started;
+		expect(
+			(
+				adapter as unknown as {
+					inFlightConfirmationRefs: Map<SessionId, number>;
+				}
+			).inFlightConfirmationRefs.get("sid" as SessionId),
+		).toBe(1);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		expect(
+			(
+				adapter as unknown as { confirmationEpochs: Map<SessionId, number> }
+			).confirmationEpochs.has("sid" as SessionId),
+		).toBe(true);
+		releaseInspect();
+		await confirmation;
+		expect(requests.some((request) => request.kind === "stop")).toBe(false);
+		expect(
+			(
+				adapter as unknown as { confirmationEpochs: Map<SessionId, number> }
+			).confirmationEpochs.has("sid" as SessionId),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("does not dispatch delete when lifecycle invalidates an in-flight confirmation", async () => {
+		const bot = new MockBot();
+		let deferInspect = false;
+		let releaseInspect!: () => void;
+		let inspectStarted!: () => void;
+		const started = new Promise<void>((resolve) => (inspectStarted = resolve));
+		const gate = new Promise<void>((resolve) => (releaseInspect = resolve));
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (deferInspect && request.kind === "inspect") {
+					inspectStarted();
+					await gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:sessions", panelMessageId);
+		await bot.callback(42, "session:details:sid", panelMessageId);
+		await bot.callback(42, "session:delete:sid", panelMessageId);
+		const token = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		deferInspect = true;
+		const confirmation = bot.callback(42, token, panelMessageId);
+		await started;
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		releaseInspect();
+		await confirmation;
+		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await adapter.stop();
+	});
+
+	it("retires epochs for lifecycle churn without confirmation references", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		for (let index = 0; index < 100; index++) {
+			emit(harnessEvent(`churn-${index}`, "status", "agent_start"));
+			emit(harnessEvent(`churn-${index}`, "status", "agent_settled"));
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(
+			(adapter as unknown as { confirmationEpochs: Map<SessionId, number> })
+				.confirmationEpochs.size,
+		).toBe(0);
 		await adapter.stop();
 	});
 
@@ -1448,6 +1609,120 @@ describe("Telegram transport", () => {
 		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(2);
 		await bot.update(42, "/sessions");
 		expect(bot.sent.at(-1)?.text).toContain("#sid");
+		await adapter.stop();
+	});
+
+	it("rebinds folder intents before publishing a replacement panel keyboard", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/menu");
+		const originalId = bot.lastMessageId;
+		await bot.callback(42, "menu:folders", originalId);
+		const staleFolder = callbackData(bot.edited.at(-1)?.options, "folder:");
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("edit target gone"), {
+				description: "Bad Request: message to edit not found",
+			}),
+		);
+		await bot.callback(42, "menu:folders", originalId);
+		const replacementId = bot.lastMessageId;
+		const replacementToken = callbackData(
+			bot.edited.at(-1)?.options,
+			"folder:",
+		);
+		expect(replacementId).not.toBe(originalId);
+		expect(bot.sendOptions.at(-1)).not.toHaveProperty("reply_markup");
+		await bot.callback(42, replacementToken, replacementId);
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await bot.callback(42, staleFolder, originalId);
+		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		await adapter.stop();
+	});
+
+	it("keeps a replacement panel reference when keyboard publication fails", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/menu");
+		const originalId = bot.lastMessageId;
+		bot.api.editMessageText
+			.mockRejectedValueOnce(
+				Object.assign(new Error("edit target gone"), {
+					description: "Bad Request: message to edit not found",
+				}),
+			)
+			.mockRejectedValueOnce(new Error("keyboard publication timed out"));
+		await bot.callback(42, "menu:folders", originalId);
+		const replacementId = bot.lastMessageId;
+		const sendsAfterReplacement = bot.api.sendMessage.mock.calls.length;
+		expect(replacementId).not.toBe(originalId);
+		const publicationAttempt = bot.api.editMessageText.mock.calls.find(
+			([, messageId]) => messageId === replacementId,
+		);
+		expect(publicationAttempt).toBeDefined();
+		const unpublishedFolderToken = callbackData(
+			publicationAttempt?.[3],
+			"folder:",
+		);
+		await bot.update(42, "/menu");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
+		expect(bot.api.editMessageText).toHaveBeenLastCalledWith(
+			42,
+			replacementId,
+			expect.any(String),
+			expect.any(Object),
+			expect.any(AbortSignal),
+		);
+
+		await bot.callback(42, unpublishedFolderToken, replacementId);
+		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
+		await adapter.stop();
+	});
+
+	it("rebinds confirmation intents to a replacement panel before keyboard publication", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const originalId = bot.lastMessageId;
+		await bot.callback(42, "menu:sessions", originalId);
+		await bot.callback(42, "session:details:sid", originalId);
+		await bot.callback(42, "session:delete:sid", originalId);
+		const staleConfirmation = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		await bot.callback(42, "action:cancel", originalId);
+		await bot.callback(42, "session:details:sid", originalId);
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("edit target gone"), {
+				description: "Bad Request: message to edit not found",
+			}),
+		);
+		await bot.callback(42, "session:delete:sid", originalId);
+		const replacementId = bot.lastMessageId;
+		const replacementToken = callbackData(
+			bot.edited.at(-1)?.options,
+			"action:confirm:",
+		);
+		expect(replacementId).not.toBe(originalId);
+		expect(bot.sendOptions.at(-1)).not.toHaveProperty("reply_markup");
+		await bot.callback(42, replacementToken, replacementId);
+		expect(requests.some((request) => request.kind === "delete")).toBe(true);
+		const actions = requests.filter(
+			(request) => request.kind === "delete",
+		).length;
+		await bot.callback(42, staleConfirmation, originalId);
+		expect(
+			requests.filter((request) => request.kind === "delete"),
+		).toHaveLength(actions);
 		await adapter.stop();
 	});
 
