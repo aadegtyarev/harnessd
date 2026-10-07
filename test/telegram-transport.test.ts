@@ -579,6 +579,8 @@ async function startAdapter(
 		onFatal?: () => void;
 		initialCwd?: string;
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
+		activityClock?: () => Date;
+		activityTimeFormatter?: (date: Date) => string;
 	} = {},
 ) {
 	let listener: ((event: HarnessEvent) => unknown) | undefined;
@@ -960,6 +962,64 @@ describe("Telegram transport", () => {
 		);
 		expect(answer?.text).toContain("All checks passed.");
 		expect(answer?.text).not.toContain("Pi activity");
+		await adapter.stop();
+	});
+
+	it("updates the local activity timestamp only for semantic tool-state changes", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `12:00:0${date.getSeconds()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track activity time");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Обновлено: 12:00:00"),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "opaque",
+				summary: "bash: test",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Обновлено: 12:00:01"),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const changedTimestamp = bot.edited
+			.at(-1)
+			?.text?.match(/Обновлено: (\d{2}:\d{2}:\d{2})/)?.[1];
+		expect(changedTimestamp).toBeDefined();
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "opaque",
+				summary: "bash: test",
+			},
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "tool_end", toolCallId: "missing", failed: false },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "tool_end", toolCallId: "opaque", failed: false },
+		});
+		await vi.waitFor(() => {
+			const terminalTimestamp = bot.edited
+				.at(-1)
+				?.text?.match(/Обновлено: (\d{2}:\d{2}:\d{2})/)?.[1];
+			expect(terminalTimestamp).not.toBe(changedTimestamp);
+		});
 		await adapter.stop();
 	});
 
@@ -5702,10 +5762,12 @@ describe("Telegram transport", () => {
 			expect(bot.edited.at(-1)?.text).toContain("Задача Scout: выполняется"),
 		);
 		emit(harnessEvent("sid", "status", "agent_start"));
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Pi выполняет ход сессии"),
-		);
-		expect(bot.edited.at(-1)?.text).not.toContain("Задача Scout: выполняется");
+		await vi.waitFor(() => {
+			expect(bot.edited.at(-1)?.text).toContain("Pi выполняет ход сессии");
+			expect(bot.edited.at(-1)?.text).not.toContain(
+				"Задача Scout: выполняется",
+			);
+		});
 		await adapter.stop();
 	});
 
