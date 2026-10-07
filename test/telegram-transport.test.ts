@@ -1517,10 +1517,27 @@ describe("Telegram transport", () => {
 		deferInspect = true;
 		const confirmation = bot.callback(42, token, panelMessageId);
 		await started;
+		expect(
+			(
+				adapter as unknown as {
+					inFlightConfirmationRefs: Map<SessionId, number>;
+				}
+			).inFlightConfirmationRefs.get("sid" as SessionId),
+		).toBe(1);
 		emit(harnessEvent("sid", "status", "agent_start"));
+		expect(
+			(
+				adapter as unknown as { confirmationEpochs: Map<SessionId, number> }
+			).confirmationEpochs.has("sid" as SessionId),
+		).toBe(true);
 		releaseInspect();
 		await confirmation;
 		expect(requests.some((request) => request.kind === "stop")).toBe(false);
+		expect(
+			(
+				adapter as unknown as { confirmationEpochs: Map<SessionId, number> }
+			).confirmationEpochs.has("sid" as SessionId),
+		).toBe(false);
 		await adapter.stop();
 	});
 
@@ -1553,6 +1570,21 @@ describe("Telegram transport", () => {
 		releaseInspect();
 		await confirmation;
 		expect(requests.some((request) => request.kind === "delete")).toBe(false);
+		await adapter.stop();
+	});
+
+	it("retires epochs for lifecycle churn without confirmation references", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		for (let index = 0; index < 100; index++) {
+			emit(harnessEvent(`churn-${index}`, "status", "agent_start"));
+			emit(harnessEvent(`churn-${index}`, "status", "agent_settled"));
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(
+			(adapter as unknown as { confirmationEpochs: Map<SessionId, number> })
+				.confirmationEpochs.size,
+		).toBe(0);
 		await adapter.stop();
 	});
 
@@ -1608,6 +1640,34 @@ describe("Telegram transport", () => {
 		expect(bot.edited.at(-1)?.text).toContain("Папки");
 		await bot.callback(42, staleFolder, originalId);
 		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		await adapter.stop();
+	});
+
+	it("keeps a replacement panel reference when keyboard publication fails", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const originalId = bot.lastMessageId;
+		bot.api.editMessageText
+			.mockRejectedValueOnce(
+				Object.assign(new Error("edit target gone"), {
+					description: "Bad Request: message to edit not found",
+				}),
+			)
+			.mockRejectedValueOnce(new Error("keyboard publication timed out"));
+		await bot.callback(42, "menu:folders", originalId);
+		const replacementId = bot.lastMessageId;
+		const sendsAfterReplacement = bot.api.sendMessage.mock.calls.length;
+		expect(replacementId).not.toBe(originalId);
+		await bot.update(42, "/menu");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
+		expect(bot.api.editMessageText).toHaveBeenLastCalledWith(
+			42,
+			replacementId,
+			expect.any(String),
+			expect.any(Object),
+			expect.any(AbortSignal),
+		);
 		await adapter.stop();
 	});
 
