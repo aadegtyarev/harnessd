@@ -5056,6 +5056,194 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("redacts streamed subagent envelopes and coalesces identical activity status", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "run subagent work");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const bubbleId = bot.lastMessageId;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const widget = `Pi: PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+			kind: "pi-subagents.async-status-snapshot",
+			runs: [
+				{
+					kind: "subagent",
+					label: "scout",
+					state: "running",
+					id: "SENTINEL_PAYLOAD_ID",
+				},
+			],
+			generatedAt: "SENTINEL_TIMESTAMP",
+		})}`;
+		const fencedWidget =
+			'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[],"id":"fenced-example"}';
+		emit(harnessEvent("sid", "output", "```json"));
+		emit(harnessEvent("sid", "output", "\n"));
+		emit(harnessEvent("sid", "output", fencedWidget));
+		emit(harnessEvent("sid", "output", "\n```"));
+		emit(harnessEvent("sid", "output", "\n"));
+		emit(harnessEvent("sid", "output", widget.slice(0, 24)));
+		emit(harnessEvent("sid", "output", widget.slice(24)));
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) =>
+					text.includes("Задача Scout: выполняется"),
+				),
+			).toBe(true),
+		);
+		emit(
+			harnessEvent("sid", "output", "\nVisible answer.\n\nNext paragraph.\n"),
+		);
+		for (let index = 0; index < 100; index++)
+			emit(harnessEvent("sid", "output", `${widget}\n`));
+		const paddedEnvelope = `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+			kind: "pi-subagents.async-status-snapshot",
+			runs: [{ kind: "subagent", label: "scout", state: "running" }],
+			ignored: "x".repeat(33_000),
+			id: "WHITESPACE_SENTINEL",
+		})}`;
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				`${" ".repeat(129)}Pi: ${paddedEnvelope}\\n`,
+			),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Visible answer.")),
+			).toBe(true),
+		);
+		const payloads = [
+			...bot.api.sendMessage.mock.calls.map(([, text]) => String(text)),
+			...bot.api.editMessageText.mock.calls.map(([, , text]) => String(text)),
+		];
+		expect(payloads.join("\n")).not.toContain("SENTINEL_PAYLOAD_ID");
+		expect(payloads.join("\n")).not.toContain("SENTINEL_TIMESTAMP");
+		expect(payloads.join("\n")).not.toContain("WHITESPACE_SENTINEL");
+		expect(payloads.join("\n")).not.toContain("Additional output omitted");
+		expect(bot.sent.some(({ text }) => text.includes("fenced-example"))).toBe(
+			true,
+		);
+		expect(
+			bot.api.editMessageText.mock.calls.filter(
+				([, messageId]) => messageId === bubbleId,
+			).length,
+		).toBeLessThan(10);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Visible answer.\n\nNext paragraph."),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("resets subagent status at each new agent run", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track status");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"scout","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Scout: выполняется"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Pi выполняет ход сессии"),
+		);
+		expect(bot.edited.at(-1)?.text).not.toContain("Задача Scout: выполняется");
+		await adapter.stop();
+	});
+
+	it("redacts subagent status notifications into the attributed bubble only", async () => {
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "attribute notification");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const bubbleId = bot.lastMessageId;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const secret = "NOTIFICATION_SENTINEL_9274";
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: `Pi: PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+					kind: "pi-subagents.async-status-snapshot",
+					runs: [
+						{ kind: "subagent", label: "worker", state: "queued", id: secret },
+					],
+				})}`,
+			},
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("Задача Worker: ожидает")),
+			).toBe(true),
+		);
+		const payloads = [
+			...bot.api.sendMessage.mock.calls.map(([, text]) => String(text)),
+			...bot.api.editMessageText.mock.calls.map(([, , text]) => String(text)),
+		];
+		expect(payloads.join("\n")).not.toContain(secret);
+		expect(log.mock.calls.flat().join(" ")).not.toContain(secret);
+		expect(
+			bot.api.sendMessage.mock.calls.some(([, text]) =>
+				String(text).startsWith("Pi: "),
+			),
+		).toBe(false);
+		expect(
+			bot.api.editMessageText.mock.calls.some(([, id]) => id !== bubbleId),
+		).toBe(false);
+		await adapter.stop();
+		log.mockRestore();
+	});
+
+	it("hides an un-attributed status notification without creating a message or bubble", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const sends = bot.api.sendMessage.mock.calls.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: 'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"scout","state":"running","id":"BACKGROUND_SENTINEL"}]}',
+			},
+		});
+		expect(bot.api.sendMessage.mock.calls).toHaveLength(sends);
+		expect(bot.api.editMessageText).not.toHaveBeenCalled();
+		expect(
+			bot.sent.some(({ text }) => text.includes("BACKGROUND_SENTINEL")),
+		).toBe(false);
+		await adapter.stop();
+	});
+
 	it("does not send a Telegram answer when a turn contains only an internal widget", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
@@ -5069,6 +5257,7 @@ describe("Telegram transport", () => {
 				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot"}',
 			),
 		);
+		emit(harnessEvent("sid", "output", "   \n"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(bot.sent).toHaveLength(messagesBeforeTurn);
@@ -5087,6 +5276,27 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(bot.sent).toHaveLength(messagesBeforeTurn);
+		await adapter.stop();
+	});
+
+	it("reports overflow when padded prose diverges from a streamed widget prefix", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", " ".repeat(33_000)));
+		emit(harnessEvent("sid", "output", "P"));
+		emit(harnessEvent("sid", "output", "rose\nVisible\n"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes(
+						"Additional output omitted because the response reached the queue limit",
+					),
+				),
+			).toHaveLength(1),
+		);
 		await adapter.stop();
 	});
 
