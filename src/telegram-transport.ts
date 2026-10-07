@@ -85,6 +85,29 @@ const CREATE_NAME_FALLBACK = "Точная папка указана в пред
 const RENAME_NAME_FALLBACK = "в точной папке из предыдущих сообщений";
 const RENAME_NAME_PREFIX = "Переименовать ";
 const RENAME_NAME_SEPARATOR = " in ";
+const NAME_PROMPT_COPY_VARIANTS = [
+	{
+		marker: NAME_PROMPT_MARKER,
+		createInstructions: CREATE_NAME_INSTRUCTIONS,
+		createPrefix: CREATE_NAME_PREFIX,
+		createFallback: CREATE_NAME_FALLBACK,
+		renameInstructions: RENAME_NAME_INSTRUCTIONS,
+		renameFallback: RENAME_NAME_FALLBACK,
+		renamePrefix: RENAME_NAME_PREFIX,
+		renameSeparator: RENAME_NAME_SEPARATOR,
+	},
+	{
+		marker: "Name this session (harnessd name prompt):",
+		createInstructions:
+			"Reply with a name. Create unnamed and Cancel buttons are below.",
+		createPrefix: "New session will be created in ",
+		createFallback: "The exact folder is shown in the preceding messages.",
+		renameInstructions: "Reply with a name; use Cancel below.",
+		renameFallback: "in the exact folder shown in the preceding messages",
+		renamePrefix: "Rename ",
+		renameSeparator: " in ",
+	},
+] as const;
 const MAX_CORRELATED_MESSAGES_PER_CHAT = 128;
 const MAX_INPUT_ATTRIBUTIONS = 512;
 type UpdateContext = {
@@ -799,35 +822,32 @@ function hasRenamePromptIdentity(identity: string): boolean {
 	const [, label, sessionId] = match;
 	return label === `#${sessionId}` || label.endsWith(` · #${sessionId}`);
 }
-function hasGeneratedNamePromptBody(body: string): boolean {
-	const createSuffix = `. ${CREATE_NAME_INSTRUCTIONS}`;
+function hasGeneratedNamePromptBody(
+	body: string,
+	copy: (typeof NAME_PROMPT_COPY_VARIANTS)[number],
+): boolean {
+	const createSuffix = `. ${copy.createInstructions}`;
 	if (
-		body.startsWith(CREATE_NAME_PREFIX) &&
+		body.startsWith(copy.createPrefix) &&
 		body.endsWith(createSuffix) &&
-		body.length > CREATE_NAME_PREFIX.length + createSuffix.length
+		body.length > copy.createPrefix.length + createSuffix.length
 	)
 		return true;
-	if (
-		body.startsWith(`${CREATE_NAME_FALLBACK} `) &&
-		body.endsWith(createSuffix)
-	)
+	if (body.startsWith(`${copy.createFallback} `) && body.endsWith(createSuffix))
 		return true;
 
-	const renameSuffix = `. ${RENAME_NAME_INSTRUCTIONS}`;
-	if (!body.startsWith(RENAME_NAME_PREFIX) || !body.endsWith(renameSuffix))
+	const renameSuffix = `. ${copy.renameInstructions}`;
+	if (!body.startsWith(copy.renamePrefix) || !body.endsWith(renameSuffix))
 		return false;
-	const renameBody = body.slice(
-		RENAME_NAME_PREFIX.length,
-		-renameSuffix.length,
-	);
-	let boundary = renameBody.indexOf(RENAME_NAME_SEPARATOR);
+	const renameBody = body.slice(copy.renamePrefix.length, -renameSuffix.length);
+	let boundary = renameBody.indexOf(copy.renameSeparator);
 	while (boundary !== -1) {
 		const identity = renameBody.slice(0, boundary);
-		const cwd = renameBody.slice(boundary + RENAME_NAME_SEPARATOR.length);
+		const cwd = renameBody.slice(boundary + copy.renameSeparator.length);
 		if (cwd.length > 0 && hasRenamePromptIdentity(identity)) return true;
-		boundary = renameBody.indexOf(RENAME_NAME_SEPARATOR, boundary + 1);
+		boundary = renameBody.indexOf(copy.renameSeparator, boundary + 1);
 	}
-	const fallbackSuffix = ` ${RENAME_NAME_FALLBACK}`;
+	const fallbackSuffix = ` ${copy.renameFallback}`;
 	if (!renameBody.endsWith(fallbackSuffix)) return false;
 	return hasRenamePromptIdentity(renameBody.slice(0, -fallbackSuffix.length));
 }
@@ -1587,7 +1607,7 @@ export class TelegramTransportAdapter
 			)
 				return this.sendDirect(
 					chatId,
-					"This name prompt has expired. Start the naming action again.",
+					"Запрос имени устарел. Начните действие заново.",
 				);
 			if (text.startsWith("/")) {
 				await this.command(chatId, sender, text);
@@ -1820,10 +1840,14 @@ export class TelegramTransportAdapter
 	}
 
 	private isNamePromptEnvelope(text?: string): boolean {
-		if (!text?.startsWith(NAME_PROMPT_ENVELOPE_PREFIX)) return false;
-		return hasGeneratedNamePromptBody(
-			text.slice(NAME_PROMPT_ENVELOPE_PREFIX.length),
-		);
+		if (text === undefined) return false;
+		return NAME_PROMPT_COPY_VARIANTS.some((copy) => {
+			const envelopePrefix = `${copy.marker}\n`;
+			return (
+				text.startsWith(envelopePrefix) &&
+				hasGeneratedNamePromptBody(text.slice(envelopePrefix.length), copy)
+			);
+		});
 	}
 
 	private rememberReplyRoute(
@@ -1918,18 +1942,18 @@ export class TelegramTransportAdapter
 			this.bot.api.sendMessage(
 				chatId,
 				sourceSession === selectedSession
-					? `Reply source is unknown. Send only to selected ${this.sessionFooter(selectedSession)} or cancel:`
-					: `This message belongs to ${this.sessionFooter(sourceSession)}, but the selected session is ${this.sessionFooter(selectedSession)}. Choose where to send it:`,
+					? `Источник ответа неизвестен. Отправить только в выбранную сессию ${this.sessionFooter(selectedSession)} или отменить:`
+					: `Это сообщение относится к ${this.sessionFooter(sourceSession)}, но выбрана ${this.sessionFooter(selectedSession)}. Выберите, куда отправить его:`,
 				{
 					reply_markup: keyboard([
 						[
 							...(sourceSession === selectedSession
-								? [inlineButton("Send to selected", `reply:${token}:c`)]
+								? [inlineButton("В выбранную сессию", `reply:${token}:c`)]
 								: [
-										inlineButton("Send to source", `reply:${token}:s`),
-										inlineButton("Send to selected", `reply:${token}:c`),
+										inlineButton("В исходную сессию", `reply:${token}:s`),
+										inlineButton("В выбранную сессию", `reply:${token}:c`),
 									]),
-							inlineButton("Cancel", `reply:${token}:x`),
+							inlineButton("Отмена", `reply:${token}:x`),
 						],
 					]),
 				},
@@ -1954,7 +1978,7 @@ export class TelegramTransportAdapter
 		) {
 			await this.sendDirect(
 				chatId,
-				"This naming choice expired. Start the naming action again.",
+				"Выбор имени устарел. Начните действие заново.",
 			);
 			return;
 		}
@@ -1984,20 +2008,20 @@ export class TelegramTransportAdapter
 		) {
 			await this.sendDirect(
 				chatId,
-				"This reply choice expired. Send the message again if still needed.",
+				"Выбор маршрута устарел. При необходимости отправьте сообщение ещё раз.",
 			);
 			return;
 		}
 		this.replyChoices.delete(match?.[1] as string);
 		if (match?.[2] === "x")
-			return this.sendDirect(chatId, "Reply cancelled; nothing was sent.");
+			return this.sendDirect(chatId, "Ответ отменён; ничего не отправлено.");
 		if (
 			match?.[2] === "c" &&
 			this.selected.get(chatId) !== choice.selectedSession
 		)
 			return this.sendDirect(
 				chatId,
-				"The selected session changed before confirmation. Nothing was sent; reply again to choose a current destination.",
+				"Выбранная сессия изменилась до подтверждения. Ничего не отправлено; ответьте ещё раз, чтобы выбрать текущего адресата.",
 			);
 		const target =
 			match?.[2] === "s" ? choice.sourceSession : choice.selectedSession;
@@ -2028,7 +2052,7 @@ export class TelegramTransportAdapter
 		if (chatId !== undefined)
 			await this.sendDirect(
 				chatId,
-				"Unsupported attachment type. Send a Telegram document or photo instead.",
+				"Этот тип вложения не поддерживается. Отправьте документ Telegram или фотографию.",
 			);
 	}
 
@@ -2063,7 +2087,7 @@ export class TelegramTransportAdapter
 		)
 			return this.sendDirect(
 				chatId,
-				"This name prompt has expired or requires text; the attachment was not submitted.",
+				"Запрос имени устарел или требует текстового ответа; вложение не отправлено.",
 			);
 		const sessionId =
 			routedSessionId ??
@@ -2402,7 +2426,7 @@ export class TelegramTransportAdapter
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
 				chatId,
-				`Created and selected ${sessionLabel(session)}.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+				`Сессия ${sessionLabel(session)} создана и выбрана.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
 			);
 		}
 		const sendCommand = /^\/send(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
@@ -2835,7 +2859,7 @@ export class TelegramTransportAdapter
 					: result.error.message,
 			);
 		}
-		return this.sendDirect(chatId, "Invalid command. Use /help.");
+		return this.sendDirect(chatId, "Неизвестная команда. Используйте /help.");
 	}
 
 	private async renameCommand(
@@ -2877,7 +2901,7 @@ export class TelegramTransportAdapter
 		if (!sessionId)
 			return this.sendDirect(
 				chatId,
-				"Provide a session ID or select a session first.",
+				"Укажите ID сессии или сначала выберите сессию.",
 			);
 		if (!nameText)
 			return this.sendDirect(
@@ -2982,7 +3006,7 @@ export class TelegramTransportAdapter
 			this.rememberStaleNamePrompt(chatId, previous.promptMessageId);
 			await this.sendDirect(
 				chatId,
-				"The previous name prompt was superseded by a new naming action.",
+				"Предыдущий запрос имени заменён новым действием.",
 			);
 		}
 		const choices = await this.telegramCall((signal) =>
@@ -2997,10 +3021,10 @@ export class TelegramTransportAdapter
 							? [
 									[
 										inlineButton("Создать без имени", "name:unnamed"),
-										inlineButton("Cancel", "name:cancel"),
+										inlineButton("Отмена", "name:cancel"),
 									],
 								]
-							: [[inlineButton("Cancel", "name:cancel")]],
+							: [[inlineButton("Отмена", "name:cancel")]],
 					),
 				},
 				signal,
@@ -3018,7 +3042,7 @@ export class TelegramTransportAdapter
 		if (messageId === undefined) {
 			await this.sendDirect(
 				chatId,
-				"Could not open the name prompt; use /rename instead.",
+				"Не удалось открыть запрос имени; используйте /rename.",
 			);
 			return;
 		}
@@ -3026,7 +3050,7 @@ export class TelegramTransportAdapter
 			this.rememberStaleNamePrompt(chatId, messageId);
 			await this.sendDirect(
 				chatId,
-				"This name prompt was superseded by a newer naming action.",
+				"Этот запрос имени заменён более новым действием.",
 			);
 			return;
 		}
@@ -3055,7 +3079,7 @@ export class TelegramTransportAdapter
 		if (!reply || (flow.kind === "rename" && reply === "/skip")) {
 			await this.sendDirect(
 				chatId,
-				"Name cannot be empty. The same naming target is still active.",
+				"Имя не может быть пустым. Тот же объект переименования остаётся активным.",
 			);
 			return this.reissueNameFlow(chatId, sender, flow);
 		}
@@ -3079,7 +3103,7 @@ export class TelegramTransportAdapter
 			await this.refreshExistingPanel(chatId, sender);
 			return this.sendDirect(
 				chatId,
-				`Created and selected ${sessionLabel(session)}.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+				`Сессия ${sessionLabel(session)} создана и выбрана.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
 			);
 		}
 		const result = await this.request(sender, {
@@ -3133,7 +3157,7 @@ export class TelegramTransportAdapter
 				const detail =
 					session.status === "running"
 						? "Its saved status is running, but no live Pi process is attached; this can happen after an unclean shutdown."
-						: "The session is not currently available to Pi.";
+						: "Сессия сейчас недоступна Pi.";
 				return this.sendDirect(
 					chatId,
 					withInput(
@@ -3204,7 +3228,7 @@ export class TelegramTransportAdapter
 			) {
 				await this.sendDirect(
 					chatId,
-					"The selected session changed before dispatch; nothing was sent.",
+					"Выбранная сессия изменилась до отправки; ничего не отправлено.",
 				);
 				return undefined;
 			}
@@ -4493,7 +4517,7 @@ export class TelegramTransportAdapter
 		this.previews.delete(chatId);
 		await this.sendDirect(
 			chatId,
-			`Selected ${sessionLabel(session)}. Ordinary messages now target this session.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+			`Выбрана ${sessionLabel(session)}. Обычные сообщения направляются в эту сессию.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
 		);
 		await this.renderPanel(chatId, sender, messageId);
 	}
@@ -4515,7 +4539,7 @@ export class TelegramTransportAdapter
 		this.previews.delete(chatId);
 		await this.sendDirect(
 			chatId,
-			`Selected ${sessionLabel(session)}. Ordinary messages now target this session.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+			`Выбрана ${sessionLabel(session)}. Обычные сообщения направляются в эту сессию.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
 		);
 		await this.renderPanel(chatId, sender, messageId);
 	}
@@ -5488,7 +5512,7 @@ export class TelegramTransportAdapter
 				if (cleanupPending)
 					await this.sendDirect(
 						chatId,
-						"Session deleted; inbox cleanup is pending.",
+						"Запись сессии удалена; очистка вложений ещё не завершена.",
 					);
 				for (const [selectedChat, selectedId] of this.selected) {
 					if (selectedId === sessionId) {
@@ -5650,7 +5674,7 @@ export class TelegramTransportAdapter
 		}
 		if (event.kind === "error") {
 			const detail = redactDiagnosticText(
-				event.text?.trim() || "Pi reported an unspecified session error.",
+				event.text?.trim() || "Pi сообщил о неуточнённой ошибке сессии.",
 				[this.options.token],
 			);
 			const fingerprint = detail;

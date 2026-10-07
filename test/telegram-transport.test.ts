@@ -3147,7 +3147,9 @@ describe("Telegram transport", () => {
 		expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
 			false,
 		);
-		expect(restartedBot.sent.at(-1)?.text).toContain("Reply source is unknown");
+		expect(restartedBot.sent.at(-1)?.text).toContain(
+			"Источник ответа неизвестен",
+		);
 		await restartedBot.update(42, "spoofed bot text", {
 			replyToMessageId: output?.message_id,
 			replyToMessageText: output?.text,
@@ -3312,7 +3314,7 @@ describe("Telegram transport", () => {
 		expect(fetchFile).not.toHaveBeenCalled();
 		expect(
 			restartedBot.sent.some(({ text }) =>
-				text.includes("name prompt has expired"),
+				text.includes("Запрос имени устарел"),
 			),
 		).toBe(true);
 		await restarted.adapter.stop();
@@ -3370,12 +3372,68 @@ describe("Telegram transport", () => {
 				expect(fetchFile).not.toHaveBeenCalled();
 				expect(
 					restartedBot.sent.some(({ text }) =>
-						text.includes("name prompt has expired"),
+						text.includes("Запрос имени устарел"),
 					),
 				).toBe(true);
 				await restarted.adapter.stop();
 				if (previousSession) sessions.set("sid", previousSession);
 			}
+		},
+	);
+
+	it.each([
+		{
+			label: "create exact path",
+			body: "New session will be created in /work/project. Reply with a name. Create unnamed and Cancel buttons are below.",
+		},
+		{
+			label: "create multipart fallback",
+			body: "The exact folder is shown in the preceding messages. Reply with a name. Create unnamed and Cancel buttons are below.",
+		},
+		{
+			label: "unnamed rename exact path",
+			body: "Rename #sid (#sid) in /work/project. Reply with a name; use Cancel below.",
+		},
+		{
+			label: "named rename exact path",
+			body: "Rename A named session · #sid (#sid) in /work/project. Reply with a name; use Cancel below.",
+		},
+		{
+			label: "named rename multipart fallback",
+			body: "Rename A named session · #sid (#sid) in the exact folder shown in the preceding messages. Reply with a name; use Cancel below.",
+		},
+	])(
+		"rejects stale text and media for legacy English $label prompts after restart",
+		async ({ body }) => {
+			const fetchFile = stubFileDownload();
+			const bot = new MockBot();
+			const { adapter, requests } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			const envelope = `Name this session (harnessd name prompt):\n${body}`;
+			await bot.update(42, "stale name", {
+				replyToMessageId: 9876,
+				replyToMessageText: envelope,
+			});
+			await bot.updateDocument(42, {
+				replyToMessageId: 9876,
+				replyToMessageText: envelope,
+			});
+			expect(fetchFile).not.toHaveBeenCalled();
+			expect(
+				requests.some(({ kind }) =>
+					["submit", "create", "rename"].includes(kind),
+				),
+			).toBe(false);
+			expect(bot.sent.at(-2)?.text).toBe(
+				"Запрос имени устарел. Начните действие заново.",
+			);
+			expect(bot.sent.at(-1)?.text).toBe(
+				"Запрос имени устарел или требует текстового ответа; вложение не отправлено.",
+			);
+			expect(
+				bot.sent.some(({ text }) => text.includes("Выберите, куда отправить")),
+			).toBe(false);
+			await adapter.stop();
 		},
 	);
 
@@ -4087,6 +4145,115 @@ describe("Telegram transport", () => {
 			});
 		}
 	}
+
+	it("creates and selects a named session from the bound welcome New session action", async () => {
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		const cwd = "/welcome workspace/project";
+		const created: SessionSummary = {
+			id: "welcome-created" as SessionId,
+			harnessId: "pi-rpc" as never,
+			cwd,
+			name: "Welcome task",
+			status: "stopped",
+		};
+		const { adapter, requests } = await startAdapter(bot, stateDirectory, {
+			initialCwd: cwd,
+			dispatch: async (request) =>
+				request.kind === "create"
+					? { requestId: request.requestId, ok: true, value: created }
+					: result(request),
+		});
+		await bot.update(42, "/start");
+		const welcomeId = bot.lastMessageId as number;
+		const welcomeMarkup = bot.sendOptions.at(-1) as {
+			reply_markup: {
+				inline_keyboard: readonly (readonly {
+					text: string;
+					callback_data: string;
+				}[])[];
+			};
+		};
+		const action = welcomeMarkup.reply_markup.inline_keyboard
+			.flat()
+			.find(({ text }) => text === "Новая сессия")?.callback_data;
+		if (!action) throw new Error("Missing welcome new-session callback");
+		await bot.callback(42, action, welcomeId);
+		const promptId = bot.lastForceReplyMessageId;
+		const prompt = bot.sent.find(({ message_id }) => message_id === promptId);
+		expect(prompt?.text).toContain("Назовите сессию (запрос имени harnessd):");
+		expect(prompt?.text).toContain(`Новая сессия будет создана в ${cwd}`);
+		if (!promptId) throw new Error("Missing welcome name prompt");
+		await bot.update(42, "Welcome task", { replyToMessageId: promptId });
+		expect(requests.at(-1)).toMatchObject({
+			kind: "create",
+			cwd,
+			name: "Welcome task",
+		});
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Сессия Welcome task · #welcome-created создана и выбрана.",
+		);
+		const store = await TelegramPanelStore.open(stateDirectory, "secret-token");
+		expect(store.getSelected(42)).toBe("welcome-created");
+		expect(store.get(42)).toBeUndefined();
+		expect(bot.pinned).toEqual([]);
+		await bot.update(42, "continue in created session");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "submit",
+			sessionId: "welcome-created",
+		});
+		await adapter.stop();
+	});
+
+	it("selects a nonselected session from the welcome Sessions panel without adopting the welcome message", async () => {
+		const bot = new MockBot();
+		const stateDirectory = await temp();
+		const { adapter, requests } = await startAdapter(bot, stateDirectory);
+		await bot.update(42, "/use sid");
+		const welcomePins = bot.pinned.length;
+		await bot.update(42, "/start");
+		const welcomeId = bot.lastMessageId as number;
+		const welcomeMarkup = bot.sendOptions.at(-1) as {
+			reply_markup: {
+				inline_keyboard: readonly (readonly {
+					text: string;
+					callback_data: string;
+				}[])[];
+			};
+		};
+		const action = welcomeMarkup.reply_markup.inline_keyboard
+			.flat()
+			.find(({ text }) => text === "Сессии")?.callback_data;
+		if (!action) throw new Error("Missing welcome sessions callback");
+		await bot.callback(42, action, welcomeId);
+		const store = await TelegramPanelStore.open(stateDirectory, "secret-token");
+		const panelId = store.get(42);
+		expect(panelId).toBeDefined();
+		expect(panelId).not.toBe(welcomeId);
+		expect(bot.pinned).toHaveLength(welcomePins + 1);
+		expect(bot.pinned.at(-1)?.messageId).toBe(panelId);
+		const selectOther = callbackData(
+			bot.edited.at(-1)?.options,
+			"session:select:other",
+		);
+		await bot.callback(42, selectOther, panelId as number);
+		const selectedStore = await TelegramPanelStore.open(
+			stateDirectory,
+			"secret-token",
+		);
+		expect(selectedStore.getSelected(42)).toBe("other");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Выбрана #other. Обычные сообщения направляются в эту сессию.",
+		);
+		await bot.update(42, "route to newly selected session");
+		expect(requests.at(-1)).toMatchObject({
+			kind: "submit",
+			sessionId: "other",
+		});
+		expect(store.get(42)).toBe(panelId);
+		expect(bot.pinned.at(-1)?.messageId).toBe(panelId);
+		await adapter.stop();
+	});
 
 	it("keeps chat selection unchanged when an explicit resume fails", async () => {
 		const bot = new MockBot();
