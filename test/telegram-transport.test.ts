@@ -1671,10 +1671,6 @@ describe("Telegram transport", () => {
 			publicationAttempt?.[3],
 			"folder:",
 		);
-		await bot.callback(42, unpublishedFolderToken, replacementId);
-		expect(bot.edited.at(-1)?.text).toContain("устарело");
-		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
-
 		await bot.update(42, "/menu");
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
 		expect(bot.api.editMessageText).toHaveBeenLastCalledWith(
@@ -1684,6 +1680,9 @@ describe("Telegram transport", () => {
 			expect.any(Object),
 			expect.any(AbortSignal),
 		);
+
+		await bot.callback(42, unpublishedFolderToken, replacementId);
+		expect(bot.edited.at(-1)?.text).toContain("устарело");
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
 		await adapter.stop();
 	});
