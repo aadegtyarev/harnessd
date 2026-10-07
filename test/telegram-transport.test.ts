@@ -1492,16 +1492,38 @@ describe("Telegram transport", () => {
 		});
 		expect(bot.sent.at(-1)?.text).toContain("not selected");
 		expect(bot.sendOptions.at(-1)).toMatchObject({
-			inline_keyboard: [
-				[
-					expect.objectContaining({
-						text: "Выбрать",
-						callback_data: "session:select:other",
-					}),
+			reply_markup: {
+				inline_keyboard: [
+					[
+						expect.objectContaining({
+							text: "Выбрать",
+							callback_data: "session:select:other",
+						}),
+					],
 				],
-			],
+			},
 		});
 		await bot.update(42, "still goes to sid");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("keeps slash resume selection unchanged and omits Select when target already matches", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/resume");
+		expect(bot.sent.at(-1)?.text).toContain("Selection is unchanged");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"ordinary messages still target this session",
+		);
+		expect(bot.sendOptions.at(-1)).toBeUndefined();
+		await bot.update(42, "after selected resume");
 		expect(
 			requests.findLast((request) => request.kind === "submit"),
 		).toMatchObject({
@@ -1528,6 +1550,7 @@ describe("Telegram transport", () => {
 		expect(requests.some((request) => request.kind === "model_list")).toBe(
 			false,
 		);
+		await bot.update(42, "/use other");
 		await bot.callback(42, "session:resume-select:sid", panelMessageId);
 		expect(
 			requests.findLast((request) => request.kind === "resume"),
@@ -1537,15 +1560,124 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "message routed to resumed session");
 		await bot.update(43, "other chat remains selected");
+		expect(requests.filter((request) => request.kind === "submit")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ sessionId: "sid" }),
+				expect.objectContaining({ sessionId: "other" }),
+			]),
+		);
+		expect(
+			requests.filter((request) => request.kind === "submit"),
+		).toHaveLength(2);
+		await adapter.stop();
+	});
+
+	it("offers a one-time stopped-session resume-and-select action after slash stop", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/stop");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const actionMessageId = bot.lastMessageId as number;
+		expect(bot.sent.at(-1)?.text).toContain("Resume and select it below");
+		await bot.callback(43, action, actionMessageId);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		await bot.callback(42, action, actionMessageId);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		await bot.callback(42, action, actionMessageId);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(1);
+		await bot.update(42, "message goes to resumed target");
 		expect(
 			requests.findLast((request) => request.kind === "submit"),
 		).toMatchObject({
 			kind: "submit",
-			sessionId: "other",
+			sessionId: "sid",
 		});
+		await adapter.stop();
+	});
+
+	it("warns when resume succeeds but saving the new selection fails", async () => {
+		const directory = await temp();
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, directory);
+		await bot.update(42, "/use other");
+		await bot.update(42, "/stop sid");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const stateFile = (await readdir(directory)).find((name) =>
+			name.startsWith("telegram-panels-"),
+		);
+		if (!stateFile) throw new Error("Missing Telegram state file");
+		const statePath = path.join(directory, stateFile);
+		await rm(statePath);
+		await mkdir(statePath);
+		await writeFile(path.join(statePath, "occupied"), "x");
+		await bot.callback(42, action, bot.lastMessageId as number);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"could not be saved for the next restart",
+		);
+		await bot.update(42, "still targets resumed session");
 		expect(
-			requests.filter((request) => request.kind === "submit"),
-		).toHaveLength(2);
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({
+			kind: "submit",
+			sessionId: "sid",
+		});
+		await adapter.stop();
+	});
+
+	it("offers callback Stop a one-time bound Resume-and-select action", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId as number;
+		await bot.callback(42, "menu:sessions", panelId);
+		await bot.callback(42, "session:details:sid", panelId);
+		await bot.callback(42, "session:stop:sid", panelId);
+		const confirm = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.callback(42, confirm, panelId);
+		const resume = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const actionMessageId = bot.lastMessageId as number;
+		await bot.callback(43, resume, actionMessageId);
+		await bot.callback(42, resume, actionMessageId);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(1);
+		expect(bot.sent.at(-1)?.text).toContain("resumed and selected");
+		await adapter.stop();
+	});
+
+	it("rejects a stopped-session resume action after the session state changes", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/stop");
+		const action = callbackData(
+			bot.sendOptions.at(-1),
+			"action:resume-select:",
+		);
+		const current = sessions.get("sid");
+		if (!current) throw new Error("Missing session fixture");
+		sessions.set("sid", { ...current, status: "running" });
+		await bot.callback(42, action, bot.lastMessageId as number);
+		expect(
+			requests.filter((request) => request.kind === "resume"),
+		).toHaveLength(0);
+		expect(bot.sent.at(-1)?.text).toContain("no longer stopped");
 		await adapter.stop();
 	});
 
