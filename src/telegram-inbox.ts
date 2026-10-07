@@ -36,6 +36,14 @@ export class TelegramInboxError extends Error {
 	}
 }
 
+export class TelegramInboxWorkspaceError extends TelegramInboxError {
+	constructor() {
+		super();
+		this.message = "Inbox cannot be inside the session workspace";
+		this.name = "TelegramInboxWorkspaceError";
+	}
+}
+
 export interface SavedTelegramAttachment {
 	readonly path: string;
 	readonly name: string;
@@ -137,7 +145,11 @@ export class TelegramInbox {
 			}
 			return { path: canonicalFile, name, bytes: data.length };
 		} catch (error) {
-			if (error instanceof TelegramInboxQuotaError) throw error;
+			if (
+				error instanceof TelegramInboxQuotaError ||
+				error instanceof TelegramInboxWorkspaceError
+			)
+				throw error;
 			throw new TelegramInboxError({ cause: error });
 		}
 	}
@@ -251,7 +263,7 @@ export class TelegramInbox {
 				!relative.startsWith(`..${path.sep}`) &&
 				!path.isAbsolute(relative))
 		)
-			throw new Error("Inbox cannot be inside the session workspace");
+			throw new TelegramInboxWorkspaceError();
 	}
 
 	private async ensureSessionDirectory(sessionId: SessionId): Promise<string> {
