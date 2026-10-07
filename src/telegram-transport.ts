@@ -64,6 +64,17 @@ const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
 const INTERNAL_WIDGET_PREFIX = "PI_SUBAGENT_ASYNC_JSON:";
 const NAME_PROMPT_MARKER = "Name this session (harnessd name prompt):";
+const NAME_PROMPT_ENVELOPE_PREFIX = `${NAME_PROMPT_MARKER}\n`;
+const CREATE_NAME_INSTRUCTIONS =
+	"Reply with a name. Create unnamed and Cancel buttons are below.";
+const RENAME_NAME_INSTRUCTIONS = "Reply with a name; use Cancel below.";
+const CREATE_NAME_PREFIX = "New session will be created in ";
+const CREATE_NAME_FALLBACK =
+	"The exact folder is shown in the preceding messages.";
+const RENAME_NAME_FALLBACK =
+	"in the exact folder shown in the preceding messages";
+const RENAME_NAME_PREFIX = "Rename ";
+const RENAME_NAME_SEPARATOR = " in ";
 const MAX_CORRELATED_MESSAGES_PER_CHAT = 128;
 type UpdateContext = {
 	from?: { id: number };
@@ -696,43 +707,46 @@ function safePathPresentation(value: string): string {
 		})
 		.join("");
 }
+function renamePromptIdentity(label: string, sessionId: SessionId): string {
+	return `${label} (#${sessionId})`;
+}
+function hasRenamePromptIdentity(identity: string): boolean {
+	const match = /^(.*) \(#([^()]*)\)$/.exec(identity);
+	if (!match || !isSessionIdToken(match[2] ?? "")) return false;
+	const [, label, sessionId] = match;
+	return label === `#${sessionId}` || label.endsWith(` · #${sessionId}`);
+}
 function hasGeneratedNamePromptBody(body: string): boolean {
-	const createSuffix =
-		". Reply with a name. Create unnamed and Cancel buttons are below.";
-	const createPrefix = "New session will be created in ";
+	const createSuffix = `. ${CREATE_NAME_INSTRUCTIONS}`;
 	if (
-		body.startsWith(createPrefix) &&
+		body.startsWith(CREATE_NAME_PREFIX) &&
 		body.endsWith(createSuffix) &&
-		body.length > createPrefix.length + createSuffix.length
+		body.length > CREATE_NAME_PREFIX.length + createSuffix.length
 	)
 		return true;
 	if (
-		body.startsWith("The exact folder is shown in the preceding messages. ") &&
+		body.startsWith(`${CREATE_NAME_FALLBACK} `) &&
 		body.endsWith(createSuffix)
 	)
 		return true;
 
-	const renameSuffix = ". Reply with a name; use Cancel below.";
-	if (!body.startsWith("Rename ") || !body.endsWith(renameSuffix)) return false;
-	const renameBody = body.slice("Rename ".length, -renameSuffix.length);
-	let boundary = renameBody.indexOf(") in ");
-	while (boundary !== -1) {
-		const target = renameBody.slice(0, boundary + 1);
-		const path = renameBody.slice(boundary + ") in ".length);
-		if (
-			path.length > 0 &&
-			/^(?:[^\n]* )?\(#(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})\)$/.test(target)
-		)
-			return true;
-		boundary = renameBody.indexOf(") in ", boundary + 1);
-	}
-	const fallback = " in the exact folder shown in the preceding messages";
-	const identity = renameBody.endsWith(fallback)
-		? renameBody.slice(0, -fallback.length)
-		: "";
-	return /^(?:[^\n]* )?\(#(?:[A-Za-z0-9][A-Za-z0-9._-]{0,127})\)$/.test(
-		identity,
+	const renameSuffix = `. ${RENAME_NAME_INSTRUCTIONS}`;
+	if (!body.startsWith(RENAME_NAME_PREFIX) || !body.endsWith(renameSuffix))
+		return false;
+	const renameBody = body.slice(
+		RENAME_NAME_PREFIX.length,
+		-renameSuffix.length,
 	);
+	let boundary = renameBody.indexOf(RENAME_NAME_SEPARATOR);
+	while (boundary !== -1) {
+		const identity = renameBody.slice(0, boundary);
+		const cwd = renameBody.slice(boundary + RENAME_NAME_SEPARATOR.length);
+		if (cwd.length > 0 && hasRenamePromptIdentity(identity)) return true;
+		boundary = renameBody.indexOf(RENAME_NAME_SEPARATOR, boundary + 1);
+	}
+	const fallbackSuffix = ` ${RENAME_NAME_FALLBACK}`;
+	if (!renameBody.endsWith(fallbackSuffix)) return false;
+	return hasRenamePromptIdentity(renameBody.slice(0, -fallbackSuffix.length));
 }
 function boundedPathPresentation(value: string, limit = 500): string {
 	const path = [...safePathPresentation(value)];
@@ -1668,9 +1682,10 @@ export class TelegramTransportAdapter
 	}
 
 	private isNamePromptEnvelope(text?: string): boolean {
-		const prefix = `${NAME_PROMPT_MARKER}\n`;
-		if (!text?.startsWith(prefix)) return false;
-		return hasGeneratedNamePromptBody(text.slice(prefix.length));
+		if (!text?.startsWith(NAME_PROMPT_ENVELOPE_PREFIX)) return false;
+		return hasGeneratedNamePromptBody(
+			text.slice(NAME_PROMPT_ENVELOPE_PREFIX.length),
+		);
 	}
 
 	private rememberReplyRoute(
@@ -2413,8 +2428,7 @@ export class TelegramTransportAdapter
 		sender: number,
 		flow: PendingNameFlow,
 	): Promise<void> {
-		if (flow.kind === "create")
-			return this.promptForCreation(chatId, flow.cwd, true);
+		if (flow.kind === "create") return this.promptForCreation(chatId, flow.cwd);
 		const inspected = await this.request(sender, {
 			kind: "inspect",
 			sessionId: flow.sessionId,
@@ -2426,25 +2440,23 @@ export class TelegramTransportAdapter
 		const sessionLabelText = session
 			? sessionLabel(session)
 			: this.sessionFooter(flow.sessionId);
+		const targetIdentity = renamePromptIdentity(
+			sessionLabelText,
+			flow.sessionId,
+		);
 		return this.promptForPathName(
 			chatId,
 			{ kind: "rename", sessionId: flow.sessionId },
 			session?.cwd ?? this.sessionCwds.get(flow.sessionId) ?? "unknown cwd",
-			`Rename ${sessionLabelText} (${this.sessionFooter(flow.sessionId)}) in `,
-			"Reply with a name; use Cancel below.",
+			`${RENAME_NAME_PREFIX}${targetIdentity}${RENAME_NAME_SEPARATOR}`,
+			RENAME_NAME_INSTRUCTIONS,
 			undefined,
-			`Rename ${sessionLabelText} (${this.sessionFooter(flow.sessionId)})`,
+			`${RENAME_NAME_PREFIX}${targetIdentity}`,
 		);
 	}
 
-	private async promptForCreation(
-		chatId: number,
-		cwd: string,
-		includeCancel: boolean,
-	): Promise<void> {
-		const instructions = includeCancel
-			? "Reply with a name. Create unnamed and Cancel buttons are below."
-			: "Reply with a name. Create unnamed and Cancel buttons are below.";
+	private async promptForCreation(chatId: number, cwd: string): Promise<void> {
+		const instructions = CREATE_NAME_INSTRUCTIONS;
 		return this.promptForPathName(
 			chatId,
 			{ kind: "create", cwd },
@@ -2475,8 +2487,8 @@ export class TelegramTransportAdapter
 		for (const chunk of splitTelegramText(path))
 			await this.sendWithDeadline(chatId, chunk);
 		const identity = fallbackIdentity
-			? `${fallbackIdentity} in the exact folder shown in the preceding messages.`
-			: "The exact folder is shown in the preceding messages.";
+			? `${fallbackIdentity} ${RENAME_NAME_FALLBACK}.`
+			: `${CREATE_NAME_FALLBACK}.`;
 		return this.promptForName(chatId, flow, `${identity} ${instructions}`);
 	}
 
@@ -2520,7 +2532,7 @@ export class TelegramTransportAdapter
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
-				`${NAME_PROMPT_MARKER}\n${text}`,
+				`${NAME_PROMPT_ENVELOPE_PREFIX}${text}`,
 				{ reply_markup: { force_reply: true, selective: true } },
 				signal,
 			),
@@ -3065,14 +3077,14 @@ export class TelegramTransportAdapter
 		if (data === "menu:new") {
 			const cwd =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
-			return this.promptForCreation(chatId, cwd, true);
+			return this.promptForCreation(chatId, cwd);
 		}
 		if (data === "folder:parent")
 			return this.changeFolder(chatId, sender, "parent", messageId);
 		if (data === "folder:new") {
 			const cwd =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
-			return this.promptForCreation(chatId, cwd, false);
+			return this.promptForCreation(chatId, cwd);
 		}
 		if (data.startsWith("folder:page:"))
 			return this.setPageAndRender(
@@ -4240,14 +4252,18 @@ export class TelegramTransportAdapter
 		if (!result.ok) return this.sendDirect(chatId, result.error.message);
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
+		const targetIdentity = renamePromptIdentity(
+			sessionLabel(session),
+			sessionId,
+		);
 		await this.promptForPathName(
 			chatId,
 			{ kind: "rename", sessionId },
 			session.cwd,
-			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)}) in `,
-			"Reply with a name; use Cancel below.",
+			`${RENAME_NAME_PREFIX}${targetIdentity}${RENAME_NAME_SEPARATOR}`,
+			RENAME_NAME_INSTRUCTIONS,
 			undefined,
-			`Rename ${sessionLabel(session)} (${this.sessionFooter(sessionId)})`,
+			`${RENAME_NAME_PREFIX}${targetIdentity}`,
 		);
 	}
 

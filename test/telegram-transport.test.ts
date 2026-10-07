@@ -2153,47 +2153,64 @@ describe("Telegram transport", () => {
 		if (previousSession) sessions.set("sid", previousSession);
 	});
 
-	it.each(["\u2028", "\u2029"])(
-		"rejects restarted replies to a generated unnamed rename prompt with separator cwd %s",
-		async (separator) => {
-			const fetchFile = stubFileDownload();
-			const stateDirectory = await temp();
-			const cwd = `/workspace${separator}subdir`;
-			const previousSession = sessions.get("sid");
-			sessions.set("sid", sessionWith("sid", { cwd, name: undefined }));
-			const firstBot = new MockBot();
-			const first = await startAdapter(firstBot, stateDirectory);
-			await firstBot.update(42, "/use sid");
-			await firstBot.update(42, "/menu");
-			await firstBot.callback(42, "session:rename:sid", firstBot.lastMessageId);
-			const promptId = firstBot.lastForceReplyMessageId;
-			const prompt = firstBot.sent.find(
-				({ message_id }) => message_id === promptId,
-			);
-			expect(prompt?.text).toContain(
-				`Rename #sid (#sid) in /workspace${separator}subdir.`,
-			);
-			await first.adapter.stop();
+	it.each([
+		{ label: "unnamed", name: undefined },
+		{ label: "named", name: "A named session" },
+	])(
+		"rejects restarted replies to generated $label rename prompts",
+		async ({ name }) => {
+			for (const [cwdCase, cwd] of [
+				["Unicode separators", `/workspace\u2028subdir\u2029end`],
+				["long fallback", `/workspace/${"long".repeat(1000)}`],
+			] as const) {
+				const fetchFile = stubFileDownload();
+				const stateDirectory = await temp();
+				const previousSession = sessions.get("sid");
+				sessions.set("sid", sessionWith("sid", { cwd, name }));
+				const firstBot = new MockBot();
+				const first = await startAdapter(firstBot, stateDirectory);
+				await firstBot.update(42, "/use sid");
+				await firstBot.update(42, "/menu");
+				await firstBot.callback(
+					42,
+					"session:rename:sid",
+					firstBot.lastMessageId,
+				);
+				const promptId = firstBot.lastForceReplyMessageId;
+				const prompt = firstBot.sent.find(
+					({ message_id }) => message_id === promptId,
+				);
+				const label = name ? `${name} · #sid` : "#sid";
+				expect(prompt?.text).toContain(`Rename ${label} (#sid)`);
+				if (cwdCase === "long fallback")
+					expect(prompt?.text).toContain(
+						"exact folder shown in the preceding messages",
+					);
+				else expect(prompt?.text).toContain(cwd);
+				await first.adapter.stop();
 
-			const restartedBot = new MockBot();
-			const restarted = await startAdapter(restartedBot, stateDirectory);
-			await restartedBot.update(42, "stale text", {
-				replyToMessageId: promptId,
-				replyToMessageText: prompt?.text,
-			});
-			await restartedBot.updateDocument(42, {
-				replyToMessageId: promptId,
-				replyToMessageText: prompt?.text,
-			});
-			expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
-				false,
-			);
-			expect(fetchFile).not.toHaveBeenCalled();
-			expect(restartedBot.sent.at(-1)?.text).toContain(
-				"name prompt has expired",
-			);
-			await restarted.adapter.stop();
-			if (previousSession) sessions.set("sid", previousSession);
+				const restartedBot = new MockBot();
+				const restarted = await startAdapter(restartedBot, stateDirectory);
+				await restartedBot.update(42, "stale text", {
+					replyToMessageId: promptId,
+					replyToMessageText: prompt?.text,
+				});
+				await restartedBot.updateDocument(42, {
+					replyToMessageId: promptId,
+					replyToMessageText: prompt?.text,
+				});
+				expect(restarted.requests.some(({ kind }) => kind === "submit")).toBe(
+					false,
+				);
+				expect(fetchFile).not.toHaveBeenCalled();
+				expect(
+					restartedBot.sent.some(({ text }) =>
+						text.includes("name prompt has expired"),
+					),
+				).toBe(true);
+				await restarted.adapter.stop();
+				if (previousSession) sessions.set("sid", previousSession);
+			}
 		},
 	);
 
