@@ -37,6 +37,7 @@ import {
 	redactDiagnosticText,
 	truncateDiagnostic,
 } from "./error-diagnostics.js";
+import { OVERFLOW_ID } from "./telegram-activity-ledger.js";
 import {
 	approvedSubagentRole,
 	localActivityTime,
@@ -4099,7 +4100,10 @@ export class TelegramTransportAdapter
 		return activity;
 	}
 
-	private liveActivityText(activity: LiveActivity): string {
+	private liveActivityText(
+		activity: LiveActivity,
+		preserveUpdatedAt = false,
+	): string {
 		const name = this.sessionNames.get(activity.sessionId);
 		const lines = [
 			`🔧 Pi activity · ${activitySessionLabel(activity.sessionId, name)}`,
@@ -4137,17 +4141,22 @@ export class TelegramTransportAdapter
 		const visibleModel = truncateActivityText(lines.join("\n"));
 		if (activity.visibleModel !== visibleModel) {
 			activity.visibleModel = visibleModel;
-			const now = this.options.activityClock?.() ?? new Date();
-			activity.updatedAt = (
-				this.options.activityTimeFormatter ?? localActivityTime
-			)(now);
+			if (!preserveUpdatedAt) {
+				const now = this.options.activityClock?.() ?? new Date();
+				activity.updatedAt = (
+					this.options.activityTimeFormatter ?? localActivityTime
+				)(now);
+			}
 		}
 		return truncateActivityText(
 			`${visibleModel}\nОбновлено: ${activity.updatedAt ?? "00:00:00"}`,
 		);
 	}
 
-	private renderLiveActivity(activity: LiveActivity): void {
+	private renderLiveActivity(
+		activity: LiveActivity,
+		preserveUpdatedAt = false,
+	): void {
 		activity.renderQueue = activity.renderQueue
 			.then(async () => {
 				if (
@@ -4158,7 +4167,7 @@ export class TelegramTransportAdapter
 					) !== activity
 				)
 					return;
-				const text = this.liveActivityText(activity);
+				const text = this.liveActivityText(activity, preserveUpdatedAt);
 				if (activity.messageId === undefined) {
 					const sent = await this.telegramCall((signal) =>
 						this.bot.api.sendMessage(
@@ -5834,6 +5843,7 @@ export class TelegramTransportAdapter
 		}
 		if (activities.length === 0) return;
 		for (const activity of activities) {
+			let preserveUpdatedAt = false;
 			switch (event.type) {
 				case "thinking":
 					if (activity.thinking === event.active) continue;
@@ -5844,10 +5854,22 @@ export class TelegramTransportAdapter
 						redactDiagnosticText(event.summary, [this.options.token]),
 						700,
 					);
+					const role = approvedSubagentRole(summary);
+					const overflowAlreadyVisible = activity.tools.some(
+						(row) => row.id === OVERFLOW_ID,
+					);
 					if (!updateActivityRow(activity.tools, event.toolCallId, summary))
 						continue;
-					const role = approvedSubagentRole(summary);
-					if (role && activity.childStatuses.has(role)) continue;
+					if (role && activity.childStatuses.has(role)) {
+						if (
+							!overflowAlreadyVisible &&
+							activity.tools.some((row) => row.id === OVERFLOW_ID)
+						) {
+							preserveUpdatedAt = true;
+							break;
+						}
+						continue;
+					}
 					activity.status = "Вызов инструмента";
 					void this.refreshLiveActivityStats(activity);
 					break;
@@ -5883,7 +5905,7 @@ export class TelegramTransportAdapter
 					}
 					break;
 			}
-			this.renderLiveActivity(activity);
+			this.renderLiveActivity(activity, preserveUpdatedAt);
 		}
 	}
 
