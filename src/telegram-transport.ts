@@ -2140,6 +2140,10 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			if (
+				!(await this.requireRunningSession(chatId, sender, sessionId, "model"))
+			)
+				return;
 			const result = await this.request(sender, {
 				kind: "model_list",
 				sessionId,
@@ -2160,6 +2164,10 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			if (
+				!(await this.requireRunningSession(chatId, sender, sessionId, "model"))
+			)
+				return;
 			const slash = args[0].indexOf("/");
 			if (slash <= 0 || slash === args[0].length - 1)
 				return this.sendDirect(
@@ -2192,6 +2200,10 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			if (
+				!(await this.requireRunningSession(chatId, sender, sessionId, "effort"))
+			)
+				return;
 			const result = await this.request(sender, {
 				kind: "effort_list",
 				sessionId,
@@ -2207,6 +2219,10 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			if (
+				!(await this.requireRunningSession(chatId, sender, sessionId, "effort"))
+			)
+				return;
 			const result = await this.request(sender, {
 				kind: "effort_set",
 				sessionId,
@@ -2274,11 +2290,17 @@ export class TelegramTransportAdapter
 				this.rememberSession(result.value as SessionSummary);
 				await this.refreshExistingPanel(chatId, sender);
 			}
+			if (result.ok) {
+				await this.sendWithDeadline(
+					chatId,
+					`Session ${this.sessionFooter(sessionId)} is running, not selected. Messages still target ${this.selected.has(chatId) ? this.sessionFooter(this.selected.get(chatId) as SessionId) : "no selected session"}. Choose Select to route future messages here.`,
+					keyboard([[inlineButton("Выбрать", `session:select:${sessionId}`)]]),
+				);
+				return;
+			}
 			return this.sendDirect(
 				chatId,
-				result.ok
-					? `Session ${this.sessionFooter(sessionId)} is running.`
-					: `${result.error.message} Choose another session with /sessions or /menu.`,
+				`${result.error.message} Selection is unchanged${this.selected.has(chatId) ? `; messages still target ${this.sessionFooter(this.selected.get(chatId) as SessionId)}` : "; no session is selected"}. Next: inspect with /sessions or /menu.`,
 			);
 		}
 		if (name === "/inspect" && args.length <= 1) {
@@ -2300,6 +2322,7 @@ export class TelegramTransportAdapter
 				(args[0] as SessionId | undefined) ?? this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const wasSelected = this.selected.get(chatId) === sessionId;
 			const result = await this.request(sender, { kind: "stop", sessionId });
 			if (result.ok) this.invalidateSessionConfirmations(sessionId);
 			let selectionCleared = true;
@@ -2308,17 +2331,34 @@ export class TelegramTransportAdapter
 				this.previews.delete(chatId);
 			}
 			if (result.ok) await this.refreshExistingPanel(chatId, sender);
+			const selectedAfterStop = this.selected.get(chatId);
 			return this.sendDirect(
 				chatId,
 				result.ok
-					? `Session ${this.sessionFooter(sessionId)} stopped.${selectionCleared ? "" : " The saved chat selection could not be cleared and may return after restart."}`
-					: result.error.message,
+					? `Session ${this.sessionFooter(sessionId)} stopped. ${selectedAfterStop === sessionId ? "Selection remains (saved selection could not be cleared; it may return after restart)." : wasSelected ? (selectionCleared ? "Selection cleared; messages have no target." : "Selection was cleared in memory but saving the change failed; it may return after restart.") : selectedAfterStop ? `Selection unchanged; messages target ${this.sessionFooter(selectedAfterStop)}.` : "No session was selected; messages have no target."} Next: /resume ${sessionId} to resume without selecting, then /use ${sessionId} to select; or choose a session in /menu.`
+					: `${result.error.message} Selection is unchanged${selectedAfterStop ? `; messages target ${this.sessionFooter(selectedAfterStop)}` : "; messages have no target"}. Next: inspect in /menu.`,
 			);
 		}
 		if (name === "/delete") {
 			if (args.length !== 1)
 				return this.sendDirect(chatId, "Usage: /delete <sessionId>");
 			const sessionId = args[0] as SessionId;
+			const inspected = await this.request(sender, {
+				kind: "inspect",
+				sessionId,
+			});
+			if (!inspected.ok)
+				return this.sendDirect(
+					chatId,
+					`${inspected.error.message} Selection is unchanged; next: inspect /menu.`,
+				);
+			const existing = inspected.value as SessionSummary;
+			this.rememberSession(existing);
+			if (existing.status !== "stopped")
+				return this.sendDirect(
+					chatId,
+					`${sessionLabel(existing)} exists and Pi is ${existing.status}; deletion is only available when stopped. Next: /stop ${sessionId}, then /delete ${sessionId}.`,
+				);
 			const { result, cleanupPending } = await this.deleteSessionAndInbox(
 				sender,
 				sessionId,
@@ -2335,11 +2375,12 @@ export class TelegramTransportAdapter
 				}
 				await this.refreshExistingPanel(chatId, sender);
 			}
+			const remainingTarget = this.selected.get(chatId);
 			return this.sendDirect(
 				chatId,
 				result.ok
-					? `Deleted stopped session ${this.sessionFooter(sessionId)} from harnessd.${cleanupPending ? " Inbox cleanup is pending." : ""}${selectionsCleared ? "" : " Saved chat selection cleanup may be retried after restart."}`
-					: result.error.message,
+					? `Deleted stopped session ${this.sessionFooter(sessionId)} from harnessd. ${remainingTarget ? `Messages target ${this.sessionFooter(remainingTarget)}.` : "This chat has no selected message target."} Next: choose a session in /menu.${cleanupPending ? " Inbox cleanup is pending." : ""}${selectionsCleared ? "" : " Saved chat selection cleanup may be retried after restart."}`
+					: `${result.error.message} Selection is unchanged${remainingTarget ? `; messages target ${this.sessionFooter(remainingTarget)}` : "; no session is selected"}. Next: inspect /menu.`,
 			);
 		}
 		if (name === "/cancel" && args.length === 1) {
@@ -2679,6 +2720,32 @@ export class TelegramTransportAdapter
 		return this.sendDirect(chatId, withInput(safeResultError(error)));
 	}
 
+	private async requireRunningSession(
+		chatId: number,
+		sender: number,
+		sessionId: SessionId,
+		control: "model" | "effort",
+	): Promise<boolean> {
+		const result = await this.request(sender, { kind: "inspect", sessionId });
+		if (!result.ok) {
+			await this.sendDirect(
+				chatId,
+				`${result.error.message} Selection is unchanged; next: inspect /menu.`,
+			);
+			return false;
+		}
+		const session = result.value as SessionSummary;
+		this.rememberSession(session);
+		if (session.status === "running") return true;
+		await this.sendDirect(
+			chatId,
+			session.status === "stopped"
+				? `${sessionLabel(session)} exists, but Pi is stopped. ${control} requires a running Pi. Next: /resume ${sessionId} (does not select it), then /use ${sessionId}.`
+				: `${sessionLabel(session)} exists with Pi status ${session.status}; ${control} requires a running Pi. No reattach or replacement is available. Next: inspect /menu or try /stop ${sessionId} to terminalize a stale instance.`,
+		);
+		return false;
+	}
+
 	private request(
 		sender: number,
 		request: TelegramRequest,
@@ -2776,8 +2843,9 @@ export class TelegramTransportAdapter
 			lines.push(`Не удалось обновить список сессий: ${listed.error.message}`);
 		if (preview) {
 			lines.push(
+				`Существует: да · Выбрана для сообщений: ${this.selected.get(chatId) === preview.id ? "да" : "нет"}`,
 				`Папка просмотра: ${panelPath(preview.cwd)}`,
-				`Статус просмотра: ${preview.status}`,
+				`Статус Pi: ${preview.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : preview.status === "stopped" ? "остановлен" : preview.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${preview.status})`,
 			);
 			if (status) lines.push(compactUsage(status.live?.usage));
 			if (status?.live?.model)
@@ -2797,19 +2865,34 @@ export class TelegramTransportAdapter
 			inlineButton("Папки", "menu:folders"),
 		]);
 		rows.push([inlineButton("Новая сессия", "menu:new")]);
-		if (previewId) {
-			rows.push([
-				inlineButton("Модель просмотра", "menu:models"),
-				inlineButton("Усилие просмотра", "menu:efforts"),
-			]);
-			rows.push([
-				inlineButton("Остановить просмотр", `session:stop:${previewId}`),
-				inlineButton("Удалить просмотр", `session:delete:${previewId}`),
-			]);
-			if (preview?.status === "stopped")
+		if (previewId && preview) {
+			if (preview.status === "running" || preview.status === "stopped")
 				rows.push([
-					inlineButton("Продолжить просмотр", `session:resume:${previewId}`),
+					inlineButton("Модель просмотра", "menu:models"),
+					inlineButton("Усилие просмотра", "menu:efforts"),
 				]);
+			if (preview.status === "running") {
+				rows.push([
+					inlineButton("Остановить просмотр", `session:stop:${previewId}`),
+				]);
+			} else if (preview.status === "stopped") {
+				rows.push([
+					inlineButton(
+						"Возобновить и выбрать",
+						`session:resume-select:${previewId}`,
+					),
+				]);
+				rows.push([
+					inlineButton("Удалить просмотр…", `session:delete:${previewId}`),
+				]);
+			} else {
+				rows.push([
+					inlineButton(
+						"Остановить для восстановления…",
+						`session:stop:${previewId}`,
+					),
+				]);
+			}
 		}
 		await this.updatePanel(
 			chatId,
@@ -3114,6 +3197,12 @@ export class TelegramTransportAdapter
 			const id = this.sessionCallbackId(data.slice(16));
 			return id
 				? this.renderSessionDetails(chatId, sender, id, messageId)
+				: this.showStaleCallback(chatId, messageId);
+		}
+		if (data.startsWith("session:resume-select:")) {
+			const id = this.sessionCallbackId(data.slice(22));
+			return id
+				? this.resumeAndSelectFromPanel(chatId, sender, id, messageId)
 				: this.showStaleCallback(chatId, messageId);
 		}
 		if (data.startsWith("session:resume:")) {
@@ -3886,12 +3975,23 @@ export class TelegramTransportAdapter
 		if (session.status === "running")
 			rows.push([inlineButton("Остановить…", `session:stop:${session.id}`)]);
 		else if (session.status === "stopped")
-			rows.push([inlineButton("Продолжить", `session:resume:${session.id}`)]);
-		rows.push([inlineButton("Удалить…", `session:delete:${session.id}`)]);
+			rows.push([
+				inlineButton("Возобновить", `session:resume:${session.id}`),
+				inlineButton(
+					"Возобновить и выбрать",
+					`session:resume-select:${session.id}`,
+				),
+			]);
+		else if (session.status === "starting" || session.status === "failed")
+			rows.push([
+				inlineButton("Остановить/восстановить…", `session:stop:${session.id}`),
+			]);
+		if (session.status === "stopped")
+			rows.push([inlineButton("Удалить…", `session:delete:${session.id}`)]);
 		rows.push([inlineButton("К списку", "menu:sessions")]);
 		await this.updatePanel(
 			chatId,
-			`${sessionLabel(session)}\nСтатус: ${session.status}\nПапка: ${panelPath(session.cwd)}`,
+			`${sessionLabel(session)}\nСуществует: да · Выбрана для сообщений: ${this.selected.get(chatId) === session.id ? "да" : "нет"}\nСтатус Pi: ${session.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : session.status === "stopped" ? "остановлен" : session.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${session.status})${session.status === "failed" ? "\nАвтоматическое переподключение и создание замены недоступны. Доступное действие: остановить сохранённую запись и затем выбрать другую сессию." : ""}\nПапка: ${panelPath(session.cwd)}`,
 			keyboard(rows),
 			messageId,
 		);
@@ -4048,6 +4148,40 @@ export class TelegramTransportAdapter
 				keyboard([[inlineButton("Назад", "menu:home")]]),
 				messageId,
 			).then(() => {});
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId,
+		});
+		if (!inspected.ok)
+			return this.updatePanel(
+				chatId,
+				inspected.error.message,
+				keyboard([[inlineButton("Назад", "menu:home")]]),
+				messageId,
+			).then(() => {});
+		const session = inspected.value as SessionSummary;
+		this.rememberSession(session);
+		if (session.status !== "running")
+			return this.updatePanel(
+				chatId,
+				session.status === "stopped"
+					? `${sessionLabel(session)} exists but Pi is stopped. Model controls require a running Pi. Resume it first.`
+					: `${sessionLabel(session)} exists with Pi status ${session.status}; model controls require a running Pi. No reattach or replacement is available.`,
+				keyboard([
+					...(session.status === "stopped"
+						? [
+								[
+									inlineButton(
+										"Возобновить и выбрать",
+										`session:resume-select:${session.id}`,
+									),
+								],
+							]
+						: []),
+					[inlineButton("Назад", "menu:home")],
+				]),
+				messageId,
+			).then(() => {});
 		const result = await this.request(sender, {
 			kind: "model_list",
 			sessionId,
@@ -4118,6 +4252,15 @@ export class TelegramTransportAdapter
 				choices.sessionId
 		)
 			return this.renderModels(chatId, sender, messageId);
+		if (
+			!(await this.requireRunningSession(
+				chatId,
+				sender,
+				choices.sessionId,
+				"model",
+			))
+		)
+			return this.renderPanel(chatId, sender, messageId);
 		const result = await this.request(sender, {
 			kind: "model_set",
 			sessionId: choices.sessionId,
@@ -4150,6 +4293,40 @@ export class TelegramTransportAdapter
 				chatId,
 				"Сначала выберите сессию.",
 				keyboard([[inlineButton("Назад", "menu:home")]]),
+				messageId,
+			).then(() => {});
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId,
+		});
+		if (!inspected.ok)
+			return this.updatePanel(
+				chatId,
+				inspected.error.message,
+				keyboard([[inlineButton("Назад", "menu:home")]]),
+				messageId,
+			).then(() => {});
+		const session = inspected.value as SessionSummary;
+		this.rememberSession(session);
+		if (session.status !== "running")
+			return this.updatePanel(
+				chatId,
+				session.status === "stopped"
+					? `${sessionLabel(session)} exists but Pi is stopped. Effort controls require a running Pi. Resume it first.`
+					: `${sessionLabel(session)} exists with Pi status ${session.status}; effort controls require a running Pi. No reattach or replacement is available.`,
+				keyboard([
+					...(session.status === "stopped"
+						? [
+								[
+									inlineButton(
+										"Возобновить и выбрать",
+										`session:resume-select:${session.id}`,
+									),
+								],
+							]
+						: []),
+					[inlineButton("Назад", "menu:home")],
+				]),
 				messageId,
 			).then(() => {});
 		const result = await this.request(sender, {
@@ -4219,6 +4396,15 @@ export class TelegramTransportAdapter
 				choices.sessionId
 		)
 			return this.renderEfforts(chatId, sender, messageId);
+		if (
+			!(await this.requireRunningSession(
+				chatId,
+				sender,
+				choices.sessionId,
+				"effort",
+			))
+		)
+			return this.renderPanel(chatId, sender, messageId);
 		const result = await this.request(sender, {
 			kind: "effort_set",
 			sessionId: choices.sessionId,
@@ -4234,12 +4420,68 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		messageId: number,
 	): Promise<void> {
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId,
+		});
+		if (
+			!inspected.ok ||
+			(inspected.value as SessionSummary).status !== "stopped"
+		) {
+			await this.showStaleCallback(chatId, messageId);
+			return;
+		}
 		const result = await this.request(sender, { kind: "resume", sessionId });
-		if (!result.ok) await this.sendDirect(chatId, result.error.message);
+		if (!result.ok)
+			await this.sendDirect(
+				chatId,
+				`${result.error.message} Selection is unchanged; use /menu to inspect the current session state.`,
+			);
 		else {
 			this.invalidateSessionConfirmations(sessionId);
 			this.rememberSession(result.value as SessionSummary);
+			const target = this.selected.get(chatId);
+			await this.sendDirect(
+				chatId,
+				`Session ${this.sessionFooter(sessionId)} resumed and is running, not selected. ${target ? `Messages still target ${this.sessionFooter(target)}.` : "No session is selected for messages."} Select it with /use ${sessionId} or the Select button.`,
+			);
 		}
+		await this.renderPanel(chatId, sender, messageId);
+	}
+
+	private async resumeAndSelectFromPanel(
+		chatId: number,
+		sender: number,
+		sessionId: SessionId,
+		messageId: number,
+	): Promise<void> {
+		const inspected = await this.request(sender, {
+			kind: "inspect",
+			sessionId,
+		});
+		if (
+			!inspected.ok ||
+			(inspected.value as SessionSummary).status !== "stopped"
+		) {
+			await this.showStaleCallback(chatId, messageId);
+			return;
+		}
+		const result = await this.request(sender, { kind: "resume", sessionId });
+		if (!result.ok) {
+			await this.sendDirect(
+				chatId,
+				`${result.error.message} Selection is unchanged; messages still target ${this.selected.get(chatId) ?? "no selected session"}.`,
+			);
+			return this.renderPanel(chatId, sender, messageId);
+		}
+		this.invalidateSessionConfirmations(sessionId);
+		this.rememberSession(result.value as SessionSummary);
+		const saved = await this.setSelected(chatId, sessionId);
+		this.previews.delete(chatId);
+		await this.sendDirect(
+			chatId,
+			`Session ${this.sessionFooter(sessionId)} resumed and selected. Messages now target ${this.sessionFooter(sessionId)}.${saved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
@@ -4297,6 +4539,18 @@ export class TelegramTransportAdapter
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
+		if (
+			(action === "delete" && session.status !== "stopped") ||
+			(action === "stop" && session.status === "stopped")
+		) {
+			await this.sendDirect(
+				chatId,
+				action === "delete"
+					? `${sessionLabel(session)} is ${session.status}, not stopped. Delete is unavailable; stop it first.`
+					: `${sessionLabel(session)} is already stopped. No stop action was taken.`,
+			);
+			return this.renderSessionDetails(chatId, sender, sessionId, messageId);
+		}
 		const prompt =
 			action === "stop"
 				? `Остановить ${sessionLabel(session)}?`
@@ -4383,7 +4637,11 @@ export class TelegramTransportAdapter
 						};
 			if (invalidated) return this.showStaleCallback(chatId, messageId);
 			if (!result.ok) {
-				await this.sendDirect(chatId, result.error.message);
+				const selectedTarget = this.selected.get(chatId);
+				await this.sendDirect(
+					chatId,
+					`${result.error.message} Selection is unchanged${selectedTarget ? `; messages target ${this.sessionFooter(selectedTarget)}` : "; no session is selected"}. Next: refresh /menu and choose an available action.`,
+				);
 				return this.renderPanel(chatId, sender, messageId);
 			}
 			let selectionPersistenceWarning = false;
@@ -4409,11 +4667,15 @@ export class TelegramTransportAdapter
 					}
 				}
 			}
-			if (selectionPersistenceWarning)
-				await this.sendDirect(
-					chatId,
-					"The session action succeeded, but a saved chat selection could not be cleared and may return after restart.",
-				);
+			const selectedAfterAction = this.selected.get(chatId);
+			const actionOutcome =
+				action === "stop"
+					? `Session ${this.sessionFooter(sessionId)} stopped.`
+					: `Stopped session ${this.sessionFooter(sessionId)} deleted from harnessd.`;
+			await this.sendDirect(
+				chatId,
+				`${actionOutcome} ${selectedAfterAction ? `Selection unchanged; messages target ${this.sessionFooter(selectedAfterAction)}.` : "This chat has no selected session for messages."} Next: ${action === "stop" ? `resume with /resume ${sessionId} (not selected), or select it with /use ${sessionId}.` : "choose another session in /menu."}${selectionPersistenceWarning ? " Saved selection cleanup may be retried after restart." : ""}${cleanupPending ? " Inbox cleanup is pending." : ""}`,
+			);
 			await this.renderPanel(chatId, sender, messageId);
 		} finally {
 			this.releaseInFlightConfirmation(sessionId);
