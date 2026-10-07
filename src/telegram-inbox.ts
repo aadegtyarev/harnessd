@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
 	link,
 	lstat,
@@ -147,18 +148,26 @@ export class TelegramInbox {
 	): Promise<void> {
 		this.validateSessionId(sessionId);
 		try {
-			const directory = await realpath(
-				path.join(this.rootDirectory, sessionId),
+			await this.assertInboxRoot();
+			const sessionDirectory = path.join(this.rootDirectory, sessionId);
+			await this.assertPrivateDirectory(
+				sessionDirectory,
+				"Unsafe inbox directory",
 			);
+			const canonicalRoot = await realpath(this.rootDirectory);
+			const directory = await realpath(sessionDirectory);
+			if (directory !== path.join(canonicalRoot, sessionId))
+				throw new Error("Inbox directory path validation failed");
+			const info = await lstat(savedPath);
+			this.assertPrivateFile(info);
+			if (info.isSymbolicLink() || !info.isFile())
+				throw new Error("Saved attachment is not a regular file");
 			const canonicalFile = await realpath(savedPath);
 			if (
 				path.dirname(canonicalFile) !== directory ||
 				!FILE_NAME_PATTERN.test(path.basename(canonicalFile))
 			)
 				throw new Error("Saved attachment path validation failed");
-			const info = await lstat(savedPath);
-			if (info.isSymbolicLink() || !info.isFile())
-				throw new Error("Saved attachment is not a regular file");
 			await unlink(canonicalFile);
 		} catch (error) {
 			if (isCode(error, "ENOENT")) return;
@@ -177,13 +186,7 @@ export class TelegramInbox {
 		const directory = path.join(this.rootDirectory, sessionId);
 		try {
 			await this.assertInboxRoot();
-			const info = await lstat(directory);
-			if (info.isSymbolicLink()) {
-				await unlink(directory);
-				return;
-			}
-			if (!info.isDirectory())
-				throw new Error("Inbox entry is not a directory");
+			await this.assertPrivateDirectory(directory, "Unsafe inbox directory");
 			await rm(directory, { recursive: true });
 		} catch (error) {
 			if (isCode(error, "ENOENT")) return;
@@ -256,20 +259,36 @@ export class TelegramInbox {
 		await this.assertInboxRoot();
 		const directory = path.join(this.rootDirectory, sessionId);
 		await mkdir(directory, { recursive: true, mode: 0o700 });
-		const info = await lstat(directory);
-		if (info.isSymbolicLink() || !info.isDirectory())
-			throw new Error("Unsafe inbox directory");
-		if (process.platform !== "win32" && (info.mode & 0o077) !== 0)
-			throw new Error("Inbox directory is not private");
+		await this.assertPrivateDirectory(directory, "Unsafe inbox directory");
 		return directory;
 	}
 
 	private async assertInboxRoot(): Promise<void> {
-		const info = await lstat(this.rootDirectory);
+		await this.assertPrivateDirectory(this.rootDirectory, "Unsafe inbox root");
+	}
+
+	private async assertPrivateDirectory(
+		directory: string,
+		unsafeMessage: string,
+	): Promise<void> {
+		const info = await lstat(directory);
 		if (info.isSymbolicLink() || !info.isDirectory())
-			throw new Error("Unsafe inbox root");
-		if (process.platform !== "win32" && (info.mode & 0o077) !== 0)
-			throw new Error("Inbox root is not private");
+			throw new Error(unsafeMessage);
+		if (process.platform !== "win32") {
+			if ((info.mode & 0o077) !== 0)
+				throw new Error("Inbox directory is not private");
+			const owner = process.getuid?.();
+			if (owner !== undefined && info.uid !== owner)
+				throw new Error("Inbox directory is not owned by this user");
+		}
+	}
+
+	private assertPrivateFile(info: Stats): void {
+		if (process.platform === "win32") return;
+		if ((info.mode & 0o077) !== 0) throw new Error("Inbox file is not private");
+		const owner = process.getuid?.();
+		if (owner !== undefined && info.uid !== owner)
+			throw new Error("Inbox file is not owned by this user");
 	}
 
 	private async sessionDirectoryIfPresent(
@@ -277,12 +296,7 @@ export class TelegramInbox {
 	): Promise<string | undefined> {
 		const directory = path.join(this.rootDirectory, sessionId);
 		try {
-			const info = await lstat(directory);
-			if (info.isSymbolicLink()) {
-				await unlink(directory);
-				return undefined;
-			}
-			if (!info.isDirectory()) throw new Error("Unsafe inbox entry");
+			await this.assertPrivateDirectory(directory, "Unsafe inbox entry");
 			return directory;
 		} catch (error) {
 			if (isCode(error, "ENOENT")) return undefined;
@@ -298,6 +312,7 @@ export class TelegramInbox {
 		for (const entry of entries) {
 			const filePath = path.join(directory, entry.name);
 			const info = await lstat(filePath);
+			this.assertPrivateFile(info);
 			if (info.isSymbolicLink() || !info.isFile())
 				throw new Error("Unsafe inbox file");
 			files.push({ path: filePath, size: info.size });

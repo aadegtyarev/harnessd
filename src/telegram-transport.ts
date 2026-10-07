@@ -272,6 +272,7 @@ type InputAttribution = {
 	state: InputDeliveryState;
 	terminal: boolean;
 	pendingSeen: boolean;
+	steered: boolean;
 	waitingForRun: boolean;
 	turn?: TurnBuffer;
 };
@@ -1090,6 +1091,7 @@ export class TelegramTransportAdapter
 	private readonly effortChoices = new Map<number, EffortChoices>();
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
 	private readonly inputAttributions = new Map<InputId, InputAttribution>();
+	private readonly cancelingInputs = new Map<InputId, number>();
 	private readonly inFlightSubmissions = new Map<
 		SessionId,
 		InFlightSubmission
@@ -1405,6 +1407,7 @@ export class TelegramTransportAdapter
 		this.liveActivities.clear();
 		this.turnBuffers.clear();
 		this.inputAttributions.clear();
+		this.cancelingInputs.clear();
 		this.inFlightSubmissions.clear();
 		try {
 			if (this.initializationPromise)
@@ -2667,11 +2670,23 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-			const result = await this.request(sender, {
-				kind: "cancel",
-				sessionId,
-				inputId: args[0] as never,
-			});
+			const inputId = args[0] as InputId;
+			this.cancelingInputs.set(
+				inputId,
+				(this.cancelingInputs.get(inputId) ?? 0) + 1,
+			);
+			let result: TransportResult;
+			try {
+				result = await this.request(sender, {
+					kind: "cancel",
+					sessionId,
+					inputId,
+				});
+			} finally {
+				const pendingCancels = this.cancelingInputs.get(inputId) ?? 0;
+				if (pendingCancels <= 1) this.cancelingInputs.delete(inputId);
+				else this.cancelingInputs.set(inputId, pendingCancels - 1);
+			}
 			return this.sendDirect(
 				chatId,
 				result.ok
@@ -5594,6 +5609,7 @@ export class TelegramTransportAdapter
 			state: "pending",
 			terminal: false,
 			pendingSeen: false,
+			steered: false,
 			waitingForRun: false,
 		};
 		this.inputAttributions.set(inputId, record);
@@ -5607,10 +5623,7 @@ export class TelegramTransportAdapter
 		record.turn = turn;
 		record.waitingForRun = false;
 		turn.pendingInputs.add(record.inputId);
-		if (
-			(record.state === "accepted" || record.state === "uncertain") &&
-			record.chatId !== undefined
-		)
+		if (record.state === "uncertain" && record.chatId !== undefined)
 			if (turn.recipients.size < 128) turn.recipients.add(record.chatId);
 	}
 
@@ -5640,12 +5653,6 @@ export class TelegramTransportAdapter
 			this.associateInputWithObservedRun(record);
 		if (
 			record.turn &&
-			state === "accepted" &&
-			record.turn.recipients.size < 128
-		)
-			record.turn.recipients.add(chatId);
-		if (
-			record.turn &&
 			state === "uncertain" &&
 			record.turn.recipients.size < 128
 		)
@@ -5662,28 +5669,44 @@ export class TelegramTransportAdapter
 		const record = this.getInputAttribution(sessionId, inputId);
 		if (!record || record.terminal) return;
 		if (state === "pending") {
+			if (!record.pendingSeen)
+				record.steered =
+					this.runningSessions.has(sessionId) ||
+					[...this.inputAttributions.values()].some(
+						(other) =>
+							other !== record &&
+							other.sessionId === sessionId &&
+							!other.terminal,
+					);
 			record.pendingSeen = true;
 			const flight = this.inFlightSubmissions.get(sessionId);
 			if (flight) record.chatId ??= flight.chatId;
 			if (!record.turn) this.associateInputWithObservedRun(record);
 			return;
 		}
+		const previousState = record.state;
 		record.state = state;
 		if (state === "accepted" && !record.turn)
 			this.associateInputWithObservedRun(record);
-		if (
-			(state === "accepted" || state === "uncertain") &&
-			record.turn &&
-			record.chatId !== undefined
-		)
+		if (state === "uncertain" && record.turn && record.chatId !== undefined)
 			if (record.turn.recipients.size < 128)
 				record.turn.recipients.add(record.chatId);
 		if (state === "uncertain") {
 			if (record.turn?.settled) this.finishInputAttribution(record, true);
 			return;
 		}
-		if (state === "completed" || state === "failed")
-			this.finishInputAttribution(record, state === "completed");
+		if (state === "completed" || state === "failed") {
+			const handledWithoutRunOutput =
+				state === "completed" &&
+				previousState === "accepted" &&
+				record.steered &&
+				record.turn !== undefined &&
+				!record.turn.settled;
+			this.finishInputAttribution(
+				record,
+				state === "completed" && !handledWithoutRunOutput,
+			);
+		}
 	}
 
 	private finishInputAttribution(
@@ -5709,6 +5732,17 @@ export class TelegramTransportAdapter
 	private settleInputAttributions(turn: TurnBuffer): void {
 		for (const record of this.inputAttributions.values()) {
 			if (record.turn !== turn || record.terminal) continue;
+			if (
+				record.state === "pending" &&
+				record.pendingSeen &&
+				record.steered &&
+				!this.cancelingInputs.has(record.inputId)
+			) {
+				turn.pendingInputs.delete(record.inputId);
+				record.turn = undefined;
+				record.waitingForRun = true;
+				continue;
+			}
 			if (record.state === "uncertain")
 				this.finishInputAttribution(record, true);
 			else if (!record.pendingSeen && record.state === "accepted")
@@ -5891,7 +5925,7 @@ export class TelegramTransportAdapter
 				queue.pendingCharacters + part.length >
 					MAX_QUEUED_CHARACTERS - INPUT_CHARACTER_RESERVE
 			) {
-				this.queueOverflow(queue, sessionId);
+				this.queueOverflow(queue, sessionId, background);
 				break;
 			}
 			queue.messages.push({
@@ -5933,7 +5967,7 @@ export class TelegramTransportAdapter
 			if (outputIndex >= 0) {
 				const [removed] = queue.messages.splice(outputIndex, 1);
 				if (removed) queue.pendingCharacters -= removed.text.length;
-				this.queueOverflow(queue, sessionId);
+				this.queueOverflow(queue, sessionId, removed?.background === true);
 				continue;
 			}
 			const replaceableInputIndex = queue.messages.findIndex(
@@ -5955,8 +5989,22 @@ export class TelegramTransportAdapter
 		queue.pendingCharacters += messageCharacters;
 	}
 
-	private queueOverflow(queue: ChatQueue, sessionId: SessionId): void {
-		if (queue.overflowQueued) return;
+	private queueOverflow(
+		queue: ChatQueue,
+		sessionId: SessionId,
+		background = false,
+	): void {
+		if (queue.overflowQueued) {
+			if (background) {
+				const existing = queue.messages.findIndex(
+					(message) => message.overflow,
+				);
+				const notice = queue.messages[existing];
+				if (notice && !notice.background)
+					queue.messages[existing] = { ...notice, background: true };
+			}
+			return;
+		}
 		queue.overflowQueued = true;
 		const notice = {
 			sessionId,
@@ -5965,6 +6013,7 @@ export class TelegramTransportAdapter
 					OVERFLOW_NOTICE,
 					this.eventFooter(sessionId),
 				)[0] ?? OVERFLOW_NOTICE,
+			...(background ? { background: true as const } : {}),
 			overflow: true as const,
 		};
 		queue.messages.push(notice);

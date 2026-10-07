@@ -119,6 +119,7 @@ describe("TelegramInbox", () => {
 		await writeFile(
 			path.join(directory, "0000000000000-aaaaaaaaaaaaaaaa-full.bin"),
 			"x",
+			{ mode: 0o600 },
 		);
 		const filler = path.join(
 			directory,
@@ -127,6 +128,7 @@ describe("TelegramInbox", () => {
 		await writeFile(
 			filler,
 			Buffer.alloc(TELEGRAM_INBOX_MAX_BYTES_PER_SESSION - 1),
+			{ mode: 0o600 },
 		);
 		await expect(
 			byteInbox.save("sid" as SessionId, "extra.txt", Buffer.from("x")),
@@ -246,5 +248,72 @@ describe("TelegramInbox", () => {
 			unsafeInbox.save("sid" as SessionId, "escape.txt", Buffer.from("x")),
 		).rejects.toThrow("Telegram inbox operation failed");
 		expect(await readdir(outside)).toEqual([]);
+	});
+
+	it.each(["root", "session"] as const)(
+		"refuses to remove stale files through a substituted %s symlink",
+		async (substitution) => {
+			const stateDirectory = await temporaryDirectory();
+			const outside = path.join(stateDirectory, "outside");
+			await mkdir(outside, { mode: 0o700 });
+			const filename = "1800000000000-aaaaaaaaaaaaaaaa-private.txt";
+			const outsideFile = path.join(outside, filename);
+			await writeFile(outsideFile, "must remain", { mode: 0o600 });
+			const inboxRoot = path.join(stateDirectory, "inbox");
+			if (substitution === "root") await symlink(outside, inboxRoot);
+			else {
+				await mkdir(inboxRoot, { mode: 0o700 });
+				await symlink(outside, path.join(inboxRoot, "sid"));
+			}
+			const inbox = new TelegramInbox(stateDirectory);
+			await expect(
+				inbox.withSessionLock("sid" as SessionId, () =>
+					inbox.removeSavedAttachmentUnderLock("sid" as SessionId, outsideFile),
+				),
+			).rejects.toBeInstanceOf(TelegramInboxError);
+			expect(await readFile(outsideFile, "utf8")).toBe("must remain");
+		},
+	);
+
+	it.each(["root", "session"] as const)(
+		"requires private inbox %s directories before stale-file removal",
+		async (nonPrivateDirectory) => {
+			const stateDirectory = await temporaryDirectory();
+			const inboxRoot = path.join(stateDirectory, "inbox");
+			const sessionDirectory = path.join(inboxRoot, "sid");
+			await mkdir(
+				nonPrivateDirectory === "root" ? inboxRoot : sessionDirectory,
+				{ recursive: true, mode: 0o755 },
+			);
+			if (nonPrivateDirectory === "root")
+				await mkdir(sessionDirectory, { mode: 0o700 });
+			const staleFile = path.join(
+				sessionDirectory,
+				"1800000000000-bbbbbbbbbbbbbbbb-private.txt",
+			);
+			await writeFile(staleFile, "must remain", { mode: 0o600 });
+			const inbox = new TelegramInbox(stateDirectory);
+			await expect(
+				inbox.withSessionLock("sid" as SessionId, () =>
+					inbox.removeSavedAttachmentUnderLock("sid" as SessionId, staleFile),
+				),
+			).rejects.toBeInstanceOf(TelegramInboxError);
+			expect(await readFile(staleFile, "utf8")).toBe("must remain");
+		},
+	);
+
+	it("removes a saved stale attachment only from its validated inbox", async () => {
+		const inbox = new TelegramInbox(await temporaryDirectory());
+		const saved = await inbox.save(
+			"sid" as SessionId,
+			"stale.txt",
+			Buffer.from("discard me"),
+		);
+		await inbox.withSessionLock("sid" as SessionId, () =>
+			inbox.removeSavedAttachmentUnderLock("sid" as SessionId, saved.path),
+		);
+		await expect(readFile(saved.path)).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 });

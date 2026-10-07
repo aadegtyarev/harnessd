@@ -1129,7 +1129,12 @@ describe("Telegram transport", () => {
 				detail: "Input canceled",
 			},
 		});
-		await new Promise((resolve) => setTimeout(resolve, 30));
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
 		expect(
 			bot.sent.some(({ text }) => text.includes("unrelated later run")),
 		).toBe(false);
@@ -1140,7 +1145,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("does not attach a submission held across settlement to the preceding run", async () => {
+	it("reassociates a steered pending input with the next run after settlement", async () => {
 		let submission = 0;
 		let releaseSecond!: (value: TransportResult) => void;
 		let secondRequest: TransportEvent | undefined;
@@ -1170,6 +1175,11 @@ describe("Telegram transport", () => {
 		await bot.update(43, "/use sid");
 		const secondSend = bot.update(43, "held until cancellation settles");
 		await vi.waitFor(() => expect(secondRequest).toBeDefined());
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-second" as never, state: "pending" },
+		});
 		await bot.update(42, "/use other");
 		await bot.update(43, "/use other");
 		emit(harnessEvent("sid", "output", "preceding run output"));
@@ -1179,11 +1189,12 @@ describe("Telegram transport", () => {
 			kind: "input",
 			inputEvent: { inputId: "input-first" as never, state: "completed" },
 		});
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "input",
-			inputEvent: { inputId: "input-second" as never, state: "pending" },
-		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
 		if (!secondRequest) throw new Error("missing second submit request");
 		const acceptedSecond = result(secondRequest);
 		if (!acceptedSecond.ok) throw new Error("second submission was rejected");
@@ -1202,6 +1213,14 @@ describe("Telegram transport", () => {
 				bot.sent.some(({ text }) => text.includes("following run output")),
 			).toBe(true),
 		);
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "unrelated subsequent run"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		expect(
+			bot.sent.some(({ text }) => text.includes("unrelated subsequent run")),
+		).toBe(false);
 		expect(
 			bot.sent.some(
 				({ chatId, text }) =>
@@ -1228,6 +1247,107 @@ describe("Telegram transport", () => {
 		).toBe(false);
 		expect(
 			bot.sent.find(({ text }) => text.includes("following run output"))?.text,
+		).toContain("Фоновая сессия");
+		await adapter.stop();
+	});
+
+	it("keeps a canceling input on its old run while a later prompt waits for the abort gate", async () => {
+		let submitCount = 0;
+		let releaseCancel!: (value: TransportResult) => void;
+		let releaseNext!: (value: TransportResult) => void;
+		let nextRequest: TransportEvent | undefined;
+		const cancelGate = new Promise<TransportResult>(
+			(resolve) => (releaseCancel = resolve),
+		);
+		const nextGate = new Promise<TransportResult>(
+			(resolve) => (releaseNext = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "cancel") return cancelGate;
+				if (request.kind !== "submit") return result(request);
+				submitCount++;
+				if (submitCount === 2) {
+					nextRequest = request;
+					return nextGate;
+				}
+				return { ...result(request), value: "cancel-owner" as never };
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "input that will be canceled");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "cancel-owner" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "cancel-owner" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const cancel = bot.update(42, "/cancel cancel-owner");
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "cancel")).toHaveLength(1),
+		);
+		const next = bot.update(42, "prompt after cancellation");
+		await vi.waitFor(() => expect(nextRequest).toBeDefined());
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "output", "canceled run partial output"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		const canceled = result(
+			requests.find(({ kind }) => kind === "cancel") as TransportEvent,
+		);
+		if (!canceled.ok) throw new Error("cancel fixture was rejected");
+		releaseCancel(canceled);
+		await cancel;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "cancel-owner" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-after-cancel" as never, state: "pending" },
+		});
+		if (!nextRequest) throw new Error("missing queued submit request");
+		const accepted = result(nextRequest);
+		if (!accepted.ok) throw new Error("queued submission was rejected");
+		releaseNext({ ...accepted, value: "input-after-cancel" as never });
+		await next;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "post-cancel run answer"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "input-after-cancel" as never,
+				state: "completed",
+			},
+		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		expect(
+			bot.sent.some(({ text }) => text.includes("canceled run partial output")),
+		).toBe(false);
+		expect(
+			bot.sent.some(({ text }) => text.includes("post-cancel run answer")),
+		).toBe(true);
+		expect(
+			bot.sent.find(({ text }) => text.includes("post-cancel run answer"))
+				?.text,
 		).toContain("Фоновая сессия");
 		await adapter.stop();
 	});
@@ -5296,6 +5416,74 @@ describe("Telegram transport", () => {
 			).toBe(true),
 		);
 		expect(bot.sent.filter(({ chatId }) => chatId === 42)).toHaveLength(26);
+		await adapter.stop();
+	});
+
+	it("delivers an overflow notice to a switched background recipient", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "run that will overflow");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		bot.api.sendMessage.mockImplementation(async (chatId, text, options) => {
+			if (chatId === 42 && telegramBody(text) === "Session status changed.")
+				await gate;
+			bot.sent.push({ chatId, text });
+			bot.sendOptions.push(options);
+		});
+		emit(harnessEvent("sid", "status", "unknown"));
+		await vi.waitFor(() =>
+			expect(
+				bot.api.sendMessage.mock.calls.some(
+					([chatId, text]) =>
+						chatId === 42 && telegramBody(text) === "Session status changed.",
+				),
+			).toBe(true),
+		);
+		for (let index = 0; index < 45; index++)
+			emit(harnessEvent("sid", "status", "unknown"));
+		const queues = (
+			adapter as unknown as {
+				queues: Map<number, { overflowQueued: boolean }>;
+			}
+		).queues;
+		await vi.waitFor(() => expect(queues.get(42)?.overflowQueued).toBe(true));
+		await bot.update(42, "/use other");
+		emit(harnessEvent("sid", "output", "x".repeat(33_000)));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		release();
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await waitForEventQueue(42);
+		const noticeIndex = bot.sent.findIndex(({ text }) =>
+			text.includes("Additional notifications were omitted"),
+		);
+		expect(noticeIndex).toBeGreaterThanOrEqual(0);
+		expect(bot.sendOptions[noticeIndex]).toMatchObject({
+			reply_markup: {
+				inline_keyboard: [[{ text: "Переключиться на эту сессию" }]],
+			},
+		});
 		await adapter.stop();
 	});
 
