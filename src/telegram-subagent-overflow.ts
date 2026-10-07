@@ -27,12 +27,12 @@ export class OversizedLineClassifier {
 		newline: boolean,
 		fenced: boolean,
 	): OversizedLineResult | undefined {
-		if (
-			!this.pending &&
-			line.length + segment.length <= MAX_SUBAGENT_ENVELOPE_CHARS
-		)
-			return;
-		if (fenced) return;
+		const tooLong = line.length + segment.length > MAX_SUBAGENT_ENVELOPE_CHARS;
+		if (!this.pending && !tooLong) return;
+		if (fenced) {
+			if (!tooLong) return;
+			return this.visible(`${line}${segment}${newline ? "\n" : ""}`, !newline);
+		}
 		if (isCompleteMarkerParts(this.pending ? this.probe : line, segment)) {
 			this.reset();
 			return { kind: "discard" };

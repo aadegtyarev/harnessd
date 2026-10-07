@@ -1,3 +1,4 @@
+import { isPotentialParts } from "./telegram-subagent-prefix.js";
 import { parseSubagentWidgetLine } from "./telegram-subagent-status.js";
 
 export type PhysicalLineState = {
@@ -6,6 +7,19 @@ export type PhysicalLineState = {
 	fenceLength: number;
 	statusReported: boolean;
 };
+
+export function reportPartialSubagentStatus(
+	line: string,
+	state: PhysicalLineState,
+	statuses: string[],
+): void {
+	if (state.fenced || !isPotentialParts(line, "")) return;
+	const parsed = parseSubagentWidgetLine(line);
+	if (parsed.status && !state.statusReported) {
+		statuses.push(parsed.status);
+		state.statusReported = true;
+	}
+}
 
 export function finishPhysicalLine(
 	line: string,

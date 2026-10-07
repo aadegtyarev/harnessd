@@ -1,19 +1,13 @@
 import {
 	finishPhysicalLine,
 	type PhysicalLineState,
+	reportPartialSubagentStatus,
 } from "./telegram-subagent-framing.js";
 import { OversizedLineClassifier } from "./telegram-subagent-overflow.js";
-import { isPotentialParts } from "./telegram-subagent-prefix.js";
-import {
-	MAX_SUBAGENT_ENVELOPE_CHARS,
-	parseSubagentWidgetLine,
-} from "./telegram-subagent-status.js";
+import { finalizeSubagentStream } from "./telegram-subagent-stream-finalize.js";
+import type { SubagentTextResult } from "./telegram-subagent-stream-result.js";
 
-export type SubagentTextResult = {
-	readonly visibleText: string;
-	readonly statuses: readonly string[];
-	readonly overflow: boolean;
-};
+export type { SubagentTextResult } from "./telegram-subagent-stream-result.js";
 
 export class SubagentTextStream {
 	private line = "";
@@ -76,15 +70,6 @@ export class SubagentTextStream {
 				cursor = newline + 1;
 				continue;
 			}
-			const tooLong =
-				this.line.length + segment.length > MAX_SUBAGENT_ENVELOPE_CHARS;
-			if (tooLong) {
-				visibleText += this.line + segment + (newline < 0 ? "" : "\n");
-				this.line = "";
-				if (newline < 0) this.continuation = true;
-				else cursor = newline + 1;
-				continue;
-			}
 			this.line += segment;
 			if (newline >= 0) {
 				visibleText += finishPhysicalLine(this.line, this.framing, statuses);
@@ -93,28 +78,19 @@ export class SubagentTextStream {
 				cursor = newline + 1;
 				continue;
 			}
-			if (!this.framing.fenced && isPotentialParts(this.line, "")) {
-				const parsed = parseSubagentWidgetLine(this.line);
-				if (parsed.status && !this.framing.statusReported) {
-					statuses.push(parsed.status);
-					this.framing.statusReported = true;
-				}
-			}
+			reportPartialSubagentStatus(this.line, this.framing, statuses);
 			break;
 		}
 		if (final) {
-			const resolved = this.oversized.finish(this.line);
-			if (resolved) {
-				visibleText += resolved.text ?? "";
-				overflow ||= resolved.overflow ?? false;
-				this.line = "";
-			}
-			if (this.line) {
-				visibleText += this.framing.fenced
-					? this.line
-					: finishPhysicalLine(this.line, this.framing, statuses, false);
-				this.line = "";
-			}
+			const resolved = finalizeSubagentStream(
+				this.line,
+				this.framing,
+				this.oversized,
+				statuses,
+			);
+			visibleText += resolved.visibleText;
+			overflow ||= resolved.overflow;
+			this.line = "";
 			this.discarding = false;
 			this.framing.statusReported = false;
 			this.continuation = false;
