@@ -4090,9 +4090,11 @@ export class TelegramTransportAdapter
 		this.rememberSession(session);
 		const selectionSaved = await this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
+		await this.sendDirect(
+			chatId,
+			`Selected ${sessionLabel(session)}. Ordinary messages now target this session.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
-		if (!selectionSaved)
-			await this.sendDirect(chatId, SELECTION_NOT_SAVED_WARNING.trim());
 	}
 
 	private async selectSession(
@@ -4110,9 +4112,11 @@ export class TelegramTransportAdapter
 		this.rememberSession(session);
 		const selectionSaved = await this.setSelected(chatId, session.id);
 		this.previews.delete(chatId);
+		await this.sendDirect(
+			chatId,
+			`Selected ${sessionLabel(session)}. Ordinary messages now target this session.${selectionSaved ? "" : SELECTION_NOT_SAVED_WARNING}`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
-		if (!selectionSaved)
-			await this.sendDirect(chatId, SELECTION_NOT_SAVED_WARNING.trim());
 	}
 
 	private async renderSessions(
@@ -4491,11 +4495,12 @@ export class TelegramTransportAdapter
 			return this.renderModels(chatId, sender, messageId);
 		}
 		const change = result.value as HarnessModelChangeResult;
-		if (change.effortConfirmed === false)
-			await this.sendDirect(
-				chatId,
-				`Модель выбрана, но усилие не подтверждено. Проверьте /status перед повтором.`,
-			);
+		await this.sendDirect(
+			chatId,
+			change.effortConfirmed === false
+				? "Модель выбрана, но усилие не подтверждено. Проверьте /status перед повтором."
+				: `Модель ${model.provider}/${model.id} выбрана.`,
+		);
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
@@ -4630,6 +4635,7 @@ export class TelegramTransportAdapter
 			effort,
 		});
 		if (!result.ok) await this.sendDirect(chatId, result.error.message);
+		else await this.sendDirect(chatId, `Усилие установлено: ${effort}.`);
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
@@ -4940,6 +4946,10 @@ export class TelegramTransportAdapter
 		}
 		const session = result.value as SessionSummary;
 		this.rememberSession(session);
+		await this.sendDirect(
+			chatId,
+			`Имя сессии ${this.sessionFooter(sessionId)} очищено.`,
+		);
 		await this.renderSessionDetails(chatId, sender, sessionId, messageId);
 	}
 
