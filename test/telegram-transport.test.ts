@@ -5056,6 +5056,68 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("redacts streamed subagent envelopes and coalesces identical activity status", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "run subagent work");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		const bubbleId = bot.lastMessageId;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const widget = `Pi: PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+			kind: "pi-subagents.async-status-snapshot",
+			runs: [
+				{
+					kind: "subagent",
+					label: "scout",
+					state: "running",
+					id: "SENTINEL_PAYLOAD_ID",
+				},
+			],
+			generatedAt: "SENTINEL_TIMESTAMP",
+		})}`;
+		emit(harnessEvent("sid", "output", widget.slice(0, 24)));
+		emit(harnessEvent("sid", "output", `${widget.slice(24)}\nVisible answer.`));
+		for (let index = 0; index < 100; index++)
+			emit(harnessEvent("sid", "output", `${widget}\n`));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) =>
+					text.includes("Задача Scout: выполняется"),
+				),
+			).toBe(true),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Visible answer.")),
+			).toBe(true),
+		);
+		const payloads = [
+			...bot.api.sendMessage.mock.calls.map(([, text]) => String(text)),
+			...bot.api.editMessageText.mock.calls.map(([, , text]) => String(text)),
+		];
+		expect(payloads.join("\n")).not.toContain("SENTINEL_PAYLOAD_ID");
+		expect(payloads.join("\n")).not.toContain("SENTINEL_TIMESTAMP");
+		expect(payloads.join("\n")).not.toContain("Additional output omitted");
+		expect(
+			bot.api.editMessageText.mock.calls.filter(
+				([, messageId]) => messageId === bubbleId,
+			).length,
+		).toBeLessThan(10);
+		expect(bot.sent.some(({ text }) => text.includes("Visible answer."))).toBe(
+			true,
+		);
+		await adapter.stop();
+	});
+
 	it("does not send a Telegram answer when a turn contains only an internal widget", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
