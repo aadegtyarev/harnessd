@@ -96,8 +96,14 @@ describe("application runtime", () => {
 			expect(launch).toHaveBeenCalledOnce();
 			expect(launch).toHaveBeenCalledWith({
 				executable: "/unused/pi",
-				args: ["--mode", "rpc"],
+				args: [
+					"--mode",
+					"rpc",
+					"--extension",
+					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				],
 				cwd: await realpath(os.tmpdir()),
+				env: undefined,
 				stdio: "pipe",
 			});
 			await runtime.close();
