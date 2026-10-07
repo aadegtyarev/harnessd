@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	type ActivityRow,
 	localActivityTime,
-	meaningfulToolSummary,
 	updateActivityRow,
 	visibleActivityRows,
 } from "../src/telegram-activity-projection.js";
@@ -12,12 +11,6 @@ afterEach(() => {
 });
 
 describe("Telegram activity projection", () => {
-	it("suppresses generic workflow and subagent management plumbing", () => {
-		expect(meaningfulToolSummary("subagent · workflow · inspect")).toBe(false);
-		expect(meaningfulToolSummary("subagent_wait: worker")).toBe(false);
-		expect(meaningfulToolSummary("bash: npm test")).toBe(true);
-	});
-
 	it("replaces an exact tool call in one row and ignores duplicates, regressions, and unknown ends", () => {
 		const rows: ActivityRow[] = [];
 		expect(updateActivityRow(rows, "opaque", "bash: npm test")).toBe(true);
@@ -64,15 +57,8 @@ describe("Telegram activity projection", () => {
 		expect(lines.at(-1)).toBe("• Ещё завершено: 2");
 	});
 
-	it("projects only approved role labels and coalesces the notification slot", () => {
+	it("projects approved role labels without exposing task text or internal IDs", () => {
 		const rows: ActivityRow[] = [];
-		expect(meaningfulToolSummary("subagent · workflow · inspect")).toBe(false);
-		expect(meaningfulToolSummary("subagent · worker · secret task text")).toBe(
-			true,
-		);
-		expect(meaningfulToolSummary("subagent · manager · secret task text")).toBe(
-			false,
-		);
 		updateActivityRow(rows, "private-id", "subagent · worker · SECRET_SUFFIX");
 		const lines = visibleActivityRows(rows);
 		expect(lines).toEqual(["• Задача Worker: выполняется …"]);
