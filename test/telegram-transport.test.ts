@@ -1645,7 +1645,11 @@ describe("Telegram transport", () => {
 
 	it("keeps a replacement panel reference when keyboard publication fails", async () => {
 		const bot = new MockBot();
-		const { adapter } = await startAdapter(bot, await temp());
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
 		await bot.update(42, "/menu");
 		const originalId = bot.lastMessageId;
 		bot.api.editMessageText
@@ -1659,6 +1663,18 @@ describe("Telegram transport", () => {
 		const replacementId = bot.lastMessageId;
 		const sendsAfterReplacement = bot.api.sendMessage.mock.calls.length;
 		expect(replacementId).not.toBe(originalId);
+		const publicationAttempt = bot.api.editMessageText.mock.calls.find(
+			([, messageId]) => messageId === replacementId,
+		);
+		expect(publicationAttempt).toBeDefined();
+		const unpublishedFolderToken = callbackData(
+			publicationAttempt?.[3],
+			"folder:",
+		);
+		await bot.callback(42, unpublishedFolderToken, replacementId);
+		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
+
 		await bot.update(42, "/menu");
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
 		expect(bot.api.editMessageText).toHaveBeenLastCalledWith(
@@ -1668,6 +1684,7 @@ describe("Telegram transport", () => {
 			expect.any(Object),
 			expect.any(AbortSignal),
 		);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
 		await adapter.stop();
 	});
 
