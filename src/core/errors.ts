@@ -17,6 +17,7 @@ export type Capability =
 	| "harness.model.set"
 	| "harness.effort.list"
 	| "harness.effort.set"
+	| "harness.reload"
 	| "harness.file.send"
 	| "process.launch"
 	| "process.signal"

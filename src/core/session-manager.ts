@@ -67,6 +67,7 @@ export class SessionManager {
 	private readonly attempts = new Map<SessionId, number>();
 	private readonly delays = new Map<SessionId, () => void>();
 	private readonly unsettledInputs = new Map<SessionId, Set<InputId>>();
+	private readonly reloads = new Set<SessionId>();
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
 
 	constructor(
@@ -607,13 +608,36 @@ export class SessionManager {
 		await control.setEffort(effort);
 	}
 
+	async reload(id: SessionId, beforeDispatch: () => boolean): Promise<void> {
+		if (this.reloads.has(id)) throw new Error("RELOAD_ALREADY_RUNNING");
+		this.reloads.add(id);
+		try {
+			const { control } = await this.requireControl(id, "harness.reload");
+			const session = await this.get(id);
+			if (
+				session.status !== "running" ||
+				!this.instances.has(id) ||
+				this.recovery.has(id) ||
+				(this.unsettledInputs.get(id)?.size ?? 0) > 0
+			)
+				throw new Error("RELOAD_BUSY");
+			if (!beforeDispatch()) throw new Error("RELOAD_SELECTION_CHANGED");
+			if (!control.reload)
+				throw new UnsupportedCapabilityError("harness.reload", id);
+			await control.reload();
+		} finally {
+			this.reloads.delete(id);
+		}
+	}
+
 	private async requireControl(
 		id: SessionId,
 		capability:
 			| "harness.model.list"
 			| "harness.model.set"
 			| "harness.effort.list"
-			| "harness.effort.set",
+			| "harness.effort.set"
+			| "harness.reload",
 	): Promise<{ control: HarnessControl; harness: HarnessAdapter }> {
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);

@@ -299,11 +299,19 @@ describe("PiRpcHarnessAdapter", () => {
 			"harness.model.set",
 			"harness.effort.list",
 			"harness.effort.set",
+			"harness.reload",
 			"input.submit",
 		]);
 		expect(fake.launchRequest).toMatchObject({
 			executable: options.executable,
-			args: ["--model", "model name", "--mode", "rpc"],
+			args: [
+				"--model",
+				"model name",
+				"--mode",
+				"rpc",
+				"--extension",
+				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+			],
 			cwd: request.cwd,
 			env: options.env,
 			stdio: "pipe",
@@ -328,9 +336,15 @@ describe("PiRpcHarnessAdapter", () => {
 		const instance = await adapter.launch(request);
 		const launchRequest = fake.launchRequest;
 		expect(launchRequest?.args).toContain("--extension");
-		const extensionIndex = launchRequest?.args.indexOf("--extension") ?? -1;
-		expect(launchRequest?.args[extensionIndex + 1]).toMatch(
-			/agent-file-send-extension\.(?:ts|js)$/,
+		const extensionPaths =
+			launchRequest?.args.flatMap((arg, index, args) =>
+				arg === "--extension" ? [args[index + 1]] : [],
+			) ?? [];
+		expect(extensionPaths).toEqual(
+			expect.arrayContaining([
+				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				expect.stringMatching(/agent-file-send-extension\.(?:ts|js)$/),
+			]),
 		);
 		const env = launchRequest?.env ?? {};
 		const url = env[AGENT_FILE_SEND_URL_ENV];
@@ -525,7 +539,13 @@ describe("PiRpcHarnessAdapter", () => {
 			}).launch(request);
 			expect(fake.launchRequest).toMatchObject({
 				executable: process.execPath,
-				args: [executable, "--mode", "rpc"],
+				args: [
+					executable,
+					"--mode",
+					"rpc",
+					"--extension",
+					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				],
 				cwd: request.cwd,
 				env: undefined,
 				stdio: "pipe",
@@ -563,7 +583,13 @@ describe("PiRpcHarnessAdapter", () => {
 			}).launch({ ...request, cwd: childCwd });
 			expect(fake.launchRequest).toMatchObject({
 				executable: process.execPath,
-				args: [executable, "--mode", "rpc"],
+				args: [
+					executable,
+					"--mode",
+					"rpc",
+					"--extension",
+					expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+				],
 				env: { PATH: envPath },
 			});
 			await instance.shutdown();
@@ -619,7 +645,12 @@ describe("PiRpcHarnessAdapter", () => {
 				startupTimeoutMs: 100,
 			}).launch(request);
 			expect(fake.launchRequest?.executable).toBe(executable);
-			expect(fake.launchRequest?.args).toEqual(["--mode", "rpc"]);
+			expect(fake.launchRequest?.args).toEqual([
+				"--mode",
+				"rpc",
+				"--extension",
+				expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
+			]);
 			await instance.shutdown();
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
@@ -734,6 +765,8 @@ describe("PiRpcHarnessAdapter", () => {
 			"rpc",
 			"--session",
 			"saved-id",
+			"--extension",
+			expect.stringMatching(/pi-reload-extension\.(?:ts|js)$/),
 		]);
 		await instance.shutdown();
 	});

@@ -132,6 +132,13 @@ export type TransportEvent =
 			readonly kind: "effort_set";
 			readonly sessionId: SessionId;
 			readonly effort: string;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "reload";
+			readonly sessionId: SessionId;
+			readonly beforeDispatch: () => boolean;
 	  };
 
 export type TransportResult =
@@ -233,6 +240,7 @@ export interface HarnessControl {
 	listEfforts(): Promise<readonly string[]>;
 	setModel(provider: string, modelId: string): Promise<HarnessModelInfo>;
 	setEffort(level: string): Promise<void>;
+	reload?(): Promise<void>;
 }
 
 export interface HarnessSessionStatus {

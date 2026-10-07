@@ -237,6 +237,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			"harness.model.set",
 			"harness.effort.list",
 			"harness.effort.set",
+			"harness.reload",
 			"input.submit",
 		];
 		if (this.options.agentFileSend) capabilities.push("harness.file.send");
@@ -320,12 +321,19 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			| undefined;
 		let child: ManagedProcess;
 		try {
+			const adapterPath = fileURLToPath(import.meta.url);
+			args.push(
+				"--extension",
+				path.join(
+					path.dirname(adapterPath),
+					`pi-reload-extension${path.extname(adapterPath)}`,
+				),
+			);
 			if (this.options.agentFileSend) {
 				fileSendBridge = await startAgentFileSendBridge(
 					request.sessionId,
 					this.options.agentFileSend,
 				);
-				const adapterPath = fileURLToPath(import.meta.url);
 				args.push(
 					"--extension",
 					path.join(
@@ -526,6 +534,7 @@ class PiRpcInstance implements HarnessInstance {
 		listEfforts: () => this.listEfforts(),
 		setModel: (provider, modelId) => this.setModel(provider, modelId),
 		setEffort: (level) => this.setEffort(level),
+		reload: () => this.reload(),
 	};
 	private readonly queue: HarnessEvent[] = [];
 	private readonly waiters: ((result: IteratorResult<HarnessEvent>) => void)[] =
@@ -536,6 +545,9 @@ class PiRpcInstance implements HarnessInstance {
 	private abortOutcomeUncertain = false;
 	private nativeId?: string;
 	private agentRunning = false;
+	private compacting = false;
+	private reloadExtensionError = false;
+	private reloadPending = false;
 	private eventsClosed = false;
 	private childExited = false;
 	private stdoutEnded = false;
@@ -667,6 +679,34 @@ class PiRpcInstance implements HarnessInstance {
 		} catch (error) {
 			if (error instanceof PiControlError) throw error;
 			throw new PiControlError("PI_CONTROL_FAILED", { cause: error });
+		}
+	}
+	private async reload(): Promise<void> {
+		if (
+			this.agentRunning ||
+			this.compacting ||
+			this.activeInputs.size > 0 ||
+			this.abortInFlight
+		)
+			throw new PiControlError("PI_CONTROL_FAILED");
+		this.reloadExtensionError = false;
+		this.reloadPending = true;
+		try {
+			const response = await this.command("prompt", {
+				message: "/harnessd-reload",
+			});
+			const data = recordValue(response.data);
+			if (
+				response.success !== true ||
+				data?.disposition !== "handled" ||
+				this.reloadExtensionError
+			)
+				throw new PiControlError("PI_CONTROL_FAILED");
+		} catch (error) {
+			if (error instanceof PiControlError) throw error;
+			throw new PiControlError("PI_CONTROL_FAILED", { cause: error });
+		} finally {
+			this.reloadPending = false;
 		}
 	}
 	get events(): AsyncIterable<HarnessEvent> {
@@ -802,6 +842,15 @@ class PiRpcInstance implements HarnessInstance {
 			return;
 		}
 		if (record.type === "extension_error") {
+			if (
+				this.reloadPending &&
+				typeof record.extensionPath === "string" &&
+				path
+					.basename(record.extensionPath)
+					.startsWith("pi-reload-extension.") &&
+				record.event === "command"
+			)
+				this.reloadExtensionError = true;
 			const extensionPath =
 				typeof record.extensionPath === "string"
 					? path.basename(record.extensionPath)
@@ -954,6 +1003,10 @@ class PiRpcInstance implements HarnessInstance {
 				});
 			return;
 		}
+		if (["auto_compaction_start", "compaction_start"].includes(record.type))
+			this.compacting = true;
+		if (["auto_compaction_end", "compaction_end"].includes(record.type))
+			this.compacting = false;
 		if (["agent_start", "agent_end", "agent_settled"].includes(record.type)) {
 			this.emit({
 				sessionId: this.sessionId,

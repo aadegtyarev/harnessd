@@ -398,6 +398,10 @@ export class ApplicationRuntime {
 					await this.manager.setEffort(request.sessionId, request.effort);
 					value = undefined as typeof value;
 					break;
+				case "reload":
+					await this.manager.reload(request.sessionId, request.beforeDispatch);
+					value = undefined as typeof value;
+					break;
 			}
 			return { requestId: request.requestId, ok: true, value };
 		} catch (error) {
