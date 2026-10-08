@@ -6,6 +6,7 @@ import {
 	mergeAdapterOptions,
 	validateAdapterOptions,
 } from "./adapter-options.js";
+import type { Capability } from "./errors.js";
 import {
 	DuplicateAdapterIdError,
 	DuplicateSessionIdError,
@@ -147,6 +148,11 @@ export class SessionManager {
 		const session = await this.store.get(id);
 		if (!session) throw new SessionNotFoundError(id);
 		return session;
+	}
+
+	async getHarnessCapabilities(id: SessionId): Promise<readonly Capability[]> {
+		const session = await this.get(id);
+		return this.harnesses.get(session.harnessId)?.descriptor.capabilities ?? [];
 	}
 
 	async rename(id: SessionId, name?: string): Promise<SessionSummary> {
@@ -651,6 +657,24 @@ export class SessionManager {
 			throw new SessionNotFoundError(id);
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		await instance.cancel(inputId);
+	}
+
+	async cancelCurrent(id: SessionId): Promise<void> {
+		if (this.configuring.has(id) || this.reloads.has(id))
+			throw new ReloadError("RELOAD_BUSY");
+		const session = await this.get(id);
+		const harness = this.harnesses.get(session.harnessId);
+		if (!harness)
+			throw new UnsupportedCapabilityError("harness.cancel", session.harnessId);
+		requireCapability(
+			harness.descriptor.capabilities,
+			"harness.cancel",
+			harness.descriptor.id,
+		);
+		const instance = this.instances.get(id);
+		if (!instance?.cancelCurrent || session.status !== "running")
+			throw new UnsupportedCapabilityError("harness.cancel", session.harnessId);
+		await instance.cancelCurrent();
 	}
 
 	async getSessionStatus(id: SessionId): Promise<HarnessSessionStatus> {

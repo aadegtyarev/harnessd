@@ -43,8 +43,9 @@ export function extensionCommands(
 
 export function telegramMenuCommands(
 	extensions: readonly HarnessCommand[],
+	includeCancel = true,
 ): readonly { readonly command: string; readonly description: string }[] {
-	const native = getTelegramCommands();
+	const native = getTelegramCommands(includeCancel);
 	const remaining = Math.max(0, TELEGRAM_COMMAND_LIMIT - native.length);
 	return [
 		...native,

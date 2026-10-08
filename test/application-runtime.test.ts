@@ -996,6 +996,17 @@ describe("application runtime", () => {
 			ok: false,
 			error: { code: "UNSUPPORTED_CAPABILITY" },
 		});
+		const cancelCurrent = await dispatch({
+			requestId: "request-cancel-current",
+			principalId: "operator",
+			kind: "cancel_current",
+			sessionId: created.value.id,
+		});
+		expect(cancelCurrent).toMatchObject({
+			requestId: "request-cancel-current",
+			ok: false,
+			error: { code: "UNSUPPORTED_CAPABILITY" },
+		});
 		const stopped = await dispatch({
 			requestId: "request-stop",
 			principalId: "operator",

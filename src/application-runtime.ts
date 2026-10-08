@@ -327,8 +327,11 @@ export class ApplicationRuntime {
 				runtime.subscribe(listener);
 			for (const transport of options.transports) {
 				started.push(transport);
-				await transport.start(runtime.dispatch, subscribeEvents, () =>
-					sessionManager.list(),
+				await transport.start(
+					runtime.dispatch,
+					subscribeEvents,
+					() => sessionManager.list(),
+					(sessionId) => sessionManager.getHarnessCapabilities(sessionId),
 				);
 			}
 			runtime.state = "running";
@@ -453,6 +456,10 @@ export class ApplicationRuntime {
 				}
 				case "cancel":
 					await this.manager.cancel(request.sessionId, request.inputId);
+					value = undefined as typeof value;
+					break;
+				case "cancel_current":
+					await this.manager.cancelCurrent(request.sessionId);
 					value = undefined as typeof value;
 					break;
 				case "session_status":

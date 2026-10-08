@@ -584,6 +584,7 @@ async function startAdapter(
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
 		activityClock?: () => Date;
 		activityTimeFormatter?: (date: Date) => string;
+		capabilities?: readonly import("../src/core/errors.js").Capability[];
 		panelClock?: () => number;
 		panelSleep?: (milliseconds: number) => Promise<void>;
 	} = {},
@@ -618,6 +619,7 @@ async function startAdapter(
 			};
 		},
 		async () => [...sessions.values()],
+		async () => extras.capabilities ?? ["harness.cancel"],
 	);
 	await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
 	bot.ready();
@@ -1269,6 +1271,32 @@ describe("Telegram transport", () => {
 		await help;
 		expect(bot.sent.at(-1)?.text).toContain("только команды harnessd");
 		expect(bot.sent.some(({ text }) => text.includes("/stale"))).toBe(false);
+		await adapter.stop();
+	});
+
+	it("hides and refuses cancel for a harness without the cancellation capability", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			capabilities: [],
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		expect(
+			bot.commandRegistrations
+				.at(-1)
+				?.commands.some(({ command }) => command === "cancel"),
+		).toBe(false);
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).not.toContain("/cancel");
+		await bot.update(42, "/cancel");
+		expect(bot.sent.at(-1)?.text).toContain("не поддерживается");
+		expect(
+			requests.some(
+				({ kind }) => kind === "cancel" || kind === "cancel_current",
+			),
+		).toBe(false);
 		await adapter.stop();
 	});
 
@@ -3024,10 +3052,13 @@ describe("Telegram transport", () => {
 		).toBe(true);
 		await bot.update(42, "/cancel");
 		expect(bot.sent.at(-1)?.text).toContain("Запрошена отмена ввода");
-		expect(requests.filter(({ kind }) => kind === "cancel")).toHaveLength(1);
-		expect(requests.find(({ kind }) => kind === "cancel")).toMatchObject({
+		expect(
+			requests.filter(({ kind }) => kind === "cancel_current"),
+		).toHaveLength(1);
+		expect(
+			requests.find(({ kind }) => kind === "cancel_current"),
+		).toMatchObject({
 			sessionId: "sid",
-			inputId: "input-1",
 		});
 		expect(submitCount).toBe(2);
 		await bot.update(42, "new message after cancel");
@@ -6267,7 +6298,6 @@ describe("Telegram transport", () => {
 			"permissions",
 			"stop",
 			"delete",
-			"cancel",
 		]);
 
 		await bot.update(100, "/start");

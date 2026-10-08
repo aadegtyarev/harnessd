@@ -21,9 +21,9 @@
 
 ## Separately approved Telegram UX pass (Stage C)
 
-- Bare `/cancel` cancels the selected Pi session's current active input; `/cancel <inputId>` remains supported. Native authorization and session routing remain unchanged. Claude does not advertise cancellation.
+- Bare `/cancel` invokes the selected Pi session's current active-run cancellation, distinct from exact `/cancel <inputId>`. The current-run operation aborts the active run while preserving Pi-native queued inputs; exact-ID cancellation retains its ambiguity protections. Native authorization and session routing remain unchanged. Claude hides and refuses cancel through descriptor capability checks.
 - Telegram distinguishes transport acceptance, Pi queueing behind busy work, and model consumption. When Pi is blocked in a `bg_wait`-like state, an ordinary message is explicitly reported as queued, not consumed. Bare `/cancel` releases/cancels that selected session's active input so the conversation can continue. No hidden replay occurs; neither cancellation nor uncertainty automatically reruns the queued message or background task.
-- Dynamic Pi `/cost` returns its bounded actual command result to Telegram, not merely dispatch acknowledgement. Use a bounded timeout and fixed safe errors, exact request correlation, and never replay/rerun after uncertainty; do not expose raw protocol or internal details.
+- Dynamic Pi `/cost` returns its bounded actual command result to Telegram, not merely dispatch acknowledgement. Pi prompt acknowledgements contain disposition only; correlate the exact `pi-ad-session-usage:report` custom message to one outstanding `/cost`, requiring a handled disposition and bounded result window. Use fixed safe errors, quarantine after uncertainty so late results cannot be mistaken for a later command, and never replay/rerun; do not expose raw protocol or internal details.
 - Do not implement MCP `send_file` in this pass.
 
 ## Non-goals

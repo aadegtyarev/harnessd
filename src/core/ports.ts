@@ -176,6 +176,12 @@ export type TransportEvent =
 	| {
 			readonly requestId: string;
 			readonly principalId: string;
+			readonly kind: "cancel_current";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
 			readonly kind: "session_status";
 			readonly sessionId: SessionId;
 	  }
@@ -303,6 +309,9 @@ export interface TransportAdapter {
 		dispatch: (event: TransportEvent) => Promise<TransportResult>,
 		subscribeEvents: TransportEventSubscription,
 		listSessions?: () => Promise<readonly SessionSummary[]>,
+		getSessionCapabilities?: (
+			sessionId: SessionId,
+		) => Promise<readonly Capability[]>,
 	): Promise<void>;
 	stop(): Promise<void>;
 }
@@ -408,6 +417,7 @@ export interface HarnessInstance {
 	isIdle?(): boolean;
 	send(input: Input): Promise<void>;
 	cancel(inputId: InputId): Promise<void>;
+	cancelCurrent?(): Promise<void>;
 	shutdown(): Promise<void>;
 }
 

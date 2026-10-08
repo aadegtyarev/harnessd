@@ -8,6 +8,7 @@ import {
 	getTelegramCommands,
 	getTelegramHelpLines,
 } from "./command-catalog.js";
+import type { Capability } from "./core/errors.js";
 import type {
 	AgentFileSendRequest,
 	AgentFileSendResult,
@@ -1188,6 +1189,9 @@ export class TelegramTransportAdapter
 		id: "telegram" as AdapterId,
 		capabilities: ["transport.poll"] as const,
 	};
+	private getSessionCapabilities?: (
+		sessionId: SessionId,
+	) => Promise<readonly Capability[]>;
 	private readonly selected = new Map<number, SessionId>();
 	private readonly selectionCurrency = new Map<number, number>();
 	private readonly commandMenuGenerations = new Map<number, number>();
@@ -1303,9 +1307,13 @@ export class TelegramTransportAdapter
 		dispatch: (event: TransportEvent) => Promise<TransportResult>,
 		subscribe: TransportEventSubscription,
 		listSessions?: () => Promise<readonly SessionSummary[]>,
+		getSessionCapabilities?: (
+			sessionId: SessionId,
+		) => Promise<readonly Capability[]>,
 	): Promise<void> {
 		this.dispatch = dispatch;
 		this.listSessions = listSessions;
+		this.getSessionCapabilities = getSessionCapabilities;
 		this.releaseLock = await acquireTelegramPollingLock(
 			this.options.token,
 			this.options.stateDirectory,
@@ -1374,7 +1382,7 @@ export class TelegramTransportAdapter
 				try {
 					await withDeadline(
 						this.bot.api.setMyCommands(
-							getTelegramCommands(),
+							getTelegramCommands(false),
 							{ scope: { type: "all_private_chats" } },
 							this.initializationAbort.signal,
 						),
@@ -1784,6 +1792,16 @@ export class TelegramTransportAdapter
 							request.sessionId,
 						)) ?? [])
 					: [];
+				let includeCancel = false;
+				if (request.sessionId && this.getSessionCapabilities) {
+					try {
+						includeCancel = (
+							await this.getSessionCapabilities(request.sessionId)
+						).includes("harness.cancel");
+					} catch {
+						includeCancel = false;
+					}
+				}
 				if (this.stopping) return;
 				if (
 					this.commandMenuRequests.get(chatId)?.generation !==
@@ -1798,7 +1816,7 @@ export class TelegramTransportAdapter
 				try {
 					publication = Promise.resolve(
 						this.bot.api.setMyCommands(
-							telegramMenuCommands(extensions),
+							telegramMenuCommands(extensions, includeCancel),
 							{ scope: { type: "chat", chat_id: chatId } },
 							controller.signal,
 						),
@@ -3028,11 +3046,24 @@ export class TelegramTransportAdapter
 			const extensions = (commands ?? []).map(
 				({ name, description }) => `/${name} — ${description}`,
 			);
+			let includeCancel = false;
+			if (sessionId && this.getSessionCapabilities) {
+				try {
+					const capabilities = await this.getSessionCapabilities(sessionId);
+					includeCancel =
+						current &&
+						this.selected.get(chatId) === sessionId &&
+						(this.selectionCurrency.get(chatId) ?? 0) === selectionCurrency &&
+						capabilities.includes("harness.cancel");
+				} catch {
+					includeCancel = false;
+				}
+			}
 			const omitted = Math.max(0, extensions.length - 1_000);
 			const lines = [
 				"Как начать: откройте /menu, выберите сессию или создайте новую. Обычные сообщения и вложения отправляются в выбранную сессию; /send <путь> отправляет файл из её рабочей папки.",
 				"Команды:",
-				...getTelegramHelpLines(),
+				...getTelegramHelpLines(includeCancel),
 				...notes,
 				...extensions.slice(0, 1_000),
 				...(omitted ? [`… ещё команд: ${omitted}`] : []),
@@ -3562,36 +3593,65 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-			const activeInputs = [...this.inputAttributions.values()].filter(
-				(record) =>
-					record.sessionId === sessionId &&
-					!record.terminal &&
-					record.state === "accepted" &&
-					!record.steered,
-			);
-			if (!args.length && activeInputs.length !== 1)
+			const selectionCurrency = this.selectionCurrency.get(chatId) ?? 0;
+			let supportsCancel = false;
+			try {
+				supportsCancel =
+					(await this.getSessionCapabilities?.(sessionId))?.includes(
+						"harness.cancel",
+					) ?? false;
+			} catch {
+				supportsCancel = false;
+			}
+			if (
+				this.selected.get(chatId) !== sessionId ||
+				(this.selectionCurrency.get(chatId) ?? 0) !== selectionCurrency
+			)
 				return this.sendDirect(
 					chatId,
-					activeInputs.length
-						? "Нельзя безопасно определить активный ввод; укажите точный ID: /cancel <inputId>."
-						: "В выбранной сессии нет подтверждённого активного ввода для отмены.",
+					"Выбор сессии изменился; отмена не выполнялась.",
 				);
-			const inputId = (args[0] ?? activeInputs[0]?.inputId) as InputId;
-			this.cancelingInputs.set(
-				inputId,
-				(this.cancelingInputs.get(inputId) ?? 0) + 1,
-			);
+			if (!supportsCancel)
+				return this.sendDirect(
+					chatId,
+					"Отмена ввода для выбранной сессии не поддерживается.",
+				);
+			const inputId = args[0] as InputId | undefined;
+			const activeInput = inputId
+				? this.inputAttributions.get(inputId)
+				: [...this.inputAttributions.values()].find(
+						(record) =>
+							record.sessionId === sessionId &&
+							!record.terminal &&
+							record.state === "accepted" &&
+							!record.steered,
+					);
+			const trackedInput =
+				activeInput?.sessionId === sessionId && !activeInput.terminal
+					? activeInput
+					: undefined;
+			if (trackedInput)
+				this.cancelingInputs.set(
+					trackedInput.inputId,
+					(this.cancelingInputs.get(trackedInput.inputId) ?? 0) + 1,
+				);
 			let result: TransportResult;
 			try {
-				result = await this.request(sender, {
-					kind: "cancel",
-					sessionId,
-					inputId,
-				});
+				result = await this.request(
+					sender,
+					inputId
+						? { kind: "cancel", sessionId, inputId }
+						: { kind: "cancel_current", sessionId },
+				);
 			} finally {
-				const pendingCancels = this.cancelingInputs.get(inputId) ?? 0;
-				if (pendingCancels <= 1) this.cancelingInputs.delete(inputId);
-				else this.cancelingInputs.set(inputId, pendingCancels - 1);
+				if (trackedInput) {
+					const pendingCancels =
+						this.cancelingInputs.get(trackedInput.inputId) ?? 0;
+					if (pendingCancels <= 1)
+						this.cancelingInputs.delete(trackedInput.inputId);
+					else
+						this.cancelingInputs.set(trackedInput.inputId, pendingCancels - 1);
+				}
 			}
 			return this.sendDirect(
 				chatId,

@@ -59,6 +59,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 const RELOAD_COMMAND_ENV = "HARNESSD_PI_RELOAD_COMMAND";
 const RELOAD_COMMAND_DESCRIPTION = "harnessd internal reload command";
+const COST_REPORT_CUSTOM_TYPE = "pi-ad-session-usage:report";
 
 export { UncertainInputDeliveryError } from "./input-delivery-error.js";
 
@@ -432,6 +433,13 @@ interface AbortGate {
 	promise: Promise<void>;
 	release: () => void;
 }
+interface CostResultWaiter {
+	active: boolean;
+	promise: Promise<string>;
+	resolve(value: string): void;
+	reject(error: Error): void;
+	timer?: ReturnType<typeof setTimeout>;
+}
 interface ActiveInput {
 	id: InputId;
 	sentAsSteer: boolean;
@@ -575,6 +583,9 @@ class PiRpcInstance implements HarnessInstance {
 		[];
 	private readonly pending = new Map<string, PendingCommand>();
 	private readonly activeInputs = new Map<InputId, ActiveInput>();
+	private costCommandPending = false;
+	private costCommandQuarantined = false;
+	private costResultWaiter?: CostResultWaiter;
 	private abortInFlight?: AbortGate;
 	private abortOutcomeUncertain = false;
 	private nativeId?: string;
@@ -758,6 +769,11 @@ class PiRpcInstance implements HarnessInstance {
 			!(await this.discoverCommands()).some((command) => command.name === name)
 		)
 			throw new PiControlError("COMMAND_NOT_AVAILABLE");
+		const isCost = name === "cost";
+		if (isCost && (this.costCommandPending || this.costCommandQuarantined))
+			throw new PiControlError("COMMAND_UNCERTAIN");
+		this.costCommandPending ||= isCost;
+		const costWaiter = isCost ? this.waitForCostResult() : undefined;
 		let dispatched = false;
 		try {
 			const response = await this.command(
@@ -777,32 +793,80 @@ class PiRpcInstance implements HarnessInstance {
 					if (!beforeDispatch())
 						throw new PiControlError("COMMAND_SELECTION_CHANGED");
 					dispatched = true;
+					if (costWaiter) {
+						costWaiter.active = true;
+						costWaiter.timer = setTimeout(() => {
+							this.costCommandQuarantined = true;
+							costWaiter.reject(new Error("Cost result unavailable"));
+						}, this.options.commandTimeoutMs ?? 30_000);
+					}
 				},
 			);
-			const responseData = recordValue(response.data);
-			const disposition = responseData?.disposition;
+			const disposition = recordValue(response.data)?.disposition;
 			if (response.success !== true)
 				throw new PiControlError("COMMAND_REJECTED");
+			if (isCost && disposition !== "handled")
+				throw new PiControlError("COMMAND_UNCERTAIN");
 			if (
 				disposition !== "handled" &&
 				!["started", "queued", "accepted"].includes(String(disposition))
 			)
 				throw new PiControlError("COMMAND_UNCERTAIN");
-			const output =
-				typeof responseData?.result === "string"
-					? truncateDiagnostic(redactDiagnosticText(responseData.result), 2000)
-					: undefined;
+			const output = costWaiter ? await costWaiter.promise : undefined;
 			return {
 				disposition: disposition === "handled" ? "handled" : "accepted",
 				...(output ? { output } : {}),
 			};
 		} catch (error) {
+			if (isCost && dispatched) this.costCommandQuarantined = true;
 			if (error instanceof PiControlError) throw error;
 			throw new PiControlError(
 				dispatched ? "COMMAND_UNCERTAIN" : "COMMAND_REJECTED",
 				{ cause: error },
 			);
+		} finally {
+			if (costWaiter) {
+				if (costWaiter.timer) clearTimeout(costWaiter.timer);
+				if (this.costResultWaiter === costWaiter)
+					this.costResultWaiter = undefined;
+				this.costCommandPending = false;
+			}
 		}
+	}
+	private waitForCostResult(): CostResultWaiter {
+		let resolve!: (value: string) => void;
+		let reject!: (error: Error) => void;
+		const promise = new Promise<string>((res, rej) => {
+			resolve = res;
+			reject = rej;
+		});
+		void promise.catch(() => {});
+		const waiter: CostResultWaiter = {
+			active: false,
+			promise,
+			resolve,
+			reject,
+		};
+		this.costResultWaiter = waiter;
+		return waiter;
+	}
+	private captureCostResult(value: unknown): void {
+		const waiter = this.costResultWaiter;
+		if (!waiter?.active) return;
+		const message = recordValue(value);
+		if (
+			message?.role !== "custom" ||
+			message.customType !== COST_REPORT_CUSTOM_TYPE
+		)
+			return;
+		if (typeof message.content !== "string" || !message.content.trim()) {
+			this.costCommandQuarantined = true;
+			waiter.reject(new Error("Malformed cost result"));
+			return;
+		}
+		waiter.resolve(
+			truncateDiagnostic(redactDiagnosticText(message.content), 2000),
+		);
 	}
 	private async reload(beforeDispatch?: () => void): Promise<void> {
 		const validateDispatch = beforeDispatch ?? (() => {});
@@ -998,6 +1062,10 @@ class PiRpcInstance implements HarnessInstance {
 			else if (item.command === "abort")
 				this.applyAbortResponse(record, item.inputId);
 			item.resolve(record);
+			return;
+		}
+		if (record.type === "message_start") {
+			this.captureCostResult(record.message);
 			return;
 		}
 		if (record.type === "extension_error") {
@@ -1433,11 +1501,28 @@ class PiRpcInstance implements HarnessInstance {
 		this.activeInputs.delete(inputId);
 		this.delivery(active.id, "completed");
 	}
+	async cancelCurrent(): Promise<void> {
+		const active = [...this.activeInputs.values()].filter(
+			(input) => !input.sentAsSteer && input.accepted && !input.uncertain,
+		);
+		if (active.length !== 1)
+			throw new Error("Pi current active input is unavailable or ambiguous");
+		const current = active[0];
+		if (!current)
+			throw new Error("Pi current active input is unavailable or ambiguous");
+		await this.cancelInput(current.id, true);
+	}
 	async cancel(inputId: InputId): Promise<void> {
+		await this.cancelInput(inputId, false);
+	}
+	private async cancelInput(
+		inputId: InputId,
+		preserveQueued: boolean,
+	): Promise<void> {
 		if (this.reloadPending) throw new PiControlError("RELOAD_BUSY");
 		const active = this.activeInputs.get(inputId);
 		if (!active) throw new Error("Input is not active");
-		if (this.activeInputs.size > 1)
+		if (!preserveQueued && this.activeInputs.size > 1)
 			throw new Error(
 				"Pi cannot cancel one input while others are queued; no input was canceled",
 			);
