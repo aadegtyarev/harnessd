@@ -27,11 +27,11 @@ export class ClaudePermissionRouter {
 			return true;
 		}
 		if (this.handled.has(id)) return true;
-		this.handled.add(id);
-		if (this.handled.size > 128) {
-			this.error(id, "Excessive permission requests");
+		if (this.handled.size >= 128) {
+			this.fail();
 			return true;
 		}
+		this.handled.add(id);
 		const request = record.request;
 		if (!isRecord(request) || request.subtype !== "can_use_tool") {
 			this.error(id, "Unsupported permission request");

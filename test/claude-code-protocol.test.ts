@@ -130,6 +130,36 @@ describe("Claude Code stream protocol", () => {
 		await instance.shutdown();
 	});
 
+	it("fails closed at the permission ID limit without growing history", async () => {
+		const fake = fakeProvider();
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch(launchRequest);
+		fake.record(init);
+		await new Promise((resolve) => setImmediate(resolve));
+		const request = (id: string) => ({
+			type: "control_request",
+			request_id: id,
+			request: { subtype: "unknown_permission" },
+		});
+		for (let index = 0; index < 130; index++)
+			fake.record(request(`flood-${index}`));
+		fake.record(request("flood-0"));
+		fake.record(request("flood-128"));
+		await new Promise((resolve) => setImmediate(resolve));
+		const responses = fake
+			.inputLines()
+			.map((line) => JSON.parse(line))
+			.filter((line) => line.type === "control_response");
+		const ids = responses.map((line) => line.response.request_id);
+		expect(ids).toHaveLength(128);
+		expect(new Set(ids).size).toBe(128);
+		expect(ids).toContain("flood-127");
+		expect(ids).not.toContain("flood-128");
+		expect(ids).not.toContain("flood-129");
+		await instance.shutdown();
+	});
+
 	it("rejects a mismatched native session before permission routing", async () => {
 		const fake = fakeProvider();
 		let prompted = false;

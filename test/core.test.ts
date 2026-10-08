@@ -537,6 +537,7 @@ describe("core capability contracts", () => {
 				"harness.options.set",
 			],
 		});
+		let replacementShutdowns = 0;
 		const harness: HarnessAdapter = {
 			...base.harness,
 			descriptor: {
@@ -547,7 +548,14 @@ describe("core capability contracts", () => {
 			},
 			async launch(request) {
 				const instance = await base.harness.launch(request);
-				return { ...instance, isIdle: () => true };
+				return {
+					...instance,
+					isIdle: () => true,
+					async shutdown() {
+						if (base.launched.length === 2) replacementShutdowns++;
+						await instance.shutdown();
+					},
+				};
 			},
 			async resume(request) {
 				return harness.launch(request);
@@ -574,6 +582,7 @@ describe("core capability contracts", () => {
 				manager.updateAdapterOptions(session.id, { set: { model: "new" } }),
 			).rejects.toThrow("HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK");
 			expect(launched).toHaveLength(3);
+			expect(replacementShutdowns).toBe(1);
 			expect((await store.get(session.id))?.adapterOptions).toBeUndefined();
 			expect((await store.get(session.id))?.status).toBe("running");
 		} finally {
