@@ -15,7 +15,6 @@ export class TelegramPanelRefreshScheduler {
 		private readonly maxWaitMs = 2000,
 		private readonly onError: (error: unknown) => void = () => {},
 	) {}
-
 	async stop(): Promise<void> {
 		this.stopped = true;
 		for (const timer of this.timers.values()) clearTimeout(timer);
@@ -27,7 +26,6 @@ export class TelegramPanelRefreshScheduler {
 			this.generations.set(chatId, (this.generations.get(chatId) ?? 0) + 1);
 		await Promise.all([...this.executions.values()]);
 	}
-
 	schedule(chatId: number, refresh: () => Promise<void>, flush = false): void {
 		if (this.stopped) return;
 		this.pending.set(chatId, refresh);
@@ -41,7 +39,6 @@ export class TelegramPanelRefreshScheduler {
 		}
 		this.arm(chatId);
 	}
-
 	private arm(chatId: number): void {
 		if (this.stopped) return;
 		this.clearTimer(chatId);
@@ -56,7 +53,6 @@ export class TelegramPanelRefreshScheduler {
 			),
 		);
 	}
-
 	private launch(chatId: number): void {
 		const execution = this.run(chatId);
 		this.executions.set(chatId, execution);
@@ -66,7 +62,6 @@ export class TelegramPanelRefreshScheduler {
 		};
 		void execution.then(cleanup, cleanup);
 	}
-
 	private async run(chatId: number): Promise<void> {
 		if (this.stopped || this.running.has(chatId)) return;
 		this.clearTimer(chatId);
