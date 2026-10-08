@@ -634,6 +634,55 @@ function callbackData(options: unknown, prefix: string): string {
 }
 
 describe("Telegram transport", () => {
+	it("refreshes live panel only for its preview on start and settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const edits = bot.edited.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() => expect(bot.edited.length).toBeGreaterThan(edits));
+		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: занята");
+		const afterStart = bot.edited.length;
+		emit(harnessEvent("other", "status", "agent_start"));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.edited).toHaveLength(afterStart);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.edited.length).toBeGreaterThan(afterStart),
+		);
+		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: ожидает");
+		await adapter.stop();
+	});
+
+	it("shows stale unavailable live state and only advances update time on semantic changes", async () => {
+		const bot = new MockBot();
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(time * 1000),
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) =>
+				request.kind === "session_status"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: {
+								session: sessions.get(request.sessionId) as SessionSummary,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Состояние Pi: состояние устарело");
+		expect(bot.sent.at(-1)?.text).toContain("Живые данные недоступны");
+		expect(bot.sent.at(-1)?.text).toContain("Обновлено: 00:00:00");
+		time = 1;
+		await bot.update(42, "/menu");
+		expect(bot.edited).toHaveLength(0);
+		await adapter.stop();
+	});
+
 	it("shows session name and full identity with Pi-reported context in status", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Focused task" }));
 		const bot = new MockBot();
@@ -1723,7 +1772,7 @@ describe("Telegram transport", () => {
 			"Выбрана (обычные сообщения →): не выбрана",
 		);
 		await bot.update(42, "/menu");
-		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		expect(bot.api.editMessageText).not.toHaveBeenCalled();
 		expect(bot.api.pinChatMessage).toHaveBeenCalledOnce();
 
 		await bot.callback(42, "session:next", panelMessageId);
@@ -2754,6 +2803,7 @@ describe("Telegram transport", () => {
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
 		const sendsAfterCreate = bot.api.sendMessage.mock.calls.length;
+		sessions.set("sid", sessionWith("sid", { name: "changed before failure" }));
 		bot.api.editMessageText.mockRejectedValueOnce(
 			new Error("temporary API failure"),
 		);
@@ -2785,6 +2835,7 @@ describe("Telegram transport", () => {
 			adapter as unknown as { panelMessageIds: Map<number, number> }
 		).panelMessageIds.get(42);
 		const pinCount = bot.pinned.length;
+		sessions.set("sid", sessionWith("sid", { name: "changed before failure" }));
 		bot.api.editMessageText.mockRejectedValueOnce(
 			new Error("temporary failure"),
 		);

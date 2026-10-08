@@ -60,6 +60,7 @@ import {
 	TelegramInboxWorkspaceError,
 } from "./telegram-inbox.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
+import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
 import { SubagentTextStream } from "./telegram-subagent-stream.js";
 
 const TELEGRAM_LIMIT = 4096;
@@ -1165,6 +1166,11 @@ export class TelegramTransportAdapter
 	private readonly panelMessageIds = new Map<number, number>();
 	private readonly panelStaleChats = new Set<number>();
 	private readonly panelGenerations = new Map<number, number>();
+	private readonly panelRenderRequests = new Map<number, number>();
+	private readonly panelSemantic = new Map<number, string>();
+	private readonly panelUpdatedAt = new Map<number, string>();
+	private readonly panelPublished = new Map<number, string>();
+	private readonly panelRefreshScheduler = new TelegramPanelRefreshScheduler();
 	private readonly welcomeIntents = new Map<string, WelcomeIntent>();
 	private readonly folderIntents = new Map<string, FolderIntent>();
 	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
@@ -3362,6 +3368,8 @@ export class TelegramTransportAdapter
 		messageId?: number,
 		hideStaleAction = false,
 	): Promise<void> {
+		const renderRequest = (this.panelRenderRequests.get(chatId) ?? 0) + 1;
+		this.panelRenderRequests.set(chatId, renderRequest);
 		const listed = await this.request(sender, { kind: "list" });
 		const sessions = listed.ok
 			? (listed.value as readonly SessionSummary[])
@@ -3409,7 +3417,28 @@ export class TelegramTransportAdapter
 				this.rememberSession(status.session);
 			}
 		}
+		if (
+			this.panelRenderRequests.get(chatId) !== renderRequest ||
+			(this.previews.get(chatId) ??
+				this.selected.get(chatId) ??
+				sessions[0]?.id) !== previewId
+		)
+			return;
 		const preview = status?.session ?? previewFromList;
+		const liveAvailable = status?.live !== undefined;
+		const liveState = !preview
+			? "offline"
+			: preview.status === "running"
+				? liveAvailable
+					? this.runningSessions.has(preview.id)
+						? "busy"
+						: "idle"
+					: "stale"
+				: preview.status === "starting"
+					? "starting"
+					: preview.status === "stopped"
+						? "stopped"
+						: "failed";
 		const selectedLabel = selected
 			? sessionLabel(selected)
 			: selectedId
@@ -3440,6 +3469,15 @@ export class TelegramTransportAdapter
 				`Папка просмотра: ${panelPath(preview.cwd)}`,
 				`Статус Pi: ${preview.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : preview.status === "stopped" ? "остановлен" : preview.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${preview.status})`,
 			);
+			lines.push(
+				`Состояние Pi: ${liveState === "busy" ? "занята" : liveState === "idle" ? "ожидает" : liveState === "stale" ? "состояние устарело" : liveState === "offline" ? "нет сессии" : liveState === "starting" ? "запускается" : liveState === "stopped" ? "остановлена" : "ошибка"}`,
+			);
+			if (
+				!liveAvailable &&
+				preview.status !== "stopped" &&
+				preview.status !== "failed"
+			)
+				lines.push("Живые данные недоступны.");
 			if (status) lines.push(compactUsage(status.live?.usage));
 			if (status?.live?.model)
 				lines.push(
@@ -3493,6 +3531,16 @@ export class TelegramTransportAdapter
 				]);
 			}
 		}
+		const semantic = JSON.stringify([lines, rows]);
+		if (this.panelSemantic.get(chatId) !== semantic) {
+			this.panelSemantic.set(chatId, semantic);
+			const now = (this.options.activityClock ?? (() => new Date()))();
+			this.panelUpdatedAt.set(
+				chatId,
+				(this.options.activityTimeFormatter ?? localActivityTime)(now),
+			);
+		}
+		lines.push(`Обновлено: ${this.panelUpdatedAt.get(chatId) ?? "недоступно"}`);
 		await this.updatePanel(
 			chatId,
 			boundedPanelText(lines),
@@ -3533,6 +3581,12 @@ export class TelegramTransportAdapter
 		replyMarkup: unknown,
 		messageId?: number,
 	): Promise<boolean> {
+		const publication = JSON.stringify([text, replyMarkup]);
+		if (
+			this.panelPublished.get(chatId) === publication &&
+			!this.panelStaleChats.has(chatId)
+		)
+			return true;
 		const generation = this.nextPanelGeneration(chatId);
 		this.panelGenerations.set(chatId, generation);
 		for (const [token, intent] of this.folderIntents)
@@ -3564,6 +3618,7 @@ export class TelegramTransportAdapter
 			if (edited.ok || isMessageNotModified(edited.error)) {
 				await this.savePanelReference(chatId, existing);
 				this.panelStaleChats.delete(chatId);
+				this.panelPublished.set(chatId, publication);
 				return true;
 			}
 			if (!isMessageNotFound(edited.error)) {
@@ -3604,6 +3659,7 @@ export class TelegramTransportAdapter
 		}
 		await this.savePanelReference(chatId, createdMessageId);
 		this.panelStaleChats.delete(chatId);
+		this.panelPublished.set(chatId, publication);
 		if (hasBoundIntents) {
 			for (const intent of this.folderIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)
@@ -5677,6 +5733,31 @@ export class TelegramTransportAdapter
 	}
 
 	private onEvent(event: HarnessEvent): void {
+		const terminalPanelEvent =
+			(event.kind === "error" && event.fatal === true) ||
+			(event.kind === "status" &&
+				(event.text === "agent_settled" ||
+					event.text === "harness_restarting" ||
+					event.text === "harness_recovered" ||
+					event.text === "harness_recovery_failed"));
+		if (
+			(event.kind === "status" &&
+				(event.text === "agent_start" || terminalPanelEvent)) ||
+			(event.kind === "error" && event.fatal === true)
+		) {
+			for (const chatId of this.panelMessageIds.keys()) {
+				const previewId =
+					this.previews.get(chatId) ?? this.selected.get(chatId);
+				if (previewId !== event.sessionId) continue;
+				const sender = this.options.allowedUserIds[0];
+				if (sender !== undefined)
+					this.panelRefreshScheduler.schedule(
+						chatId,
+						() => this.refreshExistingPanel(chatId, sender),
+						terminalPanelEvent,
+					);
+			}
+		}
 		if (event.kind === "output" && typeof event.text === "string") {
 			this.appendTurnOutput(event.sessionId, event.text);
 			return;
