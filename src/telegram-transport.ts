@@ -1345,12 +1345,13 @@ export class TelegramTransportAdapter
 				if (this.options.signal?.aborted)
 					throw new Error("Telegram startup aborted");
 				this.ready = true;
-				for (const chatId of this.panelMessageIds.keys()) {
+				for (const [chatId, messageId] of this.panelMessageIds) {
 					const sender = this.options.allowedUserIds[0];
-					if (sender !== undefined)
-						this.panelRefreshScheduler.schedule(chatId, () =>
-							this.refreshExistingPanel(chatId, sender),
-						);
+					if (sender === undefined) continue;
+					await this.publishRestoredPanelStale(chatId, messageId);
+					this.panelRefreshScheduler.schedule(chatId, () =>
+						this.refreshExistingPanel(chatId, sender),
+					);
 				}
 				this.scheduleInboxSweep();
 			} finally {
@@ -1472,7 +1473,7 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
-		this.panelRefreshScheduler.stop();
+		await this.panelRefreshScheduler.stop();
 		for (const chatId of this.panelRenderRequests.keys())
 			this.panelRenderRequests.set(
 				chatId,
@@ -1536,6 +1537,24 @@ export class TelegramTransportAdapter
 			await this.releaseLock();
 			this.releaseLock = undefined;
 		}
+	}
+
+	private async publishRestoredPanelStale(
+		chatId: number,
+		messageId: number,
+	): Promise<void> {
+		if (!(await this.waitForPanelPublication(chatId))) return;
+		const edited = await this.telegramCall((signal) =>
+			this.bot.api.editMessageText(
+				chatId,
+				messageId,
+				"📌 Панель сессий\nСостояние Pi: устарело после перезапуска; проверяем актуальный статус.",
+				{},
+				signal,
+			),
+		);
+		if (edited.ok || isMessageNotModified(edited.error))
+			this.panelPublished.delete(chatId);
 	}
 
 	private async restoreSelectedSessions(): Promise<void> {
@@ -2463,6 +2482,7 @@ export class TelegramTransportAdapter
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
+			this.refreshPanelsPreviewing(session.id, sender, true);
 			const selectionSaved = await this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
@@ -3197,6 +3217,7 @@ export class TelegramTransportAdapter
 			this.pendingNames.delete(chatId);
 			const session = result.value as SessionSummary;
 			this.rememberSession(session);
+			this.refreshPanelsPreviewing(session.id, sender, true);
 			const selectionSaved = await this.setSelected(chatId, session.id);
 			this.previews.delete(chatId);
 			await this.refreshExistingPanel(chatId, sender);
@@ -3396,12 +3417,20 @@ export class TelegramTransportAdapter
 		} as TransportEvent);
 	}
 
+	private invalidatePanelIntent(chatId: number): void {
+		this.panelRenderRequests.set(
+			chatId,
+			(this.panelRenderRequests.get(chatId) ?? 0) + 1,
+		);
+	}
+
 	private async renderPanel(
 		chatId: number,
 		sender: number,
 		messageId?: number,
 		hideStaleAction = false,
 	): Promise<void> {
+		if (this.stopping) return;
 		const renderRequest = (this.panelRenderRequests.get(chatId) ?? 0) + 1;
 		this.panelRenderRequests.set(chatId, renderRequest);
 		const listed = await this.request(sender, { kind: "list" });
@@ -3629,6 +3658,7 @@ export class TelegramTransportAdapter
 		sender: number,
 		hideStaleAction = false,
 	): Promise<void> {
+		if (this.stopping) return;
 		const messageId =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
 		if (messageId !== undefined)
@@ -3718,6 +3748,9 @@ export class TelegramTransportAdapter
 			this.panelMessageIds.get(chatId) ??
 			this.panelStore?.get(chatId) ??
 			messageId;
+		const referenceIsCurrent = (expected: number | undefined) =>
+			(this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId)) ===
+			expected;
 		if (existing !== undefined) {
 			if (!(await this.waitForPanelPublication(chatId))) return false;
 			const edited = await this.telegramCall((signal) =>
@@ -3730,12 +3763,14 @@ export class TelegramTransportAdapter
 				),
 			);
 			if (edited.ok || isMessageNotModified(edited.error)) {
+				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 				await this.savePanelReference(chatId, existing);
+				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 				this.panelStaleChats.delete(chatId);
 				this.panelPublished.set(chatId, publication);
 				return true;
 			}
-			if (!isCurrent()) return false;
+			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			if (!isMessageNotFound(edited.error)) {
 				this.dropPanelGenerationIntents(chatId, generation);
 				this.panelStaleChats.add(chatId);
@@ -3753,7 +3788,12 @@ export class TelegramTransportAdapter
 				(intent) =>
 					intent.chatId === chatId && intent.generation === intentGeneration,
 			);
-		if (!(await this.waitForPanelPublication(chatId))) return false;
+		if (
+			!isCurrent() ||
+			!referenceIsCurrent(existing) ||
+			!(await this.waitForPanelPublication(chatId))
+		)
+			return false;
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
@@ -3769,11 +3809,16 @@ export class TelegramTransportAdapter
 			return false;
 		}
 		const createdMessageId = messageIdFrom(sent.value);
-		if (createdMessageId === undefined || !isCurrent()) {
+		if (
+			createdMessageId === undefined ||
+			!isCurrent() ||
+			!referenceIsCurrent(existing)
+		) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
 			return false;
 		}
 		await this.savePanelReference(chatId, createdMessageId);
+		if (!isCurrent() || !referenceIsCurrent(createdMessageId)) return false;
 		this.panelStaleChats.delete(chatId);
 		this.panelPublished.set(chatId, publication);
 		if (hasBoundIntents) {
@@ -3783,7 +3828,12 @@ export class TelegramTransportAdapter
 			for (const intent of this.confirmationIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)
 					intent.messageId = createdMessageId;
-			if (!(await this.waitForPanelPublication(chatId))) return false;
+			if (
+				!isCurrent() ||
+				!referenceIsCurrent(createdMessageId) ||
+				!(await this.waitForPanelPublication(chatId))
+			)
+				return false;
 			const published = await this.telegramCall((signal) =>
 				this.bot.api.editMessageText(
 					chatId,
@@ -3798,10 +3848,16 @@ export class TelegramTransportAdapter
 				return false;
 			}
 		}
-		if (!(await this.waitForPanelPublication(chatId))) return false;
+		if (
+			!isCurrent() ||
+			!referenceIsCurrent(createdMessageId) ||
+			!(await this.waitForPanelPublication(chatId))
+		)
+			return false;
 		const pinned = await this.telegramCall((signal) =>
 			this.bot.api.pinChatMessage(chatId, createdMessageId, {}, signal),
 		);
+		if (!isCurrent() || !referenceIsCurrent(createdMessageId)) return false;
 		if (!pinned.ok || pinned.value === false) {
 			this.reportError(
 				"Telegram control panel could not be pinned",
@@ -3909,6 +3965,7 @@ export class TelegramTransportAdapter
 			messageId === undefined
 		)
 			return;
+		this.invalidatePanelIntent(chatId);
 		await this.telegramCall((signal) =>
 			this.bot.api.answerCallbackQuery(callback.id, {}, signal),
 		);
@@ -5544,6 +5601,7 @@ export class TelegramTransportAdapter
 		else {
 			this.invalidateSessionConfirmations(sessionId);
 			this.rememberSession(result.value as SessionSummary);
+			this.refreshPanelsPreviewing(sessionId, sender, true);
 			const target = this.selected.get(chatId);
 			await this.sendDirect(
 				chatId,
@@ -5582,6 +5640,7 @@ export class TelegramTransportAdapter
 		}
 		this.invalidateSessionConfirmations(sessionId);
 		this.rememberSession(result.value as SessionSummary);
+		this.refreshPanelsPreviewing(sessionId, sender, true);
 		const saved = await this.setSelected(chatId, sessionId);
 		this.previews.delete(chatId);
 		await this.sendDirect(

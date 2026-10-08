@@ -634,20 +634,50 @@ function callbackData(options: unknown, prefix: string): string {
 }
 
 describe("Telegram transport", () => {
+	it("spaces actual panel edit API calls by at least 500 ms", async () => {
+		const bot = new MockBot();
+		const editTimes: number[] = [];
+		const originalEdit = bot.api.editMessageText.getMockImplementation();
+		if (!originalEdit) throw new Error("Missing edit API mock");
+		bot.api.editMessageText.mockImplementation(async (...args) => {
+			editTimes.push(Date.now());
+			return originalEdit(...args);
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		sessions.set("sid", sessionWith("sid", { name: "First change" }));
+		await bot.update(42, "/menu");
+		sessions.set("sid", sessionWith("sid", { name: "Second change" }));
+		await bot.update(42, "/menu");
+		expect(editTimes.length).toBeGreaterThanOrEqual(2);
+		for (let index = 1; index < editTimes.length; index++)
+			expect(editTimes[index] - editTimes[index - 1]).toBeGreaterThanOrEqual(
+				500,
+			);
+		await adapter.stop();
+	});
+
 	it("refreshes live panel only for its preview on start and settlement", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "session:next", panelMessageId);
 		const edits = bot.edited.length;
 		emit(harnessEvent("sid", "status", "agent_start"));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.edited).toHaveLength(edits);
+		emit(harnessEvent("other", "status", "agent_start"));
 		await vi.waitFor(() => expect(bot.edited.length).toBeGreaterThan(edits));
+		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
 		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: занята");
 		const afterStart = bot.edited.length;
-		emit(harnessEvent("other", "status", "agent_start"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		expect(bot.edited).toHaveLength(afterStart);
-		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit(harnessEvent("other", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(bot.edited.length).toBeGreaterThan(afterStart),
 		);
@@ -3245,6 +3275,7 @@ describe("Telegram transport", () => {
 		const firstBot = new MockBot();
 		const first = await startAdapter(firstBot, directory);
 		await firstBot.update(42, "/use sid");
+		await firstBot.update(42, "/menu");
 		await firstBot.update(43, "/use other");
 		await first.adapter.stop();
 
@@ -3256,6 +3287,9 @@ describe("Telegram transport", () => {
 
 		const secondBot = new MockBot();
 		const second = await startAdapter(secondBot, directory);
+		expect(secondBot.edited.at(-1)?.text).toContain(
+			"устарело после перезапуска",
+		);
 		expect(second.requests).toEqual([]);
 		await secondBot.update(42, "/use");
 		expect(secondBot.sent.at(-1)?.text).toContain("Выбрана");

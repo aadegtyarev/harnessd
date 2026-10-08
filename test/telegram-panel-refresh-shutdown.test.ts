@@ -13,7 +13,7 @@ describe("TelegramPanelRefreshScheduler shutdown", () => {
 		);
 		const refresh = vi.fn(async () => {});
 		scheduler.schedule(1, refresh);
-		scheduler.stop();
+		await scheduler.stop();
 		await vi.advanceTimersByTimeAsync(2500);
 		expect(refresh).not.toHaveBeenCalled();
 		scheduler.schedule(
@@ -44,6 +44,33 @@ describe("TelegramPanelRefreshScheduler shutdown", () => {
 			true,
 		);
 		await vi.waitFor(() => expect(errors).toHaveLength(1));
-		scheduler.stop();
+		await scheduler.stop();
+	});
+
+	it("waits for an in-flight refresh before shutdown resolves", async () => {
+		let release!: () => void;
+		const scheduler = new TelegramPanelRefreshScheduler();
+		let finished = false;
+		scheduler.schedule(
+			3,
+			async () => {
+				await new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				finished = true;
+			},
+			true,
+		);
+		await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+		let stopped = false;
+		const stopping = scheduler.stop().then(() => {
+			stopped = true;
+		});
+		await Promise.resolve();
+		expect(stopped).toBe(false);
+		release();
+		await stopping;
+		expect(finished).toBe(true);
+		expect(stopped).toBe(true);
 	});
 });
