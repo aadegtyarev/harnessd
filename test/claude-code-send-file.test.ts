@@ -212,6 +212,32 @@ describe("Claude session MCP file sending", () => {
 		expect(response.match(/Parse error/g)).toHaveLength(2);
 	});
 
+	it("closes the bridge when process startup fails", async () => {
+		const fake = fakeProvider();
+		let args: readonly string[] = [];
+		fake.provider.launch = async (request) => {
+			args = request.args;
+			throw new Error("startup failed");
+		};
+		const adapter = new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+			agentFileSend: async () => ({
+				fileName: "a",
+				delivered: 1,
+				recipients: 1,
+			}),
+		});
+		await expect(adapter.launch(launchRequest)).rejects.toThrow(
+			"startup failed",
+		);
+		const config = JSON.parse(
+			args[args.indexOf("--mcp-config") + 1] ?? "{}",
+		) as { mcpServers: { harnessd: { env: Record<string, string> } } };
+		await expect(
+			fetch(config.mcpServers.harnessd.env[AGENT_FILE_SEND_URL_ENV] ?? ""),
+		).rejects.toThrow();
+	});
+
 	it("closes the bridge when the Claude process exits", async () => {
 		const fake = fakeProvider();
 		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
