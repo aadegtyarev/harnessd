@@ -11,6 +11,7 @@ export function fakeProvider(
 		readonly ignoreTerm?: boolean;
 		readonly rejectTerm?: boolean;
 		readonly rejectKill?: boolean;
+		readonly pendingSignals?: readonly string[];
 	} = {},
 ) {
 	const stdin = new PassThrough();
@@ -41,6 +42,8 @@ export function fakeProvider(
 		),
 		async sendSignal(signal: string) {
 			signals.push(signal);
+			if (options.pendingSignals?.includes(signal))
+				return new Promise<void>(() => {});
 			if (
 				(signal === "SIGTERM" && options.rejectTerm) ||
 				(signal === "SIGKILL" && options.rejectKill)

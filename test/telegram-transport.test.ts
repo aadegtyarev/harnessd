@@ -2393,6 +2393,11 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "answer this");
 		fake.record({
+			type: "user",
+			isReplay: true,
+			message: { role: "user", content: "answer this" },
+		});
+		fake.record({
 			type: "stream_event",
 			event: {
 				type: "content_block_delta",

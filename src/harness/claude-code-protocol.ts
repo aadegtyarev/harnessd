@@ -1,20 +1,13 @@
 import type { InputId, SessionId } from "../core/types.js";
+import { ClaudeInputDelivery } from "./claude-code-delivery-state.js";
 import { ClaudeCodeRecords } from "./claude-code-records.js";
 import { ClaudeCodeTurn } from "./claude-code-turn.js";
 import type { ClaudeEventQueue } from "./claude-event-queue.js";
 
-type Pending = {
-	id: InputId;
-	text: string;
-	written: boolean;
-	acknowledged: boolean;
-	resolve(): void;
-	reject(error: Error): void;
-};
-
 export class ClaudeCodeProtocol {
 	private failed = false;
-	private pending: Pending | undefined;
+	private delivery: ClaudeInputDelivery | undefined;
+	private turnInput: ClaudeInputDelivery | undefined;
 	private readonly records: ClaudeCodeRecords;
 	private readonly turn: ClaudeCodeTurn;
 	constructor(
@@ -33,24 +26,17 @@ export class ClaudeCodeProtocol {
 		});
 	}
 	begin(id: InputId, text: string): Promise<void> {
-		if (this.failed || this.pending)
+		if (this.failed || this.delivery || this.turnInput)
 			throw new Error("CLAUDE_NOT_READY_OR_BUSY");
-		return new Promise((resolve, reject) => {
-			this.pending = {
-				id,
-				text,
-				written: false,
-				acknowledged: false,
-				resolve,
-				reject,
-			};
-		});
+		const pending = new ClaudeInputDelivery(id, text);
+		this.delivery = pending;
+		this.turnInput = pending;
+		return pending.promise;
 	}
 	markWritten(): void {
-		const p = this.pending;
-		if (!p || this.failed) return;
-		p.written = true;
-		if (p.acknowledged) p.resolve();
+		if (!this.delivery || this.failed) return;
+		this.delivery.markWritten();
+		this.clearDeliveryIfSettled();
 	}
 	accept(record: Record<string, unknown>): void {
 		if (this.failed) return;
@@ -63,8 +49,9 @@ export class ClaudeCodeProtocol {
 	failProtocol(detail: string): void {
 		if (this.failed) return;
 		this.failed = true;
-		this.pending?.reject(new Error(detail));
-		this.pending = undefined;
+		this.delivery?.rejectDelivery(new Error(detail));
+		this.delivery = undefined;
+		this.turnInput = undefined;
 		this.events.fail({
 			sessionId: this.sessionId,
 			kind: "error",
@@ -74,26 +61,28 @@ export class ClaudeCodeProtocol {
 		this.onFatal();
 	}
 	streamEnded(): void {
-		if (this.pending)
+		if (this.delivery || this.turnInput)
 			this.failProtocol("Claude stream ended before turn settlement");
 		else this.events.close();
 	}
 	private acknowledge(content: string): void {
-		const p = this.pending;
-		if (!p || p.text !== content) return;
-		p.acknowledged = true;
+		const p = this.delivery;
+		if (!p?.acknowledge(content)) return;
 		this.turn.start(p.id);
-		if (p.written) p.resolve();
+		p.confirmAcknowledgement();
+		this.clearDeliveryIfSettled();
 	}
 	private output(text: string): void {
-		if (!this.pending?.acknowledged)
-			throw new Error("Unexpected assistant output");
+		if (!this.turnInput) throw new Error("Unexpected assistant output");
 		this.turn.output(text);
 	}
+	private clearDeliveryIfSettled(): void {
+		if (this.delivery?.isConfirmed) this.delivery = undefined;
+	}
 	private settle(failed: boolean): void {
-		const p = this.pending;
-		if (!p?.acknowledged) throw new Error("Unexpected result");
+		const p = this.turnInput;
+		if (!p) throw new Error("Unexpected result");
 		this.turn.settle(p.id, failed);
-		this.pending = undefined;
+		this.turnInput = undefined;
 	}
 }

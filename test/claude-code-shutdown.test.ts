@@ -20,6 +20,25 @@ describe("Claude process lifecycle", () => {
 		await expect(instance.shutdown()).rejects.toThrow("Claude shutdown failed");
 		fake.finish();
 	});
+	it("bounds a pending TERM signal and escalates", async () => {
+		const fake = fakeProvider({ pendingSignals: ["SIGTERM"] });
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch(launchRequest);
+		await instance.shutdown();
+		expect(fake.signals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+	it("fails bounded cleanup if signal promises and process exit remain pending", async () => {
+		const fake = fakeProvider({
+			ignoreTerm: true,
+			pendingSignals: ["SIGTERM", "SIGKILL"],
+		});
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch(launchRequest);
+		await expect(instance.shutdown()).rejects.toThrow("Claude shutdown failed");
+		fake.finish();
+	});
 	it("escalates after rejected TERM and ignored termination", async () => {
 		const fake = fakeProvider({ ignoreTerm: true, rejectTerm: true });
 		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
