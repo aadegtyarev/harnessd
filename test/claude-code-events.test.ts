@@ -27,6 +27,30 @@ describe("Claude event projection", () => {
 			)[0],
 		).toEqual({ sessionId: ids.sessionId, kind: "output", text: "hello" });
 	});
+	it("projects protocol errors as fixed safe events", () => {
+		expect(
+			mapClaudeEvent(
+				{ type: "error", message: "credential-bearing detail" },
+				ids.sessionId,
+			),
+		).toEqual([
+			{
+				sessionId: ids.sessionId,
+				kind: "error",
+				text: "Claude reported an error",
+			},
+		]);
+		expect(
+			mapClaudeEvent(
+				{ type: "result", subtype: "error", is_error: true, error: "private" },
+				ids.sessionId,
+				ids.inputId,
+			),
+		).toMatchObject([
+			{ kind: "error", text: "Claude request failed" },
+			{ kind: "input", inputEvent: { state: "failed" } },
+		]);
+	});
 	it("does not fabricate usage when absent", () => {
 		const events = mapClaudeEvent(
 			{ type: "result", subtype: "success", result: "done" },

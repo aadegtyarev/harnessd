@@ -52,6 +52,16 @@ describe("Claude Code harness", () => {
 		fake.finish();
 	});
 
+	it("closes the event iterator when stdout ends", async () => {
+		const fake = fakeProvider();
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch(launchRequest);
+		const iterator = instance.events[Symbol.asyncIterator]();
+		fake.finish();
+		expect(await iterator.next()).toMatchObject({ done: true });
+	});
+
 	it("fails closed when init reports another native ID", async () => {
 		const fake = fakeProvider();
 		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {

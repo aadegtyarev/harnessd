@@ -42,7 +42,11 @@ export function fakeProvider() {
 		stdout,
 		signals,
 		env: () => request?.env,
-		finish: () => exit({ code: 0, signal: null }),
+		finish: () => {
+			stdout.end();
+			stderr.end();
+			exit({ code: 0, signal: null });
+		},
 	};
 }
 
