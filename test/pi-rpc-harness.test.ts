@@ -40,6 +40,7 @@ interface FakeOptions {
 	readonly sessionId?: string;
 	readonly promptSuccess?: boolean;
 	readonly promptDisposition?: string;
+	readonly promptResult?: string;
 	readonly reloadExtensionError?: {
 		readonly extensionPath: string;
 		readonly event: string;
@@ -255,7 +256,14 @@ function fakeProvider(options: FakeOptions = {}) {
 											? (options.abortSuccess ?? true)
 											: true,
 								...(command.type === "prompt" && options.promptDisposition
-									? { data: { disposition: options.promptDisposition } }
+									? {
+											data: {
+												disposition: options.promptDisposition,
+												...(options.promptResult !== undefined
+													? { result: options.promptResult }
+													: {}),
+											},
+										}
 									: {}),
 							};
 			const override = options.rpcResponses?.[String(command.type)];
@@ -800,6 +808,7 @@ describe("PiRpcHarnessAdapter", () => {
 	it("discovers only safe extension commands and prompts with the exact raw remainder", async () => {
 		const fake = fakeProvider({
 			promptDisposition: "handled",
+			promptResult: "Cost result",
 			commandListing: (reload) => [
 				{
 					name: reload,
@@ -825,15 +834,39 @@ describe("PiRpcHarnessAdapter", () => {
 			{ name: "cost", description: "cost details" },
 		]);
 		fake.stdout.write('{"type":"agent_start"}\n');
-		expect(await instance.control?.runCommand?.("cost", "   raw  ")).toBe(
-			"handled",
-		);
+		expect(await instance.control?.runCommand?.("cost", "   raw  ")).toEqual({
+			disposition: "handled",
+			output: "Cost result",
+		});
 		expect(
 			fake.commands.filter((command) => command.type === "prompt"),
 		).toEqual([expect.objectContaining({ message: "/cost   raw  " })]);
 		expect(fake.commands.some((command) => command.streamingBehavior)).toBe(
 			false,
 		);
+		await instance.shutdown();
+	});
+
+	it("bounds a correlated dynamic command result before returning it", async () => {
+		const fake = fakeProvider({
+			promptDisposition: "handled",
+			promptResult: "x".repeat(3000),
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const result = await instance.control?.runCommand?.("cost", "");
+		expect(result?.output?.length).toBeLessThanOrEqual(2000);
+		expect(result?.output).toMatch(/^x+/);
 		await instance.shutdown();
 	});
 
@@ -964,7 +997,7 @@ describe("PiRpcHarnessAdapter", () => {
 		let current = true;
 		await expect(
 			instance.control?.runCommand?.("cost", "", () => current),
-		).resolves.toBe("accepted");
+		).resolves.toMatchObject({ disposition: "accepted" });
 		current = false;
 		await expect(
 			instance.control?.runCommand?.("cost", "", () => current),
@@ -1037,6 +1070,50 @@ describe("PiRpcHarnessAdapter", () => {
 		});
 		await instance.shutdown();
 		await expect(reload).rejects.toBeDefined();
+	});
+
+	it("does not replay a timed-out dynamic command when its late response arrives", async () => {
+		const fake = fakeProvider({
+			holdPrompt: true,
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 20,
+		}).launch(request);
+		const command = instance.control?.runCommand?.("cost", "");
+		const commandTimedOut = expect(command).rejects.toMatchObject({
+			code: "COMMAND_UNCERTAIN",
+		});
+		await vi.waitFor(() =>
+			expect(
+				fake.commands.filter((item) => item.type === "prompt"),
+			).toHaveLength(1),
+		);
+		await commandTimedOut;
+		const prompt = fake.commands.findLast((item) => item.type === "prompt");
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "response",
+				id: prompt?.id,
+				command: "prompt",
+				success: true,
+				data: { disposition: "handled", result: "late result" },
+			})}\n`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			1,
+		);
+		await instance.shutdown();
 	});
 
 	it("rechecks selection after queued write preparation completes", async () => {
@@ -1113,7 +1190,7 @@ describe("PiRpcHarnessAdapter", () => {
 			`${JSON.stringify({ type: "response", id: abort?.id, command: "abort", success: true })}\n`,
 		);
 		await cancel;
-		await expect(command).resolves.toBe("accepted");
+		await expect(command).resolves.toMatchObject({ disposition: "accepted" });
 		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
 			2,
 		);
@@ -1153,7 +1230,7 @@ describe("PiRpcHarnessAdapter", () => {
 			1,
 		);
 		fake.stdout.write('{"type":"agent_settled"}\n');
-		await expect(command).resolves.toBe("accepted");
+		await expect(command).resolves.toMatchObject({ disposition: "accepted" });
 		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
 			2,
 		);

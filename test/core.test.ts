@@ -166,7 +166,7 @@ describe("core capability contracts", () => {
 					},
 					async runCommand(name, remainder) {
 						calls.push(["run", name, remainder]);
-						return "accepted";
+						return { disposition: "accepted" };
 					},
 					async getSelection() {
 						return {};
@@ -200,9 +200,9 @@ describe("core capability contracts", () => {
 			expect(await manager.listCommands(session.id)).toEqual([
 				{ name: "cost", description: "Cost" },
 			]);
-			expect(await manager.runCommand(session.id, "cost", "  raw ")).toBe(
-				"accepted",
-			);
+			expect(await manager.runCommand(session.id, "cost", "  raw ")).toEqual({
+				disposition: "accepted",
+			});
 			expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
 		} finally {
 			await manager.close();

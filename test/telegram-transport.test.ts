@@ -657,7 +657,11 @@ describe("Telegram transport", () => {
 				if (request.kind === "command_list")
 					return { requestId: request.requestId, ok: true, value: discovered };
 				if (request.kind === "command_run")
-					return { requestId: request.requestId, ok: true, value: "accepted" };
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: { disposition: "handled", output: "Стоимость: $0.01" },
+					};
 				return result(request);
 			},
 		});
@@ -674,12 +678,12 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/CoSt@bot   two  spaces ");
 		const run = requests.find((request) => request.kind === "command_run");
 		expect(run).toMatchObject({ name: "cost", remainder: "   two  spaces " });
-		expect(bot.sent.at(-1)?.text).toContain("принял команду");
+		expect(bot.sent.at(-1)?.text).toContain("Стоимость: $0.01");
 		await bot.update(42, "/reload");
 		expect(requests.some((request) => request.kind === "reload")).toBe(true);
 		await bot.update(42, "/private");
 		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("принял команду"),
+			expect(bot.sent.at(-1)?.text).toContain("обработал команду"),
 		);
 		expect(bot.sent.at(-1)?.text).not.toContain("/secret/path");
 		await adapter.stop();
@@ -1357,7 +1361,11 @@ describe("Telegram transport", () => {
 					const accepted = request.beforeDispatch?.() ?? false;
 					finalGuard = accepted;
 					return accepted
-						? { requestId: request.requestId, ok: true, value: "accepted" }
+						? {
+								requestId: request.requestId,
+								ok: true,
+								value: { disposition: "accepted" },
+							}
 						: {
 								requestId: request.requestId,
 								ok: false,
@@ -2976,6 +2984,54 @@ describe("Telegram transport", () => {
 		expect(
 			bot.sent.find(({ text }) => text.includes("following run output"))?.text,
 		).toContain("Фоновая сессия");
+		await adapter.stop();
+	});
+
+	it("queues input behind bg_wait and bare-cancels the selected session active input without replay", async () => {
+		const bot = new MockBot();
+		let submitCount = 0;
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") {
+					submitCount++;
+					return { ...result(request), value: `input-${submitCount}` as never };
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "active input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "notification", text: "bg_wait" },
+		});
+		await bot.update(42, "queued message");
+		expect(submitCount).toBe(2);
+		expect(
+			[...bot.sent, ...bot.edited].some(({ text }) => text.includes("queued")),
+		).toBe(true);
+		await bot.update(42, "/cancel");
+		expect(bot.sent.at(-1)?.text).toContain("Запрошена отмена ввода");
+		expect(requests.filter(({ kind }) => kind === "cancel")).toHaveLength(1);
+		expect(requests.find(({ kind }) => kind === "cancel")).toMatchObject({
+			sessionId: "sid",
+			inputId: "input-1",
+		});
+		expect(submitCount).toBe(2);
+		await bot.update(42, "new message after cancel");
+		expect(submitCount).toBe(3);
 		await adapter.stop();
 	});
 

@@ -100,7 +100,7 @@ describe("application runtime", () => {
 						},
 						async runCommand(name, remainder) {
 							calls.push(["run", name, remainder]);
-							return "accepted";
+							return { disposition: "accepted" };
 						},
 						async getSelection() {
 							return {};
@@ -162,7 +162,7 @@ describe("application runtime", () => {
 				name: "cost",
 				remainder: "  raw ",
 			}),
-		).toMatchObject({ ok: true, value: "accepted" });
+		).toMatchObject({ ok: true, value: { disposition: "accepted" } });
 		expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
 		await runtime.close();
 	});

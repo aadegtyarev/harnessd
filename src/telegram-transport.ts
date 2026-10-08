@@ -3558,11 +3558,25 @@ export class TelegramTransportAdapter
 					: `${result.error.message} Selection is unchanged${remainingTarget ? `; messages target ${this.sessionFooter(remainingTarget)}` : "; no session is selected"}. Next: inspect /menu.`,
 			);
 		}
-		if (name === "/cancel" && args.length === 1) {
+		if (name === "/cancel" && args.length <= 1) {
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-			const inputId = args[0] as InputId;
+			const activeInputs = [...this.inputAttributions.values()].filter(
+				(record) =>
+					record.sessionId === sessionId &&
+					!record.terminal &&
+					record.state === "accepted" &&
+					!record.steered,
+			);
+			if (!args.length && activeInputs.length !== 1)
+				return this.sendDirect(
+					chatId,
+					activeInputs.length
+						? "Нельзя безопасно определить активный ввод; укажите точный ID: /cancel <inputId>."
+						: "В выбранной сессии нет подтверждённого активного ввода для отмены.",
+				);
+			const inputId = (args[0] ?? activeInputs[0]?.inputId) as InputId;
 			this.cancelingInputs.set(
 				inputId,
 				(this.cancelingInputs.get(inputId) ?? 0) + 1,
@@ -3657,9 +3671,19 @@ export class TelegramTransportAdapter
 						"Не удалось выполнить команду Pi; автоматического повтора нет.",
 				);
 			}
+			const commandResult = result.value as {
+				disposition?: "handled" | "accepted";
+				output?: string;
+			};
+			if (extensionName === "cost")
+				return this.sendDirect(
+					chatId,
+					commandResult.output ??
+						"Pi обработал /cost, но не вернул результат. Повтор автоматически не выполнялся.",
+				);
 			return this.sendDirect(
 				chatId,
-				result.value === "handled"
+				commandResult.disposition === "handled"
 					? "Pi обработал команду; это не подтверждает завершение работы."
 					: "Pi принял команду; это не подтверждает завершение работы.",
 			);
@@ -7341,6 +7365,15 @@ export class TelegramTransportAdapter
 		if (!record || record.terminal) return;
 		record.chatId = chatId;
 		record.state = state;
+		if (state === "accepted" && !record.pendingSeen)
+			record.steered =
+				this.runningSessions.has(sessionId) ||
+				[...this.inputAttributions.values()].some(
+					(other) =>
+						other !== record &&
+						other.sessionId === sessionId &&
+						!other.terminal,
+				);
 		if (state === "failed") {
 			this.finishInputAttribution(record, false);
 			return;

@@ -201,10 +201,10 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 	{
 		visibility: "both",
 		section: "private-chat",
-		usage: "/cancel <inputId>",
+		usage: "/cancel [inputId]",
 		telegram: {
 			command: "cancel",
-			description: "Отменить ввод в выбранной сессии.",
+			description: "Отменить активный ввод выбранной сессии.",
 		},
 	},
 ];

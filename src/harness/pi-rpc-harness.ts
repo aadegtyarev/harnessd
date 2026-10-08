@@ -779,13 +779,23 @@ class PiRpcInstance implements HarnessInstance {
 					dispatched = true;
 				},
 			);
-			const disposition = recordValue(response.data)?.disposition;
+			const responseData = recordValue(response.data);
+			const disposition = responseData?.disposition;
 			if (response.success !== true)
 				throw new PiControlError("COMMAND_REJECTED");
-			if (disposition === "handled") return "handled";
-			if (["started", "queued", "accepted"].includes(String(disposition)))
-				return "accepted";
-			throw new PiControlError("COMMAND_UNCERTAIN");
+			if (
+				disposition !== "handled" &&
+				!["started", "queued", "accepted"].includes(String(disposition))
+			)
+				throw new PiControlError("COMMAND_UNCERTAIN");
+			const output =
+				typeof responseData?.result === "string"
+					? truncateDiagnostic(redactDiagnosticText(responseData.result), 2000)
+					: undefined;
+			return {
+				disposition: disposition === "handled" ? "handled" : "accepted",
+				...(output ? { output } : {}),
+			};
 		} catch (error) {
 			if (error instanceof PiControlError) throw error;
 			throw new PiControlError(

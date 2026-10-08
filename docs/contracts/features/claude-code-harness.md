@@ -1,6 +1,6 @@
 # Feature contract: Claude Code harness
 
-- Status: approved
+- Status: approved (Stage C and separately approved Telegram UX pass)
 - Goal: add Claude Code as a first-class generic harness without coupling Claude behavior into core or Telegram.
 
 ## User-visible behavior
@@ -19,6 +19,13 @@
 - Do not advertise reload for Claude; Pi retains dynamic commands, Claude does not. Usage absent from Claude is unavailable, never synthesized.
 - Never read credentials. No automatic fallback to another harness, retry, or credential discovery.
 
+## Separately approved Telegram UX pass (Stage C)
+
+- Bare `/cancel` cancels the selected Pi session's current active input; `/cancel <inputId>` remains supported. Native authorization and session routing remain unchanged. Claude does not advertise cancellation.
+- Telegram distinguishes transport acceptance, Pi queueing behind busy work, and model consumption. When Pi is blocked in a `bg_wait`-like state, an ordinary message is explicitly reported as queued, not consumed. Bare `/cancel` releases/cancels that selected session's active input so the conversation can continue. No hidden replay occurs; neither cancellation nor uncertainty automatically reruns the queued message or background task.
+- Dynamic Pi `/cost` returns its bounded actual command result to Telegram, not merely dispatch acknowledgement. Use a bounded timeout and fixed safe errors, exact request correlation, and never replay/rerun after uncertainty; do not expose raw protocol or internal details.
+- Do not implement MCP `send_file` in this pass.
+
 ## Non-goals
 
 - No Claude-specific core/transport branches where generic schemas suffice; no implicit session migration, model/permission fallback, unsupported reload/dynamic commands, or unverified cancellation.
@@ -32,9 +39,15 @@
 - [Process provider](../surfaces/process-provider.md)
 - [Pi RPC harness](../surfaces/pi-rpc-harness.md)
 
+## Affected surface contracts
+
+- [Core session management](../surfaces/core-session-management.md)
+- [Telegram transport](../surfaces/telegram-transport.md)
+- [Pi RPC harness](../surfaces/pi-rpc-harness.md)
+
 ## Acceptance and validation
 
 - Verify canonical IDs/aliases, default and explicit option inheritance, immutable session harness identity, and additive migration behavior with focused tests.
 - Verify exact-cwd `/new @alias` and panel choice; capability-driven UI, model/effort/all-six-permission restart-resume, manual permission prompt, bypass confirmation, and conditional verified cancel.
 - Test bounded stream-json launch/resume with original session ID, allowlisted environment, generic session MCP file send/security, and absent usage as unavailable; confirm Claude has no reload/dynamic commands and no fallback/retry/credential reads.
-- Run an isolated live Claude smoke covering creation, stream, resume, permission flow and safe cancellation where supported. Run applicable project test/typecheck/build/lint/format/version and diff checks; production migration/deploy/restart are separately approved gates.
+- Run deterministic regressions for bare and explicit Telegram cancellation, busy/queued input status and continuation without replay, and `/cost` exact result correlation, timeout, late response, and no rerun. Run an isolated live Claude smoke covering creation, stream, resume, permission flow and safe cancellation where supported. Run applicable project test/typecheck/build/lint/format/version and diff checks; production migration/deploy/restart are separately approved gates.

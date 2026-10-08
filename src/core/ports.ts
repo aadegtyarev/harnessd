@@ -347,7 +347,10 @@ export interface HarnessCommand {
 	readonly description: string;
 }
 
-export type HarnessCommandResult = "handled" | "accepted";
+export interface HarnessCommandResult {
+	readonly disposition: "handled" | "accepted";
+	readonly output?: string;
+}
 
 export interface HarnessControl {
 	getCommands?(): Promise<readonly HarnessCommand[]>;
