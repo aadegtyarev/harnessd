@@ -43,11 +43,11 @@ export function createClaudeInstance(
 	void child.exit.then(
 		() => {
 			processExited = true;
-			void cleanupBridge?.();
+			void Promise.resolve(cleanupBridge?.()).catch(() => {});
 		},
 		() => {
 			processExited = true;
-			void cleanupBridge?.();
+			void Promise.resolve(cleanupBridge?.()).catch(() => {});
 		},
 	);
 	const framer = new ClaudeJsonlFramer((line) =>
@@ -86,13 +86,19 @@ export function createClaudeInstance(
 		async shutdown() {
 			protocol.close();
 			if (!cleanup) cleanup = shutdownClaudeProcess(child, stdin);
+			let shutdownError: unknown;
 			try {
 				await cleanup;
-				await cleanupBridge?.();
 			} catch (error) {
 				cleanup = undefined;
-				throw error;
+				shutdownError = error;
 			}
+			try {
+				await cleanupBridge?.();
+			} catch (error) {
+				shutdownError ??= error;
+			}
+			if (shutdownError !== undefined) throw shutdownError;
 		},
 	};
 }
