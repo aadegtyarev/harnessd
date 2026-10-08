@@ -401,6 +401,8 @@ export interface TelegramTransportOptions {
 	readonly botFactory?: BotFactory;
 	readonly activityClock?: () => Date;
 	readonly activityTimeFormatter?: (date: Date) => string;
+	readonly panelClock?: () => number;
+	readonly panelSleep?: (milliseconds: number) => Promise<void>;
 }
 
 export function telegramLockPath(
@@ -3667,14 +3669,19 @@ export class TelegramTransportAdapter
 
 	private async waitForPanelPublication(chatId: number): Promise<boolean> {
 		if (this.stopping) return false;
+		const clock = this.options.panelClock ?? Date.now;
 		const previous = this.panelPublicationTimes.get(chatId);
 		if (previous !== undefined) {
-			const remaining = 500 - (Date.now() - previous);
+			const remaining = 500 - (clock() - previous);
 			if (remaining > 0)
-				await new Promise((resolve) => setTimeout(resolve, remaining));
+				await (
+					this.options.panelSleep ??
+					((milliseconds) =>
+						new Promise((resolve) => setTimeout(resolve, milliseconds)))
+				)(remaining);
 		}
 		if (this.stopping) return false;
-		this.panelPublicationTimes.set(chatId, Date.now());
+		this.panelPublicationTimes.set(chatId, clock());
 		return true;
 	}
 
@@ -4860,7 +4867,11 @@ export class TelegramTransportAdapter
 		sender: number,
 		messageId: number,
 	): Promise<void> {
+		this.invalidatePanelIntent(chatId);
+		const intent = this.panelRenderRequests.get(chatId);
+		const isCurrent = () => this.panelRenderRequests.get(chatId) === intent;
 		const result = await this.request(sender, { kind: "list" });
+		if (!isCurrent()) return;
 		if (!result.ok) {
 			await this.updatePanel(
 				chatId,
@@ -4907,6 +4918,7 @@ export class TelegramTransportAdapter
 				: "Сохранённых сессий пока нет.",
 			keyboard(rows),
 			messageId,
+			isCurrent,
 		);
 	}
 

@@ -581,10 +581,13 @@ async function startAdapter(
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
 		activityClock?: () => Date;
 		activityTimeFormatter?: (date: Date) => string;
+		panelClock?: () => number;
+		panelSleep?: (milliseconds: number) => Promise<void>;
 	} = {},
 ) {
 	let listener: ((event: HarnessEvent) => unknown) | undefined;
 	let subscribed = false;
+	let panelNow = Date.now();
 	const requests: TransportEvent[] = [];
 	const adapter = new TelegramTransportAdapter({
 		token: "secret-token",
@@ -592,6 +595,10 @@ async function startAdapter(
 		stateDirectory: dir,
 		initialCwd: extras.initialCwd ?? "/work",
 		botFactory: () => bot as never,
+		panelClock: () => panelNow,
+		panelSleep: async (milliseconds) => {
+			panelNow += milliseconds;
+		},
 		...extras,
 	});
 	const started = adapter.start(
@@ -636,14 +643,20 @@ function callbackData(options: unknown, prefix: string): string {
 describe("Telegram transport", () => {
 	it("spaces actual panel edit API calls by at least 500 ms", async () => {
 		const bot = new MockBot();
+		let now = 0;
 		const editTimes: number[] = [];
 		const originalEdit = bot.api.editMessageText.getMockImplementation();
 		if (!originalEdit) throw new Error("Missing edit API mock");
 		bot.api.editMessageText.mockImplementation(async (...args) => {
-			editTimes.push(Date.now());
+			editTimes.push(now);
 			return originalEdit(...args);
 		});
-		const { adapter } = await startAdapter(bot, await temp());
+		const { adapter } = await startAdapter(bot, await temp(), {
+			panelClock: () => now,
+			panelSleep: async (milliseconds) => {
+				now += milliseconds;
+			},
+		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/menu");
 		sessions.set("sid", sessionWith("sid", { name: "First change" }));
