@@ -1215,7 +1215,8 @@ export class TelegramTransportAdapter
 		number,
 		{
 			readonly generation: number;
-			readonly sessionId?: SessionId;
+			readonly liveSessionId?: SessionId;
+			readonly selectedSessionId?: SessionId;
 			readonly sender: number;
 		}
 	>();
@@ -1792,17 +1793,28 @@ export class TelegramTransportAdapter
 		);
 		for (const [chatId, selectedId] of this.selected)
 			if (selectedId === sessionId)
-				void this.refreshCommandMenu(chatId, live ? sessionId : undefined);
+				void this.refreshCommandMenu(
+					chatId,
+					live ? sessionId : undefined,
+					chatId,
+					selectedId,
+				);
 	}
 
 	private refreshCommandMenu(
 		chatId: number,
-		sessionId: SessionId | undefined,
+		liveSessionId: SessionId | undefined,
 		sender = chatId,
+		selectedSessionId = liveSessionId,
 	): Promise<void> {
 		const generation = (this.commandMenuGenerations.get(chatId) ?? 0) + 1;
 		this.commandMenuGenerations.set(chatId, generation);
-		this.commandMenuRequests.set(chatId, { generation, sessionId, sender });
+		this.commandMenuRequests.set(chatId, {
+			generation,
+			liveSessionId,
+			selectedSessionId,
+			sender,
+		});
 		const existing = this.commandMenuTasks.get(chatId);
 		if (existing) return existing;
 		const task = (async () => {
@@ -1810,18 +1822,18 @@ export class TelegramTransportAdapter
 			while (!this.stopping && !this.uncertainCommandMenus.has(chatId)) {
 				const request = this.commandMenuRequests.get(chatId);
 				if (!request || request.generation === completed) return;
-				const extensions = request.sessionId
+				const extensions = request.liveSessionId
 					? ((await this.discoverExtensionCommands(
 							request.sender,
-							request.sessionId,
+							request.liveSessionId,
 						)) ?? [])
 					: [];
 				let includeCancel = false;
-				let includeReload = true;
-				if (request.sessionId && this.getSessionCapabilities) {
+				let includeReload = request.selectedSessionId === undefined;
+				if (request.selectedSessionId && this.getSessionCapabilities) {
 					try {
 						const capabilities = await this.getSessionCapabilities(
-							request.sessionId,
+							request.selectedSessionId,
 						);
 						includeCancel = capabilities.includes("harness.cancel");
 						includeReload = capabilities.includes("harness.reload");
@@ -1834,8 +1846,8 @@ export class TelegramTransportAdapter
 				if (
 					this.commandMenuRequests.get(chatId)?.generation !==
 						request.generation ||
-					(request.sessionId !== undefined &&
-						this.selected.get(chatId) !== request.sessionId)
+					(request.selectedSessionId !== undefined &&
+						this.selected.get(chatId) !== request.selectedSessionId)
 				)
 					continue;
 				const controller = new AbortController();
@@ -1876,8 +1888,9 @@ export class TelegramTransportAdapter
 									if (latest)
 										void this.refreshCommandMenu(
 											chatId,
-											latest.sessionId,
+											latest.liveSessionId,
 											latest.sender,
+											latest.selectedSessionId,
 										);
 								}
 							},
@@ -1890,8 +1903,9 @@ export class TelegramTransportAdapter
 									if (latest)
 										void this.refreshCommandMenu(
 											chatId,
-											latest.sessionId,
+											latest.liveSessionId,
 											latest.sender,
+											latest.selectedSessionId,
 										);
 								}
 							},

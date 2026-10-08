@@ -6412,7 +6412,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("shows /reload only for capable selections and rejects unsupported use", async () => {
+	it("keeps /reload hidden through Claude recovery and cross-chat stop lifecycle", async () => {
 		const bot = new MockBot();
 		sessions.set("claude", {
 			id: "claude" as SessionId,
@@ -6420,40 +6420,64 @@ describe("Telegram transport", () => {
 			cwd: "/work",
 			status: "running",
 		});
-		const { adapter, requests } = await startAdapter(bot, await temp(), {
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
 			capabilitiesFor: (sessionId) =>
 				sessionId === ("claude" as SessionId)
 					? ["harness.cancel"]
 					: ["harness.cancel", "harness.reload"],
 		});
+		const commandsFor = (chatId: number) =>
+			bot.commandRegistrations
+				.filter(({ other }) =>
+					JSON.stringify(other).includes(`"chat_id":${chatId}`),
+				)
+				.at(-1)
+				?.commands.map(({ command }) => command);
+		const countFor = (chatId: number) =>
+			bot.commandRegistrations.filter(({ other }) =>
+				JSON.stringify(other).includes(`"chat_id":${chatId}`),
+			).length;
+		const expectReload = (chatId: number, included: boolean) => {
+			const commands = commandsFor(chatId) ?? [];
+			if (included) expect(commands).toContain("reload");
+			else expect(commands).not.toContain("reload");
+		};
+
 		await bot.update(42, "/use claude");
-		await vi.waitFor(() => {
-			const menu = bot.commandRegistrations.findLast(({ other }) =>
-				JSON.stringify(other).includes('"chat_id":42'),
-			);
-			expect(menu?.commands.map(({ command }) => command)).not.toContain(
-				"reload",
-			);
-		});
-		await bot.update(42, "/help");
-		expect(
-			bot.sent
-				.filter(({ chatId }) => chatId === 42)
-				.map(({ text }) => text)
-				.join("\n"),
-		).not.toContain("/reload");
+		await vi.waitFor(() => expectReload(42, false));
 		await bot.update(42, "/reload");
 		expect(bot.sent.at(-1)?.text).toContain("не поддерживается");
+		for (const status of ["harness_restarting", "harness_recovery_failed"]) {
+			const before = countFor(42);
+			emit(harnessEvent("claude", "status", status));
+			await vi.waitFor(() => {
+				expect(countFor(42)).toBeGreaterThan(before);
+				expectReload(42, false);
+			});
+			await bot.update(42, "/help");
+			expect(bot.sent.at(-1)?.text).not.toContain("/reload");
+		}
+		await bot.update(43, "/stop claude");
+		await vi.waitFor(() => expectReload(42, false));
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).not.toContain("/reload");
+		expect(requests.find(({ kind }) => kind === "stop")).toMatchObject({
+			kind: "stop",
+			sessionId: "claude",
+		});
 		expect(requests.some(({ kind }) => kind === "reload")).toBe(false);
 
-		await bot.update(42, "/use sid");
-		await vi.waitFor(() => {
-			const menu = bot.commandRegistrations.findLast(({ other }) =>
-				JSON.stringify(other).includes('"chat_id":42'),
-			);
-			expect(menu?.commands.map(({ command }) => command)).toContain("reload");
-		});
-		await bot.update(42, "/help");
+		await bot.update(43, "/use sid");
+		await vi.waitFor(() => expectReload(43, true));
+		for (const status of ["harness_restarting", "harness_recovery_failed"]) {
+			const before = countFor(43);
+			emit(harnessEvent("sid", "status", status));
+			await vi.waitFor(() => {
+				expect(countFor(43)).toBeGreaterThan(before);
+				expectReload(43, true);
+			});
+		}
+		await bot.update(43, "/help");
 		expect(bot.sent.at(-1)?.text).toContain("/reload");
 		await adapter.stop();
 	});
