@@ -828,6 +828,21 @@ describe("Telegram transport", () => {
 		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
 			initial,
 		);
+		(adapter as unknown as { queues: Map<number, unknown> }).queues.set(42, {
+			messages: [],
+			pendingCharacters: 0,
+			failed: true,
+			overflowNotices: new Set(),
+			idleWaiters: [],
+		});
+		time = 3;
+		await bot.update(42, "/menu");
+		expect(JSON.stringify(bot.edited.at(-1)?.options)).toContain(
+			"Включить канал для новых событий",
+		);
+		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			initial,
+		);
 		await adapter.stop();
 	});
 
