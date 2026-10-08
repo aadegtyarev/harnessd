@@ -1543,18 +1543,12 @@ export class TelegramTransportAdapter
 		chatId: number,
 		messageId: number,
 	): Promise<void> {
-		if (!(await this.waitForPanelPublication(chatId))) return;
-		const edited = await this.telegramCall((signal) =>
-			this.bot.api.editMessageText(
-				chatId,
-				messageId,
-				"📌 Панель сессий\nСостояние Pi: устарело после перезапуска; проверяем актуальный статус.",
-				{},
-				signal,
-			),
+		await this.updatePanel(
+			chatId,
+			"📌 Панель сессий\nСостояние Pi: устарело после перезапуска; проверяем актуальный статус.",
+			{},
+			messageId,
 		);
-		if (edited.ok || isMessageNotModified(edited.error))
-			this.panelPublished.delete(chatId);
 	}
 
 	private async restoreSelectedSessions(): Promise<void> {
@@ -3783,12 +3777,12 @@ export class TelegramTransportAdapter
 				),
 			);
 			if (edited.ok || isMessageNotModified(edited.error)) {
-				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
+				if (!referenceIsCurrent(existing)) return false;
 				await this.savePanelReference(chatId, existing);
-				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
+				if (!referenceIsCurrent(existing)) return false;
 				this.panelStaleChats.delete(chatId);
 				this.panelPublished.set(chatId, publication);
-				return true;
+				return isCurrent();
 			}
 			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			if (!isMessageNotFound(edited.error)) {
@@ -3827,18 +3821,15 @@ export class TelegramTransportAdapter
 			return false;
 		}
 		const createdMessageId = messageIdFrom(sent.value);
-		if (
-			createdMessageId === undefined ||
-			!isCurrent() ||
-			!referenceIsCurrent(existing)
-		) {
+		if (createdMessageId === undefined || !referenceIsCurrent(existing)) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
 			return false;
 		}
 		await this.savePanelReference(chatId, createdMessageId);
-		if (!isCurrent() || !referenceIsCurrent(createdMessageId)) return false;
+		if (!referenceIsCurrent(createdMessageId)) return false;
 		this.panelStaleChats.delete(chatId);
 		this.panelPublished.set(chatId, publication);
+		if (!isCurrent()) return false;
 		if (hasBoundIntents) {
 			for (const intent of this.folderIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)

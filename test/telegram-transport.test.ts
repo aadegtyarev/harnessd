@@ -3494,6 +3494,198 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("reconciles a successful superseded edit before rendering a reverted view", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		await bot.update(42, "/menu");
+		const originalText = bot.sent.at(-1)?.text;
+		if (!originalText) throw new Error("Initial panel was not sent");
+
+		let releaseEdit!: () => void;
+		let enteredEdit!: () => void;
+		const entered = new Promise<void>((resolve) => (enteredEdit = resolve));
+		const gate = new Promise<void>((resolve) => (releaseEdit = resolve));
+		bot.api.editMessageText.mockImplementationOnce(async (...args) => {
+			enteredEdit();
+			await gate;
+			bot.edited.push({
+				chatId: args[0],
+				messageId: args[1],
+				text: args[2],
+				options: args[3],
+			});
+			return { message_id: args[1] };
+		});
+		sessions.set("sid", sessionWith("sid", { name: "Temporary panel name" }));
+		const obsolete = bot.update(42, "/menu");
+		await entered;
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		const priorIntent = (
+			adapter as unknown as {
+				panelIntents: { current(chatId: number): number };
+			}
+		).panelIntents.current(42);
+		const newest = (
+			adapter as unknown as {
+				renderPanel(chatId: number, sender: number): Promise<void>;
+			}
+		).renderPanel(42, 42);
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as {
+						panelIntents: { current(chatId: number): number };
+					}
+				).panelIntents.current(42),
+			).toBeGreaterThan(priorIntent),
+		);
+		releaseEdit();
+		await Promise.all([obsolete, newest]);
+
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toBe(originalText);
+		await adapter.stop();
+	});
+
+	it("retains a successful replacement sent after its intent is invalidated", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		await bot.update(42, "/menu");
+		const originalText = bot.sent.at(-1)?.text;
+		if (!originalText) throw new Error("Initial panel was not sent");
+		const pinCount = bot.pinned.length;
+		let releaseSend!: () => void;
+		let enteredSend!: () => void;
+		const entered = new Promise<void>((resolve) => (enteredSend = resolve));
+		const gate = new Promise<void>((resolve) => (releaseSend = resolve));
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("panel missing"), {
+				description: "Bad Request: message to edit not found",
+			}),
+		);
+		bot.api.sendMessage.mockImplementationOnce(async (...args) => {
+			enteredSend();
+			await gate;
+			const message_id = 700;
+			bot.sent.push({ chatId: args[0], text: args[1], message_id });
+			bot.sendOptions.push(args[2]);
+			return { message_id };
+		});
+		sessions.set("sid", sessionWith("sid", { name: "Temporary panel name" }));
+		const obsolete = bot.update(42, "/menu");
+		await entered;
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		const priorIntent = (
+			adapter as unknown as {
+				panelIntents: { current(chatId: number): number };
+			}
+		).panelIntents.current(42);
+		const newest = (
+			adapter as unknown as {
+				renderPanel(chatId: number, sender: number): Promise<void>;
+			}
+		).renderPanel(42, 42);
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as {
+						panelIntents: { current(chatId: number): number };
+					}
+				).panelIntents.current(42),
+			).toBeGreaterThan(priorIntent),
+		);
+		releaseSend();
+		await Promise.all([obsolete, newest]);
+
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)).toMatchObject({
+			messageId: 700,
+			text: originalText,
+		});
+		expect(bot.pinned).toHaveLength(pinCount);
+		await adapter.stop();
+	});
+
+	it("serializes restored startup status with lifecycle and user refreshes", async () => {
+		const directory = await temp();
+		const firstBot = new MockBot();
+		const first = await startAdapter(firstBot, directory);
+		await firstBot.update(42, "/menu");
+		await first.adapter.stop();
+
+		const bot = new MockBot();
+		let activeEdits = 0;
+		let maximumActiveEdits = 0;
+		let releaseStartupEdit!: () => void;
+		let enteredStartupEdit!: () => void;
+		const entered = new Promise<void>(
+			(resolve) => (enteredStartupEdit = resolve),
+		);
+		const gate = new Promise<void>((resolve) => (releaseStartupEdit = resolve));
+		const edit = bot.api.editMessageText.getMockImplementation();
+		if (!edit) throw new Error("Missing edit API mock");
+		bot.api.editMessageText.mockImplementation(async (...args) => {
+			activeEdits += 1;
+			maximumActiveEdits = Math.max(maximumActiveEdits, activeEdits);
+			try {
+				if (activeEdits === 1) {
+					enteredStartupEdit();
+					await gate;
+				}
+				return await edit(...args);
+			} finally {
+				activeEdits -= 1;
+			}
+		});
+		let listener: ((event: HarnessEvent) => unknown) | undefined;
+		const adapter = new TelegramTransportAdapter({
+			token: "secret-token",
+			allowedUserIds: [42],
+			stateDirectory: directory,
+			initialCwd: "/work",
+			botFactory: () => bot as never,
+		});
+		const started = adapter.start(
+			async (request) => result(request),
+			(subscribe) => {
+				listener = subscribe;
+				return () => (listener = undefined);
+			},
+			async () => [...sessions.values()],
+		);
+		await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
+		bot.ready();
+		await entered;
+		sessions.set("sid", sessionWith("sid", { name: "Newest startup race" }));
+		listener?.(harnessEvent("sid", "status", "agent_start"));
+		const priorIntent = (
+			adapter as unknown as {
+				panelIntents: { current(chatId: number): number };
+			}
+		).panelIntents.current(42);
+		const userRefresh = bot.update(42, "/menu");
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as {
+						panelIntents: { current(chatId: number): number };
+					}
+				).panelIntents.current(42),
+			).toBeGreaterThan(priorIntent),
+		);
+		releaseStartupEdit();
+		await Promise.all([started, userRefresh]);
+		await bot.update(42, "/menu");
+
+		expect(maximumActiveEdits).toBe(1);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toContain("Newest startup race");
+		await adapter.stop();
+	});
+
 	it("does not replace a panel after a delayed not-found edit is superseded", async () => {
 		const bot = new MockBot();
 		const directory = await temp();
