@@ -297,6 +297,7 @@ export class ApplicationRuntime {
 						processProvider ?? new NodeProcessProvider(),
 						{
 							executable: options.claudeExecutable ?? "claude",
+							...(agentFileSend ? { agentFileSend } : {}),
 						},
 					),
 					new PiRpcHarnessAdapter(

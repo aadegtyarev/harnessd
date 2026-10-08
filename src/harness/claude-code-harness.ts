@@ -1,10 +1,18 @@
+import { fileURLToPath } from "node:url";
 import type {
+	AgentFileSendHandler,
 	HarnessAdapter,
 	HarnessInstance,
 	HarnessLaunchRequest,
+	ManagedProcess,
 	ProcessProvider,
 } from "../core/ports.js";
 import type { AdapterId } from "../core/types.js";
+import { startAgentFileSendBridge } from "./agent-file-send-bridge.js";
+import {
+	AGENT_FILE_SEND_TOKEN_ENV,
+	AGENT_FILE_SEND_URL_ENV,
+} from "./agent-file-send-protocol.js";
 import { createClaudeInstance } from "./claude-code-instance.js";
 
 const PERMISSION_MODES = [
@@ -22,35 +30,39 @@ export interface ClaudeCodeHarnessOptions {
 	readonly executable: string;
 	readonly env?: Readonly<Record<string, string>>;
 	readonly acknowledgementTimeoutMs?: number;
+	readonly agentFileSend?: AgentFileSendHandler;
 }
 
 export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
-	readonly descriptor = {
-		id: "claude-code" as AdapterId,
-		aliases: ["claude"],
-		capabilities: [
-			"harness.launch",
-			"harness.stop",
-			"harness.resume",
-			"input.submit",
-			"harness.options.set",
-		] as const,
-		options: [
-			{
-				key: "model",
-				label: "Модель",
-				values: CLAUDE_MODELS,
-				allowCustom: true,
-			},
-			{ key: "effort", label: "Уровень усилий", values: EFFORT_LEVELS },
-			{
-				key: "permissionMode",
-				label: "Разрешения",
-				values: PERMISSION_MODES,
-				dangerousValues: ["bypassPermissions"],
-			},
-		] as const,
-	};
+	get descriptor() {
+		return {
+			id: "claude-code" as AdapterId,
+			aliases: ["claude"],
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"input.submit",
+				"harness.options.set",
+				...(this.options.agentFileSend ? ["harness.file.send" as const] : []),
+			] as const,
+			options: [
+				{
+					key: "model",
+					label: "Модель",
+					values: CLAUDE_MODELS,
+					allowCustom: true,
+				},
+				{ key: "effort", label: "Уровень усилий", values: EFFORT_LEVELS },
+				{
+					key: "permissionMode",
+					label: "Разрешения",
+					values: PERMISSION_MODES,
+					dangerousValues: ["bypassPermissions"],
+				},
+			] as const,
+		};
+	}
 	constructor(
 		private readonly provider: ProcessProvider,
 		private readonly options: ClaudeCodeHarnessOptions,
@@ -97,6 +109,9 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 			!EFFORT_LEVELS.includes(effort as (typeof EFFORT_LEVELS)[number])
 		)
 			throw new Error("CLAUDE_INVALID_EFFORT");
+		let fileSendBridge:
+			| Awaited<ReturnType<typeof startAgentFileSendBridge>>
+			| undefined;
 		const args = [
 			"--print",
 			"--input-format",
@@ -115,13 +130,60 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 		if (typeof effort === "string") args.push("--effort", effort);
 		if (resume) args.push("--resume", nativeId);
 		else args.push("--session-id", nativeId);
-		const child = await this.provider.launch({
-			executable: this.options.executable,
-			args,
-			cwd: request.cwd,
-			env: this.options.env ?? {},
-			stdio: "pipe",
-		});
-		return createClaudeInstance(child, request, nativeId, timeout);
+		if (this.options.agentFileSend) {
+			fileSendBridge = await startAgentFileSendBridge(
+				request.sessionId,
+				this.options.agentFileSend,
+			);
+			const serverPath = fileURLToPath(
+				new URL("./claude-send-file-mcp-server.js", import.meta.url),
+			);
+			const config = {
+				mcpServers: {
+					harnessd: {
+						type: "stdio",
+						command: process.execPath,
+						args: [serverPath],
+						env: {
+							[AGENT_FILE_SEND_URL_ENV]: fileSendBridge.url,
+							[AGENT_FILE_SEND_TOKEN_ENV]: fileSendBridge.token,
+						},
+					},
+				},
+			};
+			args.push(
+				"--mcp-config",
+				JSON.stringify(config),
+				"--strict-mcp-config",
+				"--allowedTools",
+				"mcp__harnessd__send_file",
+			);
+		}
+		let child: ManagedProcess;
+		try {
+			child = await this.provider.launch({
+				executable: this.options.executable,
+				args,
+				cwd: request.cwd,
+				env: this.options.env ?? {},
+				stdio: "pipe",
+			});
+		} catch (error) {
+			await fileSendBridge?.close();
+			throw error;
+		}
+		if (fileSendBridge)
+			void child.exit.then(
+				() => fileSendBridge?.close(),
+				() => fileSendBridge?.close(),
+			);
+		try {
+			return createClaudeInstance(child, request, nativeId, timeout, () =>
+				fileSendBridge?.close(),
+			);
+		} catch (error) {
+			await fileSendBridge?.close();
+			throw error;
+		}
 	}
 }

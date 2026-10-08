@@ -21,6 +21,7 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
+import { ClaudeCodeHarnessAdapter } from "../src/harness/claude-code-harness.js";
 import {
 	PiControlError,
 	PiRpcHarnessAdapter,
@@ -243,6 +244,54 @@ describe("application runtime", () => {
 			await runtime.close();
 		},
 	);
+
+	it("passes the same generic file handler to both built-in harnesses", async () => {
+		const makeInstance = (id: string): HarnessInstance => ({
+			processId: id as never,
+			exit: new Promise(() => {}),
+			events: (async function* () {})(),
+			async send() {},
+			async cancel() {},
+			async shutdown() {},
+		});
+		const claude = vi
+			.spyOn(ClaudeCodeHarnessAdapter.prototype, "launch")
+			.mockImplementation(function (this: ClaudeCodeHarnessAdapter) {
+				expect(this.descriptor.capabilities).toContain("harness.file.send");
+				return Promise.resolve(makeInstance("claude-file-send"));
+			});
+		const pi = vi
+			.spyOn(PiRpcHarnessAdapter.prototype, "launch")
+			.mockImplementation(function (this: PiRpcHarnessAdapter) {
+				expect(this.descriptor.capabilities).toContain("harness.file.send");
+				return Promise.resolve(makeInstance("pi-file-send"));
+			});
+		const transport = {
+			descriptor: { id: "file-send-transport" as never, capabilities: [] },
+			async start() {},
+			async stop() {},
+			async sendAgentFile() {
+				return { fileName: "a", delivered: 1, recipients: 1 };
+			},
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [transport],
+		});
+		for (const harnessId of ["claude-code", "pi-rpc"] as const) {
+			await runtime.dispatch({
+				requestId: `create-${harnessId}-file-send`,
+				principalId: "test",
+				kind: "create",
+				harnessId: harnessId as never,
+				cwd: os.tmpdir(),
+			});
+		}
+		expect(claude).toHaveBeenCalledOnce();
+		expect(pi).toHaveBeenCalledOnce();
+		await runtime.close();
+	});
 
 	it("routes optional session names and renames through the application boundary", async () => {
 		const runtime = await ApplicationRuntime.start({

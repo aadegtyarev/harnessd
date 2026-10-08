@@ -15,6 +15,7 @@ export function createClaudeInstance(
 	request: HarnessLaunchRequest,
 	nativeId: string,
 	ackTimeoutMs: number,
+	cleanupBridge?: () => Promise<void> | undefined,
 ): HarnessInstance {
 	const stdin = child.stdin;
 	const stdout = child.stdout;
@@ -42,9 +43,11 @@ export function createClaudeInstance(
 	void child.exit.then(
 		() => {
 			processExited = true;
+			void cleanupBridge?.();
 		},
 		() => {
 			processExited = true;
+			void cleanupBridge?.();
 		},
 	);
 	const framer = new ClaudeJsonlFramer((line) =>
@@ -85,6 +88,7 @@ export function createClaudeInstance(
 			if (!cleanup) cleanup = shutdownClaudeProcess(child, stdin);
 			try {
 				await cleanup;
+				await cleanupBridge?.();
 			} catch (error) {
 				cleanup = undefined;
 				throw error;
