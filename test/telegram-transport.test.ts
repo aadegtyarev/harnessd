@@ -603,7 +603,7 @@ async function startAdapter(
 	});
 	const started = adapter.start(
 		async (request) => {
-			requests.push(request);
+			if (request.kind !== "command_list") requests.push(request);
 			return (await extras.dispatch?.(request)) ?? result(request);
 		},
 		(subscribe) => {
@@ -641,6 +641,742 @@ function callbackData(options: unknown, prefix: string): string {
 }
 
 describe("Telegram transport", () => {
+	it("dispatches only fresh non-native extensions and preserves raw arguments", async () => {
+		const bot = new MockBot();
+		const discovered = [
+			{ name: "cost", description: "Cost summary" },
+			{ name: "reload", description: "shadow" },
+			{ name: "help", description: "shadow" },
+			{ name: "private", description: "/secret/path" },
+		];
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return { requestId: request.requestId, ok: true, value: discovered };
+				if (request.kind === "command_run")
+					return { requestId: request.requestId, ok: true, value: "accepted" };
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.some(
+					(registration) =>
+						(registration.other as { scope?: { type?: string } })?.scope
+							?.type === "chat",
+				),
+			).toBe(true),
+		);
+		await bot.update(42, "/CoSt@bot   two  spaces ");
+		const run = requests.find((request) => request.kind === "command_run");
+		expect(run).toMatchObject({ name: "cost", remainder: "   two  spaces " });
+		expect(bot.sent.at(-1)?.text).toContain("принял команду");
+		await bot.update(42, "/reload");
+		expect(requests.some((request) => request.kind === "reload")).toBe(true);
+		await bot.update(42, "/private");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("принял команду"),
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("/secret/path");
+		await adapter.stop();
+	});
+
+	it("discards an older menu discovery when selection changes from A to B", async () => {
+		const bot = new MockBot();
+		let releaseA!: (value: TransportResult) => void;
+		let heldA = false;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (
+					request.kind === "command_list" &&
+					request.sessionId === "sid" &&
+					!heldA
+				) {
+					heldA = true;
+					return new Promise<TransportResult>(
+						(resolve) => (releaseA = resolve),
+					);
+				}
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: request.sessionId, description: "Current" }],
+					};
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() => expect(releaseA).toBeDefined());
+		await bot.update(100, "/use other");
+		releaseA({
+			requestId: "stale" as never,
+			ok: true,
+			value: [{ name: "oldcmd", description: "Old" }],
+		});
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.at(-1)?.commands.at(-1)?.command).toBe(
+				"other",
+			),
+		);
+		expect(
+			bot.commandRegistrations.some(
+				({ commands }) => commands.at(-1)?.command === "oldcmd",
+			),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("serializes in-flight publication so the newest selected menu wins", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let entered!: () => void;
+		let release!: () => void;
+		const publicationStarted = new Promise<void>(
+			(resolve) => (entered = resolve),
+		);
+		const waitPublication = new Promise<void>((resolve) => (release = resolve));
+		bot.setMyCommandsBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			await waitPublication;
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: [{ name: request.sessionId, description: "Current" }],
+						}
+					: result(request),
+		});
+		hold = true;
+		await bot.update(100, "/use sid");
+		await publicationStarted;
+		await bot.update(100, "/use other");
+		release();
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.at(-1)?.commands.at(-1)?.command).toBe(
+				"other",
+			),
+		);
+		await adapter.stop();
+	});
+
+	it("bounds timed-out menu publication and republishes only the newest generation after settlement", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let entered!: () => void;
+		let release!: () => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		const held = new Promise<void>((resolve) => (release = resolve));
+		bot.setMyCommandsBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			await held;
+		};
+		const discoveries: SessionId[] = [];
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list") {
+					discoveries.push(request.sessionId);
+					return { requestId: request.requestId, ok: true, value: [] };
+				}
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		vi.useFakeTimers();
+		const prior = bot.commandRegistrations.length;
+		hold = true;
+		await bot.update(100, "/use other");
+		await started;
+		await vi.advanceTimersByTimeAsync(5_001);
+		await bot.update(100, "/use sid");
+		expect(bot.commandRegistrations).toHaveLength(prior + 1);
+		release();
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.at(-1)?.other).toEqual({
+				scope: { type: "chat", chat_id: 100 },
+			}),
+		);
+		await vi.waitFor(() => expect(discoveries.at(-1)).toBe("sid"));
+		await adapter.stop();
+	});
+
+	it("releases menu quarantine after a timed-out publication rejects", async () => {
+		const bot = new MockBot();
+		let entered!: () => void;
+		let reject!: (error: Error) => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		const publication = new Promise<void>((_resolve, rejectPromise) => {
+			reject = rejectPromise;
+		});
+		let hold = false;
+		bot.setMyCommandsBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			return publication;
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: [{ name: request.sessionId, description: "Selected" }],
+						}
+					: result(request),
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		vi.useFakeTimers();
+		const prior = bot.commandRegistrations.length;
+		hold = true;
+		await bot.update(100, "/use other");
+		await started;
+		await vi.advanceTimersByTimeAsync(5_001);
+		await bot.update(100, "/use sid");
+		reject(new Error("late scoped publication rejection"));
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(prior + 1),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations
+					.at(-1)
+					?.commands.some(({ command }) => command === "sid"),
+			).toBe(true),
+		);
+		await adapter.stop();
+	});
+
+	it("bounds restored-chat startup refresh and suppresses publication after shutdown", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const directory = await temp();
+		const store = await TelegramPanelStore.open(directory, "secret-token");
+		await store.setSelected(100, "sid");
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		bot.setMyCommandsBehavior = async () => {
+			const scope = (
+				bot.commandRegistrations.at(-1)?.other as { scope?: { type?: string } }
+			)?.scope;
+			if (scope?.type === "chat") await held;
+		};
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const adapter = new TelegramTransportAdapter({
+			token: "secret-token",
+			allowedUserIds: [42],
+			stateDirectory: directory,
+			initialCwd: "/work",
+			botFactory: () => bot as never,
+		});
+		const starting = adapter.start(
+			async (request) => result(request),
+			() => () => {},
+			async () => [...sessions.values()],
+		);
+		await vi.waitFor(() => expect(bot.commandRegistrations).toHaveLength(2));
+		await vi.advanceTimersByTimeAsync(5_001);
+		await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
+		bot.ready();
+		await starting;
+		const registrations = bot.commandRegistrations.length;
+		await adapter.stop();
+		release();
+		await Promise.resolve();
+		expect(bot.commandRegistrations).toHaveLength(registrations);
+		log.mockRestore();
+	});
+
+	it("keeps a late live menu from overwriting native-only stop state", async () => {
+		const bot = new MockBot();
+		let releaseDiscovery!: (value: TransportResult) => void;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return new Promise<TransportResult>(
+						(resolve) => (releaseDiscovery = resolve),
+					);
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() => expect(releaseDiscovery).toBeDefined());
+		await bot.update(100, "/stop sid");
+		releaseDiscovery({
+			requestId: "stale" as never,
+			ok: true,
+			value: [{ name: "stale", description: "Old" }],
+		});
+		await vi.waitFor(() => {
+			const scoped = bot.commandRegistrations.filter(
+				(entry) =>
+					(entry.other as { scope?: { type?: string } })?.scope?.type ===
+					"chat",
+			);
+			expect(
+				scoped.at(-1)?.commands.some(({ command }) => command === "stale"),
+			).toBe(false);
+		});
+		await adapter.stop();
+	});
+
+	it("revalidates help inventory after selection changes during discovery", async () => {
+		const bot = new MockBot();
+		let releaseHelp!: (value: TransportResult) => void;
+		let holdHelp = false;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (
+					request.kind === "command_list" &&
+					request.sessionId === "sid" &&
+					holdHelp
+				)
+					return new Promise<TransportResult>(
+						(resolve) => (releaseHelp = resolve),
+					);
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: request.sessionId, description: "Command" }],
+					};
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		holdHelp = true;
+		const help = bot.update(100, "/help");
+		await vi.waitFor(() => expect(releaseHelp).toBeDefined());
+		await bot.update(100, "/use other");
+		releaseHelp({
+			requestId: "stale-help" as never,
+			ok: true,
+			value: [{ name: "sid", description: "Stale inventory" }],
+		});
+		await help;
+		expect(bot.sent.map(({ text }) => text).join("\\n")).not.toContain(
+			"/sid — Stale inventory",
+		);
+		expect(bot.sent.map(({ text }) => text).join("\\n")).toContain(
+			"состояние сессии изменились",
+		);
+		await adapter.stop();
+	});
+
+	it("registers different extension inventories per selected private chat", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [
+							{ name: request.sessionId, description: "Session command" },
+						],
+					};
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use other");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.filter(
+					(item) =>
+						(item.other as { scope?: { type?: string } })?.scope?.type ===
+						"chat",
+				),
+			).toHaveLength(2),
+		);
+		const scoped = bot.commandRegistrations.filter(
+			(item) =>
+				(item.other as { scope?: { type?: string } })?.scope?.type === "chat",
+		);
+		expect(scoped[0]?.commands.at(-1)?.command).toBe("sid");
+		expect(scoped[1]?.commands.at(-1)?.command).toBe("other");
+		expect(scoped[0]?.other).toEqual({ scope: { type: "chat", chat_id: 100 } });
+		expect(scoped[1]?.other).toEqual({ scope: { type: "chat", chat_id: 101 } });
+		await adapter.stop();
+	});
+
+	it("refreshes every selecting chat after reload and explicit resume without changing selection", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: [{ name: "live", description: "Live" }],
+						}
+					: result(request),
+		});
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use sid");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.filter(
+					(entry) =>
+						(entry.other as { scope?: { type?: string } })?.scope?.type ===
+						"chat",
+				).length,
+			).toBeGreaterThanOrEqual(2),
+		);
+		const scopedFor = (chatId: number) =>
+			bot.commandRegistrations.filter(
+				(entry) =>
+					(entry.other as { scope?: { type?: string; chat_id?: number } })
+						?.scope?.chat_id === chatId,
+			);
+		const chat100BeforeReload = scopedFor(100).length;
+		const chat101BeforeReload = scopedFor(101).length;
+		await bot.update(100, "/reload");
+		await vi.waitFor(() => {
+			expect(scopedFor(100).length).toBeGreaterThan(chat100BeforeReload);
+			expect(scopedFor(101).length).toBeGreaterThan(chat101BeforeReload);
+		});
+		const chat101BeforeResume = scopedFor(101).length;
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		await bot.update(100, "/resume sid");
+		await vi.waitFor(() =>
+			expect(scopedFor(101).length).toBeGreaterThan(chat101BeforeResume),
+		);
+		await bot.update(100, "still selected");
+		expect(
+			requests.findLast((request) => request.kind === "submit"),
+		).toMatchObject({ kind: "submit", sessionId: "sid" });
+		await adapter.stop();
+	});
+
+	it("refreshes every selecting chat after submit implicitly resumes a stopped session", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "live", description: "Live" }],
+					};
+				if (request.kind === "submit")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: "input-1" as never,
+						resumed: true,
+					};
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use sid");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.filter(
+					(entry) =>
+						(entry.other as { scope?: { type?: string } })?.scope?.type ===
+						"chat",
+				).length,
+			).toBeGreaterThanOrEqual(2),
+		);
+		const countMenus = (chatId: number) =>
+			bot.commandRegistrations.filter(
+				(entry) =>
+					(entry.other as { scope?: { chat_id?: number } })?.scope?.chat_id ===
+					chatId,
+			).length;
+		const first = countMenus(100);
+		const second = countMenus(101);
+		await bot.update(100, "new input");
+		await vi.waitFor(() => {
+			expect(countMenus(100)).toBeGreaterThan(first);
+			expect(countMenus(101)).toBeGreaterThan(second);
+		});
+		await adapter.stop();
+	});
+
+	it.each([
+		["definite rejection", "INPUT_REJECTED", undefined],
+		["lost acknowledgement", "UNCERTAIN_INPUT_DELIVERY", "input-lost"],
+	] as const)(
+		"refreshes every selecting chat after resumed submit has %s",
+		async (_label, code, inputId) => {
+			const bot = new MockBot();
+			const { adapter } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind === "command_list")
+						return { requestId: request.requestId, ok: true, value: [] };
+					if (request.kind === "submit")
+						return {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code,
+								message: "submit failed",
+								resumed: true,
+								...(inputId ? { inputId: inputId as never } : {}),
+							},
+						};
+					return result(request);
+				},
+			});
+			await bot.update(100, "/use sid");
+			await bot.update(101, "/use sid");
+			const countMenus = (chatId: number) =>
+				bot.commandRegistrations.filter(
+					(entry) =>
+						(entry.other as { scope?: { chat_id?: number } })?.scope
+							?.chat_id === chatId,
+				).length;
+			await vi.waitFor(() => {
+				expect(countMenus(100)).toBeGreaterThan(0);
+				expect(countMenus(101)).toBeGreaterThan(0);
+			});
+			const first = countMenus(100);
+			const second = countMenus(101);
+			await bot.update(100, "new input");
+			await vi.waitFor(() => {
+				expect(countMenus(100)).toBeGreaterThan(first);
+				expect(countMenus(101)).toBeGreaterThan(second);
+			});
+			await adapter.stop();
+		},
+	);
+
+	it("shows fresh native-first paginated extension help and safe no-selection guidance", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: Array.from({ length: 40 }, (_, index) => ({
+								name: `extra${index}`,
+								description: "A safe extension description ".repeat(10),
+							})),
+						}
+					: result(request),
+		});
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).toContain("сначала выберите живую сессию");
+		await bot.update(42, "/use sid");
+		const offset = bot.sent.length;
+		await bot.update(42, "/help");
+		const pages = bot.sent.slice(offset).map(({ text }) => text);
+		expect(pages.length).toBeGreaterThan(1);
+		expect(pages.every((text) => text.length <= 4096)).toBe(true);
+		expect(pages[0]).toContain("/reload");
+		expect(pages[0]).toContain("/cancel");
+		await adapter.stop();
+	});
+
+	it("suppresses later dynamic help pages when selection changes during the first send", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let entered!: () => void;
+		let release!: () => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		const held = new Promise<void>((resolve) => (release = resolve));
+		bot.sendMessageBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			await held;
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: Array.from({ length: 40 }, (_, index) => ({
+								name: `extra${index}`,
+								description: "A safe extension description ".repeat(10),
+							})),
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		const offset = bot.sent.length;
+		hold = true;
+		const help = bot.update(42, "/help");
+		await started;
+		await bot.update(42, "/use other");
+		release();
+		await help;
+		expect(
+			bot.sent.slice(offset).filter(({ text }) => text.includes("/extra")),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("invalidates held help discovery when recovery begins", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let release!: (value: TransportResult) => void;
+		const held = new Promise<TransportResult>((resolve) => (release = resolve));
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list" && hold) return held;
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "fresh", description: "Fresh" }],
+					};
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		hold = true;
+		const help = bot.update(42, "/help");
+		await vi.waitFor(() => expect(release).toBeDefined());
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		release({
+			requestId: "held" as never,
+			ok: true,
+			value: [{ name: "stale", description: "Stale" }],
+		});
+		await help;
+		expect(bot.sent.at(-1)?.text).toContain("только команды harnessd");
+		expect(bot.sent.some(({ text }) => text.includes("/stale"))).toBe(false);
+		await adapter.stop();
+	});
+
+	it("does not dispatch a command removed from fresh discovery", async () => {
+		const bot = new MockBot();
+		let inventory: readonly { name: string; description: string }[] = [
+			{ name: "cost", description: "Cost" },
+		];
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return { requestId: request.requestId, ok: true, value: inventory };
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		inventory = [];
+		await bot.update(42, "/cost");
+		expect(requests.some((request) => request.kind === "command_run")).toBe(
+			false,
+		);
+		expect(bot.sent.at(-1)?.text).toContain("больше не обнаружена");
+		await adapter.stop();
+	});
+
+	it("does not dispatch an extension command when selection changes during discovery", async () => {
+		const bot = new MockBot();
+		let discoveryCount = 0;
+		let releaseDiscovery!: (value: TransportResult) => void;
+		const held = new Promise<TransportResult>((resolve) => {
+			releaseDiscovery = resolve;
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list") {
+					discoveryCount += 1;
+					if (discoveryCount === 2) return held;
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "cost", description: "Cost" }],
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() => expect(discoveryCount).toBeGreaterThanOrEqual(1));
+		const command = bot.update(42, "/cost");
+		await vi.waitFor(() => expect(discoveryCount).toBe(2));
+		await bot.update(42, "/use other");
+		releaseDiscovery({
+			requestId: "held" as never,
+			ok: true,
+			value: [{ name: "cost", description: "Cost" }],
+		});
+		await command;
+		expect(requests.some((request) => request.kind === "command_run")).toBe(
+			false,
+		);
+		expect(bot.sent.at(-1)?.text).toContain("Выбор сессии изменился");
+		await adapter.stop();
+	});
+
+	it("carries selection currency to the final write guard", async () => {
+		const bot = new MockBot();
+		let releaseWrite!: () => void;
+		let writeStarted!: () => void;
+		let finalGuard: boolean | undefined;
+		const started = new Promise<void>((resolve) => {
+			writeStarted = resolve;
+		});
+		const heldWrite = new Promise<void>((resolve) => {
+			releaseWrite = resolve;
+		});
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "cost", description: "Cost" }],
+					};
+				if (request.kind === "command_run") {
+					writeStarted();
+					await heldWrite;
+					const accepted = request.beforeDispatch?.() ?? false;
+					finalGuard = accepted;
+					return accepted
+						? { requestId: request.requestId, ok: true, value: "accepted" }
+						: {
+								requestId: request.requestId,
+								ok: false,
+								error: {
+									code: "COMMAND_SELECTION_CHANGED",
+									message: "selection changed",
+								},
+							};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		const command = bot.update(42, "/cost");
+		await started;
+		await bot.update(42, "/use other");
+		releaseWrite();
+		await command;
+		expect(finalGuard).toBe(false);
+		await adapter.stop();
+	});
+
 	it("spaces actual panel edit API calls by at least 500 ms", async () => {
 		const bot = new MockBot();
 		let now = 0;

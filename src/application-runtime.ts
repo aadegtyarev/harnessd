@@ -97,6 +97,23 @@ const safeErrorMessages = new Map([
 	["RELOAD_BUSY", "The session is busy; wait for Pi to become idle."],
 	["RELOAD_ALREADY_RUNNING", "A reload is already in progress."],
 	["RELOAD_SELECTION_CHANGED", "The selected session changed before reload."],
+	[
+		"COMMAND_DISCOVERY_FAILED",
+		"Pi command discovery is temporarily unavailable.",
+	],
+	[
+		"COMMAND_NOT_AVAILABLE",
+		"That Pi extension command is no longer available.",
+	],
+	[
+		"COMMAND_SELECTION_CHANGED",
+		"The selected session changed; the extension command was not sent.",
+	],
+	["COMMAND_REJECTED", "Pi did not accept that extension command."],
+	[
+		"COMMAND_UNCERTAIN",
+		"Pi may have accepted the extension command; it was not retried.",
+	],
 	["MODEL_NOT_AVAILABLE", "Model is not available; use /model to see choices."],
 	[
 		"EFFORT_NOT_SUPPORTED",
@@ -326,6 +343,7 @@ export class ApplicationRuntime {
 	private async perform(
 		request: ApplicationRequest,
 	): Promise<ApplicationResult> {
+		let resumed = false;
 		try {
 			let value: ApplicationResult extends { ok: true; value: infer T }
 				? T
@@ -363,13 +381,19 @@ export class ApplicationRuntime {
 					await this.manager.delete(request.sessionId);
 					value = undefined as typeof value;
 					break;
-				case "submit":
-					value = (await this.manager.submit(
+				case "submit": {
+					const outcome = await this.manager.submitWithOutcome(
 						request.sessionId,
 						request.text,
 						request.images,
-					)) as typeof value;
+						() => {
+							resumed = true;
+						},
+					);
+					value = outcome.inputId as typeof value;
+					resumed = outcome.resumed;
 					break;
+				}
 				case "cancel":
 					await this.manager.cancel(request.sessionId, request.inputId);
 					value = undefined as typeof value;
@@ -405,8 +429,26 @@ export class ApplicationRuntime {
 					await this.manager.reload(request.sessionId, request.beforeDispatch);
 					value = undefined as typeof value;
 					break;
+				case "command_list":
+					value = (await this.manager.listCommands(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "command_run":
+					value = (await this.manager.runCommand(
+						request.sessionId,
+						request.name,
+						request.remainder,
+						request.beforeDispatch,
+					)) as typeof value;
+					break;
 			}
-			return { requestId: request.requestId, ok: true, value };
+			return {
+				requestId: request.requestId,
+				ok: true,
+				value,
+				...(request.kind === "submit" ? { resumed } : {}),
+			};
 		} catch (error) {
 			if (error instanceof PiStartupError)
 				console.error(`harnessd: Pi startup failed (${error.code})`);
@@ -457,6 +499,7 @@ export class ApplicationRuntime {
 				error: {
 					code,
 					message: `${safeErrorMessages.get(code) ?? (reference ? `Operation failed (ref ${reference})` : "Operation failed")}\n\n${detail}`,
+					...(request.kind === "submit" && resumed ? { resumed: true } : {}),
 					...(code === "UNCERTAIN_INPUT_DELIVERY" && inputId
 						? { inputId }
 						: {}),

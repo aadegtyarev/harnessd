@@ -9,6 +9,7 @@ import type {
 import { ApplicationRuntime } from "../src/application-runtime.js";
 import type {
 	HarnessAdapter,
+	HarnessInstance,
 	ProcessProvider,
 	TransportAdapter,
 	TransportEventSubscription,
@@ -73,6 +74,98 @@ function transport(
 }
 
 describe("application runtime", () => {
+	it("dispatches dynamic command list and run requests to core", async () => {
+		const store = await SqliteSessionStore.open(await state());
+		const calls: unknown[][] = [];
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "commands" as never,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.commands.list",
+					"harness.commands.run",
+				],
+			},
+			async launch() {
+				const instance: HarnessInstance = {
+					processId: "commands" as never,
+					exit: new Promise(() => {}),
+					events: (async function* () {})(),
+					control: {
+						async getCommands() {
+							calls.push(["list"]);
+							return [{ name: "cost", description: "Cost" }];
+						},
+						async runCommand(name, remainder) {
+							calls.push(["run", name, remainder]);
+							return "accepted";
+						},
+						async getSelection() {
+							return {};
+						},
+						async getStatus() {
+							return {};
+						},
+						async listModels() {
+							return [];
+						},
+						async listEfforts() {
+							return [];
+						},
+						async setModel(provider, id) {
+							return { provider, id, name: id };
+						},
+						async setEffort() {},
+					},
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				};
+				return instance;
+			},
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			store,
+			transports: [],
+			harnesses: [harness],
+		});
+		const session = sessionFrom(
+			await runtime.dispatch({
+				requestId: "commands-create",
+				principalId: "test",
+				kind: "create",
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			}),
+		);
+		expect(
+			await runtime.dispatch({
+				requestId: "commands-list",
+				principalId: "test",
+				kind: "command_list",
+				sessionId: session.id,
+			}),
+		).toMatchObject({
+			ok: true,
+			value: [{ name: "cost", description: "Cost" }],
+		});
+		expect(
+			await runtime.dispatch({
+				requestId: "commands-run",
+				principalId: "test",
+				kind: "command_run",
+				sessionId: session.id,
+				name: "cost",
+				remainder: "  raw ",
+			}),
+		).toMatchObject({ ok: true, value: "accepted" });
+		expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
+		await runtime.close();
+	});
+
 	it.each([undefined, "direct"] as const)(
 		"delegates create launch to NodeProcessProvider in direct mode %s",
 		async (executionMode) => {
@@ -564,6 +657,7 @@ describe("application runtime", () => {
 				capabilities: [
 					"harness.launch",
 					"harness.stop",
+					"harness.resume",
 					"harness.session.status",
 					"harness.model.list",
 					"harness.model.set",
@@ -576,6 +670,7 @@ describe("application runtime", () => {
 				return {
 					processId: "proc" as never,
 					exit: new Promise(() => {}),
+					nativeSessionId: "native-session",
 					events: (async function* () {})(),
 					control: {
 						async getSelection() {
@@ -609,6 +704,8 @@ describe("application runtime", () => {
 					async send(input) {
 						if (input.text === "uncertain private prompt")
 							throw new UncertainInputDeliveryError(input.id);
+						if (input.text === "resumed rejected prompt")
+							throw new Error("delivery rejected after resume");
 						if (input.text === "sensitive failure")
 							throw Object.assign(
 								new Error(
@@ -620,6 +717,20 @@ describe("application runtime", () => {
 								},
 							);
 						sent.push(input.text);
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume(request) {
+				return {
+					processId: "resumed-proc" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: request.nativeSessionId,
+					events: (async function* () {})(),
+					async send(input) {
+						if (input.text === "resumed rejected prompt")
+							throw new Error("delivery rejected after resume");
 					},
 					async cancel() {},
 					async shutdown() {},
@@ -777,7 +888,11 @@ describe("application runtime", () => {
 			sessionId: created.value.id,
 			text: "hello",
 		});
-		expect(input).toMatchObject({ requestId: "request-submit", ok: true });
+		expect(input).toMatchObject({
+			requestId: "request-submit",
+			ok: true,
+			resumed: false,
+		});
 		if (!input.ok || typeof input.value !== "string")
 			throw new Error("submit result missing input ID");
 		expect(sent).toEqual(["hello"]);
@@ -865,6 +980,18 @@ describe("application runtime", () => {
 			requestId: "request-inspect-stopped",
 			ok: true,
 			value: { id: created.value.id, status: "stopped" },
+		});
+		const rejectedAfterResume = await dispatch({
+			requestId: "request-submit-resume-reject",
+			principalId: "operator",
+			kind: "submit",
+			sessionId: created.value.id,
+			text: "resumed rejected prompt",
+		});
+		expect(rejectedAfterResume).toMatchObject({
+			requestId: "request-submit-resume-reject",
+			ok: false,
+			error: { code: "OPERATION_FAILED", resumed: true },
 		});
 		const closing = service.close();
 		expect(

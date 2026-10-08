@@ -18,6 +18,8 @@ export type Capability =
 	| "harness.effort.list"
 	| "harness.effort.set"
 	| "harness.reload"
+	| "harness.commands.list"
+	| "harness.commands.run"
 	| "harness.file.send"
 	| "process.launch"
 	| "process.signal"

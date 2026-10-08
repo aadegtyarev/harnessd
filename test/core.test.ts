@@ -142,6 +142,71 @@ function harnessPort(
 }
 
 describe("core capability contracts", () => {
+	it("routes dynamic inventory and command dispatch through the selected live instance", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const calls: unknown[][] = [];
+		const harness = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.commands.list",
+				"harness.commands.run",
+			],
+			launch: async () => ({
+				processId: "commands" as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				control: {
+					async getCommands() {
+						calls.push(["list"]);
+						return [{ name: "cost", description: "Cost" }];
+					},
+					async runCommand(name, remainder) {
+						calls.push(["run", name, remainder]);
+						return "accepted";
+					},
+					async getSelection() {
+						return {};
+					},
+					async getStatus() {
+						return {};
+					},
+					async listModels() {
+						return [];
+					},
+					async listEfforts() {
+						return [];
+					},
+					async setModel(provider, id) {
+						return { provider, id, name: id };
+					},
+					async setEffort() {},
+				},
+
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		});
+		const manager = new SessionManager(store, [harness.harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			expect(await manager.listCommands(session.id)).toEqual([
+				{ name: "cost", description: "Cost" },
+			]);
+			expect(await manager.runCommand(session.id, "cost", "  raw ")).toBe(
+				"accepted",
+			);
+			expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
 	it("uses required fields for each transport event kind", () => {
 		const events: TransportEvent[] = [
 			{ requestId: "1", principalId: "operator", kind: "list" },
@@ -515,6 +580,7 @@ describe("SQLite session management", () => {
 			nativeSessionId?: string;
 		}[] = [];
 		const submitted: string[] = [];
+		let failResumedDelivery = false;
 		const harness: HarnessAdapter = {
 			descriptor: {
 				id: "resume-harness" as AdapterId,
@@ -547,6 +613,8 @@ describe("SQLite session management", () => {
 					nativeSessionId: "native-session-1",
 					events: (async function* () {})(),
 					async send(input) {
+						if (failResumedDelivery)
+							throw new Error("prompt delivery rejected");
 						submitted.push(input.text);
 					},
 					async cancel() {},
@@ -561,8 +629,10 @@ describe("SQLite session management", () => {
 				cwd: os.tmpdir(),
 			});
 			await manager.stop(session.id);
-			const inputId = await manager.submit(session.id, "new prompt");
+			const outcome = await manager.submitWithOutcome(session.id, "new prompt");
+			const inputId = outcome.inputId;
 			expect(inputId).toMatch(/^[0-9a-f-]{36}$/i);
+			expect(outcome.resumed).toBe(true);
 			expect(launchRequests).toHaveLength(1);
 			expect(resumeRequests).toEqual([
 				{
@@ -573,8 +643,23 @@ describe("SQLite session management", () => {
 			]);
 			expect(submitted).toEqual(["new prompt"]);
 			expect((await manager.get(session.id)).status).toBe("running");
+			await manager.stop(session.id);
+			failResumedDelivery = true;
+			let resumedSignal = false;
+			await expect(
+				manager.submitWithOutcome(
+					session.id,
+					"rejected prompt",
+					undefined,
+					() => {
+						resumedSignal = true;
+					},
+				),
+			).rejects.toThrow("prompt delivery rejected");
+			expect(resumedSignal).toBe(true);
+			expect((await manager.get(session.id)).status).toBe("running");
 			await manager.resume(session.id);
-			expect(resumeRequests).toHaveLength(1);
+			expect(resumeRequests).toHaveLength(2);
 		} finally {
 			await manager.close();
 			store.close();
