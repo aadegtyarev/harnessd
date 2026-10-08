@@ -1150,7 +1150,7 @@ export class TelegramTransportAdapter
 	private readonly reportedErrors = new Map<SessionId, Set<string>>();
 	private readonly liveActivities = new Map<string, LiveActivity>();
 	private readonly runningSessions = new Set<SessionId>();
-	private readonly reloadingSessions = new Set<SessionId>();
+	private readonly reloadingSessions = new Map<SessionId, symbol>();
 	private readonly recoveringSessions = new Set<SessionId>();
 	private readonly previews = new Map<number, SessionId>();
 	private readonly pendingNames = new Map<number, PendingNameFlow>();
@@ -2588,8 +2588,12 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-			this.reloadingSessions.add(sessionId);
-			this.refreshPanelsPreviewing(sessionId, sender, true);
+			const reloadOwner = Symbol("reload owner");
+			const ownsReloadMarker = !this.reloadingSessions.has(sessionId);
+			if (ownsReloadMarker) {
+				this.reloadingSessions.set(sessionId, reloadOwner);
+				this.refreshPanelsPreviewing(sessionId, sender, true);
+			}
 			let result: TransportResult;
 			try {
 				result = await this.request(sender, {
@@ -2598,8 +2602,13 @@ export class TelegramTransportAdapter
 					beforeDispatch: () => this.selected.get(chatId) === sessionId,
 				});
 			} finally {
-				this.reloadingSessions.delete(sessionId);
-				this.refreshPanelsPreviewing(sessionId, sender, true);
+				if (
+					ownsReloadMarker &&
+					this.reloadingSessions.get(sessionId) === reloadOwner
+				) {
+					this.reloadingSessions.delete(sessionId);
+					this.refreshPanelsPreviewing(sessionId, sender, true);
+				}
 			}
 			if (result.ok) {
 				const name = this.sessionNames.get(sessionId);
@@ -3621,8 +3630,24 @@ export class TelegramTransportAdapter
 			state: liveState,
 			reloading: preview ? this.reloadingSessions.has(preview.id) : false,
 			recovering: preview ? this.recoveringSessions.has(preview.id) : false,
-			live: status?.live ?? null,
 			queryFailed: liveQueryFailed,
+			model:
+				liveAvailable && status?.live?.model
+					? modelId(status.live.model)
+					: liveAvailable
+						? "Модель: недоступна"
+						: null,
+			effort:
+				liveAvailable && status?.live?.effort
+					? oneLine(status.live.effort)
+					: liveAvailable
+						? "Усилие: недоступно"
+						: null,
+			usage: liveAvailable ? compactUsage(status?.live?.usage) : null,
+			contextUnavailable:
+				liveAvailable &&
+				status?.live?.usage?.contextTokens == null &&
+				status?.live?.usage?.contextPercent == null,
 		});
 		if (this.panelSemantic.get(chatId) !== semantic) {
 			this.panelSemantic.set(chatId, semantic);

@@ -881,6 +881,43 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps panel update time stable for hidden and identically rendered status values", async () => {
+		const bot = new MockBot();
+		let time = 0;
+		let name = "First hidden name";
+		let totalTokens = 10_001;
+		let costUsd = 1.2344;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: {
+							model: { provider: "test", id: "m", name },
+							usage: { totalTokens, costUsd },
+						},
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const original = bot.sent.at(-1)?.text ?? "";
+		const editCount = bot.edited.length;
+		name = "Second hidden name";
+		totalTokens = 99_999;
+		costUsd = 1.23449;
+		time = 1;
+		await bot.update(42, "/menu");
+		expect(bot.edited).toHaveLength(editCount);
+		expect(original).toContain("Обновлено: 00:00:00");
+		await adapter.stop();
+	});
+
 	it("renders availability, individual missing fields, and recovery transitions", async () => {
 		const bot = new MockBot();
 		let live: Record<string, unknown> | undefined = {};
@@ -1292,6 +1329,45 @@ describe("Telegram transport", () => {
 		expect(failedBot.sent.at(-1)?.text).toContain("Результат неизвестен");
 		expect(failedBot.sent.at(-1)?.text).not.toContain("secret detail");
 		await failed.adapter.stop();
+	});
+
+	it("keeps a matching panel reloading until its owning concurrent reload completes", async () => {
+		sessions.set("sid", sessionWith("sid", {}));
+		const bot = new MockBot();
+		let started!: () => void;
+		let finish!: () => void;
+		const reloadStarted = new Promise<void>((resolve) => (started = resolve));
+		const reloadFinished = new Promise<void>((resolve) => (finish = resolve));
+		let reloadCount = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "reload") return result(request);
+				reloadCount++;
+				if (reloadCount === 1) {
+					started();
+					await reloadFinished;
+					return result(request);
+				}
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: { code: "RELOAD_ALREADY_RUNNING", message: "busy" },
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const owner = bot.update(42, "/reload");
+		await reloadStarted;
+		await bot.update(42, "/reload");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("перезагружаются ресурсы");
+		finish();
+		await owner;
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).not.toContain("перезагружаются ресурсы"),
+		);
+		await adapter.stop();
 	});
 
 	it("reports the current message destination if selection changes during reload", async () => {
