@@ -23,6 +23,7 @@ import type {
 } from "../src/core/types.js";
 import {
 	PiControlError,
+	PiRpcHarnessAdapter,
 	UncertainInputDeliveryError,
 } from "../src/harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "../src/process/node-process-provider.js";
@@ -203,6 +204,42 @@ describe("application runtime", () => {
 				},
 				stdio: "pipe",
 			});
+			await runtime.close();
+		},
+	);
+
+	it.each([undefined, "pi"] as const)(
+		"creates a session without a harness ID using the built-in Pi default (%s)",
+		async (defaultHarnessId) => {
+			const instance: HarnessInstance = {
+				processId: "default-pi-process" as never,
+				exit: new Promise(() => {}),
+				nativeSessionId: "native-default",
+				events: (async function* () {})(),
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			};
+			const launch = vi
+				.spyOn(PiRpcHarnessAdapter.prototype, "launch")
+				.mockResolvedValue(instance);
+			const runtime = await ApplicationRuntime.start({
+				piExecutable: "/unused/pi",
+				...(defaultHarnessId ? { defaultHarnessId } : {}),
+				stateDirectory: await state(),
+				transports: [],
+			});
+			const created = await runtime.dispatch({
+				requestId: "create-default-pi",
+				principalId: "test",
+				kind: "create",
+				cwd: os.tmpdir(),
+			});
+			expect(sessionFrom(created)).toMatchObject({
+				harnessId: "pi-rpc",
+				nativeSessionId: "native-default",
+			});
+			expect(launch).toHaveBeenCalledOnce();
 			await runtime.close();
 		},
 	);

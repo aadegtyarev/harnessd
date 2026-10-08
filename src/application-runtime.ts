@@ -250,6 +250,9 @@ export class ApplicationRuntime {
 				(await SqliteSessionStore.open(
 					resolveStateDirectory(options.stateDirectory),
 				));
+			const defaultHarnessId =
+				options.defaultHarnessId ??
+				(options.harnesses === undefined ? "pi-rpc" : undefined);
 			const sessionManager = new SessionManager(
 				store,
 				options.harnesses ?? [
@@ -263,9 +266,7 @@ export class ApplicationRuntime {
 					),
 				],
 				{
-					...(options.defaultHarnessId
-						? { defaultHarnessId: options.defaultHarnessId }
-						: {}),
+					...(defaultHarnessId ? { defaultHarnessId } : {}),
 					...(options.adapterOptions
 						? { adapterOptions: options.adapterOptions }
 						: {}),
