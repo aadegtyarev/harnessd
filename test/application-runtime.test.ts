@@ -657,6 +657,7 @@ describe("application runtime", () => {
 				capabilities: [
 					"harness.launch",
 					"harness.stop",
+					"harness.resume",
 					"harness.session.status",
 					"harness.model.list",
 					"harness.model.set",
@@ -669,6 +670,7 @@ describe("application runtime", () => {
 				return {
 					processId: "proc" as never,
 					exit: new Promise(() => {}),
+					nativeSessionId: "native-session",
 					events: (async function* () {})(),
 					control: {
 						async getSelection() {
@@ -702,6 +704,8 @@ describe("application runtime", () => {
 					async send(input) {
 						if (input.text === "uncertain private prompt")
 							throw new UncertainInputDeliveryError(input.id);
+						if (input.text === "resumed rejected prompt")
+							throw new Error("delivery rejected after resume");
 						if (input.text === "sensitive failure")
 							throw Object.assign(
 								new Error(
@@ -713,6 +717,20 @@ describe("application runtime", () => {
 								},
 							);
 						sent.push(input.text);
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume(request) {
+				return {
+					processId: "resumed-proc" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: request.nativeSessionId,
+					events: (async function* () {})(),
+					async send(input) {
+						if (input.text === "resumed rejected prompt")
+							throw new Error("delivery rejected after resume");
 					},
 					async cancel() {},
 					async shutdown() {},
@@ -962,6 +980,18 @@ describe("application runtime", () => {
 			requestId: "request-inspect-stopped",
 			ok: true,
 			value: { id: created.value.id, status: "stopped" },
+		});
+		const rejectedAfterResume = await dispatch({
+			requestId: "request-submit-resume-reject",
+			principalId: "operator",
+			kind: "submit",
+			sessionId: created.value.id,
+			text: "resumed rejected prompt",
+		});
+		expect(rejectedAfterResume).toMatchObject({
+			requestId: "request-submit-resume-reject",
+			ok: false,
+			error: { code: "OPERATION_FAILED", resumed: true },
 		});
 		const closing = service.close();
 		expect(

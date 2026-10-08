@@ -1787,8 +1787,18 @@ export class TelegramTransportAdapter
 								}
 							},
 							() => {
+								this.uncertainCommandMenus.delete(chatId);
 								if (this.commandMenuAborts.get(chatId) === controller)
 									this.commandMenuAborts.delete(chatId);
+								if (!this.stopping) {
+									const latest = this.commandMenuRequests.get(chatId);
+									if (latest)
+										void this.refreshCommandMenu(
+											chatId,
+											latest.sessionId,
+											latest.sender,
+										);
+								}
 							},
 						);
 					}
@@ -3710,11 +3720,11 @@ export class TelegramTransportAdapter
 		this.inFlightSubmissions.set(request.sessionId, pending);
 		try {
 			const result = await this.dispatchRequest(sender, request);
+			if ((result.ok && result.resumed) || (!result.ok && result.error.resumed))
+				this.refreshMenusForSession(request.sessionId, true);
 			if (result.ok) {
 				const inputId = result.value as InputId;
 				this.recordInputOutcome(request.sessionId, inputId, chatId, "accepted");
-				if (result.resumed)
-					this.refreshMenusForSession(request.sessionId, true);
 			} else if (result.error.inputId)
 				this.recordInputOutcome(
 					request.sessionId,

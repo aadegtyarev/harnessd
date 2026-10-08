@@ -180,6 +180,7 @@ export type TransportResult =
 				readonly code: string;
 				readonly message: string;
 				readonly inputId?: InputId;
+				readonly resumed?: true;
 			};
 	  };
 

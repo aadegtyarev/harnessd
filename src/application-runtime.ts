@@ -343,11 +343,11 @@ export class ApplicationRuntime {
 	private async perform(
 		request: ApplicationRequest,
 	): Promise<ApplicationResult> {
+		let resumed = false;
 		try {
 			let value: ApplicationResult extends { ok: true; value: infer T }
 				? T
 				: never;
-			let resumed = false;
 			switch (request.kind) {
 				case "list":
 					value = (await this.manager.list()) as typeof value;
@@ -386,6 +386,9 @@ export class ApplicationRuntime {
 						request.sessionId,
 						request.text,
 						request.images,
+						() => {
+							resumed = true;
+						},
 					);
 					value = outcome.inputId as typeof value;
 					resumed = outcome.resumed;
@@ -496,6 +499,7 @@ export class ApplicationRuntime {
 				error: {
 					code,
 					message: `${safeErrorMessages.get(code) ?? (reference ? `Operation failed (ref ${reference})` : "Operation failed")}\n\n${detail}`,
+					...(request.kind === "submit" && resumed ? { resumed: true } : {}),
 					...(code === "UNCERTAIN_INPUT_DELIVERY" && inputId
 						? { inputId }
 						: {}),

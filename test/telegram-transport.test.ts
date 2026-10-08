@@ -811,6 +811,56 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("releases menu quarantine after a timed-out publication rejects", async () => {
+		const bot = new MockBot();
+		let entered!: () => void;
+		let reject!: (error: Error) => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		const publication = new Promise<void>((_resolve, rejectPromise) => {
+			reject = rejectPromise;
+		});
+		let hold = false;
+		bot.setMyCommandsBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			return publication;
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: [{ name: request.sessionId, description: "Selected" }],
+						}
+					: result(request),
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		vi.useFakeTimers();
+		const prior = bot.commandRegistrations.length;
+		hold = true;
+		await bot.update(100, "/use other");
+		await started;
+		await vi.advanceTimersByTimeAsync(5_001);
+		await bot.update(100, "/use sid");
+		reject(new Error("late scoped publication rejection"));
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(prior + 1),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations
+					.at(-1)
+					?.commands.some(({ command }) => command === "sid"),
+			).toBe(true),
+		);
+		await adapter.stop();
+	});
+
 	it("bounds restored-chat startup refresh and suppresses publication after shutdown", async () => {
 		vi.useFakeTimers();
 		const bot = new MockBot();
@@ -1062,6 +1112,54 @@ describe("Telegram transport", () => {
 		});
 		await adapter.stop();
 	});
+
+	it.each([
+		["definite rejection", "INPUT_REJECTED", undefined],
+		["lost acknowledgement", "UNCERTAIN_INPUT_DELIVERY", "input-lost"],
+	] as const)(
+		"refreshes every selecting chat after resumed submit has %s",
+		async (_label, code, inputId) => {
+			const bot = new MockBot();
+			const { adapter } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind === "command_list")
+						return { requestId: request.requestId, ok: true, value: [] };
+					if (request.kind === "submit")
+						return {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code,
+								message: "submit failed",
+								resumed: true,
+								...(inputId ? { inputId: inputId as never } : {}),
+							},
+						};
+					return result(request);
+				},
+			});
+			await bot.update(100, "/use sid");
+			await bot.update(101, "/use sid");
+			const countMenus = (chatId: number) =>
+				bot.commandRegistrations.filter(
+					(entry) =>
+						(entry.other as { scope?: { chat_id?: number } })?.scope
+							?.chat_id === chatId,
+				).length;
+			await vi.waitFor(() => {
+				expect(countMenus(100)).toBeGreaterThan(0);
+				expect(countMenus(101)).toBeGreaterThan(0);
+			});
+			const first = countMenus(100);
+			const second = countMenus(101);
+			await bot.update(100, "new input");
+			await vi.waitFor(() => {
+				expect(countMenus(100)).toBeGreaterThan(first);
+				expect(countMenus(101)).toBeGreaterThan(second);
+			});
+			await adapter.stop();
+		},
+	);
 
 	it("shows fresh native-first paginated extension help and safe no-selection guidance", async () => {
 		const bot = new MockBot();

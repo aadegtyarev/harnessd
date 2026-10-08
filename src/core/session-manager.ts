@@ -485,6 +485,7 @@ export class SessionManager {
 		id: SessionId,
 		text: string,
 		images?: readonly { readonly mimeType: string; readonly data: string }[],
+		onResumed?: () => void,
 	): Promise<{ readonly inputId: InputId; readonly resumed: boolean }> {
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		let session = await this.get(id);
@@ -504,6 +505,7 @@ export class SessionManager {
 			if (resumeOperation) {
 				resumed = session.status === "stopped";
 				await resumeOperation;
+				if (resumed) onResumed?.();
 				session = await this.get(id);
 				instance = this.instances.get(id);
 			}

@@ -580,6 +580,7 @@ describe("SQLite session management", () => {
 			nativeSessionId?: string;
 		}[] = [];
 		const submitted: string[] = [];
+		let failResumedDelivery = false;
 		const harness: HarnessAdapter = {
 			descriptor: {
 				id: "resume-harness" as AdapterId,
@@ -612,6 +613,8 @@ describe("SQLite session management", () => {
 					nativeSessionId: "native-session-1",
 					events: (async function* () {})(),
 					async send(input) {
+						if (failResumedDelivery)
+							throw new Error("prompt delivery rejected");
 						submitted.push(input.text);
 					},
 					async cancel() {},
@@ -640,8 +643,23 @@ describe("SQLite session management", () => {
 			]);
 			expect(submitted).toEqual(["new prompt"]);
 			expect((await manager.get(session.id)).status).toBe("running");
+			await manager.stop(session.id);
+			failResumedDelivery = true;
+			let resumedSignal = false;
+			await expect(
+				manager.submitWithOutcome(
+					session.id,
+					"rejected prompt",
+					undefined,
+					() => {
+						resumedSignal = true;
+					},
+				),
+			).rejects.toThrow("prompt delivery rejected");
+			expect(resumedSignal).toBe(true);
+			expect((await manager.get(session.id)).status).toBe("running");
 			await manager.resume(session.id);
-			expect(resumeRequests).toHaveLength(1);
+			expect(resumeRequests).toHaveLength(2);
 		} finally {
 			await manager.close();
 			store.close();
