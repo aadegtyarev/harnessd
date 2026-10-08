@@ -3702,14 +3702,17 @@ export class TelegramTransportAdapter
 		text: string,
 		replyMarkup: unknown,
 		messageId?: number,
-		isCurrent: () => boolean = () => true,
+		isCurrent?: () => boolean,
 	): Promise<boolean> {
+		const generation = this.panelIntents.current(chatId);
+		const current =
+			isCurrent ?? (() => this.panelIntents.isCurrent(chatId, generation));
 		const previous = this.panelUpdateQueues.get(chatId) ?? Promise.resolve();
 		const update = previous
 			.catch(() => undefined)
 			.then(() =>
-				isCurrent()
-					? this.updatePanelNow(chatId, text, replyMarkup, messageId, isCurrent)
+				current()
+					? this.updatePanelNow(chatId, text, replyMarkup, messageId, current)
 					: false,
 			);
 		this.panelUpdateQueues.set(chatId, update);
@@ -3756,7 +3759,12 @@ export class TelegramTransportAdapter
 			(this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId)) ===
 			expected;
 		if (existing !== undefined) {
-			if (!(await this.waitForPanelPublication(chatId))) return false;
+			if (
+				!(await this.waitForPanelPublication(chatId)) ||
+				!isCurrent() ||
+				!referenceIsCurrent(existing)
+			)
+				return false;
 			const edited = await this.telegramCall((signal) =>
 				this.bot.api.editMessageText(
 					chatId,
@@ -3777,6 +3785,7 @@ export class TelegramTransportAdapter
 			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			if (!isMessageNotFound(edited.error)) {
 				this.dropPanelGenerationIntents(chatId, generation);
+				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 				this.panelStaleChats.add(chatId);
 				await this.notifyPanelStale(chatId);
 				return false;
@@ -3792,12 +3801,8 @@ export class TelegramTransportAdapter
 				(intent) =>
 					intent.chatId === chatId && intent.generation === intentGeneration,
 			);
-		if (
-			!isCurrent() ||
-			!referenceIsCurrent(existing) ||
-			!(await this.waitForPanelPublication(chatId))
-		)
-			return false;
+		if (!(await this.waitForPanelPublication(chatId))) return false;
+		if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
@@ -3807,6 +3812,7 @@ export class TelegramTransportAdapter
 			),
 		);
 		if (!sent.ok) {
+			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
 			this.panelStaleChats.add(chatId);
 			await this.notifyPanelStale(chatId);
@@ -3832,12 +3838,8 @@ export class TelegramTransportAdapter
 			for (const intent of this.confirmationIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)
 					intent.messageId = createdMessageId;
-			if (
-				!isCurrent() ||
-				!referenceIsCurrent(createdMessageId) ||
-				!(await this.waitForPanelPublication(chatId))
-			)
-				return false;
+			if (!(await this.waitForPanelPublication(chatId))) return false;
+			if (!isCurrent() || !referenceIsCurrent(createdMessageId)) return false;
 			const published = await this.telegramCall((signal) =>
 				this.bot.api.editMessageText(
 					chatId,
@@ -3852,12 +3854,8 @@ export class TelegramTransportAdapter
 				return false;
 			}
 		}
-		if (
-			!isCurrent() ||
-			!referenceIsCurrent(createdMessageId) ||
-			!(await this.waitForPanelPublication(chatId))
-		)
-			return false;
+		if (!(await this.waitForPanelPublication(chatId))) return false;
+		if (!isCurrent() || !referenceIsCurrent(createdMessageId)) return false;
 		const pinned = await this.telegramCall((signal) =>
 			this.bot.api.pinChatMessage(chatId, createdMessageId, {}, signal),
 		);
@@ -5119,6 +5117,8 @@ export class TelegramTransportAdapter
 		sender: number,
 		messageId: number,
 	): Promise<void> {
+		const intent = this.panelIntents.begin(chatId);
+		const isCurrent = () => this.panelIntents.isCurrent(chatId, intent);
 		const sessionId = this.previews.get(chatId) ?? this.selected.get(chatId);
 		if (sessionId && !this.knownSessions.has(sessionId))
 			return this.showStaleCallback(chatId, messageId);
@@ -5133,12 +5133,14 @@ export class TelegramTransportAdapter
 			kind: "inspect",
 			sessionId,
 		});
+		if (!isCurrent()) return;
 		if (!inspected.ok)
 			return this.updatePanel(
 				chatId,
 				inspected.error.message,
 				keyboard([[inlineButton("Назад", "menu:home")]]),
 				messageId,
+				isCurrent,
 			).then(() => {});
 		const session = inspected.value as SessionSummary;
 		this.rememberSession(session);
@@ -5167,6 +5169,7 @@ export class TelegramTransportAdapter
 			kind: "model_list",
 			sessionId,
 		});
+		if (!isCurrent()) return;
 		if (!result.ok)
 			return this.updatePanel(
 				chatId,
@@ -5212,6 +5215,7 @@ export class TelegramTransportAdapter
 			`Модель просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))}`,
 			keyboard(rows),
 			messageId,
+			isCurrent,
 		);
 	}
 
@@ -5267,6 +5271,8 @@ export class TelegramTransportAdapter
 		sender: number,
 		messageId: number,
 	): Promise<void> {
+		const intent = this.panelIntents.begin(chatId);
+		const isCurrent = () => this.panelIntents.isCurrent(chatId, intent);
 		const sessionId = this.previews.get(chatId) ?? this.selected.get(chatId);
 		if (sessionId && !this.knownSessions.has(sessionId))
 			return this.showStaleCallback(chatId, messageId);
@@ -5281,12 +5287,14 @@ export class TelegramTransportAdapter
 			kind: "inspect",
 			sessionId,
 		});
+		if (!isCurrent()) return;
 		if (!inspected.ok)
 			return this.updatePanel(
 				chatId,
 				inspected.error.message,
 				keyboard([[inlineButton("Назад", "menu:home")]]),
 				messageId,
+				isCurrent,
 			).then(() => {});
 		const session = inspected.value as SessionSummary;
 		this.rememberSession(session);
@@ -5315,6 +5323,7 @@ export class TelegramTransportAdapter
 			kind: "effort_list",
 			sessionId,
 		});
+		if (!isCurrent()) return;
 		if (!result.ok)
 			return this.updatePanel(
 				chatId,
@@ -5357,6 +5366,7 @@ export class TelegramTransportAdapter
 			`Усилие просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${catalog.current ? oneLine(catalog.current) : "не задано"}`,
 			keyboard(rows),
 			messageId,
+			isCurrent,
 		);
 	}
 

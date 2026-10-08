@@ -3122,6 +3122,146 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("discards a slow main list query when a newer folder view renders", async () => {
+		const bot = new MockBot();
+		let releaseList!: () => void;
+		let enteredList!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredList = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseList = resolve;
+		});
+		let delayNextList = false;
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+			dispatch: async (request) => {
+				if (delayNextList && request.kind === "list") {
+					delayNextList = false;
+					enteredList();
+					await gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		delayNextList = true;
+		const oldMain = bot.update(42, "/menu");
+		await entered;
+		await bot.callback(42, "menu:folders", panelId);
+		releaseList();
+		await oldMain;
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await adapter.stop();
+	});
+
+	it("does not replace a panel after a delayed not-found edit is superseded", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		await bot.callback(42, "menu:folders", panelId);
+		let releaseEdit!: () => void;
+		let enteredEdit!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredEdit = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseEdit = resolve;
+		});
+		bot.api.editMessageText.mockImplementationOnce(async () => {
+			enteredEdit();
+			await gate;
+			throw Object.assign(new Error("panel missing"), {
+				description: "Bad Request: message to edit not found",
+			});
+		});
+		const oldRefresh = bot.update(42, "/menu");
+		await entered;
+		const newerView = bot.callback(42, "menu:folders", panelId);
+		releaseEdit();
+		await Promise.all([oldRefresh, newerView]);
+		expect(
+			bot.api.sendMessage.mock.calls.filter(([, text]) =>
+				String(text).includes("📌 Панель сессий"),
+			),
+		).toHaveLength(1);
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await adapter.stop();
+	});
+
+	it("does not create a replacement when the stored panel ID changes during edit", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelIds = (
+			adapter as unknown as { panelMessageIds: Map<number, number> }
+		).panelMessageIds;
+		const panelId = panelIds.get(42);
+		if (panelId === undefined) throw new Error("Panel ID missing");
+		sessions.set("sid", sessionWith("sid", { name: "changed before edit" }));
+		let releaseEdit!: () => void;
+		let enteredEdit!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredEdit = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseEdit = resolve;
+		});
+		bot.api.editMessageText.mockImplementationOnce(async () => {
+			enteredEdit();
+			await gate;
+			throw Object.assign(new Error("panel missing"), {
+				description: "Bad Request: message to edit not found",
+			});
+		});
+		const refresh = bot.update(42, "/menu");
+		await entered;
+		panelIds.set(42, panelId + 100);
+		releaseEdit();
+		await refresh;
+		expect(
+			bot.api.sendMessage.mock.calls.filter(([, text]) =>
+				String(text).includes("📌 Панель сессий"),
+			),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("does not pin a replacement after its intent is invalidated", async () => {
+		const bot = new MockBot();
+		let releaseSleep!: () => void;
+		let enteredSleep!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredSleep = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseSleep = resolve;
+		});
+		const { adapter } = await startAdapter(bot, await temp(), {
+			panelSleep: async () => {
+				enteredSleep();
+				await gate;
+			},
+		});
+		const menu = bot.update(42, "/menu");
+		await entered;
+		(
+			adapter as unknown as { panelIntents: { begin(chatId: number): number } }
+		).panelIntents.begin(42);
+		releaseSleep();
+		await menu;
+		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
+		await adapter.stop();
+	});
+
 	it("does not resend after an uncertain panel edit and recovers a known-deleted panel", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
