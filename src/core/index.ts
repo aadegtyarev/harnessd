@@ -1,3 +1,4 @@
+export { applyAdapterOptionUpdate } from "./adapter-option-mutation.js";
 export {
 	mergeAdapterOptions,
 	validateAdapterOptions,
@@ -6,6 +7,7 @@ export type { Capability } from "./errors.js";
 export {
 	DuplicateAdapterIdError,
 	DuplicateSessionIdError,
+	HarnessOptionError,
 	InvalidSessionNameError,
 	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
@@ -27,6 +29,9 @@ export type {
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
 	HarnessModelInfo,
+	HarnessOptionCatalog,
+	HarnessOptionDescriptor,
+	HarnessOptionUpdate,
 	HarnessRegistryEntry,
 	HarnessSelection,
 	HarnessSessionStatus,
@@ -41,6 +46,11 @@ export type {
 	SecretGrant,
 	SecretProvider,
 	SessionPort,
+	ToolPermissionContext,
+	ToolPermissionDecision,
+	ToolPermissionHandler,
+	ToolPermissionRequest,
+	ToolPermissionTransport,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventListener,

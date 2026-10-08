@@ -3,6 +3,7 @@ import type { Capability } from "./errors.js";
 import type {
 	AdapterId,
 	AdapterOptions,
+	AdapterOptionValue,
 	HarnessEvent,
 	Input,
 	InputEvent,
@@ -17,6 +18,59 @@ export interface PortDescriptor {
 	readonly aliases?: readonly string[];
 	readonly capabilities: readonly Capability[];
 	readonly metadata?: Readonly<Record<string, string>>;
+	readonly options?: readonly HarnessOptionDescriptor[];
+}
+
+export interface HarnessOptionDescriptor {
+	readonly key: string;
+	readonly label: string;
+	readonly values: readonly AdapterOptionValue[];
+	readonly allowCustom?: boolean;
+	readonly defaultValue?: AdapterOptionValue;
+	readonly dangerousValues?: readonly AdapterOptionValue[];
+}
+
+export interface HarnessOptionUpdate {
+	readonly set?: AdapterOptions;
+	readonly resetKeys?: readonly string[];
+	readonly confirmedDangerous?: boolean;
+}
+
+export interface ToolPermissionContext {
+	readonly suggestions?: readonly AdapterOptionValue[];
+	readonly toolUseId?: string;
+	readonly agentId?: string;
+	readonly blockedPath?: string;
+	readonly decisionReason?: string;
+	readonly title?: string;
+	readonly displayName?: string;
+	readonly description?: string;
+}
+
+export interface ToolPermissionRequest {
+	readonly sessionId: SessionId;
+	readonly inputId: InputId;
+	readonly requestId: string;
+	readonly toolName: string;
+	readonly input: Readonly<Record<string, AdapterOptionValue>>;
+	readonly context: ToolPermissionContext;
+	readonly signal: AbortSignal;
+}
+
+export type ToolPermissionDecision =
+	| { readonly behavior: "allow" }
+	| {
+			readonly behavior: "deny";
+			readonly message: string;
+			readonly interrupt: false;
+	  };
+export type ToolPermissionHandler = (
+	request: ToolPermissionRequest,
+) => Promise<ToolPermissionDecision>;
+export interface ToolPermissionTransport {
+	requestToolPermission(
+		request: ToolPermissionRequest,
+	): Promise<ToolPermissionDecision>;
 }
 
 export interface HarnessRegistryEntry {
@@ -24,6 +78,7 @@ export interface HarnessRegistryEntry {
 	readonly aliases: readonly string[];
 	readonly capabilities: readonly Capability[];
 	readonly metadata?: Readonly<Record<string, string>>;
+	readonly options?: readonly HarnessOptionDescriptor[];
 }
 
 export interface SessionPort {
@@ -35,10 +90,16 @@ export interface SessionPort {
 		readonly cwd: string;
 		readonly name?: string;
 		readonly adapterOptions?: AdapterOptions;
+		readonly confirmedDangerousOptions?: boolean;
 	}): Promise<SessionSummary>;
 	rename(id: SessionId, name?: string): Promise<SessionSummary>;
 	stop(id: SessionId): Promise<void>;
 	resume(id: SessionId): Promise<SessionSummary>;
+	listAdapterOptions?(id: SessionId): Promise<HarnessOptionCatalog>;
+	updateAdapterOptions?(
+		id: SessionId,
+		update: HarnessOptionUpdate,
+	): Promise<SessionSummary>;
 }
 
 export interface InputPort {
@@ -67,6 +128,7 @@ export type TransportEvent =
 			readonly cwd: string;
 			readonly name?: string;
 			readonly adapterOptions?: AdapterOptions;
+			readonly confirmedDangerousOptions?: boolean;
 	  }
 	| {
 			readonly requestId: string;
@@ -148,6 +210,19 @@ export type TransportEvent =
 	| {
 			readonly requestId: string;
 			readonly principalId: string;
+			readonly kind: "adapter_options_list";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "adapter_options_set";
+			readonly sessionId: SessionId;
+			readonly update: HarnessOptionUpdate;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
 			readonly kind: "reload";
 			readonly sessionId: SessionId;
 			readonly beforeDispatch: () => boolean;
@@ -179,6 +254,7 @@ export type TransportResult =
 				| HarnessSessionStatus
 				| HarnessModelCatalog
 				| HarnessEffortCatalog
+				| HarnessOptionCatalog
 				| readonly HarnessCommand[]
 				| HarnessCommandResult
 				| HarnessModelChangeResult
@@ -236,6 +312,7 @@ export interface HarnessLaunchRequest {
 	readonly cwd: string;
 	readonly nativeSessionId?: string;
 	readonly adapterOptions?: AdapterOptions;
+	readonly toolPermissionHandler?: ToolPermissionHandler;
 }
 
 export interface HarnessModelInfo {
@@ -298,6 +375,13 @@ export interface HarnessModelCatalog {
 	readonly current?: HarnessModelInfo;
 }
 
+export interface HarnessOptionCatalog {
+	readonly descriptors: readonly HarnessOptionDescriptor[];
+	readonly defaults?: AdapterOptions;
+	readonly overrides?: AdapterOptions;
+	readonly effective?: AdapterOptions;
+}
+
 export interface HarnessEffortCatalog {
 	readonly levels: readonly string[];
 	readonly current?: string;
@@ -318,6 +402,7 @@ export interface HarnessInstance {
 	readonly nativeSessionId?: string;
 	readonly events: AsyncIterable<HarnessEvent>;
 	readonly control?: HarnessControl;
+	isIdle?(): boolean;
 	send(input: Input): Promise<void>;
 	cancel(inputId: InputId): Promise<void>;
 	shutdown(): Promise<void>;

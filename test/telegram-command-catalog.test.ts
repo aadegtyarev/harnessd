@@ -32,7 +32,7 @@ describe("Telegram extension command catalog", () => {
 			menu.findIndex(({ command }) => command === "reload"),
 		).toBeGreaterThan(-1);
 		expect(menu.some(({ command }) => command === "my-command")).toBe(false);
-		expect(menu.slice(-1)[0]?.command).toBe("extra079");
+		expect(menu.slice(-1)[0]?.command).toBe("extra078");
 	});
 
 	it("paginates help without exceeding Telegram's message bound", () => {

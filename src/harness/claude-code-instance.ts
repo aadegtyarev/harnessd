@@ -35,6 +35,17 @@ export function createClaudeInstance(
 		nativeId,
 		events,
 		stop,
+		stdin,
+		request.toolPermissionHandler,
+	);
+	let processExited = false;
+	void child.exit.then(
+		() => {
+			processExited = true;
+		},
+		() => {
+			processExited = true;
+		},
 	);
 	const framer = new ClaudeJsonlFramer((line) =>
 		protocol.accept(parseClaudeRecord(line)),
@@ -62,6 +73,7 @@ export function createClaudeInstance(
 		exit: child.exit,
 		nativeSessionId: nativeId,
 		events,
+		isIdle: () => !processExited && protocol.isIdle,
 		async send(input) {
 			await sendClaudeInput(input, stdin, events, protocol, ackTimeoutMs);
 		},
@@ -69,6 +81,7 @@ export function createClaudeInstance(
 			throw new Error("Unsupported capability");
 		},
 		async shutdown() {
+			protocol.close();
 			if (!cleanup) cleanup = shutdownClaudeProcess(child, stdin);
 			try {
 				await cleanup;

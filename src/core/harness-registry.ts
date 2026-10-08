@@ -19,6 +19,13 @@ export class HarnessRegistry {
 				aliases: [...aliases],
 				capabilities: [...new Set(capabilities)],
 				...(metadata ? { metadata: { ...metadata } } : {}),
+				...(adapter.descriptor.options
+					? {
+							options: adapter.descriptor.options.map((option) => ({
+								...option,
+							})),
+						}
+					: {}),
 			});
 		}
 	}

@@ -17,6 +17,8 @@ export type Capability =
 	| "harness.model.set"
 	| "harness.effort.list"
 	| "harness.effort.set"
+	| "harness.options.set"
+	| "harness.permission.request"
 	| "harness.reload"
 	| "harness.commands.list"
 	| "harness.commands.run"
@@ -95,6 +97,13 @@ export class ReloadError extends Error {
 	constructor(readonly code: ReloadErrorCode) {
 		super(code);
 		this.name = "ReloadError";
+	}
+}
+
+export class HarnessOptionError extends Error {
+	constructor(readonly code: string) {
+		super(code);
+		this.name = "HarnessOptionError";
 	}
 }
 

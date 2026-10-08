@@ -17,8 +17,13 @@ import type {
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
 	HarnessModelInfo,
+	HarnessOptionCatalog,
+	HarnessOptionUpdate,
 	HarnessSessionStatus,
 	HarnessUsageStats,
+	ToolPermissionDecision,
+	ToolPermissionRequest,
+	ToolPermissionTransport,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventSubscription,
@@ -297,10 +302,38 @@ type PendingNameRequest =
 type ModelChoices = {
 	readonly sessionId: SessionId;
 	readonly models: readonly HarnessModelInfo[];
+	readonly optionKey?: "model";
 };
 type EffortChoices = {
 	readonly sessionId: SessionId;
 	readonly levels: readonly string[];
+	readonly optionKey?: "effort";
+};
+type PermissionIntent = {
+	readonly requestId: string;
+	readonly chatId: number;
+	readonly sender: number;
+	readonly sessionId: SessionId;
+	readonly inputId: InputId;
+	messageId?: number;
+	readonly decision: ToolPermissionDecision;
+};
+type PendingPermission = {
+	readonly request: ToolPermissionRequest;
+	readonly resolve: (decision: ToolPermissionDecision) => void;
+	readonly tokens: Set<string>;
+	readonly abortListener: () => void;
+	timer?: NodeJS.Timeout;
+};
+type DangerousOptionIntent = {
+	readonly chatId: number;
+	readonly sender: number;
+	readonly sessionId: SessionId;
+	readonly key: string;
+	readonly value: string;
+	readonly confirm: boolean;
+	messageId?: number;
+	timer?: NodeJS.Timeout;
 };
 type CallbackQueryContext = UpdateContext & {
 	callbackQuery: NonNullable<UpdateContext["callbackQuery"]>;
@@ -1149,7 +1182,7 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 }
 
 export class TelegramTransportAdapter
-	implements TransportAdapter, AgentFileSendTransport
+	implements TransportAdapter, AgentFileSendTransport, ToolPermissionTransport
 {
 	readonly descriptor = {
 		id: "telegram" as AdapterId,
@@ -1185,6 +1218,12 @@ export class TelegramTransportAdapter
 	private readonly replyChoices = new Map<string, ReplyChoice>();
 	private readonly modelChoices = new Map<number, ModelChoices>();
 	private readonly effortChoices = new Map<number, EffortChoices>();
+	private readonly permissionRequests = new Map<string, PendingPermission>();
+	private readonly permissionIntents = new Map<string, PermissionIntent>();
+	private readonly dangerousOptionIntents = new Map<
+		string,
+		DangerousOptionIntent
+	>();
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
 	private readonly inputAttributions = new Map<InputId, InputAttribution>();
 	private readonly cancelingInputs = new Map<InputId, number>();
@@ -1506,6 +1545,16 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		for (const requestId of this.permissionRequests.keys())
+			this.finishPermissionRequest(requestId, {
+				behavior: "deny",
+				message: "Transport stopped",
+				interrupt: false,
+			});
+		for (const [token, intent] of this.dangerousOptionIntents) {
+			if (intent.timer) clearTimeout(intent.timer);
+			this.dangerousOptionIntents.delete(token);
+		}
 		for (const controller of this.commandMenuAborts.values())
 			controller.abort();
 		this.commandMenuAborts.clear();
@@ -1970,6 +2019,174 @@ export class TelegramTransportAdapter
 				`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}`,
 			);
 		}
+	}
+
+	requestToolPermission(
+		request: ToolPermissionRequest,
+	): Promise<ToolPermissionDecision> {
+		const deny = (message: string): ToolPermissionDecision => ({
+			behavior: "deny",
+			message,
+			interrupt: false,
+		});
+		if (
+			this.stopping ||
+			request.signal.aborted ||
+			this.permissionRequests.has(request.requestId) ||
+			this.permissionRequests.size >= 128
+		)
+			return Promise.resolve(deny("Permission request unavailable"));
+		const recipients = [...this.selected].flatMap(([chatId, sessionId]) =>
+			sessionId === request.sessionId &&
+			this.authorized.has(this.authorizedChatPrincipals.get(chatId) ?? -1)
+				? [
+						{
+							chatId,
+							sender: this.authorizedChatPrincipals.get(chatId) as number,
+						},
+					]
+				: [],
+		);
+		if (!recipients.length)
+			return Promise.resolve(deny("No authorized chat selected this session"));
+		return new Promise((resolve) => {
+			const pending: PendingPermission = {
+				request,
+				resolve,
+				tokens: new Set(),
+				abortListener: () =>
+					this.finishPermissionRequest(
+						request.requestId,
+						deny("Permission prompt expired"),
+					),
+			};
+			pending.timer = setTimeout(pending.abortListener, 55_000);
+			this.permissionRequests.set(request.requestId, pending);
+			request.signal.addEventListener("abort", pending.abortListener, {
+				once: true,
+			});
+			for (const recipient of recipients)
+				void this.sendPermissionPrompt(
+					pending,
+					recipient.chatId,
+					recipient.sender,
+				);
+		});
+	}
+
+	private async sendPermissionPrompt(
+		pending: PendingPermission,
+		chatId: number,
+		sender: number,
+	): Promise<void> {
+		const request = pending.request;
+		const token = this.makeIntentToken();
+		const allow: ToolPermissionDecision = { behavior: "allow" };
+		const deny: ToolPermissionDecision = {
+			behavior: "deny",
+			message: "Permission denied by user",
+			interrupt: false,
+		};
+		const intentBase = {
+			requestId: request.requestId,
+			chatId,
+			sender,
+			sessionId: request.sessionId,
+			inputId: request.inputId,
+		};
+		const allowIntent: PermissionIntent = { ...intentBase, decision: allow };
+		const denyToken = this.makeIntentToken();
+		const denyIntent: PermissionIntent = { ...intentBase, decision: deny };
+		pending.tokens.add(token);
+		pending.tokens.add(denyToken);
+		this.permissionIntents.set(token, allowIntent);
+		this.permissionIntents.set(denyToken, denyIntent);
+		const context = request.context;
+		const detail =
+			context.description ??
+			context.title ??
+			context.displayName ??
+			"Claude запросил разрешение на действие";
+		const input = JSON.stringify(request.input, null, 2).slice(0, 1400);
+		const text = `Запрос разрешения · ${escapeHtml(request.toolName)}\n${escapeHtml(detail.slice(0, 500))}\n<pre>${escapeHtml(input)}</pre>`;
+		const sent = await this.sendWithDeadline(
+			chatId,
+			text,
+			{
+				parse_mode: "HTML",
+				reply_markup: keyboard([
+					[
+						inlineButton("Разрешить один раз", `permission:${token}`),
+						inlineButton("Запретить", `permission:${denyToken}`),
+					],
+				]),
+			},
+			request.sessionId,
+			(messageId) => {
+				allowIntent.messageId = messageId;
+				denyIntent.messageId = messageId;
+			},
+		);
+		if (!sent) {
+			this.permissionIntents.delete(token);
+			this.permissionIntents.delete(denyToken);
+			pending.tokens.delete(token);
+			pending.tokens.delete(denyToken);
+			if (!pending.tokens.size)
+				this.finishPermissionRequest(request.requestId, {
+					behavior: "deny",
+					message: "Permission prompt could not be delivered",
+					interrupt: false,
+				});
+		}
+	}
+
+	private dispatchPermissionDecision(
+		chatId: number,
+		sender: number,
+		token: string,
+		messageId: number,
+	): void {
+		const intent = this.permissionIntents.get(token);
+		if (
+			!intent ||
+			intent.chatId !== chatId ||
+			intent.sender !== sender ||
+			intent.messageId !== messageId
+		)
+			return;
+		const pending = this.permissionRequests.get(intent.requestId);
+		if (
+			!pending ||
+			pending.request.sessionId !== intent.sessionId ||
+			pending.request.inputId !== intent.inputId
+		)
+			return;
+		if (
+			this.selected.get(chatId) !== intent.sessionId ||
+			pending.request.signal.aborted
+		) {
+			this.finishPermissionRequest(intent.requestId, {
+				behavior: "deny",
+				message: "Permission request became stale",
+				interrupt: false,
+			});
+			return;
+		}
+		this.finishPermissionRequest(intent.requestId, intent.decision);
+	}
+
+	private finishPermissionRequest(
+		requestId: string,
+		decision: ToolPermissionDecision,
+	): void {
+		const pending = this.permissionRequests.get(requestId);
+		if (!pending) return;
+		this.permissionRequests.delete(requestId);
+		if (pending.timer) clearTimeout(pending.timer);
+		pending.request.signal.removeEventListener("abort", pending.abortListener);
+		for (const token of pending.tokens) this.permissionIntents.delete(token);
+		pending.resolve(decision);
 	}
 
 	async sendAgentFile(
@@ -2919,10 +3136,31 @@ export class TelegramTransportAdapter
 					: result.error.message,
 			);
 		}
+		if (name === "/permissions")
+			return this.handlePermissionCommand(chatId, sender, args);
 		if (name === "/model" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const optionCatalogResult = await this.request(sender, {
+				kind: "adapter_options_list",
+				sessionId,
+			});
+			if (
+				optionCatalogResult.ok &&
+				optionCatalogResult.value &&
+				typeof optionCatalogResult.value === "object"
+			) {
+				const optionCatalog = optionCatalogResult.value as HarnessOptionCatalog;
+				const option = optionCatalog.descriptors.find(
+					(entry) => entry.key === "model",
+				);
+				if (option)
+					return this.sendDirect(
+						chatId,
+						`Модель: ${String(optionCatalog.effective?.model ?? option.defaultValue ?? "по умолчанию")}. Установка: /model <model>; сброс: /model default.`,
+					);
+			}
 			if (
 				!(await this.requireRunningSession(chatId, sender, sessionId, "model"))
 			)
@@ -2947,6 +3185,52 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const optionCatalogResult = await this.request(sender, {
+				kind: "adapter_options_list",
+				sessionId,
+			});
+			if (
+				optionCatalogResult.ok &&
+				optionCatalogResult.value &&
+				typeof optionCatalogResult.value === "object"
+			) {
+				const optionCatalog = optionCatalogResult.value as HarnessOptionCatalog;
+				const option = optionCatalog.descriptors.find(
+					(entry) => entry.key === "model",
+				);
+				if (option) {
+					if (args[0] === "default" && args.length === 1)
+						return this.applySessionOption(
+							chatId,
+							sender,
+							sessionId,
+							{ resetKeys: ["model"] },
+							"Переопределение модели снято.",
+						);
+					if (!args[0] || args[0].length > 128 || /\s/.test(args[0]))
+						return this.sendDirect(
+							chatId,
+							"Использование: /model <model|default> [effort].",
+						);
+					const effort = optionCatalog.descriptors.find(
+						(entry) => entry.key === "effort",
+					);
+					if (args[1] && effort && !effort.values.includes(args[1]))
+						return this.sendDirect(
+							chatId,
+							`Недопустимый effort: ${effort.values.join(", ")}.`,
+						);
+					return this.applySessionOption(
+						chatId,
+						sender,
+						sessionId,
+						{
+							set: { model: args[0], ...(args[1] ? { effort: args[1] } : {}) },
+						},
+						`Модель изменена: ${args[0]}${args[1] ? `; effort: ${args[1]}` : ""}.`,
+					);
+				}
+			}
 			if (
 				!(await this.requireRunningSession(chatId, sender, sessionId, "model"))
 			)
@@ -2983,6 +3267,25 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const optionCatalogResult = await this.request(sender, {
+				kind: "adapter_options_list",
+				sessionId,
+			});
+			if (
+				optionCatalogResult.ok &&
+				optionCatalogResult.value &&
+				typeof optionCatalogResult.value === "object"
+			) {
+				const catalog = optionCatalogResult.value as HarnessOptionCatalog;
+				const option = catalog.descriptors.find(
+					(entry) => entry.key === "effort",
+				);
+				if (option)
+					return this.sendDirect(
+						chatId,
+						`Effort: ${String(catalog.effective?.effort ?? option.defaultValue ?? "по умолчанию")}. Доступно: ${option.values.join(", ")}.`,
+					);
+			}
 			if (
 				!(await this.requireRunningSession(chatId, sender, sessionId, "effort"))
 			)
@@ -3002,6 +3305,42 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			const optionCatalogResult = await this.request(sender, {
+				kind: "adapter_options_list",
+				sessionId,
+			});
+			if (
+				optionCatalogResult.ok &&
+				optionCatalogResult.value &&
+				typeof optionCatalogResult.value === "object"
+			) {
+				const catalog = optionCatalogResult.value as HarnessOptionCatalog;
+				const option = catalog.descriptors.find(
+					(entry) => entry.key === "effort",
+				);
+				if (option) {
+					if (args[0] === "default")
+						return this.applySessionOption(
+							chatId,
+							sender,
+							sessionId,
+							{ resetKeys: ["effort"] },
+							"Переопределение effort снято.",
+						);
+					if (!option.values.includes(args[0]))
+						return this.sendDirect(
+							chatId,
+							`Недопустимый effort: ${option.values.join(", ")}.`,
+						);
+					return this.applySessionOption(
+						chatId,
+						sender,
+						sessionId,
+						{ set: { effort: args[0] } },
+						`Effort изменён: ${args[0]}.`,
+					);
+				}
+			}
 			if (
 				!(await this.requireRunningSession(chatId, sender, sessionId, "effort"))
 			)
@@ -3644,6 +3983,200 @@ export class TelegramTransportAdapter
 			}
 		}
 		return this.sendDirect(chatId, withInput(safeResultError(error)));
+	}
+
+	private async handlePermissionCommand(
+		chatId: number,
+		sender: number,
+		args: readonly string[],
+	): Promise<void> {
+		const sessionId = this.selected.get(chatId);
+		if (!sessionId) return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+		const listed = await this.request(sender, {
+			kind: "adapter_options_list",
+			sessionId,
+		});
+		if (!listed.ok) return this.sendDirect(chatId, listed.error.message);
+		if (!listed.value || typeof listed.value !== "object")
+			return this.sendDirect(chatId, "Управление разрешениями недоступно.");
+		const catalog = listed.value as HarnessOptionCatalog;
+		const descriptor = catalog.descriptors.find(
+			(option) => option.key === "permissionMode",
+		);
+		if (!descriptor)
+			return this.sendDirect(
+				chatId,
+				"Эта сессия не предоставляет управление режимом разрешений.",
+			);
+		if (args.length === 0) {
+			const current =
+				catalog.effective?.permissionMode ??
+				descriptor.defaultValue ??
+				"default";
+			const modes = descriptor.values.map((value) =>
+				value === "default"
+					? "default (ручной: /permissions manual)"
+					: String(value),
+			);
+			return this.sendDirect(
+				chatId,
+				`Режим разрешений: ${String(current)}. Доступно: ${modes.join(", ")}. /permissions default снимает переопределение.`,
+			);
+		}
+		if (args.length !== 1)
+			return this.sendDirect(
+				chatId,
+				"Использование: /permissions <режим|default>",
+			);
+		if (args[0] === "default")
+			return this.applySessionOption(
+				chatId,
+				sender,
+				sessionId,
+				{ resetKeys: [descriptor.key] },
+				"Переопределение режима разрешений снято.",
+			);
+		const value = args[0] === "manual" ? "default" : args[0];
+		if (!descriptor.values.some((candidate) => candidate === value))
+			return this.sendDirect(
+				chatId,
+				`Неизвестный режим. Доступно: ${descriptor.values.join(", ")}; ручной режим: manual.`,
+			);
+		if (descriptor.dangerousValues?.includes(value))
+			return this.confirmDangerousOption(
+				chatId,
+				sender,
+				sessionId,
+				descriptor.key,
+				value,
+			);
+		return this.applySessionOption(
+			chatId,
+			sender,
+			sessionId,
+			{ set: { [descriptor.key]: value } },
+			`Режим разрешений будет изменён на ${value}.`,
+		);
+	}
+
+	private async applySessionOption(
+		chatId: number,
+		sender: number,
+		sessionId: SessionId,
+		update: HarnessOptionUpdate,
+		message: string,
+	): Promise<void> {
+		const result = await this.request(sender, {
+			kind: "adapter_options_set",
+			sessionId,
+			update,
+		});
+		if (!result.ok) return this.sendDirect(chatId, result.error.message);
+		const session = result.value as SessionSummary;
+		this.rememberSession(session);
+		this.refreshMenusForSession(sessionId, true);
+		return this.sendDirect(
+			chatId,
+			`${message} Сессия перезапущена с сохранением native session ID.`,
+		);
+	}
+
+	private async confirmDangerousOption(
+		chatId: number,
+		sender: number,
+		sessionId: SessionId,
+		key: string,
+		value: string,
+	): Promise<void> {
+		const confirmToken = this.makeIntentToken();
+		const cancelToken = this.makeIntentToken();
+		const confirm: DangerousOptionIntent = {
+			chatId,
+			sender,
+			sessionId,
+			key,
+			value,
+			confirm: true,
+		};
+		const cancel: DangerousOptionIntent = {
+			chatId,
+			sender,
+			sessionId,
+			key,
+			value,
+			confirm: false,
+		};
+		const expire = () => {
+			this.dangerousOptionIntents.delete(confirmToken);
+			this.dangerousOptionIntents.delete(cancelToken);
+		};
+		confirm.timer = setTimeout(expire, 60_000);
+		cancel.timer = confirm.timer;
+		this.dangerousOptionIntents.set(confirmToken, confirm);
+		this.dangerousOptionIntents.set(cancelToken, cancel);
+		const sent = await this.sendWithDeadline(
+			chatId,
+			"Подтвердите bypassPermissions: он отключает интерактивные разрешения и повышает риск выполнения действий.",
+			{
+				parse_mode: "HTML",
+				reply_markup: keyboard([
+					[
+						inlineButton(
+							"Подтвердить bypass",
+							`option-confirm:${confirmToken}`,
+						),
+						inlineButton("Отмена", `option-confirm:${cancelToken}`),
+					],
+				]),
+			},
+			undefined,
+			(messageId) => {
+				confirm.messageId = messageId;
+				cancel.messageId = messageId;
+			},
+		);
+		if (!sent) {
+			clearTimeout(confirm.timer);
+			expire();
+		}
+	}
+
+	private async dispatchDangerousOptionDecision(
+		chatId: number,
+		sender: number,
+		token: string,
+		messageId: number,
+	): Promise<void> {
+		const intent = this.dangerousOptionIntents.get(token);
+		if (
+			!intent ||
+			intent.chatId !== chatId ||
+			intent.sender !== sender ||
+			intent.messageId !== messageId
+		)
+			return;
+		this.dangerousOptionIntents.delete(token);
+		if (intent.timer) clearTimeout(intent.timer);
+		for (const [key, pending] of this.dangerousOptionIntents)
+			if (pending.chatId === chatId && pending.messageId === messageId) {
+				if (pending.timer) clearTimeout(pending.timer);
+				this.dangerousOptionIntents.delete(key);
+			}
+		if (!intent.confirm || this.selected.get(chatId) !== intent.sessionId)
+			return this.sendDirect(
+				chatId,
+				"Изменение разрешений отменено или устарело.",
+			);
+		return this.applySessionOption(
+			chatId,
+			sender,
+			intent.sessionId,
+			{
+				set: { [intent.key]: intent.value },
+				confirmedDangerous: true,
+			},
+			"Подтверждён режим bypassPermissions.",
+		);
 	}
 
 	private async requireRunningSession(
@@ -4342,6 +4875,24 @@ export class TelegramTransportAdapter
 			this.bot.api.answerCallbackQuery(callback.id, {}, signal),
 		);
 		if (!callback.data || callback.data.length > 64) return;
+		if (callback.data.startsWith("permission:")) {
+			this.dispatchPermissionDecision(
+				chatId,
+				sender,
+				callback.data.slice(11),
+				messageId,
+			);
+			return;
+		}
+		if (callback.data.startsWith("option-confirm:")) {
+			await this.dispatchDangerousOptionDecision(
+				chatId,
+				sender,
+				callback.data.slice(15),
+				messageId,
+			);
+			return;
+		}
 		if (callback.data.startsWith("welcome:")) {
 			await this.dispatchWelcomeAction(
 				chatId,
@@ -5535,6 +6086,51 @@ export class TelegramTransportAdapter
 				]),
 				messageId,
 			).then(() => {});
+		const optionResult = await this.request(sender, {
+			kind: "adapter_options_list",
+			sessionId,
+		});
+		if (
+			optionResult.ok &&
+			optionResult.value &&
+			typeof optionResult.value === "object"
+		) {
+			const optionCatalog = optionResult.value as HarnessOptionCatalog;
+			const option = optionCatalog.descriptors.find(
+				(entry) => entry.key === "model",
+			);
+			if (option) {
+				const values = option.values.filter(
+					(value): value is string => typeof value === "string",
+				);
+				const current = optionCatalog.effective?.model;
+				const models = values.map((value) => ({
+					provider: "adapter-option",
+					id: value,
+					name: value,
+				}));
+				this.modelChoices.set(chatId, {
+					sessionId,
+					models,
+					optionKey: "model",
+				});
+				const rows = models.map((model, index) => [
+					inlineButton(
+						`${current === model.id ? "✓ " : ""}${buttonLabel(model.id, 50)}`,
+						`model:select:${index}`,
+					),
+				]);
+				rows.push([inlineButton("По умолчанию", "model:select:default")]);
+				rows.push([inlineButton("Назад", "menu:home")]);
+				return this.updatePanel(
+					chatId,
+					`Модель просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${String(current ?? "по умолчанию")}`,
+					keyboard(rows),
+					messageId,
+					isCurrent,
+				).then(() => {});
+			}
+		}
 		const result = await this.request(sender, {
 			kind: "model_list",
 			sessionId,
@@ -5598,6 +6194,20 @@ export class TelegramTransportAdapter
 		const choices = this.modelChoices.get(chatId);
 		if (!choices || !this.knownSessions.has(choices.sessionId))
 			return this.showStaleCallback(chatId, messageId);
+		if (choices.optionKey === "model" && rawIndex === "default") {
+			if (
+				(this.previews.get(chatId) ?? this.selected.get(chatId)) !==
+				choices.sessionId
+			)
+				return this.renderModels(chatId, sender, messageId);
+			return this.applySessionOption(
+				chatId,
+				sender,
+				choices.sessionId,
+				{ resetKeys: ["model"] },
+				"Переопределение модели снято.",
+			);
+		}
 		const index = Number(rawIndex);
 		const model = choices.models[index];
 		if (
@@ -5616,6 +6226,14 @@ export class TelegramTransportAdapter
 			))
 		)
 			return this.renderPanel(chatId, sender, messageId);
+		if (choices.optionKey === "model")
+			return this.applySessionOption(
+				chatId,
+				sender,
+				choices.sessionId,
+				{ set: { model: model.id } },
+				`Модель изменена: ${model.id}.`,
+			);
 		const result = await this.request(sender, {
 			kind: "model_set",
 			sessionId: choices.sessionId,
@@ -5689,6 +6307,46 @@ export class TelegramTransportAdapter
 				]),
 				messageId,
 			).then(() => {});
+		const optionResult = await this.request(sender, {
+			kind: "adapter_options_list",
+			sessionId,
+		});
+		if (
+			optionResult.ok &&
+			optionResult.value &&
+			typeof optionResult.value === "object"
+		) {
+			const optionCatalog = optionResult.value as HarnessOptionCatalog;
+			const option = optionCatalog.descriptors.find(
+				(entry) => entry.key === "effort",
+			);
+			if (option) {
+				const levels = option.values.filter(
+					(value): value is string => typeof value === "string",
+				);
+				const current = optionCatalog.effective?.effort;
+				this.effortChoices.set(chatId, {
+					sessionId,
+					levels,
+					optionKey: "effort",
+				});
+				const rows = levels.map((level, index) => [
+					inlineButton(
+						`${current === level ? "✓ " : ""}${buttonLabel(level, 50)}`,
+						`effort:select:${index}`,
+					),
+				]);
+				rows.push([inlineButton("По умолчанию", "effort:select:default")]);
+				rows.push([inlineButton("Назад", "menu:home")]);
+				return this.updatePanel(
+					chatId,
+					`Усилие просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${String(current ?? "по умолчанию")}`,
+					keyboard(rows),
+					messageId,
+					isCurrent,
+				).then(() => {});
+			}
+		}
 		const result = await this.request(sender, {
 			kind: "effort_list",
 			sessionId,
@@ -5749,6 +6407,20 @@ export class TelegramTransportAdapter
 		const choices = this.effortChoices.get(chatId);
 		if (!choices || !this.knownSessions.has(choices.sessionId))
 			return this.showStaleCallback(chatId, messageId);
+		if (choices.optionKey === "effort" && rawIndex === "default") {
+			if (
+				(this.previews.get(chatId) ?? this.selected.get(chatId)) !==
+				choices.sessionId
+			)
+				return this.renderEfforts(chatId, sender, messageId);
+			return this.applySessionOption(
+				chatId,
+				sender,
+				choices.sessionId,
+				{ resetKeys: ["effort"] },
+				"Переопределение effort снято.",
+			);
+		}
 		const index = Number(rawIndex);
 		const effort = choices.levels[index];
 		if (
@@ -5767,6 +6439,14 @@ export class TelegramTransportAdapter
 			))
 		)
 			return this.renderPanel(chatId, sender, messageId);
+		if (choices.optionKey === "effort")
+			return this.applySessionOption(
+				chatId,
+				sender,
+				choices.sessionId,
+				{ set: { effort } },
+				`Усилие изменено: ${effort}.`,
+			);
 		const result = await this.request(sender, {
 			kind: "effort_set",
 			sessionId: choices.sessionId,

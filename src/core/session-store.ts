@@ -18,6 +18,10 @@ export interface SessionStore {
 	delete(id: SessionId): Promise<boolean>;
 	setStatus(id: SessionId, status: SessionStatus): Promise<void>;
 	setName(id: SessionId, name?: string): Promise<void>;
+	setAdapterOptions?(
+		id: SessionId,
+		options?: SessionSummary["adapterOptions"],
+	): Promise<void>;
 	update(session: SessionSummary): Promise<void>;
 }
 
@@ -220,6 +224,29 @@ export class SqliteSessionStore implements SessionStore {
 			throw new SessionStoreError(`Could not rename session '${id}'`, {
 				cause: error,
 			});
+		}
+	}
+
+	async setAdapterOptions(
+		id: SessionId,
+		options?: SessionSummary["adapterOptions"],
+	): Promise<void> {
+		try {
+			const encoded = options
+				? JSON.stringify(validateAdapterOptions(options))
+				: null;
+			const result = this.database
+				.prepare("UPDATE sessions SET adapter_options = ? WHERE id = ?")
+				.run(encoded, id);
+			if (result.changes !== 1)
+				throw new Error("session record does not exist");
+		} catch (error) {
+			throw new SessionStoreError(
+				`Could not update options for session '${id}'`,
+				{
+					cause: error,
+				},
+			);
 		}
 	}
 

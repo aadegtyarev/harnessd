@@ -3,6 +3,7 @@ import type {
 	AgentFileSendTransport,
 	HarnessAdapter,
 	ProcessProvider,
+	ToolPermissionTransport,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventListener,
@@ -98,6 +99,26 @@ const safeErrorMessages = new Map([
 	["RELOAD_BUSY", "The session is busy; wait for Pi to become idle."],
 	["RELOAD_ALREADY_RUNNING", "A reload is already in progress."],
 	["RELOAD_SELECTION_CHANGED", "The selected session changed before reload."],
+	[
+		"HARNESS_OPTIONS_BUSY",
+		"The session must be provably idle before changing these options.",
+	],
+	[
+		"DANGEROUS_OPTION_CONFIRMATION_REQUIRED",
+		"Explicit confirmation is required for this permission mode.",
+	],
+	[
+		"HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK",
+		"The option change failed; previous options and the same native session were restored.",
+	],
+	[
+		"HARNESS_OPTIONS_RESTART_AND_ROLLBACK_FAILED",
+		"Option change and rollback could not be confirmed; the session is stopped and no fallback was started.",
+	],
+	[
+		"HARNESS_OPTIONS_SHUTDOWN_UNCONFIRMED",
+		"The previous process could not be confirmed stopped; no replacement was started.",
+	],
 	[
 		"COMMAND_DISCOVERY_FAILED",
 		"Pi command discovery is temporarily unavailable.",
@@ -242,6 +263,20 @@ export class ApplicationRuntime {
 		const agentFileSend: AgentFileSendHandler | undefined = agentFileSenders[0]
 			? (request) => agentFileSenders[0].sendAgentFile(request)
 			: undefined;
+		const permissionTransports = options.transports.filter(
+			(transport): transport is TransportAdapter & ToolPermissionTransport =>
+				typeof (transport as Partial<ToolPermissionTransport>)
+					.requestToolPermission === "function",
+		);
+		if (permissionTransports.length > 1)
+			throw new TypeError("Only one tool-permission transport is supported");
+		const toolPermissionHandler = permissionTransports[0]
+			? (
+					request: Parameters<
+						ToolPermissionTransport["requestToolPermission"]
+					>[0],
+				) => permissionTransports[0].requestToolPermission(request)
+			: undefined;
 		let store: (SessionStore & { close(): void }) | undefined;
 		let manager: SessionManager | undefined;
 		let runtimeToClose: ApplicationRuntime | undefined;
@@ -278,6 +313,7 @@ export class ApplicationRuntime {
 					...(options.adapterOptions
 						? { adapterOptions: options.adapterOptions }
 						: {}),
+					...(toolPermissionHandler ? { toolPermissionHandler } : {}),
 				},
 			);
 			manager = sessionManager;
@@ -380,6 +416,7 @@ export class ApplicationRuntime {
 						cwd: request.cwd,
 						name: request.name,
 						adapterOptions: request.adapterOptions,
+						confirmedDangerousOptions: request.confirmedDangerousOptions,
 					})) as typeof value;
 					break;
 				case "rename":
@@ -444,6 +481,17 @@ export class ApplicationRuntime {
 				case "effort_set":
 					await this.manager.setEffort(request.sessionId, request.effort);
 					value = undefined as typeof value;
+					break;
+				case "adapter_options_list":
+					value = (await this.manager.listAdapterOptions(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "adapter_options_set":
+					value = (await this.manager.updateAdapterOptions(
+						request.sessionId,
+						request.update,
+					)) as typeof value;
 					break;
 				case "reload":
 					await this.manager.reload(request.sessionId, request.beforeDispatch);

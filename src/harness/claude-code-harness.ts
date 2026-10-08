@@ -7,6 +7,17 @@ import type {
 import type { AdapterId } from "../core/types.js";
 import { createClaudeInstance } from "./claude-code-instance.js";
 
+const PERMISSION_MODES = [
+	"default",
+	"acceptEdits",
+	"plan",
+	"bypassPermissions",
+	"dontAsk",
+	"auto",
+] as const;
+const CLAUDE_MODELS = ["sonnet", "opus", "haiku"] as const;
+const EFFORT_LEVELS = ["low", "medium", "high", "max"] as const;
+
 export interface ClaudeCodeHarnessOptions {
 	readonly executable: string;
 	readonly env?: Readonly<Record<string, string>>;
@@ -22,6 +33,22 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 			"harness.stop",
 			"harness.resume",
 			"input.submit",
+			"harness.options.set",
+		] as const,
+		options: [
+			{
+				key: "model",
+				label: "Модель",
+				values: CLAUDE_MODELS,
+				allowCustom: true,
+			},
+			{ key: "effort", label: "Уровень усилий", values: EFFORT_LEVELS },
+			{
+				key: "permissionMode",
+				label: "Разрешения",
+				values: PERMISSION_MODES,
+				dangerousValues: ["bypassPermissions"],
+			},
 		] as const,
 	};
 	constructor(
@@ -48,6 +75,28 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 		const savedNativeId = request.nativeSessionId;
 		if (resume && !savedNativeId) throw new Error("CLAUDE_NATIVE_ID_REQUIRED");
 		const nativeId = savedNativeId ?? request.sessionId;
+		const permissionMode = request.adapterOptions?.permissionMode ?? "default";
+		if (
+			!PERMISSION_MODES.includes(
+				permissionMode as (typeof PERMISSION_MODES)[number],
+			)
+		)
+			throw new Error("CLAUDE_INVALID_PERMISSION_MODE");
+		const model = request.adapterOptions?.model;
+		if (
+			model !== undefined &&
+			(typeof model !== "string" ||
+				!model ||
+				model.length > 128 ||
+				/\s/.test(model))
+		)
+			throw new Error("CLAUDE_INVALID_MODEL");
+		const effort = request.adapterOptions?.effort;
+		if (
+			effort !== undefined &&
+			!EFFORT_LEVELS.includes(effort as (typeof EFFORT_LEVELS)[number])
+		)
+			throw new Error("CLAUDE_INVALID_EFFORT");
 		const args = [
 			"--print",
 			"--input-format",
@@ -58,8 +107,12 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 			"--include-partial-messages",
 			"--replay-user-messages",
 			"--permission-mode",
-			"manual",
+			permissionMode as string,
+			"--permission-prompt-tool",
+			"stdio",
 		];
+		if (typeof model === "string") args.push("--model", model);
+		if (typeof effort === "string") args.push("--effort", effort);
 		if (resume) args.push("--resume", nativeId);
 		else args.push("--session-id", nativeId);
 		const child = await this.provider.launch({

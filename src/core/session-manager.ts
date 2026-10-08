@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
+import { applyAdapterOptionUpdate } from "./adapter-option-mutation.js";
 import {
 	mergeAdapterOptions,
 	validateAdapterOptions,
@@ -27,8 +28,11 @@ import type {
 	HarnessInstance,
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
+	HarnessOptionCatalog,
+	HarnessOptionUpdate,
 	HarnessSelection,
 	HarnessSessionStatus,
+	ToolPermissionHandler,
 } from "./ports.js";
 import type { SessionStore } from "./session-store.js";
 import type {
@@ -47,6 +51,7 @@ export interface CreateSessionRequest {
 	readonly name?: string;
 	readonly id?: string;
 	readonly adapterOptions?: AdapterOptions;
+	readonly confirmedDangerousOptions?: boolean;
 }
 
 export type SessionEventListener = (event: HarnessEvent) => void;
@@ -65,6 +70,7 @@ export class SessionManager {
 	private readonly registry: HarnessRegistry;
 	private readonly defaultOptions?: AdapterOptions;
 	private readonly defaultHarnessId?: AdapterId;
+	private readonly toolPermissionHandler?: ToolPermissionHandler;
 	private adapterOptionsFor(
 		overrides?: AdapterOptions,
 	): AdapterOptions | undefined {
@@ -86,6 +92,7 @@ export class SessionManager {
 	private readonly delays = new Map<SessionId, () => void>();
 	private readonly unsettledInputs = new Map<SessionId, Set<InputId>>();
 	private readonly reloads = new Set<SessionId>();
+	private readonly configuring = new Set<SessionId>();
 	private readonly reloadWaiters = new Map<SessionId, (() => void)[]>();
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
 
@@ -95,6 +102,7 @@ export class SessionManager {
 		options: {
 			readonly defaultHarnessId?: string;
 			readonly adapterOptions?: AdapterOptions;
+			readonly toolPermissionHandler?: ToolPermissionHandler;
 		} = {},
 	) {
 		const registered = new Map<AdapterId, HarnessAdapter>();
@@ -108,6 +116,15 @@ export class SessionManager {
 		this.defaultOptions = options.adapterOptions
 			? validateAdapterOptions(options.adapterOptions)
 			: undefined;
+		this.toolPermissionHandler = options.toolPermissionHandler;
+		for (const harness of harnesses)
+			for (const option of harness.descriptor.options ?? [])
+				if (
+					option.dangerousValues?.some((value) =>
+						Object.is(value, this.defaultOptions?.[option.key]),
+					)
+				)
+					throw new Error("DANGEROUS_ADAPTER_OPTION_DEFAULT_FORBIDDEN");
 		const canonicalDefault = options.defaultHarnessId
 			? this.registry.resolve(options.defaultHarnessId)
 			: undefined;
@@ -147,7 +164,8 @@ export class SessionManager {
 			this.creating.has(id) ||
 			this.launching.has(id) ||
 			this.stopping.has(id) ||
-			this.recovery.has(id)
+			this.recovery.has(id) ||
+			this.configuring.has(id)
 		)
 			throw new SessionNotStoppedError(id);
 		if (!(await this.store.delete(id))) throw new SessionNotFoundError(id);
@@ -194,9 +212,29 @@ export class SessionManager {
 				harness.descriptor.id,
 			);
 			const cwd = await validateWorkingDirectory(request.cwd);
-			const adapterOptions = request.adapterOptions
+			const requestedOptions = request.adapterOptions
 				? validateAdapterOptions(request.adapterOptions)
 				: undefined;
+			const adapterOptions =
+				requestedOptions && harness.descriptor.options
+					? applyAdapterOptionUpdate(
+							undefined,
+							undefined,
+							harness.descriptor.options,
+							{
+								set: requestedOptions,
+								confirmedDangerous: request.confirmedDangerousOptions,
+							},
+						)
+					: requestedOptions;
+			for (const option of harness.descriptor.options ?? [])
+				if (
+					option.dangerousValues?.some((value) =>
+						Object.is(value, adapterOptions?.[option.key]),
+					) &&
+					request.confirmedDangerousOptions !== true
+				)
+					throw new Error("DANGEROUS_OPTION_CONFIRMATION_REQUIRED");
 			const starting: SessionSummary = {
 				id,
 				...(name ? { name } : {}),
@@ -215,6 +253,9 @@ export class SessionManager {
 						cwd,
 						...(this.adapterOptionsFor(adapterOptions)
 							? { adapterOptions: this.adapterOptionsFor(adapterOptions) }
+							: {}),
+						...(this.toolPermissionHandler
+							? { toolPermissionHandler: this.toolPermissionHandler }
 							: {}),
 					});
 					this.instances.set(id, instance);
@@ -311,6 +352,7 @@ export class SessionManager {
 	}
 
 	async stop(id: SessionId): Promise<void> {
+		if (this.configuring.has(id)) throw new Error("HARNESS_OPTIONS_BUSY");
 		const current = this.stopping.get(id);
 		if (current) return current;
 		const stopping = this.stopSession(id);
@@ -384,6 +426,8 @@ export class SessionManager {
 	}
 
 	resume(id: SessionId): Promise<SessionSummary> {
+		if (this.configuring.has(id))
+			return Promise.reject(new Error("HARNESS_OPTIONS_BUSY"));
 		const current = this.resuming.get(id);
 		if (current) return current;
 		if (this.stopping.has(id) || this.closing)
@@ -444,6 +488,9 @@ export class SessionManager {
 				nativeSessionId: session.nativeSessionId,
 				...(this.adapterOptionsFor(session.adapterOptions)
 					? { adapterOptions: this.adapterOptionsFor(session.adapterOptions) }
+					: {}),
+				...(this.toolPermissionHandler
+					? { toolPermissionHandler: this.toolPermissionHandler }
 					: {}),
 			});
 		} catch (error) {
@@ -533,6 +580,7 @@ export class SessionManager {
 		images?: readonly { readonly mimeType: string; readonly data: string }[],
 		onResumed?: () => void,
 	): Promise<{ readonly inputId: InputId; readonly resumed: boolean }> {
+		if (this.configuring.has(id)) throw new Error("HARNESS_OPTIONS_BUSY");
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
@@ -572,6 +620,10 @@ export class SessionManager {
 			this.unsettledInputs.set(id, unsettled);
 		}
 		unsettled.add(input.id);
+		if (this.configuring.has(id)) {
+			unsettled.delete(input.id);
+			throw new Error("HARNESS_OPTIONS_BUSY");
+		}
 		try {
 			await instance.send(input);
 		} catch (error) {
@@ -582,6 +634,7 @@ export class SessionManager {
 	}
 
 	async cancel(id: SessionId, inputId: InputId): Promise<void> {
+		if (this.configuring.has(id)) throw new ReloadError("RELOAD_BUSY");
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
@@ -674,6 +727,212 @@ export class SessionManager {
 		await control.setEffort(effort);
 	}
 
+	async listAdapterOptions(id: SessionId): Promise<HarnessOptionCatalog> {
+		const session = await this.get(id);
+		const harness = this.harnesses.get(session.harnessId);
+		if (!harness?.descriptor.options)
+			throw new UnsupportedCapabilityError(
+				"harness.options.set",
+				session.harnessId,
+			);
+		return {
+			descriptors: harness.descriptor.options,
+			...(this.defaultOptions ? { defaults: this.defaultOptions } : {}),
+			...(session.adapterOptions ? { overrides: session.adapterOptions } : {}),
+			...(this.adapterOptionsFor(session.adapterOptions)
+				? { effective: this.adapterOptionsFor(session.adapterOptions) }
+				: {}),
+		};
+	}
+
+	updateAdapterOptions(
+		id: SessionId,
+		update: HarnessOptionUpdate,
+	): Promise<SessionSummary> {
+		if (this.configuring.has(id))
+			return Promise.reject(new Error("HARNESS_OPTIONS_BUSY"));
+		this.configuring.add(id);
+		const operation = this.restartWithOptions(id, update).finally(() => {
+			this.configuring.delete(id);
+		});
+		this.launchesInProgress.add(operation);
+		void operation
+			.finally(() => this.launchesInProgress.delete(operation))
+			.catch(() => {});
+		return operation;
+	}
+
+	private async restartWithOptions(
+		id: SessionId,
+		update: HarnessOptionUpdate,
+	): Promise<SessionSummary> {
+		const session = await this.get(id);
+		const persistOptions = this.store.setAdapterOptions;
+		if (!persistOptions)
+			throw new Error("ADAPTER_OPTION_PERSISTENCE_UNSUPPORTED");
+		const harness = this.harnesses.get(session.harnessId);
+		if (!harness)
+			throw new UnsupportedCapabilityError(
+				"harness.options.set",
+				session.harnessId,
+			);
+		requireCapability(
+			harness.descriptor.capabilities,
+			"harness.options.set",
+			harness.descriptor.id,
+		);
+		requireCapability(
+			harness.descriptor.capabilities,
+			"harness.stop",
+			harness.descriptor.id,
+		);
+		requireCapability(
+			harness.descriptor.capabilities,
+			"harness.resume",
+			harness.descriptor.id,
+		);
+		if (
+			!harness.resume ||
+			session.status !== "running" ||
+			this.closing ||
+			this.stopping.has(id) ||
+			this.resuming.has(id) ||
+			this.launching.has(id) ||
+			this.recovery.has(id)
+		)
+			throw new Error("HARNESS_OPTIONS_BUSY");
+		const instance = this.instances.get(id);
+		if (
+			!instance ||
+			instance.isIdle?.() !== true ||
+			(this.unsettledInputs.get(id)?.size ?? 0) > 0 ||
+			this.reloads.has(id)
+		)
+			throw new Error("HARNESS_OPTIONS_BUSY");
+		const nextOptions = applyAdapterOptionUpdate(
+			this.defaultOptions,
+			session.adapterOptions,
+			harness.descriptor.options,
+			update,
+		);
+		if (
+			Object.is(
+				JSON.stringify(nextOptions),
+				JSON.stringify(session.adapterOptions),
+			)
+		)
+			return session;
+		const previousOptions = session.adapterOptions;
+		await this.store.setStatus(id, "starting");
+		try {
+			await instance.shutdown();
+		} catch (error) {
+			await this.store.setStatus(id, "failed").catch(() => {});
+			throw new AggregateError([error], "HARNESS_OPTIONS_SHUTDOWN_UNCONFIRMED");
+		}
+		this.instances.delete(id);
+		const pump = this.eventPumps.get(id);
+		if (pump) {
+			pump.stop();
+			try {
+				await pump.promise;
+			} catch (error) {
+				await this.store.setStatus(id, "failed").catch(() => {});
+				throw new AggregateError(
+					[error],
+					"HARNESS_OPTIONS_EVENT_DRAIN_UNCONFIRMED",
+				);
+			}
+			this.eventPumps.delete(id);
+		}
+		try {
+			await persistOptions.call(this.store, id, nextOptions);
+			return await this.launchOptionResume(session, harness, nextOptions);
+		} catch (error) {
+			const failures: unknown[] = [error];
+			if (this.instances.has(id)) {
+				await persistOptions
+					.call(this.store, id, previousOptions)
+					.catch((rollbackError) => failures.push(rollbackError));
+				await this.store
+					.setStatus(id, "failed")
+					.catch((statusError) => failures.push(statusError));
+				throw new AggregateError(
+					failures,
+					"HARNESS_OPTIONS_REPLACEMENT_CLEANUP_UNCONFIRMED",
+				);
+			}
+			try {
+				await persistOptions.call(this.store, id, previousOptions);
+				await this.launchOptionResume(session, harness, previousOptions);
+			} catch (rollbackError) {
+				failures.push(rollbackError);
+				await this.store
+					.setStatus(id, "failed")
+					.catch((statusError) => failures.push(statusError));
+				throw new AggregateError(
+					failures,
+					"HARNESS_OPTIONS_RESTART_AND_ROLLBACK_FAILED",
+				);
+			}
+			throw new AggregateError(
+				[error],
+				"HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK",
+			);
+		}
+	}
+
+	private async launchOptionResume(
+		session: SessionSummary,
+		harness: HarnessAdapter,
+		adapterOptions: AdapterOptions | undefined,
+	): Promise<SessionSummary> {
+		const nativeSessionId = session.nativeSessionId;
+		if (!nativeSessionId) throw new SessionNotResumableError(session.id);
+		const replacement = await harness.resume!({
+			sessionId: session.id,
+			cwd: session.cwd,
+			nativeSessionId,
+			...(this.adapterOptionsFor(adapterOptions)
+				? { adapterOptions: this.adapterOptionsFor(adapterOptions) }
+				: {}),
+			...(this.toolPermissionHandler
+				? { toolPermissionHandler: this.toolPermissionHandler }
+				: {}),
+		});
+		if (replacement.nativeSessionId !== nativeSessionId) {
+			try {
+				await replacement.shutdown();
+			} catch (error) {
+				this.instances.set(session.id, replacement);
+				throw new AggregateError(
+					[error],
+					"HARNESS_OPTIONS_NATIVE_ID_MISMATCH_CLEANUP_FAILED",
+				);
+			}
+			throw new SessionNotResumableError(session.id);
+		}
+		this.instances.set(session.id, replacement);
+		const running = { ...session, adapterOptions, status: "running" as const };
+		try {
+			await this.store.update(running);
+		} catch (error) {
+			try {
+				await replacement.shutdown();
+				this.instances.delete(session.id);
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[error, cleanupError],
+					"HARNESS_OPTIONS_PERSISTENCE_CLEANUP_FAILED",
+				);
+			}
+			throw error;
+		}
+		this.startEventPump(session.id, replacement);
+		this.watchExit(session.id, replacement);
+		return running;
+	}
+
 	async listCommands(id: SessionId): Promise<readonly HarnessCommand[]> {
 		const { control } = await this.requireControl(id, "harness.commands.list");
 		if (!control.getCommands)
@@ -699,6 +958,7 @@ export class SessionManager {
 	}
 
 	async reload(id: SessionId, beforeDispatch: () => boolean): Promise<void> {
+		if (this.configuring.has(id)) throw new ReloadError("RELOAD_BUSY");
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_ALREADY_RUNNING");
 		this.reloads.add(id);
 		try {
@@ -764,7 +1024,9 @@ export class SessionManager {
 			| "harness.commands.list"
 			| "harness.commands.run",
 	): Promise<{ control: HarnessControl; harness: HarnessAdapter }> {
+		if (this.configuring.has(id)) throw new Error("HARNESS_OPTIONS_BUSY");
 		const session = await this.get(id);
+		if (this.configuring.has(id)) throw new Error("HARNESS_OPTIONS_BUSY");
 		const harness = this.harnesses.get(session.harnessId);
 		if (!harness)
 			throw new UnsupportedCapabilityError(capability, session.harnessId);
@@ -908,6 +1170,9 @@ export class SessionManager {
 					nativeSessionId: session.nativeSessionId,
 					...(this.adapterOptionsFor(session.adapterOptions)
 						? { adapterOptions: this.adapterOptionsFor(session.adapterOptions) }
+						: {}),
+					...(this.toolPermissionHandler
+						? { toolPermissionHandler: this.toolPermissionHandler }
 						: {}),
 				});
 			} catch {

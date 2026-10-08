@@ -6208,6 +6208,7 @@ describe("Telegram transport", () => {
 			"reload",
 			"model",
 			"effort",
+			"permissions",
 			"stop",
 			"delete",
 			"cancel",
@@ -6512,12 +6513,16 @@ describe("Telegram transport", () => {
 			"inspect",
 			"inspect",
 			"session_status",
+			"adapter_options_list",
 			"inspect",
 			"model_list",
+			"adapter_options_list",
 			"inspect",
 			"model_set",
+			"adapter_options_list",
 			"inspect",
 			"effort_list",
+			"adapter_options_list",
 			"inspect",
 			"effort_set",
 			"session_status",
@@ -6527,24 +6532,24 @@ describe("Telegram transport", () => {
 			kind: "session_status",
 			sessionId: "sid",
 		});
-		expect(requests[4]).toMatchObject({ kind: "model_list", sessionId: "sid" });
-		expect(requests[6]).toMatchObject({
+		expect(requests[5]).toMatchObject({ kind: "model_list", sessionId: "sid" });
+		expect(requests[8]).toMatchObject({
 			kind: "model_set",
 			sessionId: "other",
 			provider: "openai",
 			modelId: "gpt-next",
 			effort: "high",
 		});
-		expect(requests[8]).toMatchObject({
+		expect(requests[11]).toMatchObject({
 			kind: "effort_list",
 			sessionId: "sid",
 		});
-		expect(requests[10]).toMatchObject({
+		expect(requests[14]).toMatchObject({
 			kind: "effort_set",
 			sessionId: "other",
 			effort: "high",
 		});
-		expect(requests[12]).toMatchObject({ kind: "submit", sessionId: "other" });
+		expect(requests[16]).toMatchObject({ kind: "submit", sessionId: "other" });
 		expect(
 			bot.sent.some(
 				({ chatId, text }) => chatId === 100 && text.includes("Токены: 1,234"),
@@ -8995,6 +9000,154 @@ describe("Telegram transport", () => {
 		nextBot.failStart();
 		await vi.waitFor(() => expect(fatal).toHaveBeenCalledOnce());
 		await live.adapter.stop();
+	});
+
+	it("routes a one-shot permission decision only from the authorized selected-session prompt", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const permission = adapter.requestToolPermission({
+			sessionId: "sid" as SessionId,
+			inputId: "turn-1" as never,
+			requestId: "wire-1",
+			toolName: "Read",
+			input: { file_path: "/work/secret.txt" },
+			context: { title: "Read file", description: "Read one file" },
+			signal: new AbortController().signal,
+		});
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Запрос разрешения"),
+		);
+		const prompt = bot.sent.at(-1);
+		const allow = callbackData(bot.sendOptions.at(-1), "permission:");
+		await bot.callback(42, allow, prompt?.message_id);
+		await expect(permission).resolves.toEqual({ behavior: "allow" });
+		await bot.callback(42, allow, prompt?.message_id);
+		expect(
+			requests.filter((request) => request.kind === "adapter_options_set"),
+		).toHaveLength(0);
+		await adapter.stop();
+	});
+
+	it("uses descriptor-declared model and effort options in the session panel", async () => {
+		const bot = new MockBot();
+		sessions.set(
+			"sid",
+			sessionWith("sid", {
+				harnessId: "claude-code" as never,
+				adapterOptions: { model: "sonnet" },
+			}),
+		);
+		const optionUpdates: Extract<
+			TransportEvent,
+			{ kind: "adapter_options_set" }
+		>[] = [];
+		const descriptors = [
+			{
+				key: "model",
+				label: "Модель",
+				values: ["sonnet", "opus"],
+				allowCustom: true,
+			},
+			{ key: "effort", label: "Effort", values: ["low", "high"] },
+		];
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "adapter_options_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: {
+							descriptors,
+							effective: { model: "sonnet", effort: "high" },
+						},
+					};
+				if (request.kind === "adapter_options_set") {
+					optionUpdates.push(request);
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: sessionWith("sid", { adapterOptions: request.update.set }),
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		await bot.callback(42, "menu:models", panelId);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Модель просмотра"),
+		);
+		await bot.callback(42, "model:select:1", panelId);
+		expect(optionUpdates[0]?.update).toEqual({ set: { model: "opus" } });
+		expect(
+			requests.some(
+				(request) =>
+					request.kind === "model_set" || request.kind === "model_list",
+			),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("requires explicit bypass confirmation and distinguishes native default from reset", async () => {
+		const bot = new MockBot();
+		const updates: Extract<TransportEvent, { kind: "adapter_options_set" }>[] =
+			[];
+		const descriptor = {
+			key: "permissionMode",
+			label: "Разрешения",
+			values: [
+				"default",
+				"acceptEdits",
+				"plan",
+				"bypassPermissions",
+				"dontAsk",
+				"auto",
+			],
+			dangerousValues: ["bypassPermissions"],
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "adapter_options_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: {
+							descriptors: [descriptor],
+							defaults: { permissionMode: "plan" },
+							effective: { permissionMode: "plan" },
+						},
+					};
+				if (request.kind === "adapter_options_set") {
+					updates.push(request);
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: sessionWith("sid", { adapterOptions: request.update.set }),
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/permissions bypassPermissions");
+		const confirmation = bot.sent.at(-1);
+		const confirmToken = callbackData(
+			bot.sendOptions.at(-1),
+			"option-confirm:",
+		);
+		await bot.callback(42, confirmToken, confirmation?.message_id);
+		expect(updates[0]?.update).toEqual({
+			set: { permissionMode: "bypassPermissions" },
+			confirmedDangerous: true,
+		});
+		await bot.update(42, "/permissions manual");
+		expect(updates[1]?.update).toEqual({ set: { permissionMode: "default" } });
+		await bot.update(42, "/permissions default");
+		expect(updates[2]?.update).toEqual({ resetKeys: ["permissionMode"] });
+		await adapter.stop();
 	});
 
 	it("claims a non-secret lock, recovers only demonstrably stale owners, and fails closed", async () => {

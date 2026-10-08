@@ -168,10 +168,19 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
-		usage: "/effort [level]",
+		usage: "/effort [level|default]",
 		telegram: {
 			command: "effort",
 			description: "Показать или задать effort модели.",
+		},
+	},
+	{
+		visibility: "telegram-only",
+		section: "private-chat",
+		usage: "/permissions [mode|default]",
+		telegram: {
+			command: "permissions",
+			description: "Показать или задать режим разрешений Claude.",
 		},
 	},
 	{

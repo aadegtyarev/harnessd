@@ -28,6 +28,71 @@ const result = {
 };
 
 describe("Claude Code stream protocol", () => {
+	it("fails closed with non-interrupting denial when no permission UI is available", async () => {
+		const fake = fakeProvider();
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch(launchRequest);
+		const sent = instance.send(input("deny-input", "read"));
+		fake.record(init);
+		fake.record(acknowledgement("read"));
+		await sent;
+		fake.record({
+			type: "control_request",
+			request_id: "deny-1",
+			request: {
+				subtype: "can_use_tool",
+				tool_name: "Read",
+				input: { path: "/tmp/a" },
+			},
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		const response = fake
+			.inputLines()
+			.map((line) => JSON.parse(line))
+			.find((line) => line.type === "control_response");
+		expect(response.response.response).toEqual({
+			behavior: "deny",
+			message: "Permission prompt unavailable",
+			interrupt: false,
+		});
+		fake.record(result);
+		await instance.shutdown();
+	});
+
+	it("cancels only the matching permission request and never responds after cancellation", async () => {
+		const fake = fakeProvider();
+		let notify!: (signal: AbortSignal) => void;
+		const entered = new Promise<AbortSignal>((resolve) => {
+			notify = resolve;
+		});
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch({
+			...launchRequest,
+			toolPermissionHandler(request) {
+				notify(request.signal);
+				return new Promise(() => {});
+			},
+		});
+		const sent = instance.send(input("cancel-input", "read"));
+		fake.record(init);
+		fake.record(acknowledgement("read"));
+		await sent;
+		fake.record({
+			type: "control_request",
+			request_id: "cancel-1",
+			request: { subtype: "can_use_tool", tool_name: "Read", input: {} },
+		});
+		const signal = await entered;
+		fake.record({ type: "control_cancel_request", request_id: "cancel-1" });
+		expect(signal.aborted).toBe(true);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(fake.inputLines().join("")).not.toContain("control_response");
+		fake.record(result);
+		await instance.shutdown();
+	});
+
 	it("waits for replay acknowledgement and accepts another input only after settlement", async () => {
 		const fake = fakeProvider();
 		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {

@@ -22,6 +22,7 @@ import type {
 	TransportEvent,
 } from "../src/core/index.js";
 import {
+	applyAdapterOptionUpdate,
 	DuplicateAdapterIdError,
 	HarnessRegistry,
 	InvalidSessionNameError,
@@ -361,14 +362,169 @@ describe("core capability contracts", () => {
 			effort: "high",
 		});
 		expect(
-			mergeAdapterOptions(
-				{ effort: "low", model: "sonnet" },
-				{ effort: "default", permission: "manual" },
-			),
-		).toEqual({ effort: "low", model: "sonnet", permission: "manual" });
+			mergeAdapterOptions({ effort: "high" }, { permissionMode: "default" }),
+		).toEqual({ effort: "high", permissionMode: "default" });
+		const descriptors = [
+			{
+				key: "permissionMode",
+				label: "Permission",
+				values: ["default", "bypassPermissions"],
+				dangerousValues: ["bypassPermissions"],
+			},
+		];
+		expect(() =>
+			applyAdapterOptionUpdate(undefined, undefined, descriptors, {
+				set: { permissionMode: "bypassPermissions" },
+			}),
+		).toThrow("DANGEROUS_OPTION_CONFIRMATION_REQUIRED");
 		expect(
-			mergeAdapterOptions(undefined, { effort: "default" }),
+			applyAdapterOptionUpdate(undefined, undefined, descriptors, {
+				set: { permissionMode: "bypassPermissions" },
+				confirmedDangerous: true,
+			}),
+		).toEqual({ permissionMode: "bypassPermissions" });
+		expect(
+			applyAdapterOptionUpdate(
+				{ permissionMode: "plan" },
+				{ permissionMode: "default" },
+				descriptors,
+				{ resetKeys: ["permissionMode"] },
+			),
 		).toBeUndefined();
+	});
+
+	it("restarts an idle harness with persisted overrides and exact native-ID rollback", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const launchRequests: import("../src/core/ports.js").HarnessLaunchRequest[] =
+			[];
+		let idle = true;
+		let failResume = false;
+		let failShutdown = false;
+		let shutdowns = 0;
+		const instance = (): HarnessInstance => ({
+			processId: "options" as never,
+			exit: new Promise(() => {}),
+			nativeSessionId: "native-original",
+			events: (async function* () {})(),
+			isIdle: () => idle,
+			async send() {},
+			async cancel() {},
+			async shutdown() {
+				shutdowns++;
+				if (failShutdown) throw new Error("shutdown unconfirmed");
+			},
+		});
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "options-harness" as AdapterId,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"harness.options.set",
+				],
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+					{ key: "effort", label: "Effort", values: ["low", "high"] },
+					{
+						key: "permissionMode",
+						label: "Permission",
+						values: ["default", "bypassPermissions"],
+						dangerousValues: ["bypassPermissions"],
+					},
+				],
+			},
+			async launch(request) {
+				launchRequests.push(request);
+				return instance();
+			},
+			async resume(request) {
+				launchRequests.push(request);
+				if (failResume) {
+					failResume = false;
+					throw new Error("resume failed");
+				}
+				return instance();
+			},
+		};
+		const manager = new SessionManager(store, [harness], {
+			adapterOptions: { model: "sonnet", effort: "high" },
+		});
+		expect(
+			() =>
+				new SessionManager(store, [harness], {
+					adapterOptions: { permissionMode: "bypassPermissions" },
+				}),
+		).toThrow("DANGEROUS_ADAPTER_OPTION_DEFAULT_FORBIDDEN");
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+				adapterOptions: { model: "opus" },
+			});
+			const changed = await manager.updateAdapterOptions(session.id, {
+				set: { effort: "low" },
+			});
+			expect(changed.adapterOptions).toEqual({ model: "opus", effort: "low" });
+			expect(launchRequests[1]?.nativeSessionId).toBe("native-original");
+			expect(launchRequests[1]?.adapterOptions).toEqual({
+				model: "opus",
+				effort: "low",
+			});
+			idle = false;
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "busy" } }),
+			).rejects.toThrow("HARNESS_OPTIONS_BUSY");
+			idle = true;
+			failResume = true;
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "broken" } }),
+			).rejects.toThrow("HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK");
+			expect(launchRequests.at(-2)?.nativeSessionId).toBe("native-original");
+			expect(launchRequests.at(-1)?.nativeSessionId).toBe("native-original");
+			expect(launchRequests.at(-1)?.adapterOptions).toEqual({
+				model: "opus",
+				effort: "low",
+			});
+			expect(await store.get(session.id)).toMatchObject({
+				status: "running",
+				nativeSessionId: "native-original",
+				adapterOptions: { model: "opus", effort: "low" },
+			});
+			const reset = await manager.updateAdapterOptions(session.id, {
+				resetKeys: ["model"],
+			});
+			expect(reset.adapterOptions).toEqual({ effort: "low" });
+			expect(launchRequests.at(-1)?.adapterOptions).toEqual({
+				model: "sonnet",
+				effort: "low",
+			});
+			const nativeDefault = await manager.updateAdapterOptions(session.id, {
+				set: { permissionMode: "default" },
+			});
+			expect(nativeDefault.adapterOptions).toEqual({
+				effort: "low",
+				permissionMode: "default",
+			});
+			expect((await store.get(session.id))?.adapterOptions).toEqual({
+				effort: "low",
+				permissionMode: "default",
+			});
+			expect(shutdowns).toBe(4);
+			const launchesBeforeUnconfirmedShutdown = launchRequests.length;
+			failShutdown = true;
+			await expect(
+				manager.updateAdapterOptions(session.id, {
+					set: { model: "unconfirmed" },
+				}),
+			).rejects.toThrow("HARNESS_OPTIONS_SHUTDOWN_UNCONFIRMED");
+			expect(launchRequests).toHaveLength(launchesBeforeUnconfirmedShutdown);
+			expect((await store.get(session.id))?.status).toBe("failed");
+			failShutdown = false;
+		} finally {
+			await manager.close();
+			store.close();
+		}
 	});
 });
 
