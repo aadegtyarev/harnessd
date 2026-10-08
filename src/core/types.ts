@@ -5,12 +5,22 @@ export type InputId = Brand<string, "InputId">;
 export type AdapterId = Brand<string, "AdapterId">;
 export type ProcessId = Brand<string, "ProcessId">;
 
+export type AdapterOptionValue =
+	| string
+	| number
+	| boolean
+	| null
+	| readonly AdapterOptionValue[]
+	| { readonly [key: string]: AdapterOptionValue };
+export type AdapterOptions = Readonly<Record<string, AdapterOptionValue>>;
+
 export interface SessionSummary {
 	readonly id: SessionId;
 	readonly name?: string;
 	readonly harnessId: AdapterId;
 	readonly cwd: string;
 	readonly nativeSessionId?: string;
+	readonly adapterOptions?: AdapterOptions;
 	readonly status: SessionStatus;
 }
 

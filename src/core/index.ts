@@ -1,7 +1,13 @@
+export { applyAdapterOptionUpdate } from "./adapter-option-mutation.js";
+export {
+	mergeAdapterOptions,
+	validateAdapterOptions,
+} from "./adapter-options.js";
 export type { Capability } from "./errors.js";
 export {
 	DuplicateAdapterIdError,
 	DuplicateSessionIdError,
+	HarnessOptionError,
 	InvalidSessionNameError,
 	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
@@ -12,6 +18,7 @@ export {
 	SessionStoreError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
+export { HarnessRegistry } from "./harness-registry.js";
 export type {
 	HarnessAdapter,
 	HarnessControl,
@@ -22,6 +29,10 @@ export type {
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
 	HarnessModelInfo,
+	HarnessOptionCatalog,
+	HarnessOptionDescriptor,
+	HarnessOptionUpdate,
+	HarnessRegistryEntry,
 	HarnessSelection,
 	HarnessSessionStatus,
 	HarnessUsageStats,
@@ -35,6 +46,11 @@ export type {
 	SecretGrant,
 	SecretProvider,
 	SessionPort,
+	ToolPermissionContext,
+	ToolPermissionDecision,
+	ToolPermissionHandler,
+	ToolPermissionRequest,
+	ToolPermissionTransport,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventListener,
@@ -50,6 +66,8 @@ export type { SessionStore } from "./session-store.js";
 export { resolveStateDirectory, SqliteSessionStore } from "./session-store.js";
 export type {
 	AdapterId,
+	AdapterOptions,
+	AdapterOptionValue,
 	HarnessEvent,
 	Input,
 	InputDeliveryState,

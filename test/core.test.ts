@@ -22,10 +22,13 @@ import type {
 	TransportEvent,
 } from "../src/core/index.js";
 import {
+	applyAdapterOptionUpdate,
 	DuplicateAdapterIdError,
+	HarnessRegistry,
 	InvalidSessionNameError,
 	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
+	mergeAdapterOptions,
 	requireCapability,
 	resolveStateDirectory,
 	SessionManager,
@@ -163,7 +166,7 @@ describe("core capability contracts", () => {
 					},
 					async runCommand(name, remainder) {
 						calls.push(["run", name, remainder]);
-						return "accepted";
+						return { disposition: "accepted" };
 					},
 					async getSelection() {
 						return {};
@@ -197,9 +200,9 @@ describe("core capability contracts", () => {
 			expect(await manager.listCommands(session.id)).toEqual([
 				{ name: "cost", description: "Cost" },
 			]);
-			expect(await manager.runCommand(session.id, "cost", "  raw ")).toBe(
-				"accepted",
-			);
+			expect(await manager.runCommand(session.id, "cost", "  raw ")).toEqual({
+				disposition: "accepted",
+			});
 			expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
 		} finally {
 			await manager.close();
@@ -295,6 +298,417 @@ describe("core capability contracts", () => {
 		);
 		store.close();
 	});
+
+	it("validates aliases, projects capabilities, and resolves inherited adapter options", async () => {
+		const state = await temporaryDirectory();
+		const workspace = await temporaryDirectory();
+		const store = await SqliteSessionStore.open(state);
+		const original = harnessPort().harness;
+		let launchOptions: unknown;
+		const harness: HarnessAdapter = {
+			...original,
+			descriptor: { ...original.descriptor, aliases: ["mock"] },
+			async launch(request) {
+				launchOptions = request.adapterOptions;
+				return original.launch(request);
+			},
+		};
+		const registry = new HarnessRegistry([harness]);
+		expect(registry.resolve("mock")).toBe("mock-harness");
+		expect(registry.project(["harness.launch"])).toHaveLength(1);
+		expect(
+			() =>
+				new HarnessRegistry([
+					{
+						...harness,
+						descriptor: { ...harness.descriptor, aliases: ["bad alias"] },
+					},
+				]),
+		).toThrow(/alias/);
+		expect(
+			() =>
+				new HarnessRegistry([
+					harness,
+					{
+						...harness,
+						descriptor: { ...harness.descriptor, id: "other" as never },
+					},
+				]),
+		).toThrow(/alias/);
+		const manager = new SessionManager(store, [harness], {
+			defaultHarnessId: "mock",
+			adapterOptions: { effort: "high", shared: true },
+		});
+		try {
+			const session = await manager.create({
+				cwd: workspace,
+				adapterOptions: { shared: false },
+			});
+			expect(session.harnessId).toBe("mock-harness");
+			expect(session.adapterOptions).toEqual({ shared: false });
+			expect(launchOptions).toEqual({ effort: "high", shared: false });
+			await store.update({ ...session, harnessId: "other" as never });
+			expect((await store.get(session.id))?.harnessId).toBe("mock-harness");
+			const explicitAliasSession = await manager.create({
+				cwd: workspace,
+				harnessId: "mock" as never,
+			});
+			expect(explicitAliasSession.harnessId).toBe("mock-harness");
+		} finally {
+			await manager.close();
+		}
+		store.close();
+		const reopened = await SqliteSessionStore.open(state);
+		const reopenedSessions = await reopened.list();
+		expect(reopenedSessions).toHaveLength(2);
+		expect(
+			reopenedSessions.every(({ harnessId }) => harnessId === "mock-harness"),
+		).toBe(true);
+		expect(reopenedSessions).toContainEqual(
+			expect.objectContaining({ adapterOptions: { shared: false } }),
+		);
+		reopened.close();
+		expect(mergeAdapterOptions({ effort: "low" }, { effort: "high" })).toEqual({
+			effort: "high",
+		});
+		expect(
+			mergeAdapterOptions({ effort: "high" }, { permissionMode: "default" }),
+		).toEqual({ effort: "high", permissionMode: "default" });
+		const descriptors = [
+			{
+				key: "permissionMode",
+				label: "Permission",
+				values: ["default", "bypassPermissions"],
+				dangerousValues: ["bypassPermissions"],
+			},
+		];
+		expect(() =>
+			applyAdapterOptionUpdate(undefined, undefined, descriptors, {
+				set: { permissionMode: "bypassPermissions" },
+			}),
+		).toThrow("DANGEROUS_OPTION_CONFIRMATION_REQUIRED");
+		expect(
+			applyAdapterOptionUpdate(undefined, undefined, descriptors, {
+				set: { permissionMode: "bypassPermissions" },
+				confirmedDangerous: true,
+			}),
+		).toEqual({ permissionMode: "bypassPermissions" });
+		expect(
+			applyAdapterOptionUpdate(
+				{ permissionMode: "plan" },
+				{ permissionMode: "default" },
+				descriptors,
+				{ resetKeys: ["permissionMode"] },
+			),
+		).toBeUndefined();
+	});
+
+	it("restarts an idle harness with persisted overrides and exact native-ID rollback", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const launchRequests: import("../src/core/ports.js").HarnessLaunchRequest[] =
+			[];
+		let idle = true;
+		let failResume = false;
+		let failShutdown = false;
+		let shutdowns = 0;
+		const instance = (): HarnessInstance => ({
+			processId: "options" as never,
+			exit: new Promise(() => {}),
+			nativeSessionId: "native-original",
+			events: (async function* () {})(),
+			isIdle: () => idle,
+			async send() {},
+			async cancel() {},
+			async shutdown() {
+				shutdowns++;
+				if (failShutdown) throw new Error("shutdown unconfirmed");
+			},
+		});
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "options-harness" as AdapterId,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"harness.options.set",
+				],
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+					{ key: "effort", label: "Effort", values: ["low", "high"] },
+					{
+						key: "permissionMode",
+						label: "Permission",
+						values: ["default", "bypassPermissions"],
+						dangerousValues: ["bypassPermissions"],
+					},
+				],
+			},
+			async launch(request) {
+				launchRequests.push(request);
+				return instance();
+			},
+			async resume(request) {
+				launchRequests.push(request);
+				if (failResume) {
+					failResume = false;
+					throw new Error("resume failed");
+				}
+				return instance();
+			},
+		};
+		const manager = new SessionManager(store, [harness], {
+			adapterOptions: { model: "sonnet", effort: "high" },
+		});
+		expect(
+			() =>
+				new SessionManager(store, [harness], {
+					adapterOptions: { permissionMode: "bypassPermissions" },
+				}),
+		).toThrow("DANGEROUS_ADAPTER_OPTION_DEFAULT_FORBIDDEN");
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+				adapterOptions: { model: "opus" },
+			});
+			const changed = await manager.updateAdapterOptions(session.id, {
+				set: { effort: "low" },
+			});
+			expect(changed.adapterOptions).toEqual({ model: "opus", effort: "low" });
+			expect(launchRequests[1]?.nativeSessionId).toBe("native-original");
+			expect(launchRequests[1]?.adapterOptions).toEqual({
+				model: "opus",
+				effort: "low",
+			});
+			idle = false;
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "busy" } }),
+			).rejects.toThrow("HARNESS_OPTIONS_BUSY");
+			idle = true;
+			failResume = true;
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "broken" } }),
+			).rejects.toThrow("HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK");
+			expect(launchRequests.at(-2)?.nativeSessionId).toBe("native-original");
+			expect(launchRequests.at(-1)?.nativeSessionId).toBe("native-original");
+			expect(launchRequests.at(-1)?.adapterOptions).toEqual({
+				model: "opus",
+				effort: "low",
+			});
+			expect(await store.get(session.id)).toMatchObject({
+				status: "running",
+				nativeSessionId: "native-original",
+				adapterOptions: { model: "opus", effort: "low" },
+			});
+			const reset = await manager.updateAdapterOptions(session.id, {
+				resetKeys: ["model"],
+			});
+			expect(reset.adapterOptions).toEqual({ effort: "low" });
+			expect(launchRequests.at(-1)?.adapterOptions).toEqual({
+				model: "sonnet",
+				effort: "low",
+			});
+			const nativeDefault = await manager.updateAdapterOptions(session.id, {
+				set: { permissionMode: "default" },
+			});
+			expect(nativeDefault.adapterOptions).toEqual({
+				effort: "low",
+				permissionMode: "default",
+			});
+			expect((await store.get(session.id))?.adapterOptions).toEqual({
+				effort: "low",
+				permissionMode: "default",
+			});
+			expect(shutdowns).toBe(4);
+			const launchesBeforeUnconfirmedShutdown = launchRequests.length;
+			failShutdown = true;
+			await expect(
+				manager.updateAdapterOptions(session.id, {
+					set: { model: "unconfirmed" },
+				}),
+			).rejects.toThrow("HARNESS_OPTIONS_SHUTDOWN_UNCONFIRMED");
+			expect(launchRequests).toHaveLength(launchesBeforeUnconfirmedShutdown);
+			expect((await store.get(session.id))?.status).toBe("failed");
+			failShutdown = false;
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("rolls back a final option persistence failure and cleans its replacement", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const base = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"harness.options.set",
+			],
+		});
+		let replacementShutdowns = 0;
+		const harness: HarnessAdapter = {
+			...base.harness,
+			descriptor: {
+				...base.harness.descriptor,
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+				],
+			},
+			async launch(request) {
+				const instance = await base.harness.launch(request);
+				return {
+					...instance,
+					isIdle: () => true,
+					async shutdown() {
+						if (base.launched.length === 2) replacementShutdowns++;
+						await instance.shutdown();
+					},
+				};
+			},
+			async resume(request) {
+				return harness.launch(request);
+			},
+		};
+		const launched = base.launched;
+		const originalPersist = store.setAdapterOptions.bind(store);
+		let failNext = false;
+		store.setAdapterOptions = async (id, options) => {
+			if (failNext) {
+				failNext = false;
+				throw new Error("final persistence failed");
+			}
+			await originalPersist(id, options);
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			failNext = true;
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "new" } }),
+			).rejects.toThrow("HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK");
+			expect(launched).toHaveLength(3);
+			expect(replacementShutdowns).toBe(1);
+			expect((await store.get(session.id))?.adapterOptions).toBeUndefined();
+			expect((await store.get(session.id))?.status).toBe("running");
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("does not auto-recover an option-owned shutdown exit", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let resumes = 0;
+		const makeInstance = () => {
+			let exit!: () => void;
+			const instance: HarnessInstance = {
+				processId: "options-race" as never,
+				exit: new Promise((resolve) => {
+					exit = () => resolve({ code: 0, signal: null });
+				}),
+				nativeSessionId: "native-race",
+				events: (async function* () {})(),
+				isIdle: () => true,
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					exit();
+				},
+			};
+			return instance;
+		};
+		const base = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"harness.options.set",
+			],
+			launch: async () => makeInstance(),
+		});
+		const harness: HarnessAdapter = {
+			...base.harness,
+			descriptor: {
+				...base.harness.descriptor,
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+				],
+			},
+			async resume() {
+				resumes++;
+				return makeInstance();
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			await manager.updateAdapterOptions(session.id, { set: { model: "new" } });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(resumes).toBe(1);
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("rejects option replacement without a native ID before shutdown", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let shutdowns = 0;
+		const base = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"harness.options.set",
+			],
+			launch: async () => ({
+				processId: "no-native" as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				isIdle: () => true,
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					shutdowns++;
+				},
+			}),
+		});
+		const harness: HarnessAdapter = {
+			...base.harness,
+			descriptor: {
+				...base.harness.descriptor,
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+				],
+			},
+			async resume() {
+				throw new Error("must not resume");
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "new" } }),
+			).rejects.toThrow("cannot be resumed");
+			expect(shutdowns).toBe(0);
+			expect((await store.get(session.id))?.status).toBe("running");
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
 });
 
 describe("SQLite session management", () => {
@@ -327,7 +741,7 @@ describe("SQLite session management", () => {
 		reopened.close();
 	});
 
-	it("migrates an existing SQLite database by adding nullable session names", async () => {
+	it("migrates an existing SQLite database by adding nullable session names and options", async () => {
 		const state = await temporaryDirectory();
 		const database = new Database(path.join(state, "sessions.sqlite3"));
 		database.exec(`CREATE TABLE sessions (
@@ -353,6 +767,9 @@ describe("SQLite session management", () => {
 		});
 		expect(await store.get("legacy-session" as SessionId)).not.toHaveProperty(
 			"name",
+		);
+		expect(await store.get("legacy-session" as SessionId)).not.toHaveProperty(
+			"adapterOptions",
 		);
 		await store.setName("legacy-session" as SessionId, "Recovered session");
 		expect(await store.get("legacy-session" as SessionId)).toMatchObject({

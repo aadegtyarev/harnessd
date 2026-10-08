@@ -42,6 +42,8 @@ Required environment:
 
 Optional environment:
   HARNESSD_PI_EXECUTABLE            Pi executable (default: pi)
+  HARNESSD_CLAUDE_EXECUTABLE        Claude Code executable (default: claude)
+  HARNESSD_DEFAULT_HARNESS          Default canonical harness ID or alias (default: pi-rpc)
   HARNESSD_STATE_DIR                Supervisor state directory
   HARNESSD_EXECUTION_MODE           direct (default, trusted; cwd is not a sandbox) or isolated (unavailable in this CLI; requires a registered isolation provider)
   HARNESSD_HOME                     Initial Telegram working folder (default: /; not a sandbox)
@@ -147,6 +149,8 @@ export async function main(options: CliOptions = {}): Promise<void> {
 			runtime = await runtimeStart({
 				executionMode,
 				piExecutable: env.HARNESSD_PI_EXECUTABLE || "pi",
+				claudeExecutable: env.HARNESSD_CLAUDE_EXECUTABLE || "claude",
+				defaultHarnessId: env.HARNESSD_DEFAULT_HARNESS || "pi-rpc",
 				stateDirectory,
 				transports: [transport],
 			});

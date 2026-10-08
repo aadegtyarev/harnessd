@@ -3,6 +3,7 @@ import type {
 	AgentFileSendTransport,
 	HarnessAdapter,
 	ProcessProvider,
+	ToolPermissionTransport,
 	TransportAdapter,
 	TransportEvent,
 	TransportEventListener,
@@ -15,8 +16,9 @@ import {
 	resolveStateDirectory,
 	SqliteSessionStore,
 } from "./core/session-store.js";
-import type { HarnessEvent } from "./core/types.js";
+import type { AdapterOptions, HarnessEvent } from "./core/types.js";
 import { describeError } from "./error-diagnostics.js";
+import { ClaudeCodeHarnessAdapter } from "./harness/claude-code-harness.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
 	PiControlError,
@@ -98,6 +100,26 @@ const safeErrorMessages = new Map([
 	["RELOAD_ALREADY_RUNNING", "A reload is already in progress."],
 	["RELOAD_SELECTION_CHANGED", "The selected session changed before reload."],
 	[
+		"HARNESS_OPTIONS_BUSY",
+		"The session must be provably idle before changing these options.",
+	],
+	[
+		"DANGEROUS_OPTION_CONFIRMATION_REQUIRED",
+		"Explicit confirmation is required for this permission mode.",
+	],
+	[
+		"HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK",
+		"The option change failed; previous options and the same native session were restored.",
+	],
+	[
+		"HARNESS_OPTIONS_RESTART_AND_ROLLBACK_FAILED",
+		"Option change and rollback could not be confirmed; the session is stopped and no fallback was started.",
+	],
+	[
+		"HARNESS_OPTIONS_SHUTDOWN_UNCONFIRMED",
+		"The previous process could not be confirmed stopped; no replacement was started.",
+	],
+	[
 		"COMMAND_DISCOVERY_FAILED",
 		"Pi command discovery is temporarily unavailable.",
 	],
@@ -168,6 +190,7 @@ function safeOperationKind(value: string): string {
 
 export interface ApplicationRuntimeOptions {
 	readonly piExecutable: string;
+	readonly claudeExecutable?: string;
 	readonly executionMode?: ExecutionMode;
 	readonly processProvider?: ProcessProvider;
 	readonly piOptions?: Omit<
@@ -176,6 +199,8 @@ export interface ApplicationRuntimeOptions {
 	>;
 	readonly transports: readonly TransportAdapter[];
 	readonly harnesses?: readonly HarnessAdapter[];
+	readonly defaultHarnessId?: string;
+	readonly adapterOptions?: AdapterOptions;
 	readonly stateDirectory?: string;
 	readonly store?: SessionStore & { close(): void };
 }
@@ -238,6 +263,20 @@ export class ApplicationRuntime {
 		const agentFileSend: AgentFileSendHandler | undefined = agentFileSenders[0]
 			? (request) => agentFileSenders[0].sendAgentFile(request)
 			: undefined;
+		const permissionTransports = options.transports.filter(
+			(transport): transport is TransportAdapter & ToolPermissionTransport =>
+				typeof (transport as Partial<ToolPermissionTransport>)
+					.requestToolPermission === "function",
+		);
+		if (permissionTransports.length > 1)
+			throw new TypeError("Only one tool-permission transport is supported");
+		const toolPermissionHandler = permissionTransports[0]
+			? (
+					request: Parameters<
+						ToolPermissionTransport["requestToolPermission"]
+					>[0],
+				) => permissionTransports[0].requestToolPermission(request)
+			: undefined;
 		let store: (SessionStore & { close(): void }) | undefined;
 		let manager: SessionManager | undefined;
 		let runtimeToClose: ApplicationRuntime | undefined;
@@ -248,9 +287,19 @@ export class ApplicationRuntime {
 				(await SqliteSessionStore.open(
 					resolveStateDirectory(options.stateDirectory),
 				));
+			const defaultHarnessId =
+				options.defaultHarnessId ??
+				(options.harnesses === undefined ? "pi-rpc" : undefined);
 			const sessionManager = new SessionManager(
 				store,
 				options.harnesses ?? [
+					new ClaudeCodeHarnessAdapter(
+						processProvider ?? new NodeProcessProvider(),
+						{
+							executable: options.claudeExecutable ?? "claude",
+							...(agentFileSend ? { agentFileSend } : {}),
+						},
+					),
 					new PiRpcHarnessAdapter(
 						processProvider ?? new NodeProcessProvider(),
 						{
@@ -260,6 +309,13 @@ export class ApplicationRuntime {
 						},
 					),
 				],
+				{
+					...(defaultHarnessId ? { defaultHarnessId } : {}),
+					...(options.adapterOptions
+						? { adapterOptions: options.adapterOptions }
+						: {}),
+					...(toolPermissionHandler ? { toolPermissionHandler } : {}),
+				},
 			);
 			manager = sessionManager;
 			const runtime = new ApplicationRuntime(
@@ -272,8 +328,12 @@ export class ApplicationRuntime {
 				runtime.subscribe(listener);
 			for (const transport of options.transports) {
 				started.push(transport);
-				await transport.start(runtime.dispatch, subscribeEvents, () =>
-					sessionManager.list(),
+				await transport.start(
+					runtime.dispatch,
+					subscribeEvents,
+					() => sessionManager.list(),
+					(sessionId) => sessionManager.getHarnessCapabilities(sessionId),
+					() => sessionManager.listHarnesses(),
 				);
 			}
 			runtime.state = "running";
@@ -360,6 +420,8 @@ export class ApplicationRuntime {
 						harnessId: request.harnessId,
 						cwd: request.cwd,
 						name: request.name,
+						adapterOptions: request.adapterOptions,
+						confirmedDangerousOptions: request.confirmedDangerousOptions,
 					})) as typeof value;
 					break;
 				case "rename":
@@ -398,6 +460,10 @@ export class ApplicationRuntime {
 					await this.manager.cancel(request.sessionId, request.inputId);
 					value = undefined as typeof value;
 					break;
+				case "cancel_current":
+					await this.manager.cancelCurrent(request.sessionId);
+					value = undefined as typeof value;
+					break;
 				case "session_status":
 					value = (await this.manager.getSessionStatus(
 						request.sessionId,
@@ -424,6 +490,17 @@ export class ApplicationRuntime {
 				case "effort_set":
 					await this.manager.setEffort(request.sessionId, request.effort);
 					value = undefined as typeof value;
+					break;
+				case "adapter_options_list":
+					value = (await this.manager.listAdapterOptions(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "adapter_options_set":
+					value = (await this.manager.updateAdapterOptions(
+						request.sessionId,
+						request.update,
+					)) as typeof value;
 					break;
 				case "reload":
 					await this.manager.reload(request.sessionId, request.beforeDispatch);

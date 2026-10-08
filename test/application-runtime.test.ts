@@ -21,8 +21,10 @@ import type {
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
+import { ClaudeCodeHarnessAdapter } from "../src/harness/claude-code-harness.js";
 import {
 	PiControlError,
+	PiRpcHarnessAdapter,
 	UncertainInputDeliveryError,
 } from "../src/harness/pi-rpc-harness.js";
 import { NodeProcessProvider } from "../src/process/node-process-provider.js";
@@ -99,7 +101,7 @@ describe("application runtime", () => {
 						},
 						async runCommand(name, remainder) {
 							calls.push(["run", name, remainder]);
-							return "accepted";
+							return { disposition: "accepted" };
 						},
 						async getSelection() {
 							return {};
@@ -161,7 +163,7 @@ describe("application runtime", () => {
 				name: "cost",
 				remainder: "  raw ",
 			}),
-		).toMatchObject({ ok: true, value: "accepted" });
+		).toMatchObject({ ok: true, value: { disposition: "accepted" } });
 		expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
 		await runtime.close();
 	});
@@ -206,6 +208,96 @@ describe("application runtime", () => {
 			await runtime.close();
 		},
 	);
+
+	it.each([undefined, "pi"] as const)(
+		"creates a session without a harness ID using the built-in Pi default (%s)",
+		async (defaultHarnessId) => {
+			const instance: HarnessInstance = {
+				processId: "default-pi-process" as never,
+				exit: new Promise(() => {}),
+				nativeSessionId: "native-default",
+				events: (async function* () {})(),
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			};
+			const launch = vi
+				.spyOn(PiRpcHarnessAdapter.prototype, "launch")
+				.mockResolvedValue(instance);
+			const runtime = await ApplicationRuntime.start({
+				piExecutable: "/unused/pi",
+				...(defaultHarnessId ? { defaultHarnessId } : {}),
+				stateDirectory: await state(),
+				transports: [],
+			});
+			const created = await runtime.dispatch({
+				requestId: "create-default-pi",
+				principalId: "test",
+				kind: "create",
+				cwd: os.tmpdir(),
+			});
+			expect(sessionFrom(created)).toMatchObject({
+				harnessId: "pi-rpc",
+				nativeSessionId: "native-default",
+			});
+			expect(launch).toHaveBeenCalledOnce();
+			await runtime.close();
+		},
+	);
+
+	it("passes the same generic file handler to both built-in harnesses", async () => {
+		const makeInstance = (id: string): HarnessInstance => ({
+			processId: id as never,
+			exit: new Promise(() => {}),
+			events: (async function* () {})(),
+			async send() {},
+			async cancel() {},
+			async shutdown() {},
+		});
+		const claude = vi
+			.spyOn(ClaudeCodeHarnessAdapter.prototype, "launch")
+			.mockImplementation(function (this: ClaudeCodeHarnessAdapter) {
+				expect(this.descriptor.capabilities).toContain("harness.file.send");
+				return Promise.resolve(makeInstance("claude-file-send"));
+			});
+		const pi = vi
+			.spyOn(PiRpcHarnessAdapter.prototype, "launch")
+			.mockImplementation(function (this: PiRpcHarnessAdapter) {
+				expect(this.descriptor.capabilities).toContain("harness.file.send");
+				return Promise.resolve(makeInstance("pi-file-send"));
+			});
+		let catalog: readonly { readonly id: string }[] = [];
+		const transport = {
+			descriptor: { id: "file-send-transport" as never, capabilities: [] },
+			async start(...args: Parameters<TransportAdapter["start"]>) {
+				catalog = args[4]?.() ?? [];
+			},
+			async stop() {},
+			async sendAgentFile() {
+				return { fileName: "a", delivered: 1, recipients: 1 };
+			},
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			transports: [transport],
+		});
+		for (const harnessId of ["claude-code", "pi-rpc"] as const) {
+			await runtime.dispatch({
+				requestId: `create-${harnessId}-file-send`,
+				principalId: "test",
+				kind: "create",
+				harnessId: harnessId as never,
+				cwd: os.tmpdir(),
+			});
+		}
+		expect(catalog.map(({ id }) => id)).toEqual(
+			expect.arrayContaining(["claude-code", "pi-rpc"]),
+		);
+		expect(claude).toHaveBeenCalledOnce();
+		expect(pi).toHaveBeenCalledOnce();
+		await runtime.close();
+	});
 
 	it("routes optional session names and renames through the application boundary", async () => {
 		const runtime = await ApplicationRuntime.start({
@@ -956,6 +1048,17 @@ describe("application runtime", () => {
 		});
 		expect(cancel).toMatchObject({
 			requestId: "request-cancel",
+			ok: false,
+			error: { code: "UNSUPPORTED_CAPABILITY" },
+		});
+		const cancelCurrent = await dispatch({
+			requestId: "request-cancel-current",
+			principalId: "operator",
+			kind: "cancel_current",
+			sessionId: created.value.id,
+		});
+		expect(cancelCurrent).toMatchObject({
+			requestId: "request-cancel-current",
 			ok: false,
 			error: { code: "UNSUPPORTED_CAPABILITY" },
 		});

@@ -14,18 +14,25 @@ import os from "node:os";
 import path from "node:path";
 import { Bot } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TransportEvent, TransportResult } from "../src/core/ports.js";
+import type {
+	HarnessRegistryEntry,
+	TransportEvent,
+	TransportResult,
+} from "../src/core/ports.js";
 import type {
 	HarnessEvent,
+	InputId,
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
+import { ClaudeCodeHarnessAdapter } from "../src/harness/claude-code-harness.js";
 import { TelegramPanelStore } from "../src/telegram-panel-store.js";
 import {
 	acquireTelegramPollingLock,
 	TelegramTransportAdapter,
 	telegramLockPath,
 } from "../src/telegram-transport.js";
+import { fakeProvider } from "./claude-code-fake.js";
 
 const roots: string[] = [];
 function telegramVisibleText(text: string): string {
@@ -117,8 +124,8 @@ class MockBot {
 	get lastForceReplyMessageId(): number | undefined {
 		const index = this.sendOptions.findLastIndex(
 			(option) =>
-				(option as { reply_markup?: { force_reply?: boolean } }).reply_markup
-					?.force_reply,
+				(option as { reply_markup?: { force_reply?: boolean } } | undefined)
+					?.reply_markup?.force_reply,
 		);
 		return index < 0 ? undefined : this.sent[index]?.message_id;
 	}
@@ -581,6 +588,11 @@ async function startAdapter(
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
 		activityClock?: () => Date;
 		activityTimeFormatter?: (date: Date) => string;
+		capabilities?: readonly import("../src/core/errors.js").Capability[];
+		capabilitiesFor?: (
+			sessionId: SessionId,
+		) => readonly import("../src/core/errors.js").Capability[];
+		harnesses?: readonly HarnessRegistryEntry[];
 		panelClock?: () => number;
 		panelSleep?: (milliseconds: number) => Promise<void>;
 	} = {},
@@ -615,6 +627,10 @@ async function startAdapter(
 			};
 		},
 		async () => [...sessions.values()],
+		async (sessionId) =>
+			extras.capabilitiesFor?.(sessionId) ??
+			extras.capabilities ?? ["harness.cancel", "harness.reload"],
+		extras.harnesses ? () => extras.harnesses ?? [] : undefined,
 	);
 	await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
 	bot.ready();
@@ -654,7 +670,11 @@ describe("Telegram transport", () => {
 				if (request.kind === "command_list")
 					return { requestId: request.requestId, ok: true, value: discovered };
 				if (request.kind === "command_run")
-					return { requestId: request.requestId, ok: true, value: "accepted" };
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: { disposition: "handled", output: "Стоимость: $0.01" },
+					};
 				return result(request);
 			},
 		});
@@ -671,12 +691,12 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/CoSt@bot   two  spaces ");
 		const run = requests.find((request) => request.kind === "command_run");
 		expect(run).toMatchObject({ name: "cost", remainder: "   two  spaces " });
-		expect(bot.sent.at(-1)?.text).toContain("принял команду");
+		expect(bot.sent.at(-1)?.text).toContain("Стоимость: $0.01");
 		await bot.update(42, "/reload");
 		expect(requests.some((request) => request.kind === "reload")).toBe(true);
 		await bot.update(42, "/private");
 		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("принял команду"),
+			expect(bot.sent.at(-1)?.text).toContain("обработал команду"),
 		);
 		expect(bot.sent.at(-1)?.text).not.toContain("/secret/path");
 		await adapter.stop();
@@ -1265,6 +1285,32 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("hides and refuses cancel for a harness without the cancellation capability", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			capabilities: [],
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		expect(
+			bot.commandRegistrations
+				.at(-1)
+				?.commands.some(({ command }) => command === "cancel"),
+		).toBe(false);
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).not.toContain("/cancel");
+		await bot.update(42, "/cancel");
+		expect(bot.sent.at(-1)?.text).toContain("не поддерживается");
+		expect(
+			requests.some(
+				({ kind }) => kind === "cancel" || kind === "cancel_current",
+			),
+		).toBe(false);
+		await adapter.stop();
+	});
+
 	it("does not dispatch a command removed from fresh discovery", async () => {
 		const bot = new MockBot();
 		let inventory: readonly { name: string; description: string }[] = [
@@ -1354,7 +1400,11 @@ describe("Telegram transport", () => {
 					const accepted = request.beforeDispatch?.() ?? false;
 					finalGuard = accepted;
 					return accepted
-						? { requestId: request.requestId, ok: true, value: "accepted" }
+						? {
+								requestId: request.requestId,
+								ok: true,
+								value: { disposition: "accepted" },
+							}
 						: {
 								requestId: request.requestId,
 								ok: false,
@@ -2350,6 +2400,125 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("delivers Claude output through generic settled-turn events", async () => {
+		sessions.set("sid", sessionWith("sid", {}));
+		const bot = new MockBot();
+		const fake = fakeProvider();
+		const claude = new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		});
+		const instance = await claude.launch({
+			sessionId: "sid" as SessionId,
+			cwd: "/work",
+		});
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				const submission = instance.send({
+					id: "claude-input" as InputId,
+					sessionId: request.sessionId,
+					text: request.text,
+					createdAt: new Date(),
+				});
+				fake.record({ type: "system", subtype: "init", session_id: "sid" });
+				fake.record({
+					type: "user",
+					isReplay: true,
+					message: { role: "user", content: request.text },
+				});
+				await submission;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: "claude-input" as InputId,
+				};
+			},
+		});
+		const pumping = (async () => {
+			for await (const event of instance.events) emit(event);
+		})();
+		await bot.update(42, "/use sid");
+		await bot.update(42, "answer this");
+		fake.record({
+			type: "user",
+			isReplay: true,
+			message: { role: "user", content: "answer this" },
+		});
+		fake.record({
+			type: "stream_event",
+			event: {
+				type: "content_block_delta",
+				delta: { type: "text_delta", text: "Claude final answer." },
+			},
+		});
+		fake.record({
+			type: "result",
+			subtype: "success",
+			session_id: "sid",
+			is_error: false,
+			result: "Claude final answer.",
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Claude final answer.")),
+			).toBe(true),
+		);
+		fake.finish();
+		await pumping;
+		await adapter.stop();
+	});
+
+	it("does not start Telegram typing for a Claude result that precedes acknowledgement", async () => {
+		sessions.set("sid", sessionWith("sid", {}));
+		const bot = new MockBot();
+		const fake = fakeProvider();
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch({ sessionId: "sid" as SessionId, cwd: "/work" });
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				const sent = instance.send({
+					id: "late-ack" as InputId,
+					sessionId: request.sessionId,
+					text: request.text,
+					createdAt: new Date(),
+				});
+				fake.record({ type: "system", subtype: "init", session_id: "sid" });
+				fake.record({
+					type: "result",
+					subtype: "success",
+					session_id: "sid",
+					is_error: false,
+					result: "done",
+				});
+				await expect(sent).rejects.toThrow();
+				fake.record({
+					type: "user",
+					isReplay: true,
+					message: { role: "user", content: request.text },
+				});
+				fake.finish();
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: {
+						code: "INPUT_UNCERTAIN",
+						message: "Claude acknowledgement missing",
+					},
+				};
+			},
+		});
+		const pumping = (async () => {
+			for await (const event of instance.events) emit(event);
+		})();
+		await bot.update(42, "/use sid");
+		await bot.update(42, "answer this");
+		await pumping;
+		expect(bot.api.sendChatAction).not.toHaveBeenCalled();
+		await adapter.stop();
+	});
+
 	it("edits one reply bubble with Pi tool activity, sends the final answer separately, then deletes the bubble", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Review task" }));
 		const bot = new MockBot();
@@ -2857,6 +3026,57 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("queues input behind bg_wait and bare-cancels the selected session active input without replay", async () => {
+		const bot = new MockBot();
+		let submitCount = 0;
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") {
+					submitCount++;
+					return { ...result(request), value: `input-${submitCount}` as never };
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "active input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "notification", text: "bg_wait" },
+		});
+		await bot.update(42, "queued message");
+		expect(submitCount).toBe(2);
+		expect(
+			[...bot.sent, ...bot.edited].some(({ text }) => text.includes("queued")),
+		).toBe(true);
+		await bot.update(42, "/cancel");
+		expect(bot.sent.at(-1)?.text).toContain("Запрошена отмена ввода");
+		expect(
+			requests.filter(({ kind }) => kind === "cancel_current"),
+		).toHaveLength(1);
+		expect(
+			requests.find(({ kind }) => kind === "cancel_current"),
+		).toMatchObject({
+			sessionId: "sid",
+		});
+		expect(submitCount).toBe(2);
+		await bot.update(42, "new message after cancel");
+		expect(submitCount).toBe(3);
+		await adapter.stop();
+	});
+
 	it("keeps a canceling input on its old run while a later prompt waits for the abort gate", async () => {
 		let submitCount = 0;
 		let releaseCancel!: (value: TransportResult) => void;
@@ -2955,6 +3175,154 @@ describe("Telegram transport", () => {
 			bot.sent.find(({ text }) => text.includes("post-cancel run answer"))
 				?.text,
 		).toContain("Фоновая сессия");
+		await adapter.stop();
+	});
+
+	it("reattributes preserved queued input after bare cancellation without leaking canceled-run output", async () => {
+		let submitCount = 0;
+		let releaseCancel!: (value: TransportResult) => void;
+		let cancelRequest: TransportEvent | undefined;
+		const cancelGate = new Promise<TransportResult>(
+			(resolve) => (releaseCancel = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "cancel_current") {
+					cancelRequest = request;
+					return cancelGate;
+				}
+				if (request.kind !== "submit") return result(request);
+				submitCount++;
+				return {
+					...result(request),
+					value: ["active-a", "queued-b", "continuation-a"][
+						submitCount - 1
+					] as never,
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(42, "active A input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "active-a" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "active-a" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(43, "queued B input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "queued-b" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "queued-b" as never, state: "accepted" },
+		});
+		const cancel = bot.update(42, "/cancel");
+		await vi.waitFor(() => expect(cancelRequest).toBeDefined());
+		emit(
+			harnessEvent("sid", "output", "canceled-run output must be suppressed"),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		const attributions = (
+			adapter as unknown as {
+				inputAttributions: Map<
+					string,
+					{ state: string; terminal: boolean; waitingForRun: boolean }
+				>;
+			}
+		).inputAttributions;
+		await vi.waitFor(() =>
+			expect(attributions.get("queued-b")).toMatchObject({
+				state: "accepted",
+				terminal: false,
+				waitingForRun: true,
+			}),
+		);
+		await bot.update(43, "/use other");
+		await bot.update(42, "A continuation");
+		if (!cancelRequest) throw new Error("missing current-run cancellation");
+		const cancelResult = result(cancelRequest);
+		if (!cancelResult.ok) throw new Error("cancel fixture was rejected");
+		releaseCancel(cancelResult);
+		await cancel;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "active-a" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(attributions.get("queued-b")).toMatchObject({
+				state: "accepted",
+				terminal: false,
+				waitingForRun: true,
+			}),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "continuation-a" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "continuation-a" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "follow-on continuation answer"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "queued-b" as never, state: "completed" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "continuation-a" as never, state: "completed" },
+		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		const answerForA = bot.sent.filter(
+			(message) =>
+				message.chatId === 42 &&
+				message.text.includes("follow-on continuation answer"),
+		);
+		const answerForB = bot.sent.filter(
+			(message) =>
+				message.chatId === 43 &&
+				message.text.includes("follow-on continuation answer"),
+		);
+		expect(answerForA).toHaveLength(1);
+		expect(answerForB).toHaveLength(1);
+		expect(answerForB[0]?.text).toContain("Фоновая сессия");
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("canceled-run output must be suppressed"),
+			),
+		).toBe(false);
+		expect(submitCount).toBe(3);
+		expect(
+			requests.filter(({ kind }) => kind === "cancel_current"),
+		).toHaveLength(1);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(3);
 		await adapter.stop();
 	});
 
@@ -6044,6 +6412,76 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps /reload hidden through Claude recovery and cross-chat stop lifecycle", async () => {
+		const bot = new MockBot();
+		sessions.set("claude", {
+			id: "claude" as SessionId,
+			harnessId: "claude-code" as never,
+			cwd: "/work",
+			status: "running",
+		});
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			capabilitiesFor: (sessionId) =>
+				sessionId === ("claude" as SessionId)
+					? ["harness.cancel"]
+					: ["harness.cancel", "harness.reload"],
+		});
+		const commandsFor = (chatId: number) =>
+			bot.commandRegistrations
+				.filter(({ other }) =>
+					JSON.stringify(other).includes(`"chat_id":${chatId}`),
+				)
+				.at(-1)
+				?.commands.map(({ command }) => command);
+		const countFor = (chatId: number) =>
+			bot.commandRegistrations.filter(({ other }) =>
+				JSON.stringify(other).includes(`"chat_id":${chatId}`),
+			).length;
+		const expectReload = (chatId: number, included: boolean) => {
+			const commands = commandsFor(chatId) ?? [];
+			if (included) expect(commands).toContain("reload");
+			else expect(commands).not.toContain("reload");
+		};
+
+		await bot.update(42, "/use claude");
+		await vi.waitFor(() => expectReload(42, false));
+		await bot.update(42, "/reload");
+		expect(bot.sent.at(-1)?.text).toContain("не поддерживается");
+		for (const status of ["harness_restarting", "harness_recovery_failed"]) {
+			const before = countFor(42);
+			emit(harnessEvent("claude", "status", status));
+			await vi.waitFor(() => {
+				expect(countFor(42)).toBeGreaterThan(before);
+				expectReload(42, false);
+			});
+			await bot.update(42, "/help");
+			expect(bot.sent.at(-1)?.text).not.toContain("/reload");
+		}
+		await bot.update(43, "/stop claude");
+		await vi.waitFor(() => expectReload(42, false));
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).not.toContain("/reload");
+		expect(requests.find(({ kind }) => kind === "stop")).toMatchObject({
+			kind: "stop",
+			sessionId: "claude",
+		});
+		expect(requests.some(({ kind }) => kind === "reload")).toBe(false);
+
+		await bot.update(43, "/use sid");
+		await vi.waitFor(() => expectReload(43, true));
+		for (const status of ["harness_restarting", "harness_recovery_failed"]) {
+			const before = countFor(43);
+			emit(harnessEvent("sid", "status", status));
+			await vi.waitFor(() => {
+				expect(countFor(43)).toBeGreaterThan(before);
+				expectReload(43, true);
+			});
+		}
+		await bot.update(43, "/help");
+		expect(bot.sent.at(-1)?.text).toContain("/reload");
+		await adapter.stop();
+	});
+
 	it("registers commands and formats IDs as safely escaped code", async () => {
 		sessions.set("other", {
 			...sessionWith("sid", { status: "stopped" }),
@@ -6086,9 +6524,9 @@ describe("Telegram transport", () => {
 			"reload",
 			"model",
 			"effort",
+			"permissions",
 			"stop",
 			"delete",
-			"cancel",
 		]);
 
 		await bot.update(100, "/start");
@@ -6390,12 +6828,16 @@ describe("Telegram transport", () => {
 			"inspect",
 			"inspect",
 			"session_status",
+			"adapter_options_list",
 			"inspect",
 			"model_list",
+			"adapter_options_list",
 			"inspect",
 			"model_set",
+			"adapter_options_list",
 			"inspect",
 			"effort_list",
+			"adapter_options_list",
 			"inspect",
 			"effort_set",
 			"session_status",
@@ -6405,24 +6847,24 @@ describe("Telegram transport", () => {
 			kind: "session_status",
 			sessionId: "sid",
 		});
-		expect(requests[4]).toMatchObject({ kind: "model_list", sessionId: "sid" });
-		expect(requests[6]).toMatchObject({
+		expect(requests[5]).toMatchObject({ kind: "model_list", sessionId: "sid" });
+		expect(requests[8]).toMatchObject({
 			kind: "model_set",
 			sessionId: "other",
 			provider: "openai",
 			modelId: "gpt-next",
 			effort: "high",
 		});
-		expect(requests[8]).toMatchObject({
+		expect(requests[11]).toMatchObject({
 			kind: "effort_list",
 			sessionId: "sid",
 		});
-		expect(requests[10]).toMatchObject({
+		expect(requests[14]).toMatchObject({
 			kind: "effort_set",
 			sessionId: "other",
 			effort: "high",
 		});
-		expect(requests[12]).toMatchObject({ kind: "submit", sessionId: "other" });
+		expect(requests[16]).toMatchObject({ kind: "submit", sessionId: "other" });
 		expect(
 			bot.sent.some(
 				({ chatId, text }) => chatId === 100 && text.includes("Токены: 1,234"),
@@ -6593,6 +7035,61 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("passes a canonical harness ID from /new and rejects unknown aliases", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			harnesses: [
+				{
+					id: "claude-code" as never,
+					aliases: ["claude"],
+					capabilities: ["harness.launch"],
+				},
+			],
+		});
+		await bot.update(42, "/new @claude /tmp/my project");
+		expect(requests[0]).toMatchObject({
+			kind: "create",
+			harnessId: "claude-code",
+			cwd: "/tmp/my project",
+		});
+		await bot.update(42, "/new @missing /tmp/fallback");
+		expect(requests.filter(({ kind }) => kind === "create")).toHaveLength(1);
+		expect(bot.sent.at(-1)?.text).toContain("Неизвестный harness");
+		await adapter.stop();
+	});
+
+	it("carries the panel harness choice through the name prompt into session creation", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			harnesses: [
+				{
+					id: "claude-code" as never,
+					aliases: ["claude"],
+					capabilities: ["harness.launch"],
+				},
+			],
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelMessageId);
+		const harnessCallback = callbackData(
+			bot.sendOptions.at(-1),
+			"create-harness:",
+		);
+		const chooserMessageId = bot.lastMessageId;
+		await bot.callback(42, harnessCallback, chooserMessageId);
+		await bot.update(42, "Panel-created", {
+			replyToMessageId: bot.lastForceReplyMessageId,
+		});
+		expect(requests.findLast(({ kind }) => kind === "create")).toMatchObject({
+			kind: "create",
+			harnessId: "claude-code",
+			cwd: "/work",
+			name: "Panel-created",
+		});
+		await adapter.stop();
+	});
+
 	it("uses the initial cwd when /new has no explicit path", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp(), {
@@ -6600,6 +7097,7 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/new");
 		expect(requests[0]).toMatchObject({ kind: "create", cwd: "/work" });
+		expect(requests[0]).not.toHaveProperty("harnessId");
 		await adapter.stop();
 	});
 
@@ -8872,6 +9370,154 @@ describe("Telegram transport", () => {
 		nextBot.failStart();
 		await vi.waitFor(() => expect(fatal).toHaveBeenCalledOnce());
 		await live.adapter.stop();
+	});
+
+	it("routes a one-shot permission decision only from the authorized selected-session prompt", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const permission = adapter.requestToolPermission({
+			sessionId: "sid" as SessionId,
+			inputId: "turn-1" as never,
+			requestId: "wire-1",
+			toolName: "Read",
+			input: { file_path: "/work/secret.txt" },
+			context: { title: "Read file", description: "Read one file" },
+			signal: new AbortController().signal,
+		});
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Запрос разрешения"),
+		);
+		const prompt = bot.sent.at(-1);
+		const allow = callbackData(bot.sendOptions.at(-1), "permission:");
+		await bot.callback(42, allow, prompt?.message_id);
+		await expect(permission).resolves.toEqual({ behavior: "allow" });
+		await bot.callback(42, allow, prompt?.message_id);
+		expect(
+			requests.filter((request) => request.kind === "adapter_options_set"),
+		).toHaveLength(0);
+		await adapter.stop();
+	});
+
+	it("uses descriptor-declared model and effort options in the session panel", async () => {
+		const bot = new MockBot();
+		sessions.set(
+			"sid",
+			sessionWith("sid", {
+				harnessId: "claude-code" as never,
+				adapterOptions: { model: "sonnet" },
+			}),
+		);
+		const optionUpdates: Extract<
+			TransportEvent,
+			{ kind: "adapter_options_set" }
+		>[] = [];
+		const descriptors = [
+			{
+				key: "model",
+				label: "Модель",
+				values: ["sonnet", "opus"],
+				allowCustom: true,
+			},
+			{ key: "effort", label: "Effort", values: ["low", "high"] },
+		];
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "adapter_options_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: {
+							descriptors,
+							effective: { model: "sonnet", effort: "high" },
+						},
+					};
+				if (request.kind === "adapter_options_set") {
+					optionUpdates.push(request);
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: sessionWith("sid", { adapterOptions: request.update.set }),
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		await bot.callback(42, "menu:models", panelId);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Модель просмотра"),
+		);
+		await bot.callback(42, "model:select:1", panelId);
+		expect(optionUpdates[0]?.update).toEqual({ set: { model: "opus" } });
+		expect(
+			requests.some(
+				(request) =>
+					request.kind === "model_set" || request.kind === "model_list",
+			),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("requires explicit bypass confirmation and distinguishes native default from reset", async () => {
+		const bot = new MockBot();
+		const updates: Extract<TransportEvent, { kind: "adapter_options_set" }>[] =
+			[];
+		const descriptor = {
+			key: "permissionMode",
+			label: "Разрешения",
+			values: [
+				"default",
+				"acceptEdits",
+				"plan",
+				"bypassPermissions",
+				"dontAsk",
+				"auto",
+			],
+			dangerousValues: ["bypassPermissions"],
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "adapter_options_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: {
+							descriptors: [descriptor],
+							defaults: { permissionMode: "plan" },
+							effective: { permissionMode: "plan" },
+						},
+					};
+				if (request.kind === "adapter_options_set") {
+					updates.push(request);
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: sessionWith("sid", { adapterOptions: request.update.set }),
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/permissions bypassPermissions");
+		const confirmation = bot.sent.at(-1);
+		const confirmToken = callbackData(
+			bot.sendOptions.at(-1),
+			"option-confirm:",
+		);
+		await bot.callback(42, confirmToken, confirmation?.message_id);
+		expect(updates[0]?.update).toEqual({
+			set: { permissionMode: "bypassPermissions" },
+			confirmedDangerous: true,
+		});
+		await bot.update(42, "/permissions manual");
+		expect(updates[1]?.update).toEqual({ set: { permissionMode: "default" } });
+		await bot.update(42, "/permissions default");
+		expect(updates[2]?.update).toEqual({ resetKeys: ["permissionMode"] });
+		await adapter.stop();
 	});
 
 	it("claims a non-secret lock, recovers only demonstrably stale owners, and fails closed", async () => {

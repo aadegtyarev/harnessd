@@ -39,6 +39,15 @@ describe("shared command catalog", () => {
 		]);
 	});
 
+	it("filters reload from Telegram help and menus by harness capability", () => {
+		expect(
+			getTelegramCommands(true, false).map(({ command }) => command),
+		).not.toContain("reload");
+		expect(
+			getTelegramCommands(true, true).map(({ command }) => command),
+		).toContain("reload");
+	});
+
 	it("has Telegram menu metadata for every command visible there", () => {
 		for (const entry of COMMAND_CATALOG) {
 			if (entry.visibility === "cli-only") continue;

@@ -168,10 +168,19 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 	{
 		visibility: "telegram-only",
 		section: "private-chat",
-		usage: "/effort [level]",
+		usage: "/effort [level|default]",
 		telegram: {
 			command: "effort",
 			description: "Показать или задать effort модели.",
+		},
+	},
+	{
+		visibility: "telegram-only",
+		section: "private-chat",
+		usage: "/permissions [mode|default]",
+		telegram: {
+			command: "permissions",
+			description: "Показать или задать режим разрешений Claude.",
 		},
 	},
 	{
@@ -192,10 +201,10 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
 	{
 		visibility: "both",
 		section: "private-chat",
-		usage: "/cancel <inputId>",
+		usage: "/cancel [inputId]",
 		telegram: {
 			command: "cancel",
-			description: "Отменить ввод в выбранной сессии.",
+			description: "Отменить активный ввод выбранной сессии.",
 		},
 	},
 ];
@@ -217,12 +226,20 @@ export function getCliCommandUsages(
 	});
 }
 
-export function getTelegramCommands(): readonly {
+export function getTelegramCommands(
+	includeCancel = true,
+	includeReload = true,
+): readonly {
 	readonly command: string;
 	readonly description: string;
 }[] {
 	return COMMAND_CATALOG.flatMap((command) => {
-		if (command.visibility === "cli-only") return [];
+		if (
+			command.visibility === "cli-only" ||
+			(!includeCancel && command.telegram.command === "cancel") ||
+			(!includeReload && command.telegram.command === "reload")
+		)
+			return [];
 		return [
 			{
 				command: command.telegram.command,
@@ -238,9 +255,14 @@ export function getTelegramHelpUsages(): readonly string[] {
 	);
 }
 
-export function getTelegramHelpLines(): readonly string[] {
+export function getTelegramHelpLines(
+	includeCancel = true,
+	includeReload = true,
+): readonly string[] {
 	return COMMAND_CATALOG.flatMap((command) =>
-		command.visibility === "cli-only"
+		command.visibility === "cli-only" ||
+		(!includeCancel && command.telegram.command === "cancel") ||
+		(!includeReload && command.telegram.command === "reload")
 			? []
 			: [`${command.usage} — ${command.telegram.description}`],
 	);
