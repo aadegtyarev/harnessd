@@ -5,6 +5,7 @@ export class TelegramPanelRefreshScheduler {
 	private readonly lastRun = new Map<number, number>();
 	private readonly generations = new Map<number, number>();
 	private readonly running = new Set<number>();
+	private readonly flushRequested = new Set<number>();
 
 	constructor(
 		private readonly clock: () => number = Date.now,
@@ -18,7 +19,8 @@ export class TelegramPanelRefreshScheduler {
 		this.generations.set(chatId, (this.generations.get(chatId) ?? 0) + 1);
 		if (flush) {
 			this.clearTimer(chatId);
-			void this.run(chatId);
+			if (this.running.has(chatId)) this.flushRequested.add(chatId);
+			else void this.run(chatId);
 			return;
 		}
 		this.arm(chatId);
@@ -52,7 +54,9 @@ export class TelegramPanelRefreshScheduler {
 			await refresh();
 		} finally {
 			this.running.delete(chatId);
-			if (
+			if (this.flushRequested.delete(chatId) && this.pending.has(chatId))
+				void this.run(chatId);
+			else if (
 				this.pending.has(chatId) &&
 				this.generations.get(chatId) !== generation
 			)

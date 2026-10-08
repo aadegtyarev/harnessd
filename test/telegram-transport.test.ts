@@ -683,6 +683,199 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("discards a slow older live-status render after a newer generation commits", async () => {
+		const bot = new MockBot();
+		let statusCount = 0;
+		let releaseOld!: (result: TransportResult) => void;
+		const oldStatus = new Promise<TransportResult>(
+			(resolve) => (releaseOld = resolve),
+		);
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				statusCount++;
+				if (statusCount === 2) return oldStatus;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: {
+							model: {
+								provider: "test",
+								id: `model-${statusCount}`,
+								name: `model-${statusCount}`,
+							},
+						},
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const olderRender = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(statusCount).toBe(2));
+		await bot.update(42, "/menu");
+		const committed = bot.edited.length;
+		expect(bot.edited.at(-1)?.text).toContain("Модель: test/model-3");
+		releaseOld({
+			requestId: "old" as never,
+			ok: true,
+			value: {
+				session: sessions.get("sid") as SessionSummary,
+				live: {
+					model: {
+						provider: "test",
+						id: "stale-model",
+						name: "stale-model",
+					},
+				},
+			},
+		} as TransportResult);
+		await olderRender;
+		expect(bot.edited).toHaveLength(committed);
+		expect(bot.edited.at(-1)?.text).not.toContain("stale-model");
+		await adapter.stop();
+	});
+
+	it("advances panel update time for metric-only changes but not identical metrics", async () => {
+		const bot = new MockBot();
+		let tokens = 10;
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(time * 1000),
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: { usage: { inputTokens: tokens } },
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const before = bot.sent.at(-1)?.text ?? "";
+		tokens = 11;
+		time = 1;
+		await bot.update(42, "/menu");
+		const changed = bot.edited.at(-1)?.text ?? "";
+		expect(changed).toContain("↑11");
+		expect(changed).toContain("Обновлено: 00:00:01");
+		time = 2;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toBe(changed);
+		expect(before).toContain("Обновлено: 00:00:00");
+		await adapter.stop();
+	});
+
+	it("refreshes the preview on recovery and fatal process-exit events", async () => {
+		const bot = new MockBot();
+		let statusQueries = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status") statusQueries++;
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		for (const text of [
+			"harness_restarting",
+			"harness_recovered",
+			"harness_recovery_failed",
+		]) {
+			const before = statusQueries;
+			emit(harnessEvent("sid", "status", text));
+			await vi.waitFor(() => expect(statusQueries).toBeGreaterThan(before));
+		}
+		const beforeFatal = statusQueries;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "error",
+			message: "process exited",
+			fatal: true,
+		} as HarnessEvent);
+		await vi.waitFor(() => expect(statusQueries).toBeGreaterThan(beforeFatal));
+		await adapter.stop();
+	});
+
+	it("does not let a delayed startup session list replace a newer panel generation", async () => {
+		const bot = new MockBot();
+		let listCount = 0;
+		let releaseOld!: (result: TransportResult) => void;
+		const oldList = new Promise<TransportResult>(
+			(resolve) => (releaseOld = resolve),
+		);
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "list") return result(request);
+				listCount++;
+				if (listCount === 1) return oldList;
+				return result(request);
+			},
+		});
+		const startupRender = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(listCount).toBe(1));
+		await bot.update(42, "/menu");
+		releaseOld({
+			requestId: "old" as never,
+			ok: true,
+			value: [sessions.get("other") as SessionSummary],
+		} as TransportResult);
+		await startupRender;
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Просмотр: #sid");
+		await adapter.stop();
+	});
+
+	it("discards stale panel updates queued behind an in-flight Telegram edit", async () => {
+		const bot = new MockBot();
+		let tokens = 10;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: { usage: { inputTokens: tokens } },
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		let releaseEdit!: () => void;
+		let editStarted!: () => void;
+		const started = new Promise<void>((resolve) => (editStarted = resolve));
+		const blocked = new Promise<void>((resolve) => (releaseEdit = resolve));
+		bot.editMessageBehavior = async () => {
+			editStarted();
+			await blocked;
+		};
+		tokens = 11;
+		const firstEdit = bot.update(42, "/menu");
+		await started;
+		tokens = 12;
+		const staleQueued = bot.update(42, "/menu");
+		tokens = 13;
+		const newestQueued = bot.update(42, "/menu");
+		releaseEdit();
+		await Promise.all([firstEdit, staleQueued, newestQueued]);
+		expect(bot.edited).toHaveLength(2);
+		expect(bot.edited.at(-1)?.text).toContain("↑13");
+		expect(bot.edited.map((entry) => entry.text).join("\n")).not.toContain(
+			"↑12",
+		);
+		await adapter.stop();
+	});
+
 	it("renders null live metrics unavailable and a transient status failure generically", async () => {
 		const bot = new MockBot();
 		let queryFails = false;

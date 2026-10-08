@@ -3381,6 +3381,7 @@ export class TelegramTransportAdapter
 		const renderRequest = (this.panelRenderRequests.get(chatId) ?? 0) + 1;
 		this.panelRenderRequests.set(chatId, renderRequest);
 		const listed = await this.request(sender, { kind: "list" });
+		if (this.panelRenderRequests.get(chatId) !== renderRequest) return;
 		const sessions = listed.ok
 			? (listed.value as readonly SessionSummary[])
 			: [];
@@ -3422,10 +3423,7 @@ export class TelegramTransportAdapter
 				kind: "session_status",
 				sessionId: previewId,
 			});
-			if (result.ok) {
-				status = result.value as HarnessSessionStatus;
-				this.rememberSession(status.session);
-			}
+			if (result.ok) status = result.value as HarnessSessionStatus;
 		}
 		if (
 			this.panelRenderRequests.get(chatId) !== renderRequest ||
@@ -3434,6 +3432,7 @@ export class TelegramTransportAdapter
 				sessions[0]?.id) !== previewId
 		)
 			return;
+		if (status) this.rememberSession(status.session);
 		const preview = status?.session ?? previewFromList;
 		const liveAvailable = status?.live !== undefined;
 		const liveState = !preview
@@ -3551,6 +3550,7 @@ export class TelegramTransportAdapter
 			boundedPanelText(lines),
 			keyboard(rows),
 			messageId,
+			() => this.panelRenderRequests.get(chatId) === renderRequest,
 		);
 	}
 
@@ -3585,11 +3585,16 @@ export class TelegramTransportAdapter
 		text: string,
 		replyMarkup: unknown,
 		messageId?: number,
+		isCurrent: () => boolean = () => true,
 	): Promise<boolean> {
 		const previous = this.panelUpdateQueues.get(chatId) ?? Promise.resolve();
 		const update = previous
 			.catch(() => undefined)
-			.then(() => this.updatePanelNow(chatId, text, replyMarkup, messageId));
+			.then(() =>
+				isCurrent()
+					? this.updatePanelNow(chatId, text, replyMarkup, messageId)
+					: false,
+			);
 		this.panelUpdateQueues.set(chatId, update);
 		const cleanup = () => {
 			if (this.panelUpdateQueues.get(chatId) === update)
