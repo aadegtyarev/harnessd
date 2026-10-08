@@ -16,18 +16,23 @@ describe("Telegram extension command catalog", () => {
 		expect(result).toEqual([{ name: "cost", description: "safe text" }]);
 	});
 
-	it("keeps native commands first and limits each menu to Telegram's maximum", () => {
-		const extensions = Array.from({ length: 120 }, (_, index) => ({
-			name: `extra${String(index).padStart(3, "0")}`,
-			description: "Extension",
-		}));
+	it("keeps native commands first, filters menu names, and enforces Telegram's maximum", () => {
+		const extensions = [
+			{ name: "my-command", description: "Invalid menu name" },
+			{ name: "extra_000", description: "Extension" },
+			...Array.from({ length: 119 }, (_, index) => ({
+				name: `extra${String(index).padStart(3, "0")}`,
+				description: "Extension",
+			})),
+		];
 		const menu = telegramMenuCommands(extensions);
 		expect(menu).toHaveLength(100);
 		expect(menu[0]?.command).toBe("start");
 		expect(
 			menu.findIndex(({ command }) => command === "reload"),
 		).toBeGreaterThan(-1);
-		expect(menu.slice(-1)[0]?.command).toBe("extra080");
+		expect(menu.some(({ command }) => command === "my-command")).toBe(false);
+		expect(menu.slice(-1)[0]?.command).toBe("extra079");
 	});
 
 	it("paginates help without exceeding Telegram's message bound", () => {

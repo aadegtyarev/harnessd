@@ -1157,6 +1157,17 @@ export class TelegramTransportAdapter
 	};
 	private readonly selected = new Map<number, SessionId>();
 	private readonly selectionCurrency = new Map<number, number>();
+	private readonly commandMenuGenerations = new Map<number, number>();
+	private readonly commandMenuRequests = new Map<
+		number,
+		{
+			readonly generation: number;
+			readonly sessionId?: SessionId;
+			readonly sender: number;
+		}
+	>();
+	private readonly commandMenuTasks = new Map<number, Promise<void>>();
+	private readonly sessionMenuCurrencies = new Map<SessionId, number>();
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
 	private readonly reportedErrors = new Map<SessionId, Set<string>>();
@@ -1493,6 +1504,25 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		for (const [chatId, sessionId] of this.selected) {
+			this.selectionCurrency.set(
+				chatId,
+				(this.selectionCurrency.get(chatId) ?? 0) + 1,
+			);
+			this.sessionMenuCurrencies.set(
+				sessionId,
+				(this.sessionMenuCurrencies.get(sessionId) ?? 0) + 1,
+			);
+		}
+		for (const chatId of this.commandMenuGenerations.keys())
+			this.commandMenuGenerations.set(
+				chatId,
+				(this.commandMenuGenerations.get(chatId) ?? 0) + 1,
+			);
+		await withDeadline(
+			Promise.all([...this.commandMenuTasks.values()]).then(() => undefined),
+			STOP_TIMEOUT_MS,
+		).catch(() => {});
 		for (const chatId of this.panelMessageIds.keys())
 			this.panelIntents.begin(chatId);
 		try {
@@ -1609,12 +1639,12 @@ export class TelegramTransportAdapter
 			chatId,
 			(this.selectionCurrency.get(chatId) ?? 0) + 1,
 		);
+		void this.refreshCommandMenu(chatId, sessionId);
 		if (previous && previous !== sessionId && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
 		if (this.activeTypingSessions.has(sessionId)) this.startTyping(sessionId);
 		try {
 			await this.panelStore?.setSelected(chatId, sessionId);
-			void this.refreshCommandMenu(chatId, sessionId);
 			return true;
 		} catch (error) {
 			this.reportError("Telegram session selection could not be saved", error, [
@@ -1631,11 +1661,11 @@ export class TelegramTransportAdapter
 			chatId,
 			(this.selectionCurrency.get(chatId) ?? 0) + 1,
 		);
+		void this.refreshCommandMenu(chatId, undefined);
 		if (previous && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
 		try {
 			await this.panelStore?.clearSelected(chatId);
-			void this.refreshCommandMenu(chatId, undefined);
 			return true;
 		} catch (error) {
 			this.reportError(
@@ -1665,29 +1695,68 @@ export class TelegramTransportAdapter
 	}
 
 	private refreshMenusForSession(sessionId: SessionId, live: boolean): void {
+		this.sessionMenuCurrencies.set(
+			sessionId,
+			(this.sessionMenuCurrencies.get(sessionId) ?? 0) + 1,
+		);
 		for (const [chatId, selectedId] of this.selected)
 			if (selectedId === sessionId)
 				void this.refreshCommandMenu(chatId, live ? sessionId : undefined);
 	}
 
-	private async refreshCommandMenu(
+	private refreshCommandMenu(
 		chatId: number,
 		sessionId: SessionId | undefined,
 		sender = chatId,
 	): Promise<void> {
-		const extensions = sessionId
-			? ((await this.discoverExtensionCommands(sender, sessionId)) ?? [])
-			: [];
-		try {
-			await withDeadline(
-				this.bot.api.setMyCommands(telegramMenuCommands(extensions), {
-					scope: { type: "chat", chat_id: chatId },
-				}),
-				SEND_TIMEOUT_MS,
-			);
-		} catch (error) {
-			this.reportError("Telegram chat command menu registration failed", error);
-		}
+		const generation = (this.commandMenuGenerations.get(chatId) ?? 0) + 1;
+		this.commandMenuGenerations.set(chatId, generation);
+		this.commandMenuRequests.set(chatId, { generation, sessionId, sender });
+		const existing = this.commandMenuTasks.get(chatId);
+		if (existing) return existing;
+		const task = (async () => {
+			let completed = 0;
+			while (!this.stopping) {
+				const request = this.commandMenuRequests.get(chatId);
+				if (!request || request.generation === completed) return;
+				const extensions = request.sessionId
+					? ((await this.discoverExtensionCommands(
+							request.sender,
+							request.sessionId,
+						)) ?? [])
+					: [];
+				if (this.stopping) return;
+				if (
+					this.commandMenuRequests.get(chatId)?.generation !==
+						request.generation ||
+					(request.sessionId !== undefined &&
+						this.selected.get(chatId) !== request.sessionId)
+				)
+					continue;
+				let publication: Promise<unknown> | undefined;
+				try {
+					publication = Promise.resolve(
+						this.bot.api.setMyCommands(telegramMenuCommands(extensions), {
+							scope: { type: "chat", chat_id: chatId },
+						}),
+					);
+					await withDeadline(publication, SEND_TIMEOUT_MS);
+				} catch (error) {
+					this.reportError(
+						"Telegram chat command menu registration failed",
+						error,
+					);
+					if (publication) await publication.catch(() => {});
+				}
+				completed = request.generation;
+			}
+		})();
+		this.commandMenuTasks.set(chatId, task);
+		void task.finally(() => {
+			if (this.commandMenuTasks.get(chatId) === task)
+				this.commandMenuTasks.delete(chatId);
+		});
+		return task;
 	}
 
 	private isAuthorized(ctx: UpdateContext): boolean {
@@ -2654,16 +2723,28 @@ export class TelegramTransportAdapter
 		const args = rawRemainder.trim().split(/\s+/).filter(Boolean);
 		if (name === "/help" && args.length === 0) {
 			const sessionId = this.selected.get(chatId);
-			const commands = sessionId
+			const selectionCurrency = this.selectionCurrency.get(chatId) ?? 0;
+			const sessionCurrency = sessionId
+				? (this.sessionMenuCurrencies.get(sessionId) ?? 0)
+				: 0;
+			const discovered = sessionId
 				? await this.discoverExtensionCommands(sender, sessionId)
 				: undefined;
+			const current =
+				sessionId !== undefined &&
+				this.selected.get(chatId) === sessionId &&
+				(this.selectionCurrency.get(chatId) ?? 0) === selectionCurrency &&
+				(this.sessionMenuCurrencies.get(sessionId) ?? 0) === sessionCurrency;
+			const commands = current ? discovered : undefined;
 			const notes = !sessionId
 				? [
 						"Расширения Pi недоступны: сначала выберите живую сессию через /menu.",
 					]
 				: !commands
 					? [
-							"Расширения Pi сейчас недоступны; показаны только команды harnessd.",
+							current
+								? "Расширения Pi сейчас недоступны; показаны только команды harnessd."
+								: "Выбор или состояние сессии изменились; показаны только команды harnessd. Повторите /help.",
 						]
 					: [];
 			const extensions = (commands ?? []).map(
@@ -2711,7 +2792,7 @@ export class TelegramTransportAdapter
 				}
 			}
 			if (result.ok) {
-				void this.refreshCommandMenu(chatId, sessionId, sender);
+				this.refreshMenusForSession(sessionId, true);
 				const name = this.sessionNames.get(sessionId);
 				const currentSelection = this.selected.get(chatId);
 				const destinationName = currentSelection
@@ -2916,7 +2997,7 @@ export class TelegramTransportAdapter
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "resume", sessionId });
 			if (result.ok) {
-				void this.refreshCommandMenu(chatId, this.selected.get(chatId), sender);
+				this.refreshMenusForSession(sessionId, true);
 				this.invalidateSessionConfirmations(sessionId);
 				this.rememberSession(result.value as SessionSummary);
 				this.refreshPanelsPreviewing(sessionId, sender, true);
@@ -5802,6 +5883,7 @@ export class TelegramTransportAdapter
 				return;
 			}
 			this.rememberSession(resumed.value as SessionSummary);
+			this.refreshMenusForSession(intent.sessionId, true);
 			this.refreshPanelsPreviewing(intent.sessionId, sender, true);
 			if (!isCurrent()) {
 				await this.sendDirect(
@@ -5849,6 +5931,7 @@ export class TelegramTransportAdapter
 		else {
 			this.invalidateSessionConfirmations(sessionId);
 			this.rememberSession(result.value as SessionSummary);
+			this.refreshMenusForSession(sessionId, true);
 			this.refreshPanelsPreviewing(sessionId, sender, true);
 			const target = this.selected.get(chatId);
 			await this.sendDirect(
@@ -5888,6 +5971,7 @@ export class TelegramTransportAdapter
 		}
 		this.invalidateSessionConfirmations(sessionId);
 		this.rememberSession(result.value as SessionSummary);
+		this.refreshMenusForSession(sessionId, true);
 		this.refreshPanelsPreviewing(sessionId, sender, true);
 		const saved = await this.setSelected(chatId, sessionId);
 		this.previews.delete(chatId);

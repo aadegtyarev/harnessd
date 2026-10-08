@@ -49,6 +49,7 @@ export function telegramMenuCommands(
 	return [
 		...native,
 		...extensionCommands(extensions)
+			.filter(({ name }) => /^[a-z0-9_]+$/.test(name))
 			.slice(0, remaining)
 			.map(({ name, description }) => ({
 				command: name,
