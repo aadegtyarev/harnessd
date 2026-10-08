@@ -1238,8 +1238,9 @@ class PiRpcInstance implements HarnessInstance {
 			if (record.type === "agent_start") this.agentRunning = true;
 			if (record.type === "agent_settled") {
 				this.agentRunning = false;
-				// Pi settles the whole queued run, without identifying individual inputs.
+				// Settlement for an aborting run says nothing about native queued inputs.
 				for (const input of this.activeInputs.values()) {
+					if (this.abortInFlight && !input.canceling) continue;
 					if (input.accepted || !input.sentAsSteer) input.settled = true;
 					if (input.uncertain) this.activeInputs.delete(input.id);
 					else if (input.accepted && input.settled && !input.canceling)

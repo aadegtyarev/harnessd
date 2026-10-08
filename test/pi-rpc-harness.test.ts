@@ -1970,8 +1970,8 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
-	it("aborts the current run while preserving Pi's queued input and allows continuation", async () => {
-		const fake = fakeProvider();
+	it("keeps native queued input unresolved through abort settlement until later consumption", async () => {
+		const fake = fakeProvider({ holdAbort: true });
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
 			executable: "pi",
 			startupTimeoutMs: 100,
@@ -1979,35 +1979,68 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.send(input("active", "active-run"));
 		fake.stdout.write('{"type":"agent_start"}\n');
 		await instance.send(input("native queued", "queued-input"));
-		await instance.cancelCurrent?.();
-		await instance.send(input("continue", "after-cancel"));
-		const prompts = fake.commands.filter(
-			(command) => command.type === "prompt",
+		const cancel = instance.cancelCurrent?.();
+		await vi.waitFor(() =>
+			expect(fake.commands.some((command) => command.type === "abort")).toBe(
+				true,
+			),
 		);
-		const aborts = fake.commands.filter((command) => command.type === "abort");
-		expect(prompts).toHaveLength(3);
-		expect(aborts).toHaveLength(1);
-		const events = await collectEvents(instance, 8);
-		const inputEvents = events.flatMap((event) => event?.inputEvent ?? []);
-		expect(inputEvents).toContainEqual({
+		const abort = fake.commands.find((command) => command.type === "abort");
+		if (!abort || typeof abort.id !== "string")
+			throw new Error("current-run abort command was not sent");
+
+		fake.stdout.write('{"type":"agent_settled"}\n');
+		const earlyEvents = await collectEvents(instance, 6);
+		const earlyInputs = earlyEvents.flatMap((event) => event?.inputEvent ?? []);
+		expect(
+			earlyInputs.some(
+				(event) =>
+					event?.inputId === "queued-input" && event.state === "completed",
+			),
+		).toBe(false);
+		const queued = (
+			instance as unknown as {
+				activeInputs: Map<InputId, { accepted: boolean; settled: boolean }>;
+			}
+		).activeInputs.get("queued-input" as InputId);
+		expect(queued).toMatchObject({ accepted: true, settled: false });
+
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "response",
+				id: abort.id,
+				command: "abort",
+				success: true,
+			})}\n`,
+		);
+		await cancel;
+		const activeCanceled = await collectEvents(instance, 1);
+		expect(activeCanceled[0]?.inputEvent).toMatchObject({
 			inputId: "active-run",
 			state: "failed",
 			detail: "Input canceled",
 		});
-		expect(inputEvents).toContainEqual({
+		await instance.send(input("continue", "after-cancel"));
+		fake.stdout.write('{"type":"agent_start"}\n{"type":"agent_settled"}\n');
+		const laterEvents = await collectEvents(instance, 6);
+		const laterInputs = laterEvents.flatMap((event) => event?.inputEvent ?? []);
+		expect(laterInputs).toContainEqual({
 			inputId: "queued-input",
-			state: "accepted",
+			state: "completed",
 		});
-		expect(inputEvents).toContainEqual({
+		expect(laterInputs).toContainEqual({
 			inputId: "after-cancel",
-			state: "accepted",
+			state: "completed",
 		});
+		const prompts = fake.commands.filter(
+			(command) => command.type === "prompt",
+		);
+		expect(prompts).toHaveLength(3);
+		expect(prompts[1]).toMatchObject({ streamingBehavior: "steer" });
+		expect(prompts[2]).toMatchObject({ streamingBehavior: "steer" });
 		expect(
-			inputEvents.some(
-				(event) =>
-					event?.inputId === "queued-input" && event.state === "failed",
-			),
-		).toBe(false);
+			fake.commands.filter((command) => command.type === "abort"),
+		).toHaveLength(1);
 		await instance.shutdown();
 	});
 
