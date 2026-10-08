@@ -15,6 +15,8 @@ import {
 } from "./errors.js";
 import type {
 	HarnessAdapter,
+	HarnessCommand,
+	HarnessCommandResult,
 	HarnessControl,
 	HarnessEffortCatalog,
 	HarnessInstance,
@@ -614,6 +616,24 @@ export class SessionManager {
 		await control.setEffort(effort);
 	}
 
+	async listCommands(id: SessionId): Promise<readonly HarnessCommand[]> {
+		const { control } = await this.requireControl(id, "harness.commands.list");
+		if (!control.getCommands)
+			throw new UnsupportedCapabilityError("harness.commands.list", id);
+		return control.getCommands();
+	}
+
+	async runCommand(
+		id: SessionId,
+		name: string,
+		remainder: string,
+	): Promise<HarnessCommandResult> {
+		const { control } = await this.requireControl(id, "harness.commands.run");
+		if (!control.runCommand)
+			throw new UnsupportedCapabilityError("harness.commands.run", id);
+		return control.runCommand(name, remainder);
+	}
+
 	async reload(id: SessionId, beforeDispatch: () => boolean): Promise<void> {
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_ALREADY_RUNNING");
 		this.reloads.add(id);
@@ -676,7 +696,9 @@ export class SessionManager {
 			| "harness.model.set"
 			| "harness.effort.list"
 			| "harness.effort.set"
-			| "harness.reload",
+			| "harness.reload"
+			| "harness.commands.list"
+			| "harness.commands.run",
 	): Promise<{ control: HarnessControl; harness: HarnessAdapter }> {
 		const session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);

@@ -97,6 +97,19 @@ const safeErrorMessages = new Map([
 	["RELOAD_BUSY", "The session is busy; wait for Pi to become idle."],
 	["RELOAD_ALREADY_RUNNING", "A reload is already in progress."],
 	["RELOAD_SELECTION_CHANGED", "The selected session changed before reload."],
+	[
+		"COMMAND_DISCOVERY_FAILED",
+		"Pi command discovery is temporarily unavailable.",
+	],
+	[
+		"COMMAND_NOT_AVAILABLE",
+		"That Pi extension command is no longer available.",
+	],
+	["COMMAND_REJECTED", "Pi did not accept that extension command."],
+	[
+		"COMMAND_UNCERTAIN",
+		"Pi may have accepted the extension command; it was not retried.",
+	],
 	["MODEL_NOT_AVAILABLE", "Model is not available; use /model to see choices."],
 	[
 		"EFFORT_NOT_SUPPORTED",
@@ -404,6 +417,18 @@ export class ApplicationRuntime {
 				case "reload":
 					await this.manager.reload(request.sessionId, request.beforeDispatch);
 					value = undefined as typeof value;
+					break;
+				case "command_list":
+					value = (await this.manager.listCommands(
+						request.sessionId,
+					)) as typeof value;
+					break;
+				case "command_run":
+					value = (await this.manager.runCommand(
+						request.sessionId,
+						request.name,
+						request.remainder,
+					)) as typeof value;
 					break;
 			}
 			return { requestId: request.requestId, ok: true, value };

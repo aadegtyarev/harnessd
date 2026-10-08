@@ -142,6 +142,71 @@ function harnessPort(
 }
 
 describe("core capability contracts", () => {
+	it("routes dynamic inventory and command dispatch through the selected live instance", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const calls: unknown[][] = [];
+		const harness = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.commands.list",
+				"harness.commands.run",
+			],
+			launch: async () => ({
+				processId: "commands" as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				control: {
+					async getCommands() {
+						calls.push(["list"]);
+						return [{ name: "cost", description: "Cost" }];
+					},
+					async runCommand(name, remainder) {
+						calls.push(["run", name, remainder]);
+						return "accepted";
+					},
+					async getSelection() {
+						return {};
+					},
+					async getStatus() {
+						return {};
+					},
+					async listModels() {
+						return [];
+					},
+					async listEfforts() {
+						return [];
+					},
+					async setModel(provider, id) {
+						return { provider, id, name: id };
+					},
+					async setEffort() {},
+				},
+
+				async send() {},
+				async cancel() {},
+				async shutdown() {},
+			}),
+		});
+		const manager = new SessionManager(store, [harness.harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			expect(await manager.listCommands(session.id)).toEqual([
+				{ name: "cost", description: "Cost" },
+			]);
+			expect(await manager.runCommand(session.id, "cost", "  raw ")).toBe(
+				"accepted",
+			);
+			expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
 	it("uses required fields for each transport event kind", () => {
 		const events: TransportEvent[] = [
 			{ requestId: "1", principalId: "operator", kind: "list" },

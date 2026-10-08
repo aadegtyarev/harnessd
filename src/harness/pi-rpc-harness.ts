@@ -9,6 +9,8 @@ import { ReloadError, requireCapability } from "../core/errors.js";
 import type {
 	AgentFileSendHandler,
 	HarnessAdapter as HarnessAdapterPort,
+	HarnessCommand,
+	HarnessCommandResult,
 	HarnessControl,
 	HarnessInstance,
 	HarnessLaunchRequest,
@@ -90,7 +92,11 @@ export type PiControlErrorCode =
 	| "MODEL_NOT_AVAILABLE"
 	| "EFFORT_NOT_SUPPORTED"
 	| "RELOAD_BUSY"
-	| "RELOAD_SELECTION_CHANGED";
+	| "RELOAD_SELECTION_CHANGED"
+	| "COMMAND_DISCOVERY_FAILED"
+	| "COMMAND_NOT_AVAILABLE"
+	| "COMMAND_REJECTED"
+	| "COMMAND_UNCERTAIN";
 
 export class PiControlError extends Error {
 	constructor(
@@ -242,6 +248,8 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			"harness.effort.list",
 			"harness.effort.set",
 			"harness.reload",
+			"harness.commands.list",
+			"harness.commands.run",
 			"input.submit",
 		];
 		if (this.options.agentFileSend) capabilities.push("harness.file.send");
@@ -445,6 +453,25 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
 		? (value as Record<string, unknown>)
 		: undefined;
 }
+function commandInfo(value: unknown): HarnessCommand | undefined {
+	const command = recordValue(value);
+	if (
+		command?.source !== "extension" ||
+		typeof command.name !== "string" ||
+		!/^[a-z][a-z0-9_-]{0,31}$/.test(command.name) ||
+		command.name === "reload"
+	)
+		return undefined;
+	const description =
+		typeof command.description === "string"
+			? command.description
+					.replace(/[\p{Cc}\p{Cf}]/gu, " ")
+					.replace(/\s+/g, " ")
+					.trim()
+					.slice(0, 256)
+			: "";
+	return { name: command.name, description };
+}
 function modelInfo(value: unknown): HarnessModelInfo | undefined {
 	const model = recordValue(value);
 	if (
@@ -539,6 +566,8 @@ class PiRpcInstance implements HarnessInstance {
 	readonly processId: ManagedProcess["id"];
 	readonly exit: ManagedProcess["exit"];
 	readonly control: HarnessControl = {
+		getCommands: () => this.getCommands(),
+		runCommand: (name, remainder) => this.runCommand(name, remainder),
 		getSelection: () => this.getControlSelection(),
 		getStatus: () => this.getControlStatus(),
 		listModels: () => this.listModels(),
@@ -561,6 +590,7 @@ class PiRpcInstance implements HarnessInstance {
 	private reloadPending = false;
 	private reloadDispatched = false;
 	private reloadCommandVerified = false;
+	private commands: HarnessCommand[] = [];
 	private reloadTimedOut = false;
 	private eventsClosed = false;
 	private childExited = false;
@@ -696,6 +726,72 @@ class PiRpcInstance implements HarnessInstance {
 			throw new PiControlError("PI_CONTROL_FAILED", { cause: error });
 		}
 	}
+	private async discoverCommands(): Promise<HarnessCommand[]> {
+		try {
+			const response = await this.command("get_commands");
+			const listed = recordValue(response.data);
+			if (response.success !== true || !Array.isArray(listed?.commands))
+				throw new Error("Malformed command inventory");
+			const seen = new Set<string>();
+			const commands: HarnessCommand[] = [];
+			for (const entry of listed.commands) {
+				const command = commandInfo(entry);
+				if (
+					!command ||
+					command.name === this.reloadCommand ||
+					seen.has(command.name)
+				)
+					continue;
+				seen.add(command.name);
+				commands.push(command);
+			}
+			this.commands = commands;
+			return commands;
+		} catch (error) {
+			throw new PiControlError("COMMAND_DISCOVERY_FAILED", { cause: error });
+		}
+	}
+	private async getCommands(): Promise<readonly HarnessCommand[]> {
+		return this.discoverCommands();
+	}
+	private async runCommand(
+		name: string,
+		remainder: string,
+	): Promise<HarnessCommandResult> {
+		if (
+			!(await this.discoverCommands()).some((command) => command.name === name)
+		)
+			throw new PiControlError("COMMAND_NOT_AVAILABLE");
+		let dispatched = false;
+		try {
+			const response = await this.command(
+				"prompt",
+				{ message: `/${name}${remainder}` },
+				undefined,
+				false,
+				false,
+				() => {
+					if (this.eventsClosed || this.childExited || this.stdoutEnded)
+						throw new Error("Pi process is closed");
+					dispatched = true;
+				},
+			);
+			const disposition = recordValue(response.data)?.disposition;
+			if (response.success !== true)
+				throw new PiControlError("COMMAND_REJECTED");
+			if (disposition === "handled") return "handled";
+			if (["started", "queued", "accepted"].includes(String(disposition)))
+				return "accepted";
+			throw new PiControlError("COMMAND_REJECTED");
+		} catch (error) {
+			if (error instanceof PiControlError && error.code === "COMMAND_REJECTED")
+				throw error;
+			throw new PiControlError(
+				dispatched ? "COMMAND_UNCERTAIN" : "COMMAND_REJECTED",
+				{ cause: error },
+			);
+		}
+	}
 	private async reload(beforeDispatch?: () => void): Promise<void> {
 		const validateDispatch = beforeDispatch ?? (() => {});
 		if (
@@ -739,6 +835,11 @@ class PiRpcInstance implements HarnessInstance {
 				this.reloadExtensionError
 			)
 				throw new PiControlError("PI_CONTROL_FAILED");
+			try {
+				await this.discoverCommands();
+			} catch {
+				this.commands = [];
+			}
 		} catch (error) {
 			if (error instanceof PiControlError || error instanceof ReloadError)
 				throw error;
@@ -1220,6 +1321,18 @@ class PiRpcInstance implements HarnessInstance {
 		});
 		if (listed.success !== true || matches.length !== 1)
 			throw new PiStartupError("PI_STARTUP_FAILED");
+		const seen = new Set<string>();
+		this.commands = commands.flatMap((entry) => {
+			const command = commandInfo(entry);
+			if (
+				!command ||
+				command.name === this.reloadCommand ||
+				seen.has(command.name)
+			)
+				return [];
+			seen.add(command.name);
+			return [command];
+		});
 		this.reloadCommandVerified = true;
 		this.nativeId = sessionId;
 		return sessionId;

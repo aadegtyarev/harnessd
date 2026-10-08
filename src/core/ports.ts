@@ -139,6 +139,20 @@ export type TransportEvent =
 			readonly kind: "reload";
 			readonly sessionId: SessionId;
 			readonly beforeDispatch: () => boolean;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "command_list";
+			readonly sessionId: SessionId;
+	  }
+	| {
+			readonly requestId: string;
+			readonly principalId: string;
+			readonly kind: "command_run";
+			readonly sessionId: SessionId;
+			readonly name: string;
+			readonly remainder: string;
 	  };
 
 export type TransportResult =
@@ -151,6 +165,8 @@ export type TransportResult =
 				| HarnessSessionStatus
 				| HarnessModelCatalog
 				| HarnessEffortCatalog
+				| readonly HarnessCommand[]
+				| HarnessCommandResult
 				| HarnessModelChangeResult
 				| InputId
 				| undefined;
@@ -233,7 +249,16 @@ export interface HarnessLiveStatus extends HarnessSelection {
 	readonly usage?: HarnessUsageStats;
 }
 
+export interface HarnessCommand {
+	readonly name: string;
+	readonly description: string;
+}
+
+export type HarnessCommandResult = "handled" | "accepted";
+
 export interface HarnessControl {
+	getCommands?(): Promise<readonly HarnessCommand[]>;
+	runCommand?(name: string, remainder: string): Promise<HarnessCommandResult>;
 	getSelection(): Promise<HarnessSelection>;
 	getStatus(): Promise<HarnessLiveStatus>;
 	listModels(): Promise<readonly HarnessModelInfo[]>;

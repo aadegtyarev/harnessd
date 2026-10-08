@@ -9,6 +9,7 @@ import type {
 import { ApplicationRuntime } from "../src/application-runtime.js";
 import type {
 	HarnessAdapter,
+	HarnessInstance,
 	ProcessProvider,
 	TransportAdapter,
 	TransportEventSubscription,
@@ -73,6 +74,98 @@ function transport(
 }
 
 describe("application runtime", () => {
+	it("dispatches dynamic command list and run requests to core", async () => {
+		const store = await SqliteSessionStore.open(await state());
+		const calls: unknown[][] = [];
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "commands" as never,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.commands.list",
+					"harness.commands.run",
+				],
+			},
+			async launch() {
+				const instance: HarnessInstance = {
+					processId: "commands" as never,
+					exit: new Promise(() => {}),
+					events: (async function* () {})(),
+					control: {
+						async getCommands() {
+							calls.push(["list"]);
+							return [{ name: "cost", description: "Cost" }];
+						},
+						async runCommand(name, remainder) {
+							calls.push(["run", name, remainder]);
+							return "accepted";
+						},
+						async getSelection() {
+							return {};
+						},
+						async getStatus() {
+							return {};
+						},
+						async listModels() {
+							return [];
+						},
+						async listEfforts() {
+							return [];
+						},
+						async setModel(provider, id) {
+							return { provider, id, name: id };
+						},
+						async setEffort() {},
+					},
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				};
+				return instance;
+			},
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: await state(),
+			store,
+			transports: [],
+			harnesses: [harness],
+		});
+		const session = sessionFrom(
+			await runtime.dispatch({
+				requestId: "commands-create",
+				principalId: "test",
+				kind: "create",
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			}),
+		);
+		expect(
+			await runtime.dispatch({
+				requestId: "commands-list",
+				principalId: "test",
+				kind: "command_list",
+				sessionId: session.id,
+			}),
+		).toMatchObject({
+			ok: true,
+			value: [{ name: "cost", description: "Cost" }],
+		});
+		expect(
+			await runtime.dispatch({
+				requestId: "commands-run",
+				principalId: "test",
+				kind: "command_run",
+				sessionId: session.id,
+				name: "cost",
+				remainder: "  raw ",
+			}),
+		).toMatchObject({ ok: true, value: "accepted" });
+		expect(calls).toEqual([["list"], ["run", "cost", "  raw "]]);
+		await runtime.close();
+	});
+
 	it.each([undefined, "direct"] as const)(
 		"delegates create launch to NodeProcessProvider in direct mode %s",
 		async (executionMode) => {
