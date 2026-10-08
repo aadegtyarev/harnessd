@@ -1352,8 +1352,11 @@ export class TelegramTransportAdapter
 					const sender = this.options.allowedUserIds[0];
 					if (sender === undefined) continue;
 					await this.publishRestoredPanelStale(chatId, messageId);
+					const intent = this.panelIntents.current(chatId);
 					this.panelRefreshScheduler.schedule(chatId, () =>
-						this.refreshExistingPanel(chatId, sender),
+						this.panelIntents.isCurrent(chatId, intent)
+							? this.refreshExistingPanel(chatId, sender)
+							: Promise.resolve(),
 					);
 				}
 				this.scheduleInboxSweep();
@@ -3644,6 +3647,7 @@ export class TelegramTransportAdapter
 						? "Усилие: недоступно"
 						: null,
 			usage: liveAvailable ? compactUsage(status?.live?.usage) : null,
+			usageUnavailable: liveAvailable && !status?.live?.usage,
 			contextUnavailable:
 				liveAvailable &&
 				status?.live?.usage?.contextTokens == null &&
@@ -3679,9 +3683,13 @@ export class TelegramTransportAdapter
 			)
 				continue;
 			if (invalidateIntents) this.invalidatePanelIntent(chatId);
+			const intent = this.panelIntents.current(chatId);
 			this.panelRefreshScheduler.schedule(
 				chatId,
-				() => this.refreshExistingPanel(chatId, sender),
+				() =>
+					this.panelIntents.isCurrent(chatId, intent)
+						? this.refreshExistingPanel(chatId, sender)
+						: Promise.resolve(),
 				flush,
 			);
 		}

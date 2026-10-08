@@ -918,6 +918,57 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("advances panel time when usage availability changes without metric values", async () => {
+		const bot = new MockBot();
+		let live: Record<string, unknown> = {};
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) =>
+				request.kind === "session_status"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: {
+								session: sessions.get(request.sessionId) as SessionSummary,
+								live,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Использование: недоступно");
+		live = { usage: {} };
+		time = 1;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).not.toContain("Использование: недоступно");
+		expect(bot.edited.at(-1)?.text).toContain("Обновлено: 00:00:01");
+		await adapter.stop();
+	});
+
+	it("discards pending event refreshes after navigation but honors later events", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		const { adapter, emit } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.callback(42, "menu:folders", bot.lastMessageId);
+		const folderText = bot.edited.at(-1)?.text;
+		expect(folderText).toContain("Папки");
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.edited.at(-1)?.text).toBe(folderText);
+
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.edited.at(-1)?.text).toContain("📌 Панель сессий");
+		await adapter.stop();
+	});
+
 	it("renders availability, individual missing fields, and recovery transitions", async () => {
 		const bot = new MockBot();
 		let live: Record<string, unknown> | undefined = {};

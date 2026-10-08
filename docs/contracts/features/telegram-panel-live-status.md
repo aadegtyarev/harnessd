@@ -22,7 +22,7 @@ Show truthful, useful live status for the session currently previewed by each au
 ## Interfaces and constraints
 
 - Query only the current preview; do not broaden into session polling or alter core lifecycle/recovery ownership. Keep preview and selection independent.
-- Serialize edits per chat with a trailing newest-wins coalescer and generation guards. Enforce 500 ms minimum spacing and 2 s maximum wait; flush terminal lifecycle and explicit user actions.
+- Serialize edits per chat with a trailing newest-wins coalescer and generation guards. Enforce 500 ms minimum spacing and 2 s maximum wait for waiting/coalescing before API dispatch readiness. This maximum wait excludes time blocked behind an already in-flight strict single-flight Telegram edit: that call is neither overlapped nor canceled by the maximum-wait deadline and retains its existing ≤5 s API timeout. Once it completes, dispatch the newest queued render next, subject to the 500 ms spacing rule. Flush terminal lifecycle and explicit user actions.
 - Deduplicate when both rendered text and keyboard are identical. Preserve existing Telegram failure semantics; do not retry failed edits.
 - Local `Обновлено: HH:mm:ss` advances only when visible semantic lifecycle, activity, model, effort, usage, context, or availability changes—not on duplicate events/polls.
 - Retain authorization, HTML escaping, output truncation, and bounded query/API deadlines. Keep state in memory only; never persist live status or claim cached data is current.
