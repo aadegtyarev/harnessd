@@ -1,3 +1,7 @@
+export {
+	mergeAdapterOptions,
+	validateAdapterOptions,
+} from "./adapter-options.js";
 export type { Capability } from "./errors.js";
 export {
 	DuplicateAdapterIdError,
@@ -12,6 +16,7 @@ export {
 	SessionStoreError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
+export { HarnessRegistry } from "./harness-registry.js";
 export type {
 	HarnessAdapter,
 	HarnessControl,
@@ -22,6 +27,7 @@ export type {
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
 	HarnessModelInfo,
+	HarnessRegistryEntry,
 	HarnessSelection,
 	HarnessSessionStatus,
 	HarnessUsageStats,
@@ -50,6 +56,8 @@ export type { SessionStore } from "./session-store.js";
 export { resolveStateDirectory, SqliteSessionStore } from "./session-store.js";
 export type {
 	AdapterId,
+	AdapterOptions,
+	AdapterOptionValue,
 	HarnessEvent,
 	Input,
 	InputDeliveryState,

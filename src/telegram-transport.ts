@@ -2682,7 +2682,6 @@ export class TelegramTransportAdapter
 				: currentDirectory;
 			const result = await this.request(sender, {
 				kind: "create",
-				harnessId: "pi-rpc" as never,
 				cwd,
 			});
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
@@ -3554,7 +3553,6 @@ export class TelegramTransportAdapter
 			const name = reply === "/skip" ? undefined : text;
 			const result = await this.request(sender, {
 				kind: "create",
-				harnessId: "pi-rpc" as AdapterId,
 				cwd: flow.cwd,
 				...(name !== undefined ? { name } : {}),
 			});

@@ -254,7 +254,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			"input.submit",
 		];
 		if (this.options.agentFileSend) capabilities.push("harness.file.send");
-		return { id: "pi-rpc" as AdapterId, capabilities };
+		return { id: "pi-rpc" as AdapterId, aliases: ["pi"], capabilities };
 	}
 	constructor(
 		private readonly processes: ProcessProvider,

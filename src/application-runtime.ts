@@ -15,7 +15,7 @@ import {
 	resolveStateDirectory,
 	SqliteSessionStore,
 } from "./core/session-store.js";
-import type { HarnessEvent } from "./core/types.js";
+import type { AdapterOptions, HarnessEvent } from "./core/types.js";
 import { describeError } from "./error-diagnostics.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
@@ -176,6 +176,8 @@ export interface ApplicationRuntimeOptions {
 	>;
 	readonly transports: readonly TransportAdapter[];
 	readonly harnesses?: readonly HarnessAdapter[];
+	readonly defaultHarnessId?: string;
+	readonly adapterOptions?: AdapterOptions;
 	readonly stateDirectory?: string;
 	readonly store?: SessionStore & { close(): void };
 }
@@ -260,6 +262,14 @@ export class ApplicationRuntime {
 						},
 					),
 				],
+				{
+					...(options.defaultHarnessId
+						? { defaultHarnessId: options.defaultHarnessId }
+						: {}),
+					...(options.adapterOptions
+						? { adapterOptions: options.adapterOptions }
+						: {}),
+				},
 			);
 			manager = sessionManager;
 			const runtime = new ApplicationRuntime(
@@ -360,6 +370,7 @@ export class ApplicationRuntime {
 						harnessId: request.harnessId,
 						cwd: request.cwd,
 						name: request.name,
+						adapterOptions: request.adapterOptions,
 					})) as typeof value;
 					break;
 				case "rename":

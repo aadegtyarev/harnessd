@@ -2,6 +2,7 @@ import { mkdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { validateAdapterOptions } from "./adapter-options.js";
 import { InvalidStateDirectoryError, SessionStoreError } from "./errors.js";
 import type {
 	AdapterId,
@@ -118,6 +119,7 @@ export class SqliteSessionStore implements SessionStore {
 				native_session_id TEXT,
 				status TEXT NOT NULL CHECK (status IN ('starting', 'running', 'stopped', 'failed', 'uncertain')),
 				name TEXT,
+				adapter_options TEXT,
 				created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 			)`);
 			const columns = database.pragma("table_info(sessions)") as {
@@ -125,6 +127,8 @@ export class SqliteSessionStore implements SessionStore {
 			}[];
 			if (!columns.some((column) => column.name === "name"))
 				database.exec("ALTER TABLE sessions ADD COLUMN name TEXT");
+			if (!columns.some((column) => column.name === "adapter_options"))
+				database.exec("ALTER TABLE sessions ADD COLUMN adapter_options TEXT");
 			return new SqliteSessionStore(stateDirectory, database);
 		} catch (error) {
 			try {
@@ -142,9 +146,12 @@ export class SqliteSessionStore implements SessionStore {
 
 	async create(session: SessionSummary): Promise<void> {
 		try {
+			const adapterOptions = session.adapterOptions
+				? JSON.stringify(validateAdapterOptions(session.adapterOptions))
+				: null;
 			this.database
-				.prepare(`INSERT INTO sessions (id, harness_id, cwd, native_session_id, status, name)
-				VALUES (?, ?, ?, ?, ?, ?)`)
+				.prepare(`INSERT INTO sessions (id, harness_id, cwd, native_session_id, status, name, adapter_options)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`)
 				.run(
 					session.id,
 					session.harnessId,
@@ -152,6 +159,7 @@ export class SqliteSessionStore implements SessionStore {
 					session.nativeSessionId ?? null,
 					session.status,
 					session.name ?? null,
+					adapterOptions,
 				);
 		} catch (error) {
 			throw new SessionStoreError(`Could not persist session '${session.id}'`, {
@@ -164,7 +172,7 @@ export class SqliteSessionStore implements SessionStore {
 		try {
 			const rows = this.database
 				.prepare(
-					"SELECT id, harness_id, cwd, native_session_id, status, name FROM sessions ORDER BY created_at, id",
+					"SELECT id, harness_id, cwd, native_session_id, status, name, adapter_options FROM sessions ORDER BY created_at, id",
 				)
 				.all() as SessionRow[];
 			return rows.map(fromRow);
@@ -177,7 +185,7 @@ export class SqliteSessionStore implements SessionStore {
 		try {
 			const row = this.database
 				.prepare(
-					"SELECT id, harness_id, cwd, native_session_id, status, name FROM sessions WHERE id = ?",
+					"SELECT id, harness_id, cwd, native_session_id, status, name, adapter_options FROM sessions WHERE id = ?",
 				)
 				.get(id) as SessionRow | undefined;
 			return row ? fromRow(row) : undefined;
@@ -263,12 +271,20 @@ interface SessionRow {
 	native_session_id: string | null;
 	status: SessionStatus;
 	name: string | null;
+	adapter_options: string | null;
 }
 
 function fromRow(row: SessionRow): SessionSummary {
 	return {
 		id: row.id as SessionId,
 		...(row.name === null ? {} : { name: row.name }),
+		...(row.adapter_options === null
+			? {}
+			: {
+					adapterOptions: validateAdapterOptions(
+						JSON.parse(row.adapter_options),
+					),
+				}),
 		harnessId: row.harness_id as AdapterId,
 		cwd: row.cwd,
 		...(row.native_session_id === null

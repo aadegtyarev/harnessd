@@ -2,6 +2,7 @@ import type { Readable, Writable } from "node:stream";
 import type { Capability } from "./errors.js";
 import type {
 	AdapterId,
+	AdapterOptions,
 	HarnessEvent,
 	Input,
 	InputEvent,
@@ -13,7 +14,16 @@ import type {
 
 export interface PortDescriptor {
 	readonly id: AdapterId;
+	readonly aliases?: readonly string[];
 	readonly capabilities: readonly Capability[];
+	readonly metadata?: Readonly<Record<string, string>>;
+}
+
+export interface HarnessRegistryEntry {
+	readonly id: AdapterId;
+	readonly aliases: readonly string[];
+	readonly capabilities: readonly Capability[];
+	readonly metadata?: Readonly<Record<string, string>>;
 }
 
 export interface SessionPort {
@@ -21,9 +31,10 @@ export interface SessionPort {
 	list(): Promise<readonly SessionSummary[]>;
 	get(id: SessionId): Promise<SessionSummary | undefined>;
 	create(input: {
-		readonly harnessId: AdapterId;
+		readonly harnessId?: AdapterId;
 		readonly cwd: string;
 		readonly name?: string;
+		readonly adapterOptions?: AdapterOptions;
 	}): Promise<SessionSummary>;
 	rename(id: SessionId, name?: string): Promise<SessionSummary>;
 	stop(id: SessionId): Promise<void>;
@@ -52,9 +63,10 @@ export type TransportEvent =
 			readonly requestId: string;
 			readonly principalId: string;
 			readonly kind: "create";
-			readonly harnessId: AdapterId;
+			readonly harnessId?: AdapterId;
 			readonly cwd: string;
 			readonly name?: string;
+			readonly adapterOptions?: AdapterOptions;
 	  }
 	| {
 			readonly requestId: string;
@@ -223,6 +235,7 @@ export interface HarnessLaunchRequest {
 	readonly sessionId: SessionId;
 	readonly cwd: string;
 	readonly nativeSessionId?: string;
+	readonly adapterOptions?: AdapterOptions;
 }
 
 export interface HarnessModelInfo {

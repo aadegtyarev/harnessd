@@ -23,9 +23,11 @@ import type {
 } from "../src/core/index.js";
 import {
 	DuplicateAdapterIdError,
+	HarnessRegistry,
 	InvalidSessionNameError,
 	InvalidStateDirectoryError,
 	InvalidWorkingDirectoryError,
+	mergeAdapterOptions,
 	requireCapability,
 	resolveStateDirectory,
 	SessionManager,
@@ -295,6 +297,70 @@ describe("core capability contracts", () => {
 		);
 		store.close();
 	});
+
+	it("validates aliases, projects capabilities, and resolves inherited adapter options", async () => {
+		const state = await temporaryDirectory();
+		const workspace = await temporaryDirectory();
+		const store = await SqliteSessionStore.open(state);
+		const original = harnessPort().harness;
+		let launchOptions: unknown;
+		const harness: HarnessAdapter = {
+			...original,
+			descriptor: { ...original.descriptor, aliases: ["mock"] },
+			async launch(request) {
+				launchOptions = request.adapterOptions;
+				return original.launch(request);
+			},
+		};
+		const registry = new HarnessRegistry([harness]);
+		expect(registry.resolve("mock")).toBe("mock-harness");
+		expect(registry.project(["harness.launch"])).toHaveLength(1);
+		expect(
+			() =>
+				new HarnessRegistry([
+					{
+						...harness,
+						descriptor: { ...harness.descriptor, aliases: ["bad alias"] },
+					},
+				]),
+		).toThrow(/alias/);
+		expect(
+			() =>
+				new HarnessRegistry([
+					harness,
+					{
+						...harness,
+						descriptor: { ...harness.descriptor, id: "other" as never },
+					},
+				]),
+		).toThrow(/alias/);
+		const manager = new SessionManager(store, [harness], {
+			defaultHarnessId: "mock",
+			adapterOptions: { effort: "high", shared: true },
+		});
+		try {
+			const session = await manager.create({
+				cwd: workspace,
+				adapterOptions: { shared: false },
+			});
+			expect(session.harnessId).toBe("mock-harness");
+			expect(session.adapterOptions).toEqual({ shared: false });
+			expect(launchOptions).toEqual({ effort: "high", shared: false });
+			await store.update({ ...session, harnessId: "other" as never });
+			expect((await store.get(session.id))?.harnessId).toBe("mock-harness");
+		} finally {
+			await manager.close();
+		}
+		store.close();
+		const reopened = await SqliteSessionStore.open(state);
+		expect(await reopened.list()).toMatchObject([
+			{ harnessId: "mock-harness", adapterOptions: { shared: false } },
+		]);
+		reopened.close();
+		expect(mergeAdapterOptions({ effort: "low" }, { effort: "high" })).toEqual({
+			effort: "high",
+		});
+	});
 });
 
 describe("SQLite session management", () => {
@@ -327,7 +393,7 @@ describe("SQLite session management", () => {
 		reopened.close();
 	});
 
-	it("migrates an existing SQLite database by adding nullable session names", async () => {
+	it("migrates an existing SQLite database by adding nullable session names and options", async () => {
 		const state = await temporaryDirectory();
 		const database = new Database(path.join(state, "sessions.sqlite3"));
 		database.exec(`CREATE TABLE sessions (
@@ -353,6 +419,9 @@ describe("SQLite session management", () => {
 		});
 		expect(await store.get("legacy-session" as SessionId)).not.toHaveProperty(
 			"name",
+		);
+		expect(await store.get("legacy-session" as SessionId)).not.toHaveProperty(
+			"adapterOptions",
 		);
 		await store.setName("legacy-session" as SessionId, "Recovered session");
 		expect(await store.get("legacy-session" as SessionId)).toMatchObject({

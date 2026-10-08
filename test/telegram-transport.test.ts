@@ -6600,6 +6600,7 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/new");
 		expect(requests[0]).toMatchObject({ kind: "create", cwd: "/work" });
+		expect(requests[0]).not.toHaveProperty("harnessId");
 		await adapter.stop();
 	});
 

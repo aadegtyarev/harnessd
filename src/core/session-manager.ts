@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import {
+	mergeAdapterOptions,
+	validateAdapterOptions,
+} from "./adapter-options.js";
+import {
 	DuplicateAdapterIdError,
 	DuplicateSessionIdError,
 	InvalidSessionNameError,
@@ -13,6 +17,7 @@ import {
 	SessionNotStoppedError,
 	UnsupportedCapabilityError,
 } from "./errors.js";
+import { HarnessRegistry } from "./harness-registry.js";
 import type {
 	HarnessAdapter,
 	HarnessCommand,
@@ -28,6 +33,7 @@ import type {
 import type { SessionStore } from "./session-store.js";
 import type {
 	AdapterId,
+	AdapterOptions,
 	HarnessEvent,
 	Input,
 	InputId,
@@ -36,10 +42,11 @@ import type {
 } from "./types.js";
 
 export interface CreateSessionRequest {
-	readonly harnessId: AdapterId;
+	readonly harnessId?: AdapterId;
 	readonly cwd: string;
 	readonly name?: string;
 	readonly id?: string;
+	readonly adapterOptions?: AdapterOptions;
 }
 
 export type SessionEventListener = (event: HarnessEvent) => void;
@@ -55,6 +62,14 @@ type EventReadResult =
 
 export class SessionManager {
 	private readonly harnesses: ReadonlyMap<AdapterId, HarnessAdapter>;
+	private readonly registry: HarnessRegistry;
+	private readonly defaultOptions?: AdapterOptions;
+	private readonly defaultHarnessId?: AdapterId;
+	private adapterOptionsFor(
+		overrides?: AdapterOptions,
+	): AdapterOptions | undefined {
+		return mergeAdapterOptions(this.defaultOptions, overrides);
+	}
 	private readonly instances = new Map<SessionId, HarnessInstance>();
 	private readonly eventListeners = new Set<SessionEventListener>();
 	private readonly eventPumps = new Map<SessionId, ManagedEventPump>();
@@ -77,6 +92,10 @@ export class SessionManager {
 	constructor(
 		private readonly store: SessionStore,
 		harnesses: readonly HarnessAdapter[],
+		options: {
+			readonly defaultHarnessId?: string;
+			readonly adapterOptions?: AdapterOptions;
+		} = {},
 	) {
 		const registered = new Map<AdapterId, HarnessAdapter>();
 		for (const harness of harnesses) {
@@ -85,6 +104,16 @@ export class SessionManager {
 			registered.set(id, harness);
 		}
 		this.harnesses = registered;
+		this.registry = new HarnessRegistry(harnesses);
+		this.defaultOptions = options.adapterOptions
+			? validateAdapterOptions(options.adapterOptions)
+			: undefined;
+		const canonicalDefault = options.defaultHarnessId
+			? this.registry.resolve(options.defaultHarnessId)
+			: undefined;
+		if (options.defaultHarnessId && !canonicalDefault)
+			throw new Error(`Unknown default harness: ${options.defaultHarnessId}`);
+		this.defaultHarnessId = canonicalDefault;
 	}
 
 	subscribe(listener: SessionEventListener): () => void {
@@ -149,11 +178,15 @@ export class SessionManager {
 		this.creating.add(id);
 		try {
 			if (await this.store.get(id)) throw new DuplicateSessionIdError(id);
-			const harness = this.harnesses.get(request.harnessId);
+			const selectedHarness = request.harnessId ?? this.defaultHarnessId;
+			const canonicalId = selectedHarness
+				? this.registry.resolve(selectedHarness)
+				: undefined;
+			const harness = canonicalId ? this.harnesses.get(canonicalId) : undefined;
 			if (!harness)
 				throw new UnsupportedCapabilityError(
 					"harness.launch",
-					request.harnessId,
+					selectedHarness ?? "default",
 				);
 			requireCapability(
 				harness.descriptor.capabilities,
@@ -161,11 +194,15 @@ export class SessionManager {
 				harness.descriptor.id,
 			);
 			const cwd = await validateWorkingDirectory(request.cwd);
+			const adapterOptions = request.adapterOptions
+				? validateAdapterOptions(request.adapterOptions)
+				: undefined;
 			const starting: SessionSummary = {
 				id,
 				...(name ? { name } : {}),
-				harnessId: request.harnessId,
+				harnessId: harness.descriptor.id,
 				cwd,
+				...(adapterOptions ? { adapterOptions } : {}),
 				status: "starting",
 			};
 			let instance: HarnessInstance | undefined;
@@ -173,7 +210,13 @@ export class SessionManager {
 			const launch = this.store.create(starting).then(async () => {
 				recordCreated = true;
 				try {
-					instance = await harness.launch({ sessionId: id, cwd });
+					instance = await harness.launch({
+						sessionId: id,
+						cwd,
+						...(this.adapterOptionsFor(adapterOptions)
+							? { adapterOptions: this.adapterOptionsFor(adapterOptions) }
+							: {}),
+					});
 					this.instances.set(id, instance);
 					const running: SessionSummary = {
 						...starting,
@@ -399,6 +442,9 @@ export class SessionManager {
 				sessionId: id,
 				cwd: session.cwd,
 				nativeSessionId: session.nativeSessionId,
+				...(this.adapterOptionsFor(session.adapterOptions)
+					? { adapterOptions: this.adapterOptionsFor(session.adapterOptions) }
+					: {}),
 			});
 		} catch (error) {
 			try {
@@ -860,6 +906,9 @@ export class SessionManager {
 					sessionId: id,
 					cwd: session.cwd,
 					nativeSessionId: session.nativeSessionId,
+					...(this.adapterOptionsFor(session.adapterOptions)
+						? { adapterOptions: this.adapterOptionsFor(session.adapterOptions) }
+						: {}),
 				});
 			} catch {
 				if (attempt >= waits.length) {

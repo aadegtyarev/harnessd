@@ -321,6 +321,32 @@ describe("CLI", () => {
 		).rejects.toThrow("HARNESSD_TELEGRAM_ALLOWED_USER_IDS");
 	});
 
+	it("uses process environment over dotenv for generic default harness", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-default-"));
+		try {
+			await writeFile(path.join(cwd, ".env"), "HARNESSD_DEFAULT_HARNESS=pi\n");
+			let runtimeOptions: unknown;
+			const running = runMain({
+				cwd,
+				env: {
+					HARNESSD_TELEGRAM_BOT_TOKEN: "token",
+					HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+					HARNESSD_DEFAULT_HARNESS: "pi-rpc",
+				},
+				runtimeStart: vi.fn(async (options: unknown) => {
+					runtimeOptions = options;
+					return { close: async () => {} } as never;
+				}) as never,
+			});
+			await vi.waitFor(() => expect(runtimeOptions).toBeDefined());
+			process.emit("SIGTERM");
+			await running;
+			expect(runtimeOptions).toMatchObject({ defaultHarnessId: "pi-rpc" });
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it.each(["SIGINT", "SIGTERM"] as const)(
 		"composes one runtime and shuts it down on %s",
 		async (signal) => {
