@@ -17,15 +17,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TransportEvent, TransportResult } from "../src/core/ports.js";
 import type {
 	HarnessEvent,
+	InputId,
 	SessionId,
 	SessionSummary,
 } from "../src/core/types.js";
+import { ClaudeCodeHarnessAdapter } from "../src/harness/claude-code-harness.js";
 import { TelegramPanelStore } from "../src/telegram-panel-store.js";
 import {
 	acquireTelegramPollingLock,
 	TelegramTransportAdapter,
 	telegramLockPath,
 } from "../src/telegram-transport.js";
+import { fakeProvider } from "./claude-code-fake.js";
 
 const roots: string[] = [];
 function telegramVisibleText(text: string): string {
@@ -2347,6 +2350,69 @@ describe("Telegram transport", () => {
 		expect(journal.mock.calls.flat().join(" ")).toContain(
 			"Telegram input acceptance reaction failed",
 		);
+		await adapter.stop();
+	});
+
+	it("delivers Claude output through generic settled-turn events", async () => {
+		sessions.set("sid", sessionWith("sid", {}));
+		const bot = new MockBot();
+		const fake = fakeProvider();
+		const claude = new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		});
+		const instance = await claude.launch({
+			sessionId: "sid" as SessionId,
+			cwd: "/work",
+		});
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				const submission = instance.send({
+					id: "claude-input" as InputId,
+					sessionId: request.sessionId,
+					text: request.text,
+					createdAt: new Date(),
+				});
+				fake.record({ type: "system", subtype: "init", session_id: "sid" });
+				fake.record({
+					type: "user",
+					isReplay: true,
+					message: { role: "user", content: request.text },
+				});
+				await submission;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: "claude-input" as InputId,
+				};
+			},
+		});
+		const pumping = (async () => {
+			for await (const event of instance.events) emit(event);
+		})();
+		await bot.update(42, "/use sid");
+		await bot.update(42, "answer this");
+		fake.record({
+			type: "stream_event",
+			event: {
+				type: "content_block_delta",
+				delta: { type: "text_delta", text: "Claude final answer." },
+			},
+		});
+		fake.record({
+			type: "result",
+			subtype: "success",
+			session_id: "sid",
+			is_error: false,
+			result: "Claude final answer.",
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Claude final answer.")),
+			).toBe(true),
+		);
+		fake.finish();
+		await pumping;
 		await adapter.stop();
 	});
 

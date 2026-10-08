@@ -10,6 +10,7 @@ import { createClaudeInstance } from "./claude-code-instance.js";
 export interface ClaudeCodeHarnessOptions {
 	readonly executable: string;
 	readonly env?: Readonly<Record<string, string>>;
+	readonly acknowledgementTimeoutMs?: number;
 }
 
 export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
@@ -37,6 +38,13 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 		request: HarnessLaunchRequest,
 		resume: boolean,
 	): Promise<HarnessInstance> {
+		const timeout = this.options.acknowledgementTimeoutMs ?? 15_000;
+		if (
+			!Number.isSafeInteger(timeout) ||
+			timeout < 1 ||
+			timeout > 2_147_483_647
+		)
+			throw new Error("CLAUDE_INVALID_TIMEOUT");
 		const savedNativeId = request.nativeSessionId;
 		if (resume && !savedNativeId) throw new Error("CLAUDE_NATIVE_ID_REQUIRED");
 		const nativeId = savedNativeId ?? request.sessionId;
@@ -48,6 +56,7 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 			"stream-json",
 			"--verbose",
 			"--include-partial-messages",
+			"--replay-user-messages",
 			"--permission-mode",
 			"manual",
 		];
@@ -60,6 +69,6 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
 			env: this.options.env ?? {},
 			stdio: "pipe",
 		});
-		return createClaudeInstance(child, request, nativeId);
+		return createClaudeInstance(child, request, nativeId, timeout);
 	}
 }

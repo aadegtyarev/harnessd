@@ -41,6 +41,7 @@ import {
 	AGENT_FILE_SEND_TOKEN_ENV,
 	AGENT_FILE_SEND_URL_ENV,
 } from "./agent-file-send-protocol.js";
+import { UncertainInputDeliveryError } from "./input-delivery-error.js";
 
 export interface PiRpcHarnessOptions {
 	readonly executable: string;
@@ -59,16 +60,7 @@ const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 const RELOAD_COMMAND_ENV = "HARNESSD_PI_RELOAD_COMMAND";
 const RELOAD_COMMAND_DESCRIPTION = "harnessd internal reload command";
 
-export class UncertainInputDeliveryError extends Error {
-	readonly code = "UNCERTAIN_INPUT_DELIVERY";
-	constructor(
-		readonly inputId: InputId,
-		options?: ErrorOptions,
-	) {
-		super("Input delivery is uncertain", options);
-		this.name = "UncertainInputDeliveryError";
-	}
-}
+export { UncertainInputDeliveryError } from "./input-delivery-error.js";
 
 export type PiStartupErrorCode =
 	| "PI_EXECUTABLE_NOT_FOUND"

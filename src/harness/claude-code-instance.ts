@@ -3,8 +3,10 @@ import type {
 	HarnessLaunchRequest,
 	ManagedProcess,
 } from "../core/ports.js";
-import type { Input, InputId } from "../core/types.js";
-import { mapClaudeEvent } from "./claude-code-events.js";
+import type { InputId } from "../core/types.js";
+import { ClaudeCodeProtocol } from "./claude-code-protocol.js";
+import { sendClaudeInput } from "./claude-code-send.js";
+import { shutdownClaudeProcess } from "./claude-code-shutdown.js";
 import { ClaudeEventQueue } from "./claude-event-queue.js";
 import { ClaudeJsonlFramer, parseClaudeRecord } from "./claude-jsonl.js";
 
@@ -12,85 +14,68 @@ export function createClaudeInstance(
 	child: ManagedProcess,
 	request: HarnessLaunchRequest,
 	nativeId: string,
+	ackTimeoutMs: number,
 ): HarnessInstance {
 	const stdin = child.stdin;
 	const stdout = child.stdout;
 	const stderr = child.stderr;
 	if (!stdin || !stdout || !stderr) throw new Error("CLAUDE_PIPE_REQUIRED");
+	stderr.on("error", () => {});
 	void stderr.resume();
-	const queue = new ClaudeEventQueue();
-	let inputId: InputId | undefined;
-	let mismatch = false;
-	const framer = new ClaudeJsonlFramer((line) => {
-		const record = parseClaudeRecord(line);
-		if (
-			record.type === "system" &&
-			record.subtype === "init" &&
-			record.session_id !== nativeId
-		) {
-			mismatch = true;
-			queue.push({
-				sessionId: request.sessionId,
-				kind: "error",
-				text: "Claude session identity mismatch",
-				fatal: true,
-			});
-			void child.sendSignal("SIGTERM");
-			return;
-		}
-		for (const event of mapClaudeEvent(record, request.sessionId, inputId))
-			queue.push(event);
-	});
+	const events = new ClaudeEventQueue();
+	let cleanup: Promise<void> | undefined;
+	const stop = () => {
+		cleanup ??= shutdownClaudeProcess(child, stdin);
+		void cleanup.catch(() => {
+			cleanup = undefined;
+		});
+	};
+	const protocol = new ClaudeCodeProtocol(
+		request.sessionId,
+		nativeId,
+		events,
+		stop,
+	);
+	const framer = new ClaudeJsonlFramer((line) =>
+		protocol.accept(parseClaudeRecord(line)),
+	);
+	const fail = () => protocol.failProtocol("Claude protocol error");
 	stdout.on("data", (chunk: Buffer) => {
 		try {
 			framer.push(chunk);
 		} catch {
-			queue.push({
-				sessionId: request.sessionId,
-				kind: "error",
-				text: "Claude protocol error",
-				fatal: true,
-			});
-			void child.sendSignal("SIGTERM");
+			fail();
 		}
 	});
+	stdout.on("error", fail);
 	stdout.on("end", () => {
 		try {
 			framer.finish();
+			protocol.streamEnded();
 		} catch {
-			queue.push({
-				sessionId: request.sessionId,
-				kind: "error",
-				text: "Claude protocol error",
-				fatal: true,
-			});
+			fail();
 		}
-		queue.close();
 	});
+	stdin.on("error", fail);
 	return {
 		processId: child.id,
 		exit: child.exit,
 		nativeSessionId: nativeId,
-		events: queue,
-		async send(input: Input) {
-			if (mismatch || inputId)
-				throw new Error("Claude accepts one prompt per process");
-			inputId = input.id;
-			queue.push({
-				sessionId: input.sessionId,
-				kind: "input",
-				inputEvent: { inputId: input.id, state: "pending" },
-			});
-			stdin.write(
-				`${JSON.stringify({ type: "user", message: { role: "user", content: input.text } })}\n`,
-			);
+		events,
+		async send(input) {
+			await sendClaudeInput(input, stdin, events, protocol, ackTimeoutMs);
 		},
 		async cancel(_id: InputId) {
 			throw new Error("Unsupported capability");
 		},
 		async shutdown() {
-			stdin.end();
-			await child.sendSignal("SIGTERM").catch(() => {});
+			if (!cleanup) cleanup = shutdownClaudeProcess(child, stdin);
+			try {
+				await cleanup;
+			} catch (error) {
+				cleanup = undefined;
+				throw error;
+			}
 		},
 	};
 }

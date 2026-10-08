@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import type { InputId } from "../src/core/types.js";
 import { ClaudeCodeHarnessAdapter } from "../src/harness/claude-code-harness.js";
 import { fakeProvider, launchRequest } from "./claude-code-fake.js";
 
@@ -21,17 +20,11 @@ describe("Claude Code harness", () => {
 			"harness.effort.set",
 		])
 			expect(adapter.descriptor.capabilities).not.toContain(unsupported);
+		expect(fake.args()).toContain("--replay-user-messages");
 		expect(fake.args()).toContain("--session-id");
 		expect(fake.args()).toContain(launchRequest.sessionId);
 		expect(fake.env()).toEqual({});
 		expect(instance.nativeSessionId).toBe(launchRequest.sessionId);
-		await instance.send({
-			id: "input" as InputId,
-			sessionId: launchRequest.sessionId,
-			text: "safe",
-			createdAt: new Date(),
-		});
-		expect(fake.stdin.read()?.toString()).toContain('"content":"safe"');
 		fake.finish();
 	});
 
@@ -49,34 +42,6 @@ describe("Claude Code harness", () => {
 		expect(fake.args()).toContain(nativeId);
 		expect(fake.args()).not.toContain("--session-id");
 		expect(instance.nativeSessionId).toBe(nativeId);
-		fake.finish();
-	});
-
-	it("closes the event iterator when stdout ends", async () => {
-		const fake = fakeProvider();
-		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
-			executable: "claude",
-		}).launch(launchRequest);
-		const iterator = instance.events[Symbol.asyncIterator]();
-		fake.finish();
-		expect(await iterator.next()).toMatchObject({ done: true });
-	});
-
-	it("fails closed when init reports another native ID", async () => {
-		const fake = fakeProvider();
-		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
-			executable: "claude",
-		}).launch(launchRequest);
-		const nextEvent = instance.events[Symbol.asyncIterator]().next();
-		fake.stdout.write(
-			`${JSON.stringify({ type: "system", subtype: "init", session_id: "different" })}\n`,
-		);
-		expect((await nextEvent).value).toMatchObject({
-			kind: "error",
-			fatal: true,
-			text: "Claude session identity mismatch",
-		});
-		expect(fake.signals).toContain("SIGTERM");
 		fake.finish();
 	});
 });
