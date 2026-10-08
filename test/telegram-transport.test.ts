@@ -772,6 +772,93 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("does not dispatch an extension command when selection changes during discovery", async () => {
+		const bot = new MockBot();
+		let discoveryCount = 0;
+		let releaseDiscovery!: (value: TransportResult) => void;
+		const held = new Promise<TransportResult>((resolve) => {
+			releaseDiscovery = resolve;
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list") {
+					discoveryCount += 1;
+					if (discoveryCount === 2) return held;
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "cost", description: "Cost" }],
+					};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() => expect(discoveryCount).toBeGreaterThanOrEqual(1));
+		const command = bot.update(42, "/cost");
+		await vi.waitFor(() => expect(discoveryCount).toBe(2));
+		await bot.update(42, "/use other");
+		releaseDiscovery({
+			requestId: "held" as never,
+			ok: true,
+			value: [{ name: "cost", description: "Cost" }],
+		});
+		await command;
+		expect(requests.some((request) => request.kind === "command_run")).toBe(
+			false,
+		);
+		expect(bot.sent.at(-1)?.text).toContain("Выбор сессии изменился");
+		await adapter.stop();
+	});
+
+	it("carries selection currency to the final write guard", async () => {
+		const bot = new MockBot();
+		let releaseWrite!: () => void;
+		let writeStarted!: () => void;
+		let finalGuard: boolean | undefined;
+		const started = new Promise<void>((resolve) => {
+			writeStarted = resolve;
+		});
+		const heldWrite = new Promise<void>((resolve) => {
+			releaseWrite = resolve;
+		});
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "cost", description: "Cost" }],
+					};
+				if (request.kind === "command_run") {
+					writeStarted();
+					await heldWrite;
+					const accepted = request.beforeDispatch?.() ?? false;
+					finalGuard = accepted;
+					return accepted
+						? { requestId: request.requestId, ok: true, value: "accepted" }
+						: {
+								requestId: request.requestId,
+								ok: false,
+								error: {
+									code: "COMMAND_SELECTION_CHANGED",
+									message: "selection changed",
+								},
+							};
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		const command = bot.update(42, "/cost");
+		await started;
+		await bot.update(42, "/use other");
+		releaseWrite();
+		await command;
+		expect(finalGuard).toBe(false);
+		await adapter.stop();
+	});
+
 	it("spaces actual panel edit API calls by at least 500 ms", async () => {
 		const bot = new MockBot();
 		let now = 0;

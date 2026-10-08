@@ -105,6 +105,10 @@ const safeErrorMessages = new Map([
 		"COMMAND_NOT_AVAILABLE",
 		"That Pi extension command is no longer available.",
 	],
+	[
+		"COMMAND_SELECTION_CHANGED",
+		"The selected session changed; the extension command was not sent.",
+	],
 	["COMMAND_REJECTED", "Pi did not accept that extension command."],
 	[
 		"COMMAND_UNCERTAIN",
@@ -428,6 +432,7 @@ export class ApplicationRuntime {
 						request.sessionId,
 						request.name,
 						request.remainder,
+						request.beforeDispatch,
 					)) as typeof value;
 					break;
 			}

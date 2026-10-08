@@ -918,6 +918,177 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("treats an unrecognized successful command disposition as uncertain", async () => {
+		const fake = fakeProvider({
+			promptDisposition: "future-value",
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await expect(
+			instance.control?.runCommand?.("cost", ""),
+		).rejects.toMatchObject({
+			code: "COMMAND_UNCERTAIN",
+		});
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it("revalidates command currency at the actual prompt-write boundary", async () => {
+		const fake = fakeProvider({
+			promptDisposition: "accepted",
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		let current = true;
+		await expect(
+			instance.control?.runCommand?.("cost", "", () => current),
+		).resolves.toBe("accepted");
+		current = false;
+		await expect(
+			instance.control?.runCommand?.("cost", "", () => current),
+		).rejects.toMatchObject({ code: "COMMAND_SELECTION_CHANGED" });
+		expect(
+			fake.commands.filter((command) => command.type === "prompt"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
+	it("rejects dynamic commands while reload owns the session", async () => {
+		const fake = fakeProvider({
+			holdPrompt: true,
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 1000,
+		}).launch(request);
+		const reload = instance.control?.reload?.();
+		await vi.waitFor(() =>
+			expect(fake.commands.some((command) => command.type === "prompt")).toBe(
+				true,
+			),
+		);
+		await expect(
+			instance.control?.runCommand?.("cost", ""),
+		).rejects.toMatchObject({
+			code: "RELOAD_BUSY",
+		});
+		await instance.shutdown();
+		await expect(reload).rejects.toBeDefined();
+	});
+
+	it("holds dynamic commands behind an in-flight abort gate", async () => {
+		const fake = fakeProvider({
+			holdAbort: true,
+			promptDisposition: "accepted",
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const inputId = "cancel-target" as InputId;
+		await instance.send(input("active", inputId));
+		const cancel = instance.cancel(inputId);
+		await vi.waitFor(() =>
+			expect(fake.commands.some((command) => command.type === "abort")).toBe(
+				true,
+			),
+		);
+		const command = instance.control?.runCommand?.("cost", "");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			1,
+		);
+		const abort = fake.commands.find((item) => item.type === "abort");
+		fake.stdout.write(
+			`${JSON.stringify({ type: "response", id: abort?.id, command: "abort", success: true })}\n`,
+		);
+		await cancel;
+		await expect(command).resolves.toBe("accepted");
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			2,
+		);
+		await instance.shutdown();
+	});
+
+	it("holds commands through uncertain abort until the run settles", async () => {
+		const fake = fakeProvider({
+			holdAbort: true,
+			promptDisposition: "accepted",
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 100,
+		}).launch(request);
+		const inputId = "uncertain-cancel" as InputId;
+		await instance.send(input("active", inputId));
+		const cancel = instance.cancel(inputId);
+		await vi.waitFor(() =>
+			expect(fake.commands.some((command) => command.type === "abort")).toBe(
+				true,
+			),
+		);
+		const command = instance.control?.runCommand?.("cost", "");
+		await expect(cancel).rejects.toBeDefined();
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			1,
+		);
+		fake.stdout.write('{"type":"agent_settled"}\n');
+		await expect(command).resolves.toBe("accepted");
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			2,
+		);
+		await instance.shutdown();
+	});
+
 	it("refreshes command inventory after each successful reload", async () => {
 		const fake = fakeProvider({ promptDisposition: "handled" });
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {

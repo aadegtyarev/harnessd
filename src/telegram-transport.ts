@@ -1156,6 +1156,7 @@ export class TelegramTransportAdapter
 		capabilities: ["transport.poll"] as const,
 	};
 	private readonly selected = new Map<number, SessionId>();
+	private readonly selectionCurrency = new Map<number, number>();
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
 	private readonly reportedErrors = new Map<SessionId, Set<string>>();
@@ -1574,8 +1575,13 @@ export class TelegramTransportAdapter
 	private async restoreSelectedSessions(): Promise<void> {
 		const store = this.panelStore;
 		if (!store) return;
-		for (const [chatId, sessionId] of store.selections())
+		for (const [chatId, sessionId] of store.selections()) {
 			this.selected.set(chatId, sessionId as SessionId);
+			this.selectionCurrency.set(
+				chatId,
+				(this.selectionCurrency.get(chatId) ?? 0) + 1,
+			);
+		}
 		if (!this.listSessions) return;
 		try {
 			const sessions = await this.listSessions();
@@ -1599,6 +1605,10 @@ export class TelegramTransportAdapter
 	): Promise<boolean> {
 		const previous = this.selected.get(chatId);
 		this.selected.set(chatId, sessionId);
+		this.selectionCurrency.set(
+			chatId,
+			(this.selectionCurrency.get(chatId) ?? 0) + 1,
+		);
 		if (previous && previous !== sessionId && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
 		if (this.activeTypingSessions.has(sessionId)) this.startTyping(sessionId);
@@ -1617,6 +1627,10 @@ export class TelegramTransportAdapter
 	private async clearSelected(chatId: number): Promise<boolean> {
 		const previous = this.selected.get(chatId);
 		this.selected.delete(chatId);
+		this.selectionCurrency.set(
+			chatId,
+			(this.selectionCurrency.get(chatId) ?? 0) + 1,
+		);
 		if (previous && this.typingTimers.has(previous))
 			this.refreshTyping(previous);
 		try {
@@ -3081,6 +3095,7 @@ export class TelegramTransportAdapter
 		const extensionName = commandToken.split("@")[0]?.toLowerCase() ?? "";
 		if (commandToken && !isNativeTelegramCommand(extensionName)) {
 			const sessionId = this.selected.get(chatId);
+			const selectionCurrency = this.selectionCurrency.get(chatId) ?? 0;
 			if (!sessionId)
 				return this.sendDirect(
 					chatId,
@@ -3101,6 +3116,14 @@ export class TelegramTransportAdapter
 					chatId,
 					"Эта команда Pi сейчас недоступна или больше не обнаружена.",
 				);
+			if (
+				this.selected.get(chatId) !== sessionId ||
+				(this.selectionCurrency.get(chatId) ?? 0) !== selectionCurrency
+			)
+				return this.sendDirect(
+					chatId,
+					"Выбор сессии изменился; повторите команду.",
+				);
 			let result: TransportResult;
 			try {
 				result = await this.request(sender, {
@@ -3108,6 +3131,9 @@ export class TelegramTransportAdapter
 					sessionId,
 					name: extensionName,
 					remainder: rawRemainder,
+					beforeDispatch: () =>
+						this.selected.get(chatId) === sessionId &&
+						(this.selectionCurrency.get(chatId) ?? 0) === selectionCurrency,
 				});
 			} catch (error) {
 				this.reportError("Telegram extension command dispatch failed", error);
@@ -3120,6 +3146,9 @@ export class TelegramTransportAdapter
 				const replies: Record<string, string> = {
 					COMMAND_NOT_AVAILABLE:
 						"Эта команда Pi больше недоступна; запрос не повторялся.",
+					COMMAND_SELECTION_CHANGED:
+						"Выбор сессии изменился; команда Pi не была отправлена.",
+					RELOAD_BUSY: "Идёт перезагрузка Pi; команда не была отправлена.",
 					COMMAND_REJECTED: "Pi не принял команду; запрос не повторялся.",
 					COMMAND_UNCERTAIN:
 						"Pi мог принять команду; результат неизвестен, повтор не выполнялся.",

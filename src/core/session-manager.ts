@@ -627,11 +627,17 @@ export class SessionManager {
 		id: SessionId,
 		name: string,
 		remainder: string,
+		beforeDispatch: () => boolean = () => true,
 	): Promise<HarnessCommandResult> {
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		const { control } = await this.requireControl(id, "harness.commands.run");
 		if (!control.runCommand)
 			throw new UnsupportedCapabilityError("harness.commands.run", id);
-		return control.runCommand(name, remainder);
+		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
+		return control.runCommand(name, remainder, () => {
+			if (this.reloads.has(id)) return false;
+			return beforeDispatch();
+		});
 	}
 
 	async reload(id: SessionId, beforeDispatch: () => boolean): Promise<void> {

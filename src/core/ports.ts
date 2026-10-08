@@ -153,6 +153,7 @@ export type TransportEvent =
 			readonly sessionId: SessionId;
 			readonly name: string;
 			readonly remainder: string;
+			readonly beforeDispatch?: () => boolean;
 	  };
 
 export type TransportResult =
@@ -258,7 +259,11 @@ export type HarnessCommandResult = "handled" | "accepted";
 
 export interface HarnessControl {
 	getCommands?(): Promise<readonly HarnessCommand[]>;
-	runCommand?(name: string, remainder: string): Promise<HarnessCommandResult>;
+	runCommand?(
+		name: string,
+		remainder: string,
+		beforeDispatch?: () => boolean,
+	): Promise<HarnessCommandResult>;
 	getSelection(): Promise<HarnessSelection>;
 	getStatus(): Promise<HarnessLiveStatus>;
 	listModels(): Promise<readonly HarnessModelInfo[]>;
