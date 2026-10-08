@@ -74,6 +74,33 @@ describe("Claude Code harness", () => {
 		fake.finish();
 	});
 
+	it("maps every native permission mode to argv", async () => {
+		for (const mode of [
+			"default",
+			"acceptEdits",
+			"plan",
+			"bypassPermissions",
+			"dontAsk",
+			"auto",
+		]) {
+			const fake = fakeProvider();
+			await new ClaudeCodeHarnessAdapter(fake.provider, {
+				executable: "claude",
+			}).launch({
+				...launchRequest,
+				adapterOptions: { permissionMode: mode },
+			});
+			const args = fake.args() ?? [];
+			expect(
+				args.slice(
+					args.indexOf("--permission-mode"),
+					args.indexOf("--permission-mode") + 2,
+				),
+			).toEqual(["--permission-mode", mode]);
+			fake.finish();
+		}
+	});
+
 	it("resumes only the exact saved native session ID", async () => {
 		const fake = fakeProvider();
 		const adapter = new ClaudeCodeHarnessAdapter(fake.provider, {

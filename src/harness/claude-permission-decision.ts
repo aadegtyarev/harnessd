@@ -29,6 +29,10 @@ export class ClaudePermissionDecision {
 		this.pending = undefined;
 	}
 
+	settle(): void {
+		this.close();
+	}
+
 	close(): void {
 		if (this.pending?.timer) clearTimeout(this.pending.timer);
 		this.pending?.abort.abort();
@@ -73,7 +77,12 @@ export class ClaudePermissionDecision {
 			const decision = await waitForPermissionDecision(prompt, (timer) => {
 				if (this.pending?.id === id) this.pending.timer = timer;
 			});
-			if (this.pending?.id !== id || abort.signal.aborted) return;
+			if (
+				this.pending?.id !== id ||
+				abort.signal.aborted ||
+				this.activeInput() !== inputId
+			)
+				return;
 			await this.send(id, decision);
 		} catch {
 			if (this.pending?.id === id && !abort.signal.aborted)

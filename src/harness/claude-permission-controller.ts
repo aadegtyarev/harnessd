@@ -33,6 +33,10 @@ export class ClaudePermissionController {
 		return this.router.accept(record);
 	}
 
+	settle(): void {
+		this.decision.settle();
+	}
+
 	close(): void {
 		this.decision.close();
 	}

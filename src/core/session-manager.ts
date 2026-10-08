@@ -93,6 +93,7 @@ export class SessionManager {
 	private readonly unsettledInputs = new Map<SessionId, Set<InputId>>();
 	private readonly reloads = new Set<SessionId>();
 	private readonly configuring = new Set<SessionId>();
+	private readonly optionOwnedShutdowns = new WeakSet<HarnessInstance>();
 	private readonly reloadWaiters = new Map<SessionId, (() => void)[]>();
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
 
@@ -802,9 +803,9 @@ export class SessionManager {
 		)
 			throw new Error("HARNESS_OPTIONS_BUSY");
 		const instance = this.instances.get(id);
+		if (!session.nativeSessionId) throw new SessionNotResumableError(id);
 		if (
-			!instance ||
-			instance.isIdle?.() !== true ||
+			instance?.isIdle?.() !== true ||
 			(this.unsettledInputs.get(id)?.size ?? 0) > 0 ||
 			this.reloads.has(id)
 		)
@@ -823,7 +824,13 @@ export class SessionManager {
 		)
 			return session;
 		const previousOptions = session.adapterOptions;
-		await this.store.setStatus(id, "starting");
+		this.optionOwnedShutdowns.add(instance);
+		try {
+			await this.store.setStatus(id, "starting");
+		} catch (error) {
+			this.optionOwnedShutdowns.delete(instance);
+			throw error;
+		}
 		try {
 			await instance.shutdown();
 		} catch (error) {
@@ -846,7 +853,6 @@ export class SessionManager {
 			this.eventPumps.delete(id);
 		}
 		try {
-			await persistOptions.call(this.store, id, nextOptions);
 			return await this.launchOptionResume(session, harness, nextOptions);
 		} catch (error) {
 			const failures: unknown[] = [error];
@@ -888,8 +894,10 @@ export class SessionManager {
 		adapterOptions: AdapterOptions | undefined,
 	): Promise<SessionSummary> {
 		const nativeSessionId = session.nativeSessionId;
-		if (!nativeSessionId) throw new SessionNotResumableError(session.id);
-		const replacement = await harness.resume!({
+		const resume = harness.resume;
+		if (!nativeSessionId || !resume)
+			throw new SessionNotResumableError(session.id);
+		const replacement = await resume.call(harness, {
 			sessionId: session.id,
 			cwd: session.cwd,
 			nativeSessionId,
@@ -912,22 +920,26 @@ export class SessionManager {
 			}
 			throw new SessionNotResumableError(session.id);
 		}
-		this.instances.set(session.id, replacement);
 		const running = { ...session, adapterOptions, status: "running" as const };
 		try {
+			if (!this.store.setAdapterOptions)
+				throw new Error("ADAPTER_OPTION_PERSISTENCE_UNSUPPORTED");
+			await this.store.setAdapterOptions(session.id, adapterOptions);
 			await this.store.update(running);
 		} catch (error) {
 			try {
 				await replacement.shutdown();
-				this.instances.delete(session.id);
 			} catch (cleanupError) {
+				this.instances.set(session.id, replacement);
 				throw new AggregateError(
 					[error, cleanupError],
 					"HARNESS_OPTIONS_PERSISTENCE_CLEANUP_FAILED",
 				);
 			}
+			this.instances.delete(session.id);
 			throw error;
 		}
+		this.instances.set(session.id, replacement);
 		this.startEventPump(session.id, replacement);
 		this.watchExit(session.id, replacement);
 		return running;
@@ -1048,6 +1060,7 @@ export class SessionManager {
 			.then(async () => {
 				if (
 					this.instances.get(id) !== instance ||
+					this.optionOwnedShutdowns.has(instance) ||
 					this.terminal.has(id) ||
 					this.closing
 				)
@@ -1056,6 +1069,7 @@ export class SessionManager {
 				if (pump) await pump.promise.catch(() => undefined);
 				if (
 					this.instances.get(id) !== instance ||
+					this.optionOwnedShutdowns.has(instance) ||
 					this.terminal.has(id) ||
 					this.closing
 				)

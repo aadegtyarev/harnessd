@@ -93,6 +93,69 @@ describe("Claude Code stream protocol", () => {
 		await instance.shutdown();
 	});
 
+	it("invalidates a pending permission at settlement and ignores duplicate IDs", async () => {
+		const fake = fakeProvider();
+		let resolveDecision!: (decision: { behavior: "allow" }) => void;
+		let entered!: () => void;
+		const seen = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch({
+			...launchRequest,
+			toolPermissionHandler() {
+				entered();
+				return new Promise((resolve) => {
+					resolveDecision = resolve;
+				});
+			},
+		});
+		const sent = instance.send(input("settle-permission", "read"));
+		fake.record(init);
+		fake.record(acknowledgement("read"));
+		await sent;
+		const request = {
+			type: "control_request",
+			request_id: "one-shot",
+			request: { subtype: "can_use_tool", tool_name: "Read", input: {} },
+		};
+		fake.record(request);
+		await seen;
+		fake.record(request);
+		fake.record(result);
+		resolveDecision({ behavior: "allow" });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(fake.inputLines().join("")).not.toContain('"request_id":"one-shot"');
+		await instance.shutdown();
+	});
+
+	it("rejects a mismatched native session before permission routing", async () => {
+		const fake = fakeProvider();
+		let prompted = false;
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch({
+			...launchRequest,
+			async toolPermissionHandler() {
+				prompted = true;
+				return { behavior: "allow" };
+			},
+		});
+		const sent = instance.send(input("mismatch-permission", "read"));
+		fake.record(init);
+		fake.record(acknowledgement("read"));
+		await sent;
+		fake.record({
+			type: "control_request",
+			session_id: "another-native-session",
+			request_id: "mismatch",
+			request: { subtype: "can_use_tool", tool_name: "Read", input: {} },
+		});
+		expect(prompted).toBe(false);
+		await expect(instance.shutdown()).resolves.toBeUndefined();
+	});
+
 	it("waits for replay acknowledgement and accepts another input only after settlement", async () => {
 		const fake = fakeProvider();
 		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {

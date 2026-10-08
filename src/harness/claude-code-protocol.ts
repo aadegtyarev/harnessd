@@ -17,7 +17,7 @@ export class ClaudeCodeProtocol {
 	private readonly permissions: ClaudePermissionController;
 	constructor(
 		private readonly sessionId: SessionId,
-		nativeId: string,
+		private readonly nativeId: string,
 		private readonly events: ClaudeEventQueue,
 		private readonly onFatal: () => void,
 		stdin: Writable,
@@ -62,6 +62,12 @@ export class ClaudeCodeProtocol {
 	accept(record: Record<string, unknown>): void {
 		if (this.failed) return;
 		try {
+			if (
+				record.session_id !== undefined &&
+				(typeof record.session_id !== "string" ||
+					record.session_id !== this.nativeId)
+			)
+				throw new Error("Mismatched native session ID");
 			if (this.permissions.accept(record)) return;
 			this.records.accept(record);
 		} catch {
@@ -110,6 +116,7 @@ export class ClaudeCodeProtocol {
 	private settle(failed: boolean): void {
 		const p = this.turnInput;
 		if (!p) throw new Error("Unexpected result");
+		this.permissions.settle();
 		this.turn.settle(p.id, failed);
 		this.turnInput = undefined;
 	}

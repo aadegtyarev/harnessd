@@ -526,6 +526,170 @@ describe("core capability contracts", () => {
 			store.close();
 		}
 	});
+
+	it("rolls back a final option persistence failure and cleans its replacement", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		const base = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"harness.options.set",
+			],
+		});
+		const harness: HarnessAdapter = {
+			...base.harness,
+			descriptor: {
+				...base.harness.descriptor,
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+				],
+			},
+			async launch(request) {
+				const instance = await base.harness.launch(request);
+				return { ...instance, isIdle: () => true };
+			},
+			async resume(request) {
+				return harness.launch(request);
+			},
+		};
+		const launched = base.launched;
+		const originalPersist = store.setAdapterOptions.bind(store);
+		let failNext = false;
+		store.setAdapterOptions = async (id, options) => {
+			if (failNext) {
+				failNext = false;
+				throw new Error("final persistence failed");
+			}
+			await originalPersist(id, options);
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			failNext = true;
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "new" } }),
+			).rejects.toThrow("HARNESS_OPTIONS_RESTART_FAILED_ROLLED_BACK");
+			expect(launched).toHaveLength(3);
+			expect((await store.get(session.id))?.adapterOptions).toBeUndefined();
+			expect((await store.get(session.id))?.status).toBe("running");
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("does not auto-recover an option-owned shutdown exit", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let resumes = 0;
+		const makeInstance = () => {
+			let exit!: () => void;
+			const instance: HarnessInstance = {
+				processId: "options-race" as never,
+				exit: new Promise((resolve) => {
+					exit = () => resolve({ code: 0, signal: null });
+				}),
+				nativeSessionId: "native-race",
+				events: (async function* () {})(),
+				isIdle: () => true,
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					exit();
+				},
+			};
+			return instance;
+		};
+		const base = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"harness.options.set",
+			],
+			launch: async () => makeInstance(),
+		});
+		const harness: HarnessAdapter = {
+			...base.harness,
+			descriptor: {
+				...base.harness.descriptor,
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+				],
+			},
+			async resume() {
+				resumes++;
+				return makeInstance();
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			await manager.updateAdapterOptions(session.id, { set: { model: "new" } });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(resumes).toBe(1);
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
+
+	it("rejects option replacement without a native ID before shutdown", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let shutdowns = 0;
+		const base = harnessPort({
+			capabilities: [
+				"harness.launch",
+				"harness.stop",
+				"harness.resume",
+				"harness.options.set",
+			],
+			launch: async () => ({
+				processId: "no-native" as never,
+				exit: new Promise(() => {}),
+				events: (async function* () {})(),
+				isIdle: () => true,
+				async send() {},
+				async cancel() {},
+				async shutdown() {
+					shutdowns++;
+				},
+			}),
+		});
+		const harness: HarnessAdapter = {
+			...base.harness,
+			descriptor: {
+				...base.harness.descriptor,
+				options: [
+					{ key: "model", label: "Model", values: [], allowCustom: true },
+				],
+			},
+			async resume() {
+				throw new Error("must not resume");
+			},
+		};
+		const manager = new SessionManager(store, [harness]);
+		try {
+			const session = await manager.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.homedir(),
+			});
+			await expect(
+				manager.updateAdapterOptions(session.id, { set: { model: "new" } }),
+			).rejects.toThrow("cannot be resumed");
+			expect(shutdowns).toBe(0);
+			expect((await store.get(session.id))?.status).toBe("running");
+		} finally {
+			await manager.close();
+			store.close();
+		}
+	});
 });
 
 describe("SQLite session management", () => {
