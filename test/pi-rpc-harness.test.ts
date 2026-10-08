@@ -975,6 +975,38 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("cancels an unwritten command when its response deadline expires", async () => {
+		const fake = fakeProvider({
+			promptDisposition: "accepted",
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			commandTimeoutMs: 20,
+		}).launch(request);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		(instance as unknown as { writeChain: Promise<void> }).writeChain = held;
+		const command = (
+			instance as unknown as { command: (name: string) => Promise<unknown> }
+		).command("prompt");
+		await expect(command).rejects.toThrow("timed out");
+		release();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			0,
+		);
+		await instance.shutdown();
+	});
+
 	it("rejects dynamic commands while reload owns the session", async () => {
 		const fake = fakeProvider({
 			holdPrompt: true,
@@ -1005,6 +1037,45 @@ describe("PiRpcHarnessAdapter", () => {
 		});
 		await instance.shutdown();
 		await expect(reload).rejects.toBeDefined();
+	});
+
+	it("rechecks selection after queued write preparation completes", async () => {
+		const fake = fakeProvider({
+			commandListing: (reload) => [
+				{
+					name: reload,
+					source: "extension",
+					description: "harnessd internal reload command",
+				},
+				{ name: "cost", source: "extension", description: "cost" },
+			],
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		let current = true;
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		(instance as unknown as { writeChain: Promise<void> }).writeChain = held;
+		const command = instance.control?.runCommand?.("cost", "", () => current);
+		await vi.waitFor(() =>
+			expect(
+				(instance as unknown as { pending: Map<string, unknown> }).pending.size,
+			).toBeGreaterThan(0),
+		);
+		const preparation = (instance as unknown as { writeChain: Promise<void> })
+			.writeChain;
+		current = false;
+		release();
+		await preparation;
+		await expect(command).rejects.toMatchObject({
+			code: "COMMAND_SELECTION_CHANGED",
+		});
+		expect(fake.commands.filter((item) => item.type === "prompt")).toHaveLength(
+			0,
+		);
+		await instance.shutdown();
 	});
 
 	it("holds dynamic commands behind an in-flight abort gate", async () => {

@@ -776,13 +776,14 @@ class PiRpcInstance implements HarnessInstance {
 				false,
 				async () => {
 					while (this.abortInFlight) await this.abortInFlight.promise;
+				},
+				() => {
 					if (this.eventsClosed || this.childExited || this.stdoutEnded)
 						throw new Error("Pi process is closed");
 					if (this.reloadPending) throw new PiControlError("RELOAD_BUSY");
+					if (this.abortInFlight) throw new PiControlError("COMMAND_REJECTED");
 					if (!beforeDispatch())
 						throw new PiControlError("COMMAND_SELECTION_CHANGED");
-				},
-				() => {
 					dispatched = true;
 				},
 			);
@@ -823,6 +824,7 @@ class PiRpcInstance implements HarnessInstance {
 				undefined,
 				true,
 				true,
+				undefined,
 				() => {
 					if (this.eventsClosed || this.childExited || this.stdoutEnded)
 						throw new PiControlError("PI_CONTROL_FAILED");
@@ -1214,7 +1216,7 @@ class PiRpcInstance implements HarnessInstance {
 	private write(
 		value: Record<string, unknown>,
 		beforeWrite?: () => void | Promise<void>,
-		onWrite?: () => void,
+		validateWrite?: () => void,
 	): Promise<void> {
 		const line = `${JSON.stringify(value)}\n`;
 		const operation = this.writeChain.then(async () => {
@@ -1222,7 +1224,7 @@ class PiRpcInstance implements HarnessInstance {
 			if (stdin.destroyed || stdin.writableEnded)
 				throw new Error("Pi stdin is closed");
 			await beforeWrite?.();
-			onWrite?.();
+			validateWrite?.();
 			if (!stdin.write(line))
 				await new Promise<void>((resolve, reject) => {
 					const done = () => {
@@ -1258,6 +1260,7 @@ class PiRpcInstance implements HarnessInstance {
 			rejectResponse = reject;
 		});
 		let writeCancelled = false;
+		let writeStarted = false;
 		const pending: PendingCommand = {
 			command,
 			...(inputId !== undefined ? { inputId } : {}),
@@ -1267,6 +1270,7 @@ class PiRpcInstance implements HarnessInstance {
 			reject: rejectResponse,
 		};
 		pending.timer = setTimeout(() => {
+			if (!writeStarted) writeCancelled = true;
 			if (!pending.retainAfterTimeout) this.pending.delete(id);
 			if (pending.isReload) this.reloadTimedOut = true;
 			rejectResponse(new Error(`Pi RPC ${command} timed out`));
@@ -1287,7 +1291,12 @@ class PiRpcInstance implements HarnessInstance {
 					if (writeCancelled)
 						throw new Error("Pi RPC command expired before write");
 				},
-				onWrite,
+				() => {
+					if (writeCancelled)
+						throw new Error("Pi RPC command expired before write");
+					onWrite?.();
+					writeStarted = true;
+				},
 			);
 			if (pending.isReload) {
 				void write.catch(() => {
