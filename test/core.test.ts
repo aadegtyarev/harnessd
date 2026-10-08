@@ -626,8 +626,10 @@ describe("SQLite session management", () => {
 				cwd: os.tmpdir(),
 			});
 			await manager.stop(session.id);
-			const inputId = await manager.submit(session.id, "new prompt");
+			const outcome = await manager.submitWithOutcome(session.id, "new prompt");
+			const inputId = outcome.inputId;
 			expect(inputId).toMatch(/^[0-9a-f-]{36}$/i);
+			expect(outcome.resumed).toBe(true);
 			expect(launchRequests).toHaveLength(1);
 			expect(resumeRequests).toEqual([
 				{

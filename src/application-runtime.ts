@@ -347,6 +347,7 @@ export class ApplicationRuntime {
 			let value: ApplicationResult extends { ok: true; value: infer T }
 				? T
 				: never;
+			let resumed = false;
 			switch (request.kind) {
 				case "list":
 					value = (await this.manager.list()) as typeof value;
@@ -380,13 +381,16 @@ export class ApplicationRuntime {
 					await this.manager.delete(request.sessionId);
 					value = undefined as typeof value;
 					break;
-				case "submit":
-					value = (await this.manager.submit(
+				case "submit": {
+					const outcome = await this.manager.submitWithOutcome(
 						request.sessionId,
 						request.text,
 						request.images,
-					)) as typeof value;
+					);
+					value = outcome.inputId as typeof value;
+					resumed = outcome.resumed;
 					break;
+				}
 				case "cancel":
 					await this.manager.cancel(request.sessionId, request.inputId);
 					value = undefined as typeof value;
@@ -436,7 +440,12 @@ export class ApplicationRuntime {
 					)) as typeof value;
 					break;
 			}
-			return { requestId: request.requestId, ok: true, value };
+			return {
+				requestId: request.requestId,
+				ok: true,
+				value,
+				...(request.kind === "submit" ? { resumed } : {}),
+			};
 		} catch (error) {
 			if (error instanceof PiStartupError)
 				console.error(`harnessd: Pi startup failed (${error.code})`);

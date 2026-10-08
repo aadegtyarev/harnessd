@@ -870,7 +870,11 @@ describe("application runtime", () => {
 			sessionId: created.value.id,
 			text: "hello",
 		});
-		expect(input).toMatchObject({ requestId: "request-submit", ok: true });
+		expect(input).toMatchObject({
+			requestId: "request-submit",
+			ok: true,
+			resumed: false,
+		});
 		if (!input.ok || typeof input.value !== "string")
 			throw new Error("submit result missing input ID");
 		expect(sent).toEqual(["hello"]);

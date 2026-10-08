@@ -478,6 +478,14 @@ export class SessionManager {
 		text: string,
 		images?: readonly { readonly mimeType: string; readonly data: string }[],
 	): Promise<InputId> {
+		return (await this.submitWithOutcome(id, text, images)).inputId;
+	}
+
+	async submitWithOutcome(
+		id: SessionId,
+		text: string,
+		images?: readonly { readonly mimeType: string; readonly data: string }[],
+	): Promise<{ readonly inputId: InputId; readonly resumed: boolean }> {
 		if (this.reloads.has(id)) throw new ReloadError("RELOAD_BUSY");
 		let session = await this.get(id);
 		const harness = this.harnesses.get(session.harnessId);
@@ -489,10 +497,12 @@ export class SessionManager {
 			harness.descriptor.id,
 		);
 		let instance = this.instances.get(id);
+		let resumed = false;
 		if (!instance) {
 			const resumeOperation =
 				session.status === "stopped" ? this.resume(id) : this.resuming.get(id);
 			if (resumeOperation) {
+				resumed = session.status === "stopped";
 				await resumeOperation;
 				session = await this.get(id);
 				instance = this.instances.get(id);
@@ -520,7 +530,7 @@ export class SessionManager {
 			if (!isUncertainDelivery(error, input.id)) unsettled.delete(input.id);
 			throw error;
 		}
-		return input.id;
+		return { inputId: input.id, resumed };
 	}
 
 	async cancel(id: SessionId, inputId: InputId): Promise<void> {

@@ -160,6 +160,7 @@ export type TransportResult =
 	| {
 			readonly requestId: string;
 			readonly ok: true;
+			readonly resumed?: boolean;
 			readonly value:
 				| readonly SessionSummary[]
 				| SessionSummary

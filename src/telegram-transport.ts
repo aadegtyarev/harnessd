@@ -1167,6 +1167,8 @@ export class TelegramTransportAdapter
 		}
 	>();
 	private readonly commandMenuTasks = new Map<number, Promise<void>>();
+	private readonly commandMenuAborts = new Map<number, AbortController>();
+	private readonly uncertainCommandMenus = new Set<number>();
 	private readonly sessionMenuCurrencies = new Map<SessionId, number>();
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
@@ -1504,6 +1506,14 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		for (const controller of this.commandMenuAborts.values())
+			controller.abort();
+		this.commandMenuAborts.clear();
+		for (const chatId of this.selected.keys())
+			this.commandMenuGenerations.set(
+				chatId,
+				(this.commandMenuGenerations.get(chatId) ?? 0) + 1,
+			);
 		for (const [chatId, sessionId] of this.selected) {
 			this.selectionCurrency.set(
 				chatId,
@@ -1716,7 +1726,7 @@ export class TelegramTransportAdapter
 		if (existing) return existing;
 		const task = (async () => {
 			let completed = 0;
-			while (!this.stopping) {
+			while (!this.stopping && !this.uncertainCommandMenus.has(chatId)) {
 				const request = this.commandMenuRequests.get(chatId);
 				if (!request || request.generation === completed) return;
 				const extensions = request.sessionId
@@ -1733,21 +1743,63 @@ export class TelegramTransportAdapter
 						this.selected.get(chatId) !== request.sessionId)
 				)
 					continue;
-				let publication: Promise<unknown> | undefined;
+				const controller = new AbortController();
+				this.commandMenuAborts.set(chatId, controller);
+				let publication: Promise<unknown>;
 				try {
 					publication = Promise.resolve(
-						this.bot.api.setMyCommands(telegramMenuCommands(extensions), {
-							scope: { type: "chat", chat_id: chatId },
-						}),
+						this.bot.api.setMyCommands(
+							telegramMenuCommands(extensions),
+							{ scope: { type: "chat", chat_id: chatId } },
+							controller.signal,
+						),
 					);
+				} catch (error) {
+					publication = Promise.reject(error);
+				}
+				void publication.catch(() => {});
+				try {
 					await withDeadline(publication, SEND_TIMEOUT_MS);
 				} catch (error) {
 					this.reportError(
 						"Telegram chat command menu registration failed",
 						error,
 					);
-					if (publication) await publication.catch(() => {});
+					if (
+						!this.stopping &&
+						error instanceof Error &&
+						error.message === "deadline"
+					) {
+						this.uncertainCommandMenus.add(chatId);
+						void publication.then(
+							() => {
+								this.uncertainCommandMenus.delete(chatId);
+								if (this.commandMenuAborts.get(chatId) === controller)
+									this.commandMenuAborts.delete(chatId);
+								if (!this.stopping) {
+									const latest = this.commandMenuRequests.get(chatId);
+									if (latest)
+										void this.refreshCommandMenu(
+											chatId,
+											latest.sessionId,
+											latest.sender,
+										);
+								}
+							},
+							() => {
+								if (this.commandMenuAborts.get(chatId) === controller)
+									this.commandMenuAborts.delete(chatId);
+							},
+						);
+					}
 				}
+				if (
+					!this.uncertainCommandMenus.has(chatId) &&
+					this.commandMenuAborts.get(chatId) === controller
+				)
+					this.commandMenuAborts.delete(chatId);
+				if (this.stopping) return;
+				if (this.uncertainCommandMenus.has(chatId)) return;
 				completed = request.generation;
 			}
 		})();
@@ -2759,8 +2811,21 @@ export class TelegramTransportAdapter
 				...extensions.slice(0, 1_000),
 				...(omitted ? [`… ещё команд: ${omitted}`] : []),
 			];
-			for (const page of paginateTelegramHelp(lines))
+			for (const page of paginateTelegramHelp(lines)) {
+				const carriesExtensions = extensions.some((line) =>
+					page.includes(line),
+				);
+				if (
+					carriesExtensions &&
+					(!sessionId ||
+						this.selected.get(chatId) !== sessionId ||
+						(this.selectionCurrency.get(chatId) ?? 0) !== selectionCurrency ||
+						(this.sessionMenuCurrencies.get(sessionId) ?? 0) !==
+							sessionCurrency)
+				)
+					break;
 				await this.sendDirect(chatId, page);
+			}
 			return;
 		}
 		if (name === "/reload") {
@@ -3645,14 +3710,12 @@ export class TelegramTransportAdapter
 		this.inFlightSubmissions.set(request.sessionId, pending);
 		try {
 			const result = await this.dispatchRequest(sender, request);
-			if (result.ok)
-				this.recordInputOutcome(
-					request.sessionId,
-					result.value as InputId,
-					chatId,
-					"accepted",
-				);
-			else if (result.error.inputId)
+			if (result.ok) {
+				const inputId = result.value as InputId;
+				this.recordInputOutcome(request.sessionId, inputId, chatId, "accepted");
+				if (result.resumed)
+					this.refreshMenusForSession(request.sessionId, true);
+			} else if (result.error.inputId)
 				this.recordInputOutcome(
 					request.sessionId,
 					result.error.inputId as InputId,
@@ -6292,12 +6355,10 @@ export class TelegramTransportAdapter
 				event.text === "harness_recovered" ||
 				event.text === "harness_recovery_failed"
 			)
-				for (const [chatId, selectedId] of this.selected)
-					if (selectedId === event.sessionId)
-						void this.refreshCommandMenu(
-							chatId,
-							event.text === "harness_recovered" ? selectedId : undefined,
-						);
+				this.refreshMenusForSession(
+					event.sessionId,
+					event.text === "harness_recovered",
+				);
 			if (
 				event.text === "harness_restarting" ||
 				event.text === "harness_recovered" ||

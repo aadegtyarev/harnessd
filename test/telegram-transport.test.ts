@@ -766,6 +766,91 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("bounds timed-out menu publication and republishes only the newest generation after settlement", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let entered!: () => void;
+		let release!: () => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		const held = new Promise<void>((resolve) => (release = resolve));
+		bot.setMyCommandsBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			await held;
+		};
+		const discoveries: SessionId[] = [];
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list") {
+					discoveries.push(request.sessionId);
+					return { requestId: request.requestId, ok: true, value: [] };
+				}
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		vi.useFakeTimers();
+		const prior = bot.commandRegistrations.length;
+		hold = true;
+		await bot.update(100, "/use other");
+		await started;
+		await vi.advanceTimersByTimeAsync(5_001);
+		await bot.update(100, "/use sid");
+		expect(bot.commandRegistrations).toHaveLength(prior + 1);
+		release();
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.at(-1)?.other).toEqual({
+				scope: { type: "chat", chat_id: 100 },
+			}),
+		);
+		await vi.waitFor(() => expect(discoveries.at(-1)).toBe("sid"));
+		await adapter.stop();
+	});
+
+	it("bounds restored-chat startup refresh and suppresses publication after shutdown", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const directory = await temp();
+		const store = await TelegramPanelStore.open(directory, "secret-token");
+		await store.setSelected(100, "sid");
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		bot.setMyCommandsBehavior = async () => {
+			const scope = (
+				bot.commandRegistrations.at(-1)?.other as { scope?: { type?: string } }
+			)?.scope;
+			if (scope?.type === "chat") await held;
+		};
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const adapter = new TelegramTransportAdapter({
+			token: "secret-token",
+			allowedUserIds: [42],
+			stateDirectory: directory,
+			initialCwd: "/work",
+			botFactory: () => bot as never,
+		});
+		const starting = adapter.start(
+			async (request) => result(request),
+			() => () => {},
+			async () => [...sessions.values()],
+		);
+		await vi.waitFor(() => expect(bot.commandRegistrations).toHaveLength(2));
+		await vi.advanceTimersByTimeAsync(5_001);
+		await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
+		bot.ready();
+		await starting;
+		const registrations = bot.commandRegistrations.length;
+		await adapter.stop();
+		release();
+		await Promise.resolve();
+		expect(bot.commandRegistrations).toHaveLength(registrations);
+		log.mockRestore();
+	});
+
 	it("keeps a late live menu from overwriting native-only stop state", async () => {
 		const bot = new MockBot();
 		let releaseDiscovery!: (value: TransportResult) => void;
@@ -931,6 +1016,53 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("refreshes every selecting chat after submit implicitly resumes a stopped session", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "live", description: "Live" }],
+					};
+				if (request.kind === "submit")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: "input-1" as never,
+						resumed: true,
+					};
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use sid");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.filter(
+					(entry) =>
+						(entry.other as { scope?: { type?: string } })?.scope?.type ===
+						"chat",
+				).length,
+			).toBeGreaterThanOrEqual(2),
+		);
+		const countMenus = (chatId: number) =>
+			bot.commandRegistrations.filter(
+				(entry) =>
+					(entry.other as { scope?: { chat_id?: number } })?.scope?.chat_id ===
+					chatId,
+			).length;
+		const first = countMenus(100);
+		const second = countMenus(101);
+		await bot.update(100, "new input");
+		await vi.waitFor(() => {
+			expect(countMenus(100)).toBeGreaterThan(first);
+			expect(countMenus(101)).toBeGreaterThan(second);
+		});
+		await adapter.stop();
+	});
+
 	it("shows fresh native-first paginated extension help and safe no-selection guidance", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp(), {
@@ -956,6 +1088,82 @@ describe("Telegram transport", () => {
 		expect(pages.every((text) => text.length <= 4096)).toBe(true);
 		expect(pages[0]).toContain("/reload");
 		expect(pages[0]).toContain("/cancel");
+		await adapter.stop();
+	});
+
+	it("suppresses later dynamic help pages when selection changes during the first send", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let entered!: () => void;
+		let release!: () => void;
+		const started = new Promise<void>((resolve) => (entered = resolve));
+		const held = new Promise<void>((resolve) => (release = resolve));
+		bot.sendMessageBehavior = async () => {
+			if (!hold) return;
+			hold = false;
+			entered();
+			await held;
+		};
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: Array.from({ length: 40 }, (_, index) => ({
+								name: `extra${index}`,
+								description: "A safe extension description ".repeat(10),
+							})),
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		const offset = bot.sent.length;
+		hold = true;
+		const help = bot.update(42, "/help");
+		await started;
+		await bot.update(42, "/use other");
+		release();
+		await help;
+		expect(
+			bot.sent.slice(offset).filter(({ text }) => text.includes("/extra")),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("invalidates held help discovery when recovery begins", async () => {
+		const bot = new MockBot();
+		let hold = false;
+		let release!: (value: TransportResult) => void;
+		const held = new Promise<TransportResult>((resolve) => (release = resolve));
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list" && hold) return held;
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [{ name: "fresh", description: "Fresh" }],
+					};
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		hold = true;
+		const help = bot.update(42, "/help");
+		await vi.waitFor(() => expect(release).toBeDefined());
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		release({
+			requestId: "held" as never,
+			ok: true,
+			value: [{ name: "stale", description: "Stale" }],
+		});
+		await help;
+		expect(bot.sent.at(-1)?.text).toContain("только команды harnessd");
+		expect(bot.sent.some(({ text }) => text.includes("/stale"))).toBe(false);
 		await adapter.stop();
 	});
 
