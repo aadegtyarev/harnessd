@@ -58,9 +58,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isId(value: unknown): value is string | number | null {
+function isId(value: unknown): value is string | number {
 	return (
-		value === null ||
 		typeof value === "string" ||
 		(typeof value === "number" && Number.isSafeInteger(value))
 	);
