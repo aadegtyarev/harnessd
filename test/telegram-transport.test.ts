@@ -3167,6 +3167,154 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("reattributes preserved queued input after bare cancellation without leaking canceled-run output", async () => {
+		let submitCount = 0;
+		let releaseCancel!: (value: TransportResult) => void;
+		let cancelRequest: TransportEvent | undefined;
+		const cancelGate = new Promise<TransportResult>(
+			(resolve) => (releaseCancel = resolve),
+		);
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "cancel_current") {
+					cancelRequest = request;
+					return cancelGate;
+				}
+				if (request.kind !== "submit") return result(request);
+				submitCount++;
+				return {
+					...result(request),
+					value: ["active-a", "queued-b", "continuation-a"][
+						submitCount - 1
+					] as never,
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(42, "active A input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "active-a" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "active-a" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(43, "queued B input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "queued-b" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "queued-b" as never, state: "accepted" },
+		});
+		const cancel = bot.update(42, "/cancel");
+		await vi.waitFor(() => expect(cancelRequest).toBeDefined());
+		emit(
+			harnessEvent("sid", "output", "canceled-run output must be suppressed"),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		const attributions = (
+			adapter as unknown as {
+				inputAttributions: Map<
+					string,
+					{ state: string; terminal: boolean; waitingForRun: boolean }
+				>;
+			}
+		).inputAttributions;
+		await vi.waitFor(() =>
+			expect(attributions.get("queued-b")).toMatchObject({
+				state: "accepted",
+				terminal: false,
+				waitingForRun: true,
+			}),
+		);
+		await bot.update(43, "/use other");
+		await bot.update(42, "A continuation");
+		if (!cancelRequest) throw new Error("missing current-run cancellation");
+		const cancelResult = result(cancelRequest);
+		if (!cancelResult.ok) throw new Error("cancel fixture was rejected");
+		releaseCancel(cancelResult);
+		await cancel;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "active-a" as never,
+				state: "failed",
+				detail: "Input canceled",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(attributions.get("queued-b")).toMatchObject({
+				state: "accepted",
+				terminal: false,
+				waitingForRun: true,
+			}),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "continuation-a" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "continuation-a" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "follow-on continuation answer"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "queued-b" as never, state: "completed" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "continuation-a" as never, state: "completed" },
+		});
+		const waitForEventQueue = (
+			adapter as unknown as {
+				waitForEventQueue: (chatId: number) => Promise<boolean>;
+			}
+		).waitForEventQueue.bind(adapter);
+		await Promise.all([waitForEventQueue(42), waitForEventQueue(43)]);
+		const answerForA = bot.sent.filter(
+			(message) =>
+				message.chatId === 42 &&
+				message.text.includes("follow-on continuation answer"),
+		);
+		const answerForB = bot.sent.filter(
+			(message) =>
+				message.chatId === 43 &&
+				message.text.includes("follow-on continuation answer"),
+		);
+		expect(answerForA).toHaveLength(1);
+		expect(answerForB).toHaveLength(1);
+		expect(answerForB[0]?.text).toContain("Фоновая сессия");
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("canceled-run output must be suppressed"),
+			),
+		).toBe(false);
+		expect(submitCount).toBe(3);
+		expect(
+			requests.filter(({ kind }) => kind === "cancel_current"),
+		).toHaveLength(1);
+		expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(3);
+		await adapter.stop();
+	});
+
 	it("bounds input history and reconciles overflow at run settlement", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());

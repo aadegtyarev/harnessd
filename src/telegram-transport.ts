@@ -358,6 +358,7 @@ type TurnBuffer = {
 	characters: number;
 	settled: boolean;
 	interrupted: boolean;
+	cancelled?: boolean;
 	overflow: boolean;
 };
 type InputAttribution = {
@@ -1231,6 +1232,7 @@ export class TelegramTransportAdapter
 	private readonly turnBuffers = new Map<SessionId, TurnBuffer>();
 	private readonly inputAttributions = new Map<InputId, InputAttribution>();
 	private readonly cancelingInputs = new Map<InputId, number>();
+	private readonly cancelingCurrentRunInputs = new Map<InputId, number>();
 	private readonly inFlightSubmissions = new Map<
 		SessionId,
 		InFlightSubmission
@@ -1626,6 +1628,7 @@ export class TelegramTransportAdapter
 		this.turnBuffers.clear();
 		this.inputAttributions.clear();
 		this.cancelingInputs.clear();
+		this.cancelingCurrentRunInputs.clear();
 		this.inFlightSubmissions.clear();
 		try {
 			if (this.initializationPromise)
@@ -3630,11 +3633,17 @@ export class TelegramTransportAdapter
 				activeInput?.sessionId === sessionId && !activeInput.terminal
 					? activeInput
 					: undefined;
-			if (trackedInput)
+			if (trackedInput) {
 				this.cancelingInputs.set(
 					trackedInput.inputId,
 					(this.cancelingInputs.get(trackedInput.inputId) ?? 0) + 1,
 				);
+				if (!inputId)
+					this.cancelingCurrentRunInputs.set(
+						trackedInput.inputId,
+						(this.cancelingCurrentRunInputs.get(trackedInput.inputId) ?? 0) + 1,
+					);
+			}
 			let result: TransportResult;
 			try {
 				result = await this.request(
@@ -3651,6 +3660,17 @@ export class TelegramTransportAdapter
 						this.cancelingInputs.delete(trackedInput.inputId);
 					else
 						this.cancelingInputs.set(trackedInput.inputId, pendingCancels - 1);
+					if (!inputId) {
+						const pendingCurrentCancels =
+							this.cancelingCurrentRunInputs.get(trackedInput.inputId) ?? 0;
+						if (pendingCurrentCancels <= 1)
+							this.cancelingCurrentRunInputs.delete(trackedInput.inputId);
+						else
+							this.cancelingCurrentRunInputs.set(
+								trackedInput.inputId,
+								pendingCurrentCancels - 1,
+							);
+					}
 				}
 			}
 			return this.sendDirect(
@@ -7225,9 +7245,9 @@ export class TelegramTransportAdapter
 		}
 		if (event.kind === "input" && event.inputEvent) {
 			const { inputId, state, detail } = event.inputEvent;
-			this.trackInputEvent(event.sessionId, inputId, state);
 			const canceledByUser =
 				state === "failed" && detail?.toLowerCase() === "input canceled";
+			this.trackInputEvent(event.sessionId, inputId, state, canceledByUser);
 			const inputPresentation = canceledByUser
 				? `Ввод ${inputId}: отменён пользователем`
 				: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`;
@@ -7454,6 +7474,7 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		inputId: InputId,
 		state: InputDeliveryState,
+		canceledByUser = false,
 	): void {
 		const record = this.getInputAttribution(sessionId, inputId);
 		if (!record || record.terminal) return;
@@ -7485,6 +7506,8 @@ export class TelegramTransportAdapter
 			return;
 		}
 		if (state === "completed" || state === "failed") {
+			if (state === "failed" && canceledByUser)
+				this.reassignQueuedInputsAfterCancellation(record);
 			const handledWithoutRunOutput =
 				state === "completed" &&
 				previousState === "accepted" &&
@@ -7519,8 +7542,26 @@ export class TelegramTransportAdapter
 	}
 
 	private settleInputAttributions(turn: TurnBuffer): void {
+		const cancellationPending = [...this.inputAttributions.values()].some(
+			(record) =>
+				record.turn === turn &&
+				this.cancelingCurrentRunInputs.has(record.inputId),
+		);
 		for (const record of this.inputAttributions.values()) {
 			if (record.turn !== turn || record.terminal) continue;
+			if (
+				cancellationPending &&
+				this.cancelingCurrentRunInputs.has(record.inputId)
+			)
+				continue;
+			if (
+				cancellationPending &&
+				record.steered &&
+				(record.state === "pending" || record.state === "accepted")
+			) {
+				this.detachInputFromTurn(record, turn);
+				continue;
+			}
 			if (
 				record.state === "pending" &&
 				record.pendingSeen &&
@@ -7536,6 +7577,47 @@ export class TelegramTransportAdapter
 				this.finishInputAttribution(record, true);
 			else if (!record.pendingSeen && record.state === "accepted")
 				this.finishInputAttribution(record, true);
+		}
+	}
+
+	private reassignQueuedInputsAfterCancellation(
+		canceledInput: InputAttribution,
+	): void {
+		const turn = canceledInput.turn;
+		if (!turn) return;
+		turn.cancelled = true;
+		for (const record of this.inputAttributions.values()) {
+			if (
+				record === canceledInput ||
+				record.turn !== turn ||
+				record.terminal ||
+				!record.steered ||
+				(record.state !== "pending" && record.state !== "accepted")
+			)
+				continue;
+			this.detachInputFromTurn(record, turn);
+		}
+	}
+
+	private detachInputFromTurn(
+		record: InputAttribution,
+		turn: TurnBuffer,
+	): void {
+		turn.pendingInputs.delete(record.inputId);
+		record.turn = undefined;
+		record.waitingForRun = true;
+		if (
+			record.chatId !== undefined &&
+			![...this.inputAttributions.values()].some(
+				(other) =>
+					other !== record &&
+					other.turn === turn &&
+					!other.terminal &&
+					other.chatId === record.chatId,
+			)
+		) {
+			turn.recipients.delete(record.chatId);
+			turn.statusRecipients.delete(record.chatId);
 		}
 	}
 
@@ -7629,7 +7711,8 @@ export class TelegramTransportAdapter
 		if (buffer.pendingInputs.size > 0) return;
 		if (this.turnBuffers.get(sessionId) === buffer)
 			this.turnBuffers.delete(sessionId);
-		if (buffer.characters === 0 && !buffer.overflow) return;
+		if (buffer.cancelled || (buffer.characters === 0 && !buffer.overflow))
+			return;
 		let text = buffer.chunks.join("");
 		const overflowNotice =
 			"[Additional output omitted because the response reached the queue limit.]";
