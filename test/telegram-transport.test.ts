@@ -876,6 +876,49 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("does not let a slow main view overwrite newer folder navigation", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		let statusCount = 0;
+		let releaseOld!: (result: TransportResult) => void;
+		const oldStatus = new Promise<TransportResult>(
+			(resolve) => (releaseOld = resolve),
+		);
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				statusCount++;
+				if (statusCount === 2) return oldStatus;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: { model: { provider: "test", id: "fresh", name: "fresh" } },
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const stale = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(statusCount).toBe(2));
+		await bot.callback(42, "menu:folders", bot.lastMessageId);
+		releaseOld({
+			requestId: "old" as never,
+			ok: true,
+			value: {
+				session: sessions.get("sid") as SessionSummary,
+				live: { model: { provider: "test", id: "stale", name: "stale" } },
+			},
+		} as TransportResult);
+		await stale;
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		expect(bot.edited.at(-1)?.text).not.toContain("Модель: test/stale");
+		await adapter.stop();
+	});
+
 	it("discards stale panel updates queued behind an in-flight Telegram edit", async () => {
 		const bot = new MockBot();
 		let tokens = 10;
