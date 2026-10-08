@@ -2,12 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import { TelegramPanelRefreshScheduler } from "../src/telegram-panel-refresh.js";
 
 describe("TelegramPanelRefreshScheduler backlog timing", () => {
-	it("bounds a sustained API-edit backlog to two seconds and terminal flushes at the boundary", async () => {
+	it("publishes the newest job by two seconds without releasing a blocked prior job", async () => {
 		vi.useFakeTimers();
 		const scheduler = new TelegramPanelRefreshScheduler(() => Date.now());
 		const began = Date.now();
-		const apiEdit = vi.fn(async (_text: string) => {});
-		const publish = (text: string) => async () => apiEdit(text);
+		const published: string[] = [];
+		const publish = (text: string) => async () => {
+			published.push(text);
+		};
 		let finishFirst!: () => void;
 		scheduler.schedule(
 			8,
@@ -18,18 +20,21 @@ describe("TelegramPanelRefreshScheduler backlog timing", () => {
 			true,
 		);
 		await vi.advanceTimersByTimeAsync(0);
-		for (let index = 0; index < 20; index++) {
+		for (let index = 0; index < 19; index++) {
 			await vi.advanceTimersByTimeAsync(100);
 			scheduler.schedule(8, publish(`backlog-${index}`));
 		}
+		scheduler.schedule(8, publish("backlog-19"));
+		const newestQueuedAt = Date.now();
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(published.at(-1)).toBe("backlog-19");
+		expect(Date.now() - newestQueuedAt).toBeLessThanOrEqual(2000);
 		finishFirst();
 		await vi.advanceTimersByTimeAsync(0);
-		expect(apiEdit).toHaveBeenLastCalledWith("backlog-19");
-		expect(Date.now() - began).toBe(2000);
 		scheduler.schedule(8, publish("explicit-terminal"), true);
 		await vi.advanceTimersByTimeAsync(0);
-		expect(apiEdit).toHaveBeenLastCalledWith("explicit-terminal");
-		expect(Date.now() - began).toBe(2000);
+		expect(published.at(-1)).toBe("explicit-terminal");
+		expect(Date.now() - began).toBe(3900);
 		await scheduler.stop();
 		vi.useRealTimers();
 	});

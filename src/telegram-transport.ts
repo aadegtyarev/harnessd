@@ -1476,9 +1476,13 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
-		await this.panelRefreshScheduler.stop();
 		for (const chatId of this.panelMessageIds.keys())
 			this.panelIntents.begin(chatId);
+		try {
+			await withDeadline(this.panelRefreshScheduler.stop(), STOP_TIMEOUT_MS);
+		} catch {
+			// Late refreshes are invalidated and cannot publish after shutdown.
+		}
 		if (this.inboxSweepTimer) clearInterval(this.inboxSweepTimer);
 		this.inboxSweepTimer = undefined;
 		if (this.inboxSweepPromise)
@@ -3428,7 +3432,8 @@ export class TelegramTransportAdapter
 		if (this.stopping) return;
 		const renderRequest = this.panelIntents.begin(chatId);
 		const listed = await this.request(sender, { kind: "list" });
-		if (!this.panelIntents.isCurrent(chatId, renderRequest)) return;
+		if (this.stopping || !this.panelIntents.isCurrent(chatId, renderRequest))
+			return;
 		const sessions = listed.ok
 			? (listed.value as readonly SessionSummary[])
 			: [];
@@ -3472,10 +3477,13 @@ export class TelegramTransportAdapter
 				kind: "session_status",
 				sessionId: previewId,
 			});
+			if (this.stopping || !this.panelIntents.isCurrent(chatId, renderRequest))
+				return;
 			if (result.ok) status = result.value as HarnessSessionStatus;
 			else liveQueryFailed = true;
 		}
 		if (
+			this.stopping ||
 			!this.panelIntents.isCurrent(chatId, renderRequest) ||
 			(this.previews.get(chatId) ??
 				this.selected.get(chatId) ??

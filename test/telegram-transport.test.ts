@@ -1030,6 +1030,31 @@ describe("Telegram transport", () => {
 			beforeInFlightEdits,
 		);
 		expect(unhandled).toEqual([]);
+		vi.useRealTimers();
+
+		const listBot = new MockBot();
+		let holdList = false;
+		let releaseList!: () => void;
+		const heldList = await startAdapter(listBot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "list" && holdList)
+					return new Promise((resolve) => {
+						releaseList = () => resolve(result(request));
+					});
+				return result(request);
+			},
+		});
+		await listBot.update(42, "/use sid");
+		await listBot.update(42, "/menu");
+		holdList = true;
+		heldList.emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() => expect(releaseList).toBeTypeOf("function"));
+		const stoppingList = heldList.adapter.stop();
+		releaseList();
+		await stoppingList;
+		expect(
+			heldList.requests.filter((request) => request.kind === "session_status"),
+		).toHaveLength(1);
 	});
 
 	it("refreshes the preview on recovery and fatal process-exit events", async () => {

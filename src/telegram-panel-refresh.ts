@@ -3,10 +3,7 @@ export class TelegramPanelRefreshScheduler {
 	private readonly timers = new Map<number, ReturnType<typeof setTimeout>>();
 	private readonly queuedAt = new Map<number, number>();
 	private readonly lastRun = new Map<number, number>();
-	private readonly generations = new Map<number, number>();
-	private readonly running = new Set<number>();
-	private readonly executions = new Map<number, Promise<void>>();
-	private readonly flushRequested = new Set<number>();
+	private readonly executions = new Map<number, Set<Promise<void>>>();
 	private stopped = false;
 
 	constructor(
@@ -21,20 +18,17 @@ export class TelegramPanelRefreshScheduler {
 		this.timers.clear();
 		this.pending.clear();
 		this.queuedAt.clear();
-		this.flushRequested.clear();
-		for (const chatId of this.generations.keys())
-			this.generations.set(chatId, (this.generations.get(chatId) ?? 0) + 1);
-		await Promise.all([...this.executions.values()]);
+		await Promise.all(
+			[...this.executions.values()].flatMap((jobs) => [...jobs]),
+		);
 	}
 	schedule(chatId: number, refresh: () => Promise<void>, flush = false): void {
 		if (this.stopped) return;
 		this.pending.set(chatId, refresh);
 		if (!this.queuedAt.has(chatId)) this.queuedAt.set(chatId, this.clock());
-		this.generations.set(chatId, (this.generations.get(chatId) ?? 0) + 1);
 		if (flush) {
 			this.clearTimer(chatId);
-			if (this.running.has(chatId)) this.flushRequested.add(chatId);
-			else this.launch(chatId);
+			this.launch(chatId);
 			return;
 		}
 		this.arm(chatId);
@@ -54,24 +48,28 @@ export class TelegramPanelRefreshScheduler {
 		);
 	}
 	private launch(chatId: number): void {
-		const execution = this.run(chatId);
-		this.executions.set(chatId, execution);
-		const cleanup = () => {
-			if (this.executions.get(chatId) === execution)
-				this.executions.delete(chatId);
-		};
-		void execution.then(cleanup, cleanup);
-	}
-	private async run(chatId: number): Promise<void> {
-		if (this.stopped || this.running.has(chatId)) return;
-		this.clearTimer(chatId);
+		if (this.stopped) return;
 		const refresh = this.pending.get(chatId);
 		if (!refresh) return;
-		const generation = this.generations.get(chatId);
+		this.clearTimer(chatId);
 		this.pending.delete(chatId);
 		this.queuedAt.delete(chatId);
-		this.running.add(chatId);
 		this.lastRun.set(chatId, this.clock());
+		const execution = this.run(refresh);
+		const jobs = this.executions.get(chatId) ?? new Set<Promise<void>>();
+		jobs.add(execution);
+		this.executions.set(chatId, jobs);
+		void execution.then(
+			() => this.finish(chatId, execution),
+			() => this.finish(chatId, execution),
+		);
+	}
+	private finish(chatId: number, execution: Promise<void>): void {
+		const jobs = this.executions.get(chatId);
+		jobs?.delete(execution);
+		if (!jobs?.size) this.executions.delete(chatId);
+	}
+	private async run(refresh: () => Promise<void>): Promise<void> {
 		try {
 			await refresh();
 		} catch (error) {
@@ -80,15 +78,6 @@ export class TelegramPanelRefreshScheduler {
 			} catch {
 				// Error reporting must not escape the scheduler task.
 			}
-		} finally {
-			this.running.delete(chatId);
-			if (this.flushRequested.delete(chatId) && this.pending.has(chatId))
-				this.launch(chatId);
-			else if (
-				this.pending.has(chatId) &&
-				this.generations.get(chatId) !== generation
-			)
-				this.arm(chatId);
 		}
 	}
 
