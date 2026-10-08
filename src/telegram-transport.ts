@@ -2865,13 +2865,15 @@ export class TelegramTransportAdapter
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const wasSelected = this.selected.get(chatId) === sessionId;
 			const result = await this.request(sender, { kind: "stop", sessionId });
-			if (result.ok) this.invalidateSessionConfirmations(sessionId);
+			if (result.ok) {
+				this.invalidateSessionConfirmations(sessionId);
+				this.refreshPanelsPreviewing(sessionId, sender, true);
+			}
 			let selectionCleared = true;
 			if (result.ok && this.selected.get(chatId) === sessionId) {
 				selectionCleared = await this.clearSelected(chatId);
 				this.previews.delete(chatId);
 			}
-			if (result.ok) this.refreshPanelsPreviewing(sessionId, sender, true);
 			const selectedAfterStop = this.selected.get(chatId);
 			const selectionMessage =
 				selectedAfterStop === sessionId
@@ -2934,6 +2936,7 @@ export class TelegramTransportAdapter
 			);
 			let selectionsCleared = true;
 			if (result.ok) {
+				this.refreshPanelsPreviewing(sessionId, sender, true);
 				this.invalidateSession(sessionId);
 				for (const [selectedChat, selectedId] of this.selected) {
 					if (selectedId === sessionId) {
@@ -2942,7 +2945,6 @@ export class TelegramTransportAdapter
 						this.previews.delete(selectedChat);
 					}
 				}
-				this.refreshPanelsPreviewing(sessionId, sender, true);
 			}
 			const remainingTarget = this.selected.get(chatId);
 			return this.sendDirect(
@@ -3638,12 +3640,14 @@ export class TelegramTransportAdapter
 		sessionId: SessionId,
 		sender: number,
 		flush = true,
+		invalidateIntents = false,
 	): void {
 		for (const chatId of this.panelMessageIds.keys()) {
 			if (
 				(this.previews.get(chatId) ?? this.selected.get(chatId)) !== sessionId
 			)
 				continue;
+			if (invalidateIntents) this.invalidatePanelIntent(chatId);
 			this.panelRefreshScheduler.schedule(
 				chatId,
 				() => this.refreshExistingPanel(chatId, sender),
@@ -5584,6 +5588,7 @@ export class TelegramTransportAdapter
 				return;
 			}
 			this.rememberSession(resumed.value as SessionSummary);
+			this.refreshPanelsPreviewing(intent.sessionId, sender, true);
 			if (!isCurrent()) {
 				await this.sendDirect(
 					chatId,
@@ -5844,6 +5849,7 @@ export class TelegramTransportAdapter
 			}
 			let selectionPersistenceWarning = false;
 			this.invalidateSessionConfirmations(sessionId);
+			this.refreshPanelsPreviewing(sessionId, sender, true);
 			if (action === "stop") {
 				if (this.selected.get(chatId) === sessionId) {
 					selectionPersistenceWarning = !(await this.clearSelected(chatId));
@@ -5951,19 +5957,14 @@ export class TelegramTransportAdapter
 				(event.text === "agent_start" || terminalPanelEvent)) ||
 			(event.kind === "error" && event.fatal === true)
 		) {
-			for (const chatId of this.panelMessageIds.keys()) {
-				const previewId =
-					this.previews.get(chatId) ?? this.selected.get(chatId);
-				if (previewId !== event.sessionId) continue;
-				this.invalidatePanelIntent(chatId);
-				const sender = this.options.allowedUserIds[0];
-				if (sender !== undefined)
-					this.panelRefreshScheduler.schedule(
-						chatId,
-						() => this.refreshExistingPanel(chatId, sender),
-						terminalPanelEvent,
-					);
-			}
+			const sender = this.options.allowedUserIds[0];
+			if (sender !== undefined)
+				this.refreshPanelsPreviewing(
+					event.sessionId,
+					sender,
+					terminalPanelEvent,
+					true,
+				);
 		}
 		if (event.kind === "output" && typeof event.text === "string") {
 			this.appendTurnOutput(event.sessionId, event.text);

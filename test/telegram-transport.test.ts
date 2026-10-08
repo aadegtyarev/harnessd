@@ -2552,6 +2552,126 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("panel resume fans out only to stored panels previewing the transitioned session", async () => {
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		const bot = new MockBot();
+		const statusQueries = new Map<string, number>();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status")
+					statusQueries.set(
+						request.sessionId,
+						(statusQueries.get(request.sessionId) ?? 0) + 1,
+					);
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(44, "/use other");
+		const previews = (
+			adapter as unknown as { previews: Map<number, SessionId> }
+		).previews;
+		previews.set(42, "sid" as SessionId);
+		previews.set(43, "sid" as SessionId);
+		previews.set(44, "other" as SessionId);
+		await bot.update(42, "/menu");
+		const initiatingPanel = bot.lastMessageId as number;
+		await bot.update(43, "/menu");
+		const otherMatchingPanel = bot.lastMessageId as number;
+		await bot.update(44, "/menu");
+		const nonmatchingPanel = bot.lastMessageId as number;
+		const beforeSid = statusQueries.get("sid") ?? 0;
+		const beforeOther = statusQueries.get("other") ?? 0;
+		const selection = (
+			adapter as unknown as { selected: Map<number, SessionId> }
+		).selected;
+		const previewSnapshot = [...previews];
+		await bot.callback(42, "session:resume:sid", initiatingPanel);
+		await vi.waitFor(() =>
+			expect(statusQueries.get("sid") ?? 0).toBeGreaterThanOrEqual(
+				beforeSid + 2,
+			),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some((edit) => edit.messageId === otherMatchingPanel),
+			).toBe(true),
+		);
+		expect(statusQueries.get("other") ?? 0).toBe(beforeOther);
+		expect(selection.get(42)).toBe("sid");
+		expect(selection.get(43)).toBe("sid");
+		expect(selection.get(44)).toBe("other");
+		expect([...previews]).toEqual(previewSnapshot);
+		expect(bot.edited.some((edit) => edit.messageId === nonmatchingPanel)).toBe(
+			false,
+		);
+		await adapter.stop();
+	});
+
+	it("confirmed panel stop and delete refresh matching chats but not other previews", async () => {
+		sessions.set("other", sessionWith("other", { status: "running" }));
+		const bot = new MockBot();
+		const statusQueries = new Map<string, number>();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status")
+					statusQueries.set(
+						request.sessionId,
+						(statusQueries.get(request.sessionId) ?? 0) + 1,
+					);
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(44, "/use other");
+		await bot.update(42, "/menu");
+		const initiatingPanel = bot.lastMessageId as number;
+		await bot.update(43, "/menu");
+		const otherMatchingPanel = bot.lastMessageId as number;
+		await bot.update(44, "/menu");
+		const nonmatchingPanel = bot.lastMessageId as number;
+		const beforeStop = statusQueries.get("sid") ?? 0;
+		await bot.callback(42, "session:stop:sid", initiatingPanel);
+		const stop = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.callback(42, stop, initiatingPanel);
+		await vi.waitFor(() =>
+			expect(statusQueries.get("sid") ?? 0).toBeGreaterThanOrEqual(
+				beforeStop + 2,
+			),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some((edit) => edit.messageId === otherMatchingPanel),
+			).toBe(true),
+		);
+		expect(bot.edited.some((edit) => edit.messageId === nonmatchingPanel)).toBe(
+			false,
+		);
+
+		const editsBeforeDelete = bot.edited.length;
+		await bot.callback(42, "session:delete:sid", initiatingPanel);
+		const remove = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.callback(42, remove, initiatingPanel);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited
+					.slice(editsBeforeDelete)
+					.some((edit) => edit.messageId === otherMatchingPanel),
+			).toBe(true),
+		);
+		expect(bot.edited.some((edit) => edit.messageId === nonmatchingPanel)).toBe(
+			false,
+		);
+		expect(
+			(adapter as unknown as { selected: Map<number, SessionId> }).selected.has(
+				43,
+			),
+		).toBe(false);
+		await adapter.stop();
+	});
+
 	it("panel Resume distinguishes an already-selected session from a different target", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
