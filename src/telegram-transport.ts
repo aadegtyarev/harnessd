@@ -12,6 +12,7 @@ import type {
 	AgentFileSendRequest,
 	AgentFileSendResult,
 	AgentFileSendTransport,
+	HarnessCommand,
 	HarnessEffortCatalog,
 	HarnessModelCatalog,
 	HarnessModelChangeResult,
@@ -44,6 +45,12 @@ import {
 	updateActivityRow,
 	visibleActivityRows,
 } from "./telegram-activity-projection.js";
+import {
+	extensionCommands,
+	isNativeTelegramCommand,
+	paginateTelegramHelp,
+	telegramMenuCommands,
+} from "./telegram-command-catalog.js";
 import {
 	listDirectories,
 	listDirectoryEntries,
@@ -216,7 +223,11 @@ type TelegramBot = {
 				readonly command: string;
 				readonly description: string;
 			}[],
-			other?: { readonly scope?: { readonly type: "all_private_chats" } },
+			other?: {
+				readonly scope?:
+					| { readonly type: "all_private_chats" }
+					| { readonly type: "chat"; readonly chat_id: number };
+			},
 			signal?: AbortSignal,
 		): Promise<unknown>;
 	};
@@ -1319,6 +1330,8 @@ export class TelegramTransportAdapter
 				} catch (error) {
 					this.reportError("Telegram command menu registration failed", error);
 				}
+				for (const chatId of this.selected.keys())
+					await this.refreshCommandMenu(chatId, this.selected.get(chatId));
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortInitialization);
 			}
@@ -1591,6 +1604,7 @@ export class TelegramTransportAdapter
 		if (this.activeTypingSessions.has(sessionId)) this.startTyping(sessionId);
 		try {
 			await this.panelStore?.setSelected(chatId, sessionId);
+			void this.refreshCommandMenu(chatId, sessionId);
 			return true;
 		} catch (error) {
 			this.reportError("Telegram session selection could not be saved", error, [
@@ -1607,6 +1621,7 @@ export class TelegramTransportAdapter
 			this.refreshTyping(previous);
 		try {
 			await this.panelStore?.clearSelected(chatId);
+			void this.refreshCommandMenu(chatId, undefined);
 			return true;
 		} catch (error) {
 			this.reportError(
@@ -1615,6 +1630,49 @@ export class TelegramTransportAdapter
 				[previous ?? ""],
 			);
 			return false;
+		}
+	}
+
+	private async discoverExtensionCommands(
+		sender: number,
+		sessionId: SessionId,
+	): Promise<readonly HarnessCommand[] | undefined> {
+		try {
+			const result = await this.request(sender, {
+				kind: "command_list",
+				sessionId,
+			});
+			if (!result.ok || !Array.isArray(result.value)) return undefined;
+			return extensionCommands(result.value as HarnessCommand[]);
+		} catch (error) {
+			this.reportError("Telegram extension command discovery failed", error);
+			return undefined;
+		}
+	}
+
+	private refreshMenusForSession(sessionId: SessionId, live: boolean): void {
+		for (const [chatId, selectedId] of this.selected)
+			if (selectedId === sessionId)
+				void this.refreshCommandMenu(chatId, live ? sessionId : undefined);
+	}
+
+	private async refreshCommandMenu(
+		chatId: number,
+		sessionId: SessionId | undefined,
+		sender = chatId,
+	): Promise<void> {
+		const extensions = sessionId
+			? ((await this.discoverExtensionCommands(sender, sessionId)) ?? [])
+			: [];
+		try {
+			await withDeadline(
+				this.bot.api.setMyCommands(telegramMenuCommands(extensions), {
+					scope: { type: "chat", chat_id: chatId },
+				}),
+				SEND_TIMEOUT_MS,
+			);
+		} catch (error) {
+			this.reportError("Telegram chat command menu registration failed", error);
 		}
 	}
 
@@ -2419,6 +2477,7 @@ export class TelegramTransportAdapter
 		raw: string,
 	): Promise<void> {
 		this.invalidatePanelIntent(chatId);
+		raw = raw.replace(/^\/(\S+)/, (token) => token.toLowerCase());
 		if (/^\/start(?:@[^\s]+)?$/.test(raw)) {
 			const actions: readonly WelcomeAction[] = ["panel", "sessions", "new"];
 			const tokens = actions.map((action) => {
@@ -2574,17 +2633,41 @@ export class TelegramTransportAdapter
 				);
 			}
 		}
-		const [command, ...args] = raw.trim().split(/\s+/);
-		const name = command.split("@")[0];
-		if (name === "/help" && args.length === 0)
-			return this.sendDirect(
-				chatId,
-				[
-					"Как начать: откройте /menu, выберите сессию или создайте новую. Обычные сообщения и вложения отправляются в выбранную сессию; /send <путь> отправляет файл из её рабочей папки.",
-					"Команды:",
-					...getTelegramHelpLines(),
-				].join("\n"),
+		const tokenMatch = /^\/(\S+)([\s\S]*)$/.exec(raw);
+		const commandToken = tokenMatch?.[1] ?? "";
+		const name = `/${commandToken.split("@")[0]}`.toLowerCase();
+		const rawRemainder = tokenMatch?.[2] ?? "";
+		const args = rawRemainder.trim().split(/\s+/).filter(Boolean);
+		if (name === "/help" && args.length === 0) {
+			const sessionId = this.selected.get(chatId);
+			const commands = sessionId
+				? await this.discoverExtensionCommands(sender, sessionId)
+				: undefined;
+			const notes = !sessionId
+				? [
+						"Расширения Pi недоступны: сначала выберите живую сессию через /menu.",
+					]
+				: !commands
+					? [
+							"Расширения Pi сейчас недоступны; показаны только команды harnessd.",
+						]
+					: [];
+			const extensions = (commands ?? []).map(
+				({ name, description }) => `/${name} — ${description}`,
 			);
+			const omitted = Math.max(0, extensions.length - 1_000);
+			const lines = [
+				"Как начать: откройте /menu, выберите сессию или создайте новую. Обычные сообщения и вложения отправляются в выбранную сессию; /send <путь> отправляет файл из её рабочей папки.",
+				"Команды:",
+				...getTelegramHelpLines(),
+				...notes,
+				...extensions.slice(0, 1_000),
+				...(omitted ? [`… ещё команд: ${omitted}`] : []),
+			];
+			for (const page of paginateTelegramHelp(lines))
+				await this.sendDirect(chatId, page);
+			return;
+		}
 		if (name === "/reload") {
 			if (args.length !== 0)
 				return this.sendDirect(chatId, "Использование: /reload");
@@ -2614,6 +2697,7 @@ export class TelegramTransportAdapter
 				}
 			}
 			if (result.ok) {
+				void this.refreshCommandMenu(chatId, sessionId, sender);
 				const name = this.sessionNames.get(sessionId);
 				const currentSelection = this.selected.get(chatId);
 				const destinationName = currentSelection
@@ -2818,6 +2902,7 @@ export class TelegramTransportAdapter
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			const result = await this.request(sender, { kind: "resume", sessionId });
 			if (result.ok) {
+				void this.refreshCommandMenu(chatId, this.selected.get(chatId), sender);
 				this.invalidateSessionConfirmations(sessionId);
 				this.rememberSession(result.value as SessionSummary);
 				this.refreshPanelsPreviewing(sessionId, sender, true);
@@ -2876,6 +2961,7 @@ export class TelegramTransportAdapter
 			const wasSelected = this.selected.get(chatId) === sessionId;
 			const result = await this.request(sender, { kind: "stop", sessionId });
 			if (result.ok) {
+				this.refreshMenusForSession(sessionId, false);
 				this.invalidateSessionConfirmations(sessionId);
 				this.refreshPanelsPreviewing(sessionId, sender, true);
 			}
@@ -2990,6 +3076,69 @@ export class TelegramTransportAdapter
 				result.ok
 					? `Запрошена отмена ввода для ${sessionId}.`
 					: result.error.message,
+			);
+		}
+		const extensionName = commandToken.split("@")[0]?.toLowerCase() ?? "";
+		if (commandToken && !isNativeTelegramCommand(extensionName)) {
+			const sessionId = this.selected.get(chatId);
+			if (!sessionId)
+				return this.sendDirect(
+					chatId,
+					"Сначала выберите живую сессию через /menu.",
+				);
+			const inventory = await this.discoverExtensionCommands(sender, sessionId);
+			if (!inventory)
+				return this.sendDirect(
+					chatId,
+					"Команды расширений Pi сейчас недоступны; выполните /help позже.",
+				);
+			if (
+				!inventory.some(
+					(command) => command.name.toLowerCase() === extensionName,
+				)
+			)
+				return this.sendDirect(
+					chatId,
+					"Эта команда Pi сейчас недоступна или больше не обнаружена.",
+				);
+			let result: TransportResult;
+			try {
+				result = await this.request(sender, {
+					kind: "command_run",
+					sessionId,
+					name: extensionName,
+					remainder: rawRemainder,
+				});
+			} catch (error) {
+				this.reportError("Telegram extension command dispatch failed", error);
+				return this.sendDirect(
+					chatId,
+					"Не удалось подтвердить команду Pi; автоматического повтора нет.",
+				);
+			}
+			if (!result.ok) {
+				const replies: Record<string, string> = {
+					COMMAND_NOT_AVAILABLE:
+						"Эта команда Pi больше недоступна; запрос не повторялся.",
+					COMMAND_REJECTED: "Pi не принял команду; запрос не повторялся.",
+					COMMAND_UNCERTAIN:
+						"Pi мог принять команду; результат неизвестен, повтор не выполнялся.",
+					COMMAND_DISCOVERY_FAILED:
+						"Не удалось проверить команду Pi; запрос не повторялся.",
+					SESSION_NOT_FOUND:
+						"Выбранная живая сессия недоступна; команда не выполнялась.",
+				};
+				return this.sendDirect(
+					chatId,
+					replies[result.error.code] ??
+						"Не удалось выполнить команду Pi; автоматического повтора нет.",
+				);
+			}
+			return this.sendDirect(
+				chatId,
+				result.value === "handled"
+					? "Pi обработал команду; это не подтверждает завершение работы."
+					: "Pi принял команду; это не подтверждает завершение работы.",
 			);
 		}
 		return this.sendDirect(chatId, "Неизвестная команда. Используйте /help.");
@@ -5887,6 +6036,7 @@ export class TelegramTransportAdapter
 			this.invalidateSessionConfirmations(sessionId);
 			this.refreshPanelsPreviewing(sessionId, sender, true);
 			if (action === "stop") {
+				this.refreshMenusForSession(sessionId, false);
 				if (this.selected.get(chatId) === sessionId) {
 					selectionPersistenceWarning = !(await this.clearSelected(chatId));
 					this.previews.delete(chatId);
@@ -6024,6 +6174,17 @@ export class TelegramTransportAdapter
 		if (event.kind === "status") {
 			if (event.text === "harness_recovered")
 				this.reportedErrors.delete(event.sessionId);
+			if (
+				event.text === "harness_restarting" ||
+				event.text === "harness_recovered" ||
+				event.text === "harness_recovery_failed"
+			)
+				for (const [chatId, selectedId] of this.selected)
+					if (selectedId === event.sessionId)
+						void this.refreshCommandMenu(
+							chatId,
+							event.text === "harness_recovered" ? selectedId : undefined,
+						);
 			if (
 				event.text === "harness_restarting" ||
 				event.text === "harness_recovered" ||

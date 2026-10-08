@@ -603,7 +603,7 @@ async function startAdapter(
 	});
 	const started = adapter.start(
 		async (request) => {
-			requests.push(request);
+			if (request.kind !== "command_list") requests.push(request);
 			return (await extras.dispatch?.(request)) ?? result(request);
 		},
 		(subscribe) => {
@@ -641,6 +641,137 @@ function callbackData(options: unknown, prefix: string): string {
 }
 
 describe("Telegram transport", () => {
+	it("dispatches only fresh non-native extensions and preserves raw arguments", async () => {
+		const bot = new MockBot();
+		const discovered = [
+			{ name: "cost", description: "Cost summary" },
+			{ name: "reload", description: "shadow" },
+			{ name: "help", description: "shadow" },
+			{ name: "private", description: "/secret/path" },
+		];
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return { requestId: request.requestId, ok: true, value: discovered };
+				if (request.kind === "command_run")
+					return { requestId: request.requestId, ok: true, value: "accepted" };
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.some(
+					(registration) =>
+						(registration.other as { scope?: { type?: string } })?.scope
+							?.type === "chat",
+				),
+			).toBe(true),
+		);
+		await bot.update(42, "/CoSt@bot   two  spaces ");
+		const run = requests.find((request) => request.kind === "command_run");
+		expect(run).toMatchObject({ name: "cost", remainder: "   two  spaces " });
+		expect(bot.sent.at(-1)?.text).toContain("принял команду");
+		await bot.update(42, "/reload");
+		expect(requests.some((request) => request.kind === "reload")).toBe(true);
+		await bot.update(42, "/private");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("принял команду"),
+		);
+		expect(bot.sent.at(-1)?.text).not.toContain("/secret/path");
+		await adapter.stop();
+	});
+
+	it("registers different extension inventories per selected private chat", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: [
+							{ name: request.sessionId, description: "Session command" },
+						],
+					};
+				return result(request);
+			},
+		});
+		await bot.update(100, "/use sid");
+		await bot.update(101, "/use other");
+		await vi.waitFor(() =>
+			expect(
+				bot.commandRegistrations.filter(
+					(item) =>
+						(item.other as { scope?: { type?: string } })?.scope?.type ===
+						"chat",
+				),
+			).toHaveLength(2),
+		);
+		const scoped = bot.commandRegistrations.filter(
+			(item) =>
+				(item.other as { scope?: { type?: string } })?.scope?.type === "chat",
+		);
+		expect(scoped[0]?.commands.at(-1)?.command).toBe("sid");
+		expect(scoped[1]?.commands.at(-1)?.command).toBe("other");
+		expect(scoped[0]?.other).toEqual({ scope: { type: "chat", chat_id: 100 } });
+		expect(scoped[1]?.other).toEqual({ scope: { type: "chat", chat_id: 101 } });
+		await adapter.stop();
+	});
+
+	it("shows fresh native-first paginated extension help and safe no-selection guidance", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "command_list"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: Array.from({ length: 40 }, (_, index) => ({
+								name: `extra${index}`,
+								description: "A safe extension description ".repeat(10),
+							})),
+						}
+					: result(request),
+		});
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).toContain("сначала выберите живую сессию");
+		await bot.update(42, "/use sid");
+		const offset = bot.sent.length;
+		await bot.update(42, "/help");
+		const pages = bot.sent.slice(offset).map(({ text }) => text);
+		expect(pages.length).toBeGreaterThan(1);
+		expect(pages.every((text) => text.length <= 4096)).toBe(true);
+		expect(pages[0]).toContain("/reload");
+		expect(pages[0]).toContain("/cancel");
+		await adapter.stop();
+	});
+
+	it("does not dispatch a command removed from fresh discovery", async () => {
+		const bot = new MockBot();
+		let inventory: readonly { name: string; description: string }[] = [
+			{ name: "cost", description: "Cost" },
+		];
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "command_list")
+					return { requestId: request.requestId, ok: true, value: inventory };
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() =>
+			expect(bot.commandRegistrations.length).toBeGreaterThan(1),
+		);
+		inventory = [];
+		await bot.update(42, "/cost");
+		expect(requests.some((request) => request.kind === "command_run")).toBe(
+			false,
+		);
+		expect(bot.sent.at(-1)?.text).toContain("больше не обнаружена");
+		await adapter.stop();
+	});
+
 	it("spaces actual panel edit API calls by at least 500 ms", async () => {
 		const bot = new MockBot();
 		let now = 0;
