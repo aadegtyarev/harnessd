@@ -31,6 +31,7 @@ import type {
 	HarnessModelChangeResult,
 	HarnessOptionCatalog,
 	HarnessOptionUpdate,
+	HarnessRegistryEntry,
 	HarnessSelection,
 	HarnessSessionStatus,
 	ToolPermissionHandler,
@@ -153,6 +154,10 @@ export class SessionManager {
 	async getHarnessCapabilities(id: SessionId): Promise<readonly Capability[]> {
 		const session = await this.get(id);
 		return this.harnesses.get(session.harnessId)?.descriptor.capabilities ?? [];
+	}
+
+	listHarnesses(): readonly HarnessRegistryEntry[] {
+		return this.registry.list();
 	}
 
 	async rename(id: SessionId, name?: string): Promise<SessionSummary> {

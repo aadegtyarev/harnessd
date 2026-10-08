@@ -349,14 +349,24 @@ describe("core capability contracts", () => {
 			expect(launchOptions).toEqual({ effort: "high", shared: false });
 			await store.update({ ...session, harnessId: "other" as never });
 			expect((await store.get(session.id))?.harnessId).toBe("mock-harness");
+			const explicitAliasSession = await manager.create({
+				cwd: workspace,
+				harnessId: "mock" as never,
+			});
+			expect(explicitAliasSession.harnessId).toBe("mock-harness");
 		} finally {
 			await manager.close();
 		}
 		store.close();
 		const reopened = await SqliteSessionStore.open(state);
-		expect(await reopened.list()).toMatchObject([
-			{ harnessId: "mock-harness", adapterOptions: { shared: false } },
-		]);
+		const reopenedSessions = await reopened.list();
+		expect(reopenedSessions).toHaveLength(2);
+		expect(
+			reopenedSessions.every(({ harnessId }) => harnessId === "mock-harness"),
+		).toBe(true);
+		expect(reopenedSessions).toContainEqual(
+			expect.objectContaining({ adapterOptions: { shared: false } }),
+		);
 		reopened.close();
 		expect(mergeAdapterOptions({ effort: "low" }, { effort: "high" })).toEqual({
 			effort: "high",

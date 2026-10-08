@@ -312,6 +312,7 @@ export interface TransportAdapter {
 		getSessionCapabilities?: (
 			sessionId: SessionId,
 		) => Promise<readonly Capability[]>,
+		listHarnesses?: () => readonly HarnessRegistryEntry[],
 	): Promise<void>;
 	stop(): Promise<void>;
 }

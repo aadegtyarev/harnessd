@@ -226,14 +226,18 @@ export function getCliCommandUsages(
 	});
 }
 
-export function getTelegramCommands(includeCancel = true): readonly {
+export function getTelegramCommands(
+	includeCancel = true,
+	includeReload = true,
+): readonly {
 	readonly command: string;
 	readonly description: string;
 }[] {
 	return COMMAND_CATALOG.flatMap((command) => {
 		if (
 			command.visibility === "cli-only" ||
-			(!includeCancel && command.telegram.command === "cancel")
+			(!includeCancel && command.telegram.command === "cancel") ||
+			(!includeReload && command.telegram.command === "reload")
 		)
 			return [];
 		return [
@@ -251,10 +255,14 @@ export function getTelegramHelpUsages(): readonly string[] {
 	);
 }
 
-export function getTelegramHelpLines(includeCancel = true): readonly string[] {
+export function getTelegramHelpLines(
+	includeCancel = true,
+	includeReload = true,
+): readonly string[] {
 	return COMMAND_CATALOG.flatMap((command) =>
 		command.visibility === "cli-only" ||
-		(!includeCancel && command.telegram.command === "cancel")
+		(!includeCancel && command.telegram.command === "cancel") ||
+		(!includeReload && command.telegram.command === "reload")
 			? []
 			: [`${command.usage} — ${command.telegram.description}`],
 	);

@@ -333,6 +333,7 @@ export class ApplicationRuntime {
 					subscribeEvents,
 					() => sessionManager.list(),
 					(sessionId) => sessionManager.getHarnessCapabilities(sessionId),
+					() => sessionManager.listHarnesses(),
 				);
 			}
 			runtime.state = "running";

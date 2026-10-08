@@ -20,6 +20,7 @@ import type {
 	HarnessModelInfo,
 	HarnessOptionCatalog,
 	HarnessOptionUpdate,
+	HarnessRegistryEntry,
 	HarnessSessionStatus,
 	HarnessUsageStats,
 	ToolPermissionDecision,
@@ -66,6 +67,7 @@ import {
 	resolvePathFrom,
 	safeAttachmentName,
 } from "./telegram-filesystem.js";
+import { parseNewHarnessSelection } from "./telegram-harness-selection.js";
 import {
 	TelegramInbox,
 	TelegramInboxError,
@@ -268,6 +270,7 @@ type PendingNameFlow =
 	| {
 			readonly kind: "create";
 			readonly cwd: string;
+			readonly harnessId?: AdapterId;
 			readonly promptMessageId: number;
 			choiceMessageId?: number;
 			processing?: boolean;
@@ -279,6 +282,13 @@ type PendingNameFlow =
 			choiceMessageId?: number;
 			processing?: boolean;
 	  };
+type CreateHarnessIntent = {
+	readonly chatId: number;
+	readonly sender: number;
+	readonly cwd: string;
+	readonly harnessId: AdapterId;
+	messageId?: number;
+};
 type ReplyRoute = { readonly sessionId: SessionId };
 type WelcomeAction = "panel" | "sessions" | "new";
 type WelcomeIntent = {
@@ -298,7 +308,11 @@ type ReplyChoice = {
 	readonly message?: NonNullable<UpdateContext["message"]>;
 };
 type PendingNameRequest =
-	| { readonly kind: "create"; readonly cwd: string }
+	| {
+			readonly kind: "create";
+			readonly cwd: string;
+			readonly harnessId?: AdapterId;
+	  }
 	| { readonly kind: "rename"; readonly sessionId: SessionId };
 type ModelChoices = {
 	readonly sessionId: SessionId;
@@ -1193,6 +1207,7 @@ export class TelegramTransportAdapter
 	private getSessionCapabilities?: (
 		sessionId: SessionId,
 	) => Promise<readonly Capability[]>;
+	private listHarnesses?: () => readonly HarnessRegistryEntry[];
 	private readonly selected = new Map<number, SessionId>();
 	private readonly selectionCurrency = new Map<number, number>();
 	private readonly commandMenuGenerations = new Map<number, number>();
@@ -1254,6 +1269,10 @@ export class TelegramTransportAdapter
 		(error) => this.reportError("Telegram panel refresh failed", error),
 	);
 	private readonly welcomeIntents = new Map<string, WelcomeIntent>();
+	private readonly createHarnessIntents = new Map<
+		string,
+		CreateHarnessIntent
+	>();
 	private readonly folderIntents = new Map<string, FolderIntent>();
 	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
 	private readonly resumeSelectIntents = new Map<string, ResumeSelectIntent>();
@@ -1312,10 +1331,12 @@ export class TelegramTransportAdapter
 		getSessionCapabilities?: (
 			sessionId: SessionId,
 		) => Promise<readonly Capability[]>,
+		listHarnesses?: () => readonly HarnessRegistryEntry[],
 	): Promise<void> {
 		this.dispatch = dispatch;
 		this.listSessions = listSessions;
 		this.getSessionCapabilities = getSessionCapabilities;
+		this.listHarnesses = listHarnesses;
 		this.releaseLock = await acquireTelegramPollingLock(
 			this.options.token,
 			this.options.stateDirectory,
@@ -1796,13 +1817,17 @@ export class TelegramTransportAdapter
 						)) ?? [])
 					: [];
 				let includeCancel = false;
+				let includeReload = true;
 				if (request.sessionId && this.getSessionCapabilities) {
 					try {
-						includeCancel = (
-							await this.getSessionCapabilities(request.sessionId)
-						).includes("harness.cancel");
+						const capabilities = await this.getSessionCapabilities(
+							request.sessionId,
+						);
+						includeCancel = capabilities.includes("harness.cancel");
+						includeReload = capabilities.includes("harness.reload");
 					} catch {
 						includeCancel = false;
+						includeReload = false;
 					}
 				}
 				if (this.stopping) return;
@@ -1819,7 +1844,7 @@ export class TelegramTransportAdapter
 				try {
 					publication = Promise.resolve(
 						this.bot.api.setMyCommands(
-							telegramMenuCommands(extensions, includeCancel),
+							telegramMenuCommands(extensions, includeCancel, includeReload),
 							{ scope: { type: "chat", chat_id: chatId } },
 							controller.signal,
 						),
@@ -2907,20 +2932,26 @@ export class TelegramTransportAdapter
 			return this.renameCommand(chatId, sender, renameCommand[1] ?? "");
 		const newCommand = /^\/new(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (newCommand) {
-			const parsedPath = parsePathArgument(newCommand[1]);
-			if (!parsedPath.ok)
+			const selection = parseNewHarnessSelection(
+				newCommand[1],
+				this.listHarnesses?.() ?? [],
+			);
+			if (!selection.ok)
 				return this.sendDirect(
 					chatId,
-					"Возьмите весь путь в парные кавычки или уберите кавычки.",
+					selection.reason === "unknown_harness"
+						? "Неизвестный harness. Укажите зарегистрированный alias после @; сессия не создана."
+						: "Возьмите весь путь в парные кавычки или уберите кавычки.",
 				);
 			const currentDirectory =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
-			const cwd = parsedPath.path
-				? resolvePathFrom(parsedPath.path, currentDirectory)
+			const cwd = selection.cwdArgument
+				? resolvePathFrom(selection.cwdArgument, currentDirectory)
 				: currentDirectory;
 			const result = await this.request(sender, {
 				kind: "create",
 				cwd,
+				...(selection.harnessId ? { harnessId: selection.harnessId } : {}),
 			});
 			if (!result.ok) return this.sendDirect(chatId, result.error.message);
 			const session = result.value as SessionSummary;
@@ -3050,23 +3081,28 @@ export class TelegramTransportAdapter
 				({ name, description }) => `/${name} — ${description}`,
 			);
 			let includeCancel = false;
+			let includeReload = true;
 			if (sessionId && this.getSessionCapabilities) {
 				try {
 					const capabilities = await this.getSessionCapabilities(sessionId);
-					includeCancel =
+					const stillCurrent =
 						current &&
 						this.selected.get(chatId) === sessionId &&
-						(this.selectionCurrency.get(chatId) ?? 0) === selectionCurrency &&
-						capabilities.includes("harness.cancel");
+						(this.selectionCurrency.get(chatId) ?? 0) === selectionCurrency;
+					includeCancel =
+						stillCurrent && capabilities.includes("harness.cancel");
+					includeReload =
+						stillCurrent && capabilities.includes("harness.reload");
 				} catch {
 					includeCancel = false;
+					includeReload = false;
 				}
 			}
 			const omitted = Math.max(0, extensions.length - 1_000);
 			const lines = [
 				"Как начать: откройте /menu, выберите сессию или создайте новую. Обычные сообщения и вложения отправляются в выбранную сессию; /send <путь> отправляет файл из её рабочей папки.",
 				"Команды:",
-				...getTelegramHelpLines(includeCancel),
+				...getTelegramHelpLines(includeCancel, includeReload),
 				...notes,
 				...extensions.slice(0, 1_000),
 				...(omitted ? [`… ещё команд: ${omitted}`] : []),
@@ -3094,6 +3130,24 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+			if (this.getSessionCapabilities) {
+				try {
+					if (
+						!(await this.getSessionCapabilities(sessionId)).includes(
+							"harness.reload",
+						)
+					)
+						return this.sendDirect(
+							chatId,
+							"Команда /reload не поддерживается выбранной сессией.",
+						);
+				} catch {
+					return this.sendDirect(
+						chatId,
+						"Не удалось проверить поддержку /reload выбранной сессией.",
+					);
+				}
+			}
 			const reloadOwner = Symbol("reload owner");
 			const ownsReloadMarker = !this.reloadingSessions.has(sessionId);
 			if (ownsReloadMarker) {
@@ -3838,7 +3892,8 @@ export class TelegramTransportAdapter
 		sender: number,
 		flow: PendingNameFlow,
 	): Promise<void> {
-		if (flow.kind === "create") return this.promptForCreation(chatId, flow.cwd);
+		if (flow.kind === "create")
+			return this.promptForCreation(chatId, sender, flow.cwd, flow.harnessId);
 		const inspected = await this.request(sender, {
 			kind: "inspect",
 			sessionId: flow.sessionId,
@@ -3865,11 +3920,83 @@ export class TelegramTransportAdapter
 		);
 	}
 
-	private async promptForCreation(chatId: number, cwd: string): Promise<void> {
+	private async promptForHarnessSelection(
+		chatId: number,
+		sender: number,
+		cwd: string,
+	): Promise<void> {
+		const entries = this.listHarnesses?.() ?? [];
+		if (!entries.length) return this.promptForCreation(chatId, sender, cwd);
+		const tokens = entries.map(() => this.makeIntentToken());
+		entries.forEach((entry, index) => {
+			const token = tokens[index];
+			if (token)
+				this.createHarnessIntents.set(token, {
+					chatId,
+					sender,
+					cwd,
+					harnessId: entry.id,
+				});
+		});
+		while (this.createHarnessIntents.size > 512)
+			this.createHarnessIntents.delete(
+				this.createHarnessIntents.keys().next().value as string,
+			);
+		const rows = entries.map((entry, index) => {
+			const label = oneLine(entry.metadata?.name ?? entry.id).slice(0, 48);
+			const token = tokens[index];
+			return [inlineButton(label, `create-harness:${token}`)];
+		});
+		const sent = await this.sendWithDeadline(
+			chatId,
+			"Выберите harness для новой сессии.",
+			{ reply_markup: keyboard(rows) },
+			undefined,
+			(messageId) => {
+				for (const token of tokens) {
+					const intent = token
+						? this.createHarnessIntents.get(token)
+						: undefined;
+					if (intent && messageId !== undefined) intent.messageId = messageId;
+				}
+			},
+		);
+		if (!sent)
+			for (const token of tokens) this.createHarnessIntents.delete(token);
+	}
+
+	private async dispatchCreateHarness(
+		chatId: number,
+		sender: number,
+		token: string,
+		messageId: number,
+	): Promise<void> {
+		const intent = this.createHarnessIntents.get(token);
+		if (
+			!intent ||
+			intent.chatId !== chatId ||
+			intent.sender !== sender ||
+			intent.messageId !== messageId
+		)
+			return this.showStaleCallback(chatId, messageId);
+		for (const [key, candidate] of this.createHarnessIntents)
+			if (candidate.chatId === chatId && candidate.messageId === messageId)
+				this.createHarnessIntents.delete(key);
+		return this.promptForCreation(chatId, sender, intent.cwd, intent.harnessId);
+	}
+
+	private async promptForCreation(
+		chatId: number,
+		sender: number,
+		cwd: string,
+		harnessId?: AdapterId,
+	): Promise<void> {
+		if (!harnessId && this.listHarnesses?.().length)
+			return this.promptForHarnessSelection(chatId, sender, cwd);
 		const instructions = CREATE_NAME_INSTRUCTIONS;
 		return this.promptForPathName(
 			chatId,
-			{ kind: "create", cwd },
+			{ kind: "create", cwd, ...(harnessId ? { harnessId } : {}) },
 			cwd,
 			CREATE_NAME_PREFIX,
 			instructions,
@@ -3997,6 +4124,7 @@ export class TelegramTransportAdapter
 			const result = await this.request(sender, {
 				kind: "create",
 				cwd: flow.cwd,
+				...(flow.harnessId ? { harnessId: flow.harnessId } : {}),
 				...(name !== undefined ? { name } : {}),
 			});
 			if (!result.ok) {
@@ -5015,6 +5143,7 @@ export class TelegramTransportAdapter
 			return;
 		}
 		const directAction =
+			callback.data.startsWith("create-harness:") ||
 			callback.data.startsWith("action:resume-select:") ||
 			callback.data.startsWith("action:select:") ||
 			callback.data === "panel:refresh";
@@ -5052,7 +5181,7 @@ export class TelegramTransportAdapter
 		if (intent.action === "new") {
 			const cwd =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
-			return this.promptForCreation(chatId, cwd);
+			return this.promptForCreation(chatId, sender, cwd);
 		}
 		let panelId =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
@@ -5071,6 +5200,13 @@ export class TelegramTransportAdapter
 		data: string,
 		messageId: number,
 	): Promise<void> {
+		if (data.startsWith("create-harness:"))
+			return this.dispatchCreateHarness(
+				chatId,
+				sender,
+				data.slice(15),
+				messageId,
+			);
 		if (data === "menu:home")
 			return this.renderPanel(chatId, sender, messageId);
 		if (data === "panel:refresh")
@@ -5105,14 +5241,14 @@ export class TelegramTransportAdapter
 		if (data === "menu:new") {
 			const cwd =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
-			return this.promptForCreation(chatId, cwd);
+			return this.promptForCreation(chatId, sender, cwd);
 		}
 		if (data === "folder:parent")
 			return this.changeFolder(chatId, sender, "parent", messageId);
 		if (data === "folder:new") {
 			const cwd =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
-			return this.promptForCreation(chatId, cwd);
+			return this.promptForCreation(chatId, sender, cwd);
 		}
 		if (data.startsWith("folder:page:"))
 			return this.setPageAndRender(

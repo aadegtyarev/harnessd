@@ -14,7 +14,11 @@ import os from "node:os";
 import path from "node:path";
 import { Bot } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TransportEvent, TransportResult } from "../src/core/ports.js";
+import type {
+	HarnessRegistryEntry,
+	TransportEvent,
+	TransportResult,
+} from "../src/core/ports.js";
 import type {
 	HarnessEvent,
 	InputId,
@@ -120,8 +124,8 @@ class MockBot {
 	get lastForceReplyMessageId(): number | undefined {
 		const index = this.sendOptions.findLastIndex(
 			(option) =>
-				(option as { reply_markup?: { force_reply?: boolean } }).reply_markup
-					?.force_reply,
+				(option as { reply_markup?: { force_reply?: boolean } } | undefined)
+					?.reply_markup?.force_reply,
 		);
 		return index < 0 ? undefined : this.sent[index]?.message_id;
 	}
@@ -585,6 +589,10 @@ async function startAdapter(
 		activityClock?: () => Date;
 		activityTimeFormatter?: (date: Date) => string;
 		capabilities?: readonly import("../src/core/errors.js").Capability[];
+		capabilitiesFor?: (
+			sessionId: SessionId,
+		) => readonly import("../src/core/errors.js").Capability[];
+		harnesses?: readonly HarnessRegistryEntry[];
 		panelClock?: () => number;
 		panelSleep?: (milliseconds: number) => Promise<void>;
 	} = {},
@@ -619,7 +627,10 @@ async function startAdapter(
 			};
 		},
 		async () => [...sessions.values()],
-		async () => extras.capabilities ?? ["harness.cancel"],
+		async (sessionId) =>
+			extras.capabilitiesFor?.(sessionId) ??
+			extras.capabilities ?? ["harness.cancel", "harness.reload"],
+		extras.harnesses ? () => extras.harnesses ?? [] : undefined,
 	);
 	await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
 	bot.ready();
@@ -6401,6 +6412,52 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("shows /reload only for capable selections and rejects unsupported use", async () => {
+		const bot = new MockBot();
+		sessions.set("claude", {
+			id: "claude" as SessionId,
+			harnessId: "claude-code" as never,
+			cwd: "/work",
+			status: "running",
+		});
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			capabilitiesFor: (sessionId) =>
+				sessionId === ("claude" as SessionId)
+					? ["harness.cancel"]
+					: ["harness.cancel", "harness.reload"],
+		});
+		await bot.update(42, "/use claude");
+		await vi.waitFor(() => {
+			const menu = bot.commandRegistrations.findLast(({ other }) =>
+				JSON.stringify(other).includes('"chat_id":42'),
+			);
+			expect(menu?.commands.map(({ command }) => command)).not.toContain(
+				"reload",
+			);
+		});
+		await bot.update(42, "/help");
+		expect(
+			bot.sent
+				.filter(({ chatId }) => chatId === 42)
+				.map(({ text }) => text)
+				.join("\n"),
+		).not.toContain("/reload");
+		await bot.update(42, "/reload");
+		expect(bot.sent.at(-1)?.text).toContain("не поддерживается");
+		expect(requests.some(({ kind }) => kind === "reload")).toBe(false);
+
+		await bot.update(42, "/use sid");
+		await vi.waitFor(() => {
+			const menu = bot.commandRegistrations.findLast(({ other }) =>
+				JSON.stringify(other).includes('"chat_id":42'),
+			);
+			expect(menu?.commands.map(({ command }) => command)).toContain("reload");
+		});
+		await bot.update(42, "/help");
+		expect(bot.sent.at(-1)?.text).toContain("/reload");
+		await adapter.stop();
+	});
+
 	it("registers commands and formats IDs as safely escaped code", async () => {
 		sessions.set("other", {
 			...sessionWith("sid", { status: "stopped" }),
@@ -6951,6 +7008,61 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toBe(
 			"Возьмите весь путь в парные кавычки или уберите кавычки.",
 		);
+		await adapter.stop();
+	});
+
+	it("passes a canonical harness ID from /new and rejects unknown aliases", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			harnesses: [
+				{
+					id: "claude-code" as never,
+					aliases: ["claude"],
+					capabilities: ["harness.launch"],
+				},
+			],
+		});
+		await bot.update(42, "/new @claude /tmp/my project");
+		expect(requests[0]).toMatchObject({
+			kind: "create",
+			harnessId: "claude-code",
+			cwd: "/tmp/my project",
+		});
+		await bot.update(42, "/new @missing /tmp/fallback");
+		expect(requests.filter(({ kind }) => kind === "create")).toHaveLength(1);
+		expect(bot.sent.at(-1)?.text).toContain("Неизвестный harness");
+		await adapter.stop();
+	});
+
+	it("carries the panel harness choice through the name prompt into session creation", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			harnesses: [
+				{
+					id: "claude-code" as never,
+					aliases: ["claude"],
+					capabilities: ["harness.launch"],
+				},
+			],
+		});
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "menu:new", panelMessageId);
+		const harnessCallback = callbackData(
+			bot.sendOptions.at(-1),
+			"create-harness:",
+		);
+		const chooserMessageId = bot.lastMessageId;
+		await bot.callback(42, harnessCallback, chooserMessageId);
+		await bot.update(42, "Panel-created", {
+			replyToMessageId: bot.lastForceReplyMessageId,
+		});
+		expect(requests.findLast(({ kind }) => kind === "create")).toMatchObject({
+			kind: "create",
+			harnessId: "claude-code",
+			cwd: "/work",
+			name: "Panel-created",
+		});
 		await adapter.stop();
 	});
 

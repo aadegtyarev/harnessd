@@ -266,9 +266,12 @@ describe("application runtime", () => {
 				expect(this.descriptor.capabilities).toContain("harness.file.send");
 				return Promise.resolve(makeInstance("pi-file-send"));
 			});
+		let catalog: readonly { readonly id: string }[] = [];
 		const transport = {
 			descriptor: { id: "file-send-transport" as never, capabilities: [] },
-			async start() {},
+			async start(...args: Parameters<TransportAdapter["start"]>) {
+				catalog = args[4]?.() ?? [];
+			},
 			async stop() {},
 			async sendAgentFile() {
 				return { fileName: "a", delivered: 1, recipients: 1 };
@@ -288,6 +291,9 @@ describe("application runtime", () => {
 				cwd: os.tmpdir(),
 			});
 		}
+		expect(catalog.map(({ id }) => id)).toEqual(
+			expect.arrayContaining(["claude-code", "pi-rpc"]),
+		);
 		expect(claude).toHaveBeenCalledOnce();
 		expect(pi).toHaveBeenCalledOnce();
 		await runtime.close();
