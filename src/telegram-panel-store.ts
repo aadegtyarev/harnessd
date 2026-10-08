@@ -37,6 +37,10 @@ export class TelegramPanelStore {
 		return this.messages.get(chatId);
 	}
 
+	panels(): readonly (readonly [number, number])[] {
+		return [...this.messages.entries()];
+	}
+
 	getSelected(chatId: number): string | undefined {
 		return this.selectedSessions.get(chatId);
 	}

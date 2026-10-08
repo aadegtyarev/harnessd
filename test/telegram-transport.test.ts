@@ -581,10 +581,13 @@ async function startAdapter(
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
 		activityClock?: () => Date;
 		activityTimeFormatter?: (date: Date) => string;
+		panelClock?: () => number;
+		panelSleep?: (milliseconds: number) => Promise<void>;
 	} = {},
 ) {
 	let listener: ((event: HarnessEvent) => unknown) | undefined;
 	let subscribed = false;
+	let panelNow = Date.now();
 	const requests: TransportEvent[] = [];
 	const adapter = new TelegramTransportAdapter({
 		token: "secret-token",
@@ -592,6 +595,10 @@ async function startAdapter(
 		stateDirectory: dir,
 		initialCwd: extras.initialCwd ?? "/work",
 		botFactory: () => bot as never,
+		panelClock: () => panelNow,
+		panelSleep: async (milliseconds) => {
+			panelNow += milliseconds;
+		},
 		...extras,
 	});
 	const started = adapter.start(
@@ -634,6 +641,701 @@ function callbackData(options: unknown, prefix: string): string {
 }
 
 describe("Telegram transport", () => {
+	it("spaces actual panel edit API calls by at least 500 ms", async () => {
+		const bot = new MockBot();
+		let now = 0;
+		const editTimes: number[] = [];
+		const originalEdit = bot.api.editMessageText.getMockImplementation();
+		if (!originalEdit) throw new Error("Missing edit API mock");
+		bot.api.editMessageText.mockImplementation(async (...args) => {
+			editTimes.push(now);
+			return originalEdit(...args);
+		});
+		const { adapter } = await startAdapter(bot, await temp(), {
+			panelClock: () => now,
+			panelSleep: async (milliseconds) => {
+				now += milliseconds;
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		sessions.set("sid", sessionWith("sid", { name: "First change" }));
+		await bot.update(42, "/menu");
+		sessions.set("sid", sessionWith("sid", { name: "Second change" }));
+		await bot.update(42, "/menu");
+		expect(editTimes.length).toBeGreaterThanOrEqual(2);
+		for (let index = 1; index < editTimes.length; index++)
+			expect(editTimes[index] - editTimes[index - 1]).toBeGreaterThanOrEqual(
+				500,
+			);
+		await adapter.stop();
+	});
+
+	it("refreshes live panel only for its preview on start and settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		await bot.callback(42, "session:next", panelMessageId);
+		const edits = bot.edited.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.edited).toHaveLength(edits);
+		emit(harnessEvent("other", "status", "agent_start"));
+		await vi.waitFor(() => expect(bot.edited.length).toBeGreaterThan(edits));
+		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
+		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: занята");
+		const afterStart = bot.edited.length;
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.edited).toHaveLength(afterStart);
+		emit(harnessEvent("other", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.edited.length).toBeGreaterThan(afterStart),
+		);
+		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: ожидает");
+		await adapter.stop();
+	});
+
+	it("shows offline only when the successful session list confirms no sessions", async () => {
+		const bot = new MockBot();
+		const known = [...sessions.entries()];
+		sessions.clear();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Состояние Pi: нет сессии");
+		await adapter.stop();
+		for (const [id, session] of known) sessions.set(id, session);
+	});
+
+	it("shows stale unavailable live state and only advances update time on semantic changes", async () => {
+		const bot = new MockBot();
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(time * 1000),
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) =>
+				request.kind === "session_status"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: {
+								session: sessions.get(request.sessionId) as SessionSummary,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Состояние Pi: состояние устарело");
+		expect(bot.sent.at(-1)?.text).toContain("Живые данные недоступны");
+		expect(bot.sent.at(-1)?.text).toContain("Обновлено: 00:00:00");
+		time = 1;
+		await bot.update(42, "/menu");
+		expect(bot.edited).toHaveLength(0);
+		await adapter.stop();
+	});
+
+	it("discards a slow older live-status render after a newer generation commits", async () => {
+		const bot = new MockBot();
+		let statusCount = 0;
+		let releaseOld!: (result: TransportResult) => void;
+		const oldStatus = new Promise<TransportResult>(
+			(resolve) => (releaseOld = resolve),
+		);
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				statusCount++;
+				if (statusCount === 2) return oldStatus;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: {
+							model: {
+								provider: "test",
+								id: `model-${statusCount}`,
+								name: `model-${statusCount}`,
+							},
+						},
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const olderRender = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(statusCount).toBe(2));
+		await bot.update(42, "/menu");
+		const committed = bot.edited.length;
+		expect(bot.edited.at(-1)?.text).toContain("Модель: test/model-3");
+		releaseOld({
+			requestId: "old" as never,
+			ok: true,
+			value: {
+				session: sessions.get("sid") as SessionSummary,
+				live: {
+					model: {
+						provider: "test",
+						id: "stale-model",
+						name: "stale-model",
+					},
+				},
+			},
+		} as TransportResult);
+		await olderRender;
+		expect(bot.edited).toHaveLength(committed);
+		expect(bot.edited.at(-1)?.text).not.toContain("stale-model");
+		await adapter.stop();
+	});
+
+	it("keeps live-status time stable across selection and creation-directory UI changes", async () => {
+		const bot = new MockBot();
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) =>
+				request.kind === "session_status"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: {
+								session: sessions.get(request.sessionId) as SessionSummary,
+								live: {},
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const initial = bot.sent.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
+		time = 1;
+		await bot.update(42, "/use other");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Выбрана (обычные сообщения →): #other",
+		);
+		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			initial,
+		);
+		time = 2;
+		await bot.update(42, "/cd /tmp");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("папка создания: /tmp");
+		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			initial,
+		);
+		(adapter as unknown as { queues: Map<number, unknown> }).queues.set(42, {
+			messages: [],
+			pendingCharacters: 0,
+			failed: true,
+			overflowNotices: new Set(),
+			idleWaiters: [],
+		});
+		time = 3;
+		await bot.update(42, "/menu");
+		expect(JSON.stringify(bot.edited.at(-1)?.options)).toContain(
+			"Включить канал для новых событий",
+		);
+		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			initial,
+		);
+		await adapter.stop();
+	});
+
+	it("advances panel update time for metric-only changes but not identical metrics", async () => {
+		const bot = new MockBot();
+		let tokens = 10;
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(time * 1000),
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: { usage: { inputTokens: tokens } },
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const before = bot.sent.at(-1)?.text ?? "";
+		tokens = 11;
+		time = 1;
+		await bot.update(42, "/menu");
+		const changed = bot.edited.at(-1)?.text ?? "";
+		expect(changed).toContain("↑11");
+		expect(changed).toContain("Обновлено: 00:00:01");
+		time = 2;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toBe(changed);
+		expect(before).toContain("Обновлено: 00:00:00");
+		await adapter.stop();
+	});
+
+	it("keeps panel update time stable for hidden and identically rendered status values", async () => {
+		const bot = new MockBot();
+		let time = 0;
+		let name = "First hidden name";
+		let totalTokens = 10_001;
+		let costUsd = 1.2344;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: {
+							model: { provider: "test", id: "m", name },
+							usage: { totalTokens, costUsd },
+						},
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const original = bot.sent.at(-1)?.text ?? "";
+		const editCount = bot.edited.length;
+		name = "Second hidden name";
+		totalTokens = 99_999;
+		costUsd = 1.23449;
+		time = 1;
+		await bot.update(42, "/menu");
+		expect(bot.edited).toHaveLength(editCount);
+		expect(original).toContain("Обновлено: 00:00:00");
+		await adapter.stop();
+	});
+
+	it("advances panel time when usage availability changes without metric values", async () => {
+		const bot = new MockBot();
+		let live: Record<string, unknown> = {};
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) =>
+				request.kind === "session_status"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: {
+								session: sessions.get(request.sessionId) as SessionSummary,
+								live,
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Использование: недоступно");
+		live = { usage: {} };
+		time = 1;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).not.toContain("Использование: недоступно");
+		expect(bot.edited.at(-1)?.text).toContain("Обновлено: 00:00:01");
+		await adapter.stop();
+	});
+
+	it("discards pending event refreshes after navigation but honors later events", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		const { adapter, emit } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.callback(42, "menu:folders", bot.lastMessageId);
+		const folderText = bot.edited.at(-1)?.text;
+		expect(folderText).toContain("Папки");
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.edited.at(-1)?.text).toBe(folderText);
+
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.edited.at(-1)?.text).toContain("📌 Панель сессий");
+		await adapter.stop();
+	});
+
+	it("renders availability, individual missing fields, and recovery transitions", async () => {
+		const bot = new MockBot();
+		let live: Record<string, unknown> | undefined = {};
+		let failStatus = false;
+		let time = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				if (failStatus)
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: { code: "INTERNAL", message: "unavailable" },
+					} as TransportResult;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						...(live === undefined ? {} : { live }),
+					},
+				} as TransportResult;
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		let text = bot.sent.at(-1)?.text ?? "";
+		expect(text).toContain("Состояние Pi: ожидает");
+		expect(text).toContain("Модель: недоступна");
+		expect(text).toContain("Усилие: недоступно");
+		expect(text).toContain("Использование: недоступно");
+		expect(text).toContain("Контекст: недоступен");
+		live = {
+			model: { provider: "test", id: "m", name: "M" },
+			effort: "high",
+			usage: { inputTokens: 1, contextTokens: 2 },
+		};
+		time = 1;
+		await bot.update(42, "/menu");
+		text = bot.edited.at(-1)?.text ?? "";
+		expect(text).toContain("Модель: test/m");
+		expect(text).toContain("Усилие: high");
+		const completeLive = { ...live };
+		for (const [field, unavailable] of [
+			["model", "Модель: недоступна"],
+			["effort", "Усилие: недоступно"],
+			["usage", "Использование: недоступно"],
+			["context", "Контекст: недоступен"],
+		] as const) {
+			live = { ...completeLive };
+			if (field === "context") live.usage = { inputTokens: 1 };
+			else delete live[field];
+			time++;
+			await bot.update(42, "/menu");
+			expect(bot.edited.at(-1)?.text).toContain(unavailable);
+		}
+		live = {};
+		time = 2;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("Обновлено: 00:00:02");
+		failStatus = true;
+		time = 3;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Состояние Pi: живое состояние недоступно",
+		);
+		expect(bot.edited.at(-1)?.text).toContain("запрос завершился ошибкой");
+		failStatus = false;
+		live = undefined;
+		time = 4;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Состояние Pi: состояние устарело",
+		);
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Состояние Pi: восстанавливается",
+		);
+		emit(harnessEvent("sid", "status", "harness_recovered"));
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(
+			(
+				adapter as unknown as { recoveringSessions: Set<string> }
+			).recoveringSessions.has("sid"),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("stops pending and in-flight live refreshes without post-stop queries or edits", async () => {
+		const bot = new MockBot();
+		let queryCount = 0;
+		const { adapter, emit, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status") queryCount++;
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		vi.useFakeTimers();
+		const beforeQueries = queryCount;
+		const beforeEdits = bot.api.editMessageText.mock.calls.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await adapter.stop();
+		await vi.advanceTimersByTimeAsync(2500);
+		expect(queryCount).toBe(beforeQueries);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(beforeEdits);
+		expect(
+			requests.filter((request) => request.kind === "session_status"),
+		).toHaveLength(beforeQueries);
+
+		vi.useRealTimers();
+		const inFlightBot = new MockBot();
+		let release!: () => void;
+		let holdStatus = false;
+		const inFlight = await startAdapter(inFlightBot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				queryCount++;
+				if (holdStatus)
+					return new Promise((_resolve, reject) => {
+						release = () => reject(new Error("late status failure"));
+					});
+				return result(request);
+			},
+		});
+		await inFlightBot.update(42, "/use sid");
+		await inFlightBot.update(42, "/menu");
+		vi.useFakeTimers();
+		const beforeInFlightEdits =
+			inFlightBot.api.editMessageText.mock.calls.length;
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown) => unhandled.push(error);
+		process.on("unhandledRejection", onUnhandled);
+		holdStatus = true;
+		inFlight.emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(500);
+		const stopping = inFlight.adapter.stop();
+		release();
+		await stopping;
+		process.off("unhandledRejection", onUnhandled);
+		await vi.advanceTimersByTimeAsync(2500);
+		expect(inFlightBot.api.editMessageText).toHaveBeenCalledTimes(
+			beforeInFlightEdits,
+		);
+		expect(unhandled).toEqual([]);
+		vi.useRealTimers();
+
+		const listBot = new MockBot();
+		let holdList = false;
+		let releaseList!: () => void;
+		const heldList = await startAdapter(listBot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "list" && holdList)
+					return new Promise((resolve) => {
+						releaseList = () => resolve(result(request));
+					});
+				return result(request);
+			},
+		});
+		await listBot.update(42, "/use sid");
+		await listBot.update(42, "/menu");
+		holdList = true;
+		heldList.emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() => expect(releaseList).toBeTypeOf("function"));
+		const stoppingList = heldList.adapter.stop();
+		releaseList();
+		await stoppingList;
+		expect(
+			heldList.requests.filter((request) => request.kind === "session_status"),
+		).toHaveLength(1);
+	});
+
+	it("refreshes the preview on recovery and fatal process-exit events", async () => {
+		const bot = new MockBot();
+		let statusQueries = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status") statusQueries++;
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		for (const text of [
+			"harness_restarting",
+			"harness_recovered",
+			"harness_recovery_failed",
+		]) {
+			const before = statusQueries;
+			emit(harnessEvent("sid", "status", text));
+			await vi.waitFor(() => expect(statusQueries).toBeGreaterThan(before));
+		}
+		const beforeFatal = statusQueries;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "error",
+			message: "process exited",
+			fatal: true,
+		} as HarnessEvent);
+		await vi.waitFor(() => expect(statusQueries).toBeGreaterThan(beforeFatal));
+		await adapter.stop();
+	});
+
+	it("does not let a delayed startup session list replace a newer panel generation", async () => {
+		const bot = new MockBot();
+		let listCount = 0;
+		let releaseOld!: (result: TransportResult) => void;
+		const oldList = new Promise<TransportResult>(
+			(resolve) => (releaseOld = resolve),
+		);
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "list") return result(request);
+				listCount++;
+				if (listCount === 1) return oldList;
+				return result(request);
+			},
+		});
+		const startupRender = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(listCount).toBe(1));
+		await bot.update(42, "/menu");
+		releaseOld({
+			requestId: "old" as never,
+			ok: true,
+			value: [sessions.get("other") as SessionSummary],
+		} as TransportResult);
+		await startupRender;
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Просмотр: #sid");
+		await adapter.stop();
+	});
+
+	it("does not let a slow main view overwrite newer folder navigation", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		let statusCount = 0;
+		let releaseOld!: (result: TransportResult) => void;
+		const oldStatus = new Promise<TransportResult>(
+			(resolve) => (releaseOld = resolve),
+		);
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				statusCount++;
+				if (statusCount === 2) return oldStatus;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: { model: { provider: "test", id: "fresh", name: "fresh" } },
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const stale = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(statusCount).toBe(2));
+		await bot.callback(42, "menu:folders", bot.lastMessageId);
+		releaseOld({
+			requestId: "old" as never,
+			ok: true,
+			value: {
+				session: sessions.get("sid") as SessionSummary,
+				live: { model: { provider: "test", id: "stale", name: "stale" } },
+			},
+		} as TransportResult);
+		await stale;
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		expect(bot.edited.at(-1)?.text).not.toContain("Модель: test/stale");
+		await adapter.stop();
+	});
+
+	it("discards stale panel updates queued behind an in-flight Telegram edit", async () => {
+		const bot = new MockBot();
+		let tokens = 10;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: { usage: { inputTokens: tokens } },
+					},
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		let releaseEdit!: () => void;
+		let editStarted!: () => void;
+		const started = new Promise<void>((resolve) => (editStarted = resolve));
+		const blocked = new Promise<void>((resolve) => (releaseEdit = resolve));
+		bot.editMessageBehavior = async () => {
+			editStarted();
+			await blocked;
+		};
+		tokens = 11;
+		const firstEdit = bot.update(42, "/menu");
+		await started;
+		tokens = 12;
+		const staleQueued = bot.update(42, "/menu");
+		tokens = 13;
+		const newestQueued = bot.update(42, "/menu");
+		releaseEdit();
+		await Promise.all([firstEdit, staleQueued, newestQueued]);
+		expect(bot.edited).toHaveLength(2);
+		expect(bot.edited.at(-1)?.text).toContain("↑13");
+		expect(bot.edited.map((entry) => entry.text).join("\n")).not.toContain(
+			"↑12",
+		);
+		await adapter.stop();
+	});
+
+	it("renders null live metrics unavailable and a transient status failure generically", async () => {
+		const bot = new MockBot();
+		let queryFails = false;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				if (queryFails)
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: { code: "TEMPORARY", message: "private transient detail" },
+					};
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: {
+							usage: {
+								inputTokens: null,
+								outputTokens: null,
+								cacheReadTokens: null,
+								cacheWriteTokens: null,
+								costUsd: null,
+								contextTokens: null,
+								contextWindow: null,
+								contextPercent: null,
+							},
+						},
+					},
+				} as unknown as TransportResult;
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("↑— ↓— R— CH— —");
+		expect(bot.sent.at(-1)?.text).toContain("↑— ↓— R— CH— — ?/?/— (auto)");
+		queryFails = true;
+		await bot.update(42, "/menu");
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text).toContain("Живые данные недоступны");
+		expect(text).not.toContain("private transient detail");
+		await adapter.stop();
+	});
+
 	it("shows session name and full identity with Pi-reported context in status", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Focused task" }));
 		const bot = new MockBot();
@@ -678,6 +1380,45 @@ describe("Telegram transport", () => {
 		expect(failedBot.sent.at(-1)?.text).toContain("Результат неизвестен");
 		expect(failedBot.sent.at(-1)?.text).not.toContain("secret detail");
 		await failed.adapter.stop();
+	});
+
+	it("keeps a matching panel reloading until its owning concurrent reload completes", async () => {
+		sessions.set("sid", sessionWith("sid", {}));
+		const bot = new MockBot();
+		let started!: () => void;
+		let finish!: () => void;
+		const reloadStarted = new Promise<void>((resolve) => (started = resolve));
+		const reloadFinished = new Promise<void>((resolve) => (finish = resolve));
+		let reloadCount = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "reload") return result(request);
+				reloadCount++;
+				if (reloadCount === 1) {
+					started();
+					await reloadFinished;
+					return result(request);
+				}
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: { code: "RELOAD_ALREADY_RUNNING", message: "busy" },
+				};
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const owner = bot.update(42, "/reload");
+		await reloadStarted;
+		await bot.update(42, "/reload");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("перезагружаются ресурсы");
+		finish();
+		await owner;
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).not.toContain("перезагружаются ресурсы"),
+		);
+		await adapter.stop();
 	});
 
 	it("reports the current message destination if selection changes during reload", async () => {
@@ -1723,7 +2464,7 @@ describe("Telegram transport", () => {
 			"Выбрана (обычные сообщения →): не выбрана",
 		);
 		await bot.update(42, "/menu");
-		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		expect(bot.api.editMessageText).not.toHaveBeenCalled();
 		expect(bot.api.pinChatMessage).toHaveBeenCalledOnce();
 
 		await bot.callback(42, "session:next", panelMessageId);
@@ -2176,6 +2917,126 @@ describe("Telegram transport", () => {
 			kind: "submit",
 			sessionId: "sid",
 		});
+		await adapter.stop();
+	});
+
+	it("panel resume fans out only to stored panels previewing the transitioned session", async () => {
+		sessions.set("sid", sessionWith("sid", { status: "stopped" }));
+		const bot = new MockBot();
+		const statusQueries = new Map<string, number>();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status")
+					statusQueries.set(
+						request.sessionId,
+						(statusQueries.get(request.sessionId) ?? 0) + 1,
+					);
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(44, "/use other");
+		const previews = (
+			adapter as unknown as { previews: Map<number, SessionId> }
+		).previews;
+		previews.set(42, "sid" as SessionId);
+		previews.set(43, "sid" as SessionId);
+		previews.set(44, "other" as SessionId);
+		await bot.update(42, "/menu");
+		const initiatingPanel = bot.lastMessageId as number;
+		await bot.update(43, "/menu");
+		const otherMatchingPanel = bot.lastMessageId as number;
+		await bot.update(44, "/menu");
+		const nonmatchingPanel = bot.lastMessageId as number;
+		const beforeSid = statusQueries.get("sid") ?? 0;
+		const beforeOther = statusQueries.get("other") ?? 0;
+		const selection = (
+			adapter as unknown as { selected: Map<number, SessionId> }
+		).selected;
+		const previewSnapshot = [...previews];
+		await bot.callback(42, "session:resume:sid", initiatingPanel);
+		await vi.waitFor(() =>
+			expect(statusQueries.get("sid") ?? 0).toBeGreaterThanOrEqual(
+				beforeSid + 2,
+			),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some((edit) => edit.messageId === otherMatchingPanel),
+			).toBe(true),
+		);
+		expect(statusQueries.get("other") ?? 0).toBe(beforeOther);
+		expect(selection.get(42)).toBe("sid");
+		expect(selection.get(43)).toBe("sid");
+		expect(selection.get(44)).toBe("other");
+		expect([...previews]).toEqual(previewSnapshot);
+		expect(bot.edited.some((edit) => edit.messageId === nonmatchingPanel)).toBe(
+			false,
+		);
+		await adapter.stop();
+	});
+
+	it("confirmed panel stop and delete refresh matching chats but not other previews", async () => {
+		sessions.set("other", sessionWith("other", { status: "running" }));
+		const bot = new MockBot();
+		const statusQueries = new Map<string, number>();
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status")
+					statusQueries.set(
+						request.sessionId,
+						(statusQueries.get(request.sessionId) ?? 0) + 1,
+					);
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(44, "/use other");
+		await bot.update(42, "/menu");
+		const initiatingPanel = bot.lastMessageId as number;
+		await bot.update(43, "/menu");
+		const otherMatchingPanel = bot.lastMessageId as number;
+		await bot.update(44, "/menu");
+		const nonmatchingPanel = bot.lastMessageId as number;
+		const beforeStop = statusQueries.get("sid") ?? 0;
+		await bot.callback(42, "session:stop:sid", initiatingPanel);
+		const stop = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.callback(42, stop, initiatingPanel);
+		await vi.waitFor(() =>
+			expect(statusQueries.get("sid") ?? 0).toBeGreaterThanOrEqual(
+				beforeStop + 2,
+			),
+		);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some((edit) => edit.messageId === otherMatchingPanel),
+			).toBe(true),
+		);
+		expect(bot.edited.some((edit) => edit.messageId === nonmatchingPanel)).toBe(
+			false,
+		);
+
+		const editsBeforeDelete = bot.edited.length;
+		await bot.callback(42, "session:delete:sid", initiatingPanel);
+		const remove = callbackData(bot.edited.at(-1)?.options, "action:confirm:");
+		await bot.callback(42, remove, initiatingPanel);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited
+					.slice(editsBeforeDelete)
+					.some((edit) => edit.messageId === otherMatchingPanel),
+			).toBe(true),
+		);
+		expect(bot.edited.some((edit) => edit.messageId === nonmatchingPanel)).toBe(
+			false,
+		);
+		expect(
+			(adapter as unknown as { selected: Map<number, SessionId> }).selected.has(
+				43,
+			),
+		).toBe(false);
 		await adapter.stop();
 	});
 
@@ -2749,11 +3610,351 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("discards a slow main list query when a newer folder view renders", async () => {
+		const bot = new MockBot();
+		let releaseList!: () => void;
+		let enteredList!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredList = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseList = resolve;
+		});
+		let delayNextList = false;
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+			dispatch: async (request) => {
+				if (delayNextList && request.kind === "list") {
+					delayNextList = false;
+					enteredList();
+					await gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		delayNextList = true;
+		const oldMain = bot.update(42, "/menu");
+		await entered;
+		await bot.callback(42, "menu:folders", panelId);
+		releaseList();
+		await oldMain;
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await adapter.stop();
+	});
+
+	it("reconciles a successful superseded edit before rendering a reverted view", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		await bot.update(42, "/menu");
+		const originalText = bot.sent.at(-1)?.text;
+		if (!originalText) throw new Error("Initial panel was not sent");
+
+		let releaseEdit!: () => void;
+		let enteredEdit!: () => void;
+		const entered = new Promise<void>((resolve) => (enteredEdit = resolve));
+		const gate = new Promise<void>((resolve) => (releaseEdit = resolve));
+		bot.api.editMessageText.mockImplementationOnce(async (...args) => {
+			enteredEdit();
+			await gate;
+			bot.edited.push({
+				chatId: args[0],
+				messageId: args[1],
+				text: args[2],
+				options: args[3],
+			});
+			return { message_id: args[1] };
+		});
+		sessions.set("sid", sessionWith("sid", { name: "Temporary panel name" }));
+		const obsolete = bot.update(42, "/menu");
+		await entered;
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		const priorIntent = (
+			adapter as unknown as {
+				panelIntents: { current(chatId: number): number };
+			}
+		).panelIntents.current(42);
+		const newest = (
+			adapter as unknown as {
+				renderPanel(chatId: number, sender: number): Promise<void>;
+			}
+		).renderPanel(42, 42);
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as {
+						panelIntents: { current(chatId: number): number };
+					}
+				).panelIntents.current(42),
+			).toBeGreaterThan(priorIntent),
+		);
+		releaseEdit();
+		await Promise.all([obsolete, newest]);
+
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toBe(originalText);
+		await adapter.stop();
+	});
+
+	it("retains a successful replacement sent after its intent is invalidated", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		await bot.update(42, "/menu");
+		const originalText = bot.sent.at(-1)?.text;
+		if (!originalText) throw new Error("Initial panel was not sent");
+		const pinCount = bot.pinned.length;
+		let releaseSend!: () => void;
+		let enteredSend!: () => void;
+		const entered = new Promise<void>((resolve) => (enteredSend = resolve));
+		const gate = new Promise<void>((resolve) => (releaseSend = resolve));
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("panel missing"), {
+				description: "Bad Request: message to edit not found",
+			}),
+		);
+		bot.api.sendMessage.mockImplementationOnce(async (...args) => {
+			enteredSend();
+			await gate;
+			const message_id = 700;
+			bot.sent.push({ chatId: args[0], text: args[1], message_id });
+			bot.sendOptions.push(args[2]);
+			return { message_id };
+		});
+		sessions.set("sid", sessionWith("sid", { name: "Temporary panel name" }));
+		const obsolete = bot.update(42, "/menu");
+		await entered;
+		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
+		const priorIntent = (
+			adapter as unknown as {
+				panelIntents: { current(chatId: number): number };
+			}
+		).panelIntents.current(42);
+		const newest = (
+			adapter as unknown as {
+				renderPanel(chatId: number, sender: number): Promise<void>;
+			}
+		).renderPanel(42, 42);
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as {
+						panelIntents: { current(chatId: number): number };
+					}
+				).panelIntents.current(42),
+			).toBeGreaterThan(priorIntent),
+		);
+		releaseSend();
+		await Promise.all([obsolete, newest]);
+
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)).toMatchObject({
+			messageId: 700,
+			text: originalText,
+		});
+		expect(bot.pinned).toHaveLength(pinCount);
+		await adapter.stop();
+	});
+
+	it("keeps held restored startup refresh from replacing newer folder navigation", async () => {
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const firstBot = new MockBot();
+		const first = await startAdapter(firstBot, directory, {
+			initialCwd: directory,
+		});
+		await firstBot.update(42, "/menu");
+		await first.adapter.stop();
+
+		const bot = new MockBot();
+		let activeEdits = 0;
+		let maximumActiveEdits = 0;
+		let releaseStartupEdit!: () => void;
+		let enteredStartupEdit!: () => void;
+		const entered = new Promise<void>(
+			(resolve) => (enteredStartupEdit = resolve),
+		);
+		const gate = new Promise<void>((resolve) => (releaseStartupEdit = resolve));
+		const edit = bot.api.editMessageText.getMockImplementation();
+		if (!edit) throw new Error("Missing edit API mock");
+		bot.api.editMessageText.mockImplementation(async (...args) => {
+			activeEdits += 1;
+			maximumActiveEdits = Math.max(maximumActiveEdits, activeEdits);
+			try {
+				if (activeEdits === 1) {
+					enteredStartupEdit();
+					await gate;
+				}
+				return await edit(...args);
+			} finally {
+				activeEdits -= 1;
+			}
+		});
+		let listener: ((event: HarnessEvent) => unknown) | undefined;
+		const adapter = new TelegramTransportAdapter({
+			token: "secret-token",
+			allowedUserIds: [42],
+			stateDirectory: directory,
+			initialCwd: directory,
+			botFactory: () => bot as never,
+		});
+		const started = adapter.start(
+			async (request) => result(request),
+			(subscribe) => {
+				listener = subscribe;
+				return () => (listener = undefined);
+			},
+			async () => [...sessions.values()],
+		);
+		await vi.waitFor(() => expect(bot.startOptions).toBeDefined());
+		bot.ready();
+		await entered;
+		sessions.set("sid", sessionWith("sid", { name: "Newest startup race" }));
+		listener?.(harnessEvent("sid", "status", "agent_start"));
+		const priorIntent = (
+			adapter as unknown as {
+				panelIntents: { current(chatId: number): number };
+			}
+		).panelIntents.current(42);
+		const folderNavigation = bot.callback(
+			42,
+			"menu:folders",
+			bot.lastMessageId,
+		);
+		await vi.waitFor(() =>
+			expect(
+				(
+					adapter as unknown as {
+						panelIntents: { current(chatId: number): number };
+					}
+				).panelIntents.current(42),
+			).toBeGreaterThan(priorIntent),
+		);
+		releaseStartupEdit();
+		await Promise.all([started, folderNavigation]);
+
+		expect(maximumActiveEdits).toBe(1);
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("Newest startup race");
+		await adapter.stop();
+	});
+
+	it("does not replace a panel after a delayed not-found edit is superseded", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
+		const { adapter } = await startAdapter(bot, directory, {
+			initialCwd: directory,
+		});
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		await bot.callback(42, "menu:folders", panelId);
+		let releaseEdit!: () => void;
+		let enteredEdit!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredEdit = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseEdit = resolve;
+		});
+		bot.api.editMessageText.mockImplementationOnce(async () => {
+			enteredEdit();
+			await gate;
+			throw Object.assign(new Error("panel missing"), {
+				description: "Bad Request: message to edit not found",
+			});
+		});
+		const oldRefresh = bot.update(42, "/menu");
+		await entered;
+		const newerView = bot.callback(42, "menu:folders", panelId);
+		releaseEdit();
+		await Promise.all([oldRefresh, newerView]);
+		expect(
+			bot.api.sendMessage.mock.calls.filter(([, text]) =>
+				String(text).includes("📌 Панель сессий"),
+			),
+		).toHaveLength(1);
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await adapter.stop();
+	});
+
+	it("does not create a replacement when the stored panel ID changes during edit", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelIds = (
+			adapter as unknown as { panelMessageIds: Map<number, number> }
+		).panelMessageIds;
+		const panelId = panelIds.get(42);
+		if (panelId === undefined) throw new Error("Panel ID missing");
+		sessions.set("sid", sessionWith("sid", { name: "changed before edit" }));
+		let releaseEdit!: () => void;
+		let enteredEdit!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredEdit = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseEdit = resolve;
+		});
+		bot.api.editMessageText.mockImplementationOnce(async () => {
+			enteredEdit();
+			await gate;
+			throw Object.assign(new Error("panel missing"), {
+				description: "Bad Request: message to edit not found",
+			});
+		});
+		const refresh = bot.update(42, "/menu");
+		await entered;
+		panelIds.set(42, panelId + 100);
+		releaseEdit();
+		await refresh;
+		expect(
+			bot.api.sendMessage.mock.calls.filter(([, text]) =>
+				String(text).includes("📌 Панель сессий"),
+			),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("does not pin a replacement after its intent is invalidated", async () => {
+		const bot = new MockBot();
+		let releaseSleep!: () => void;
+		let enteredSleep!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enteredSleep = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseSleep = resolve;
+		});
+		const { adapter } = await startAdapter(bot, await temp(), {
+			panelSleep: async () => {
+				enteredSleep();
+				await gate;
+			},
+		});
+		const menu = bot.update(42, "/menu");
+		await entered;
+		(
+			adapter as unknown as { panelIntents: { begin(chatId: number): number } }
+		).panelIntents.begin(42);
+		releaseSleep();
+		await menu;
+		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
+		await adapter.stop();
+	});
+
 	it("does not resend after an uncertain panel edit and recovers a known-deleted panel", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
 		const sendsAfterCreate = bot.api.sendMessage.mock.calls.length;
+		sessions.set("sid", sessionWith("sid", { name: "changed before failure" }));
 		bot.api.editMessageText.mockRejectedValueOnce(
 			new Error("temporary API failure"),
 		);
@@ -2785,6 +3986,7 @@ describe("Telegram transport", () => {
 			adapter as unknown as { panelMessageIds: Map<number, number> }
 		).panelMessageIds.get(42);
 		const pinCount = bot.pinned.length;
+		sessions.set("sid", sessionWith("sid", { name: "changed before failure" }));
 		bot.api.editMessageText.mockRejectedValueOnce(
 			new Error("temporary failure"),
 		);
@@ -2956,6 +4158,7 @@ describe("Telegram transport", () => {
 		const firstBot = new MockBot();
 		const first = await startAdapter(firstBot, directory);
 		await firstBot.update(42, "/use sid");
+		await firstBot.update(42, "/menu");
 		await firstBot.update(43, "/use other");
 		await first.adapter.stop();
 
@@ -2967,6 +4170,9 @@ describe("Telegram transport", () => {
 
 		const secondBot = new MockBot();
 		const second = await startAdapter(secondBot, directory);
+		expect(secondBot.edited.at(-1)?.text).toContain(
+			"устарело после перезапуска",
+		);
 		expect(second.requests).toEqual([]);
 		await secondBot.update(42, "/use");
 		expect(secondBot.sent.at(-1)?.text).toContain("Выбрана");
