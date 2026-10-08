@@ -360,6 +360,15 @@ describe("core capability contracts", () => {
 		expect(mergeAdapterOptions({ effort: "low" }, { effort: "high" })).toEqual({
 			effort: "high",
 		});
+		expect(
+			mergeAdapterOptions(
+				{ effort: "low", model: "sonnet" },
+				{ effort: "default", permission: "manual" },
+			),
+		).toEqual({ effort: "low", model: "sonnet", permission: "manual" });
+		expect(
+			mergeAdapterOptions(undefined, { effort: "default" }),
+		).toBeUndefined();
 	});
 });
 

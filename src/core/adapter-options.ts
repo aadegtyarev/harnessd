@@ -48,5 +48,13 @@ export function mergeAdapterOptions(
 	overrides: AdapterOptions | undefined,
 ): AdapterOptions | undefined {
 	if (!defaults && !overrides) return undefined;
-	return { ...defaults, ...overrides };
+	const effective = { ...defaults, ...overrides };
+	for (const [key, value] of Object.entries(overrides ?? {})) {
+		if (value === "default") {
+			if (defaults && Object.hasOwn(defaults, key))
+				effective[key] = defaults[key];
+			else delete effective[key];
+		}
+	}
+	return Object.keys(effective).length > 0 ? effective : undefined;
 }
