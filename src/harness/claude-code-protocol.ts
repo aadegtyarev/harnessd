@@ -30,7 +30,6 @@ export class ClaudeCodeProtocol {
 			throw new Error("CLAUDE_NOT_READY_OR_BUSY");
 		const pending = new ClaudeInputDelivery(id, text);
 		this.delivery = pending;
-		this.turnInput = pending;
 		return pending.promise;
 	}
 	markWritten(): void {
@@ -69,6 +68,7 @@ export class ClaudeCodeProtocol {
 		const p = this.delivery;
 		if (!p?.acknowledge(content)) return;
 		this.turn.start(p.id);
+		this.turnInput = p;
 		p.confirmAcknowledgement();
 		this.clearDeliveryIfSettled();
 	}

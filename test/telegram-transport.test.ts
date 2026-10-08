@@ -2421,6 +2421,57 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("does not start Telegram typing for a Claude result that precedes acknowledgement", async () => {
+		sessions.set("sid", sessionWith("sid", {}));
+		const bot = new MockBot();
+		const fake = fakeProvider();
+		const instance = await new ClaudeCodeHarnessAdapter(fake.provider, {
+			executable: "claude",
+		}).launch({ sessionId: "sid" as SessionId, cwd: "/work" });
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				const sent = instance.send({
+					id: "late-ack" as InputId,
+					sessionId: request.sessionId,
+					text: request.text,
+					createdAt: new Date(),
+				});
+				fake.record({ type: "system", subtype: "init", session_id: "sid" });
+				fake.record({
+					type: "result",
+					subtype: "success",
+					session_id: "sid",
+					is_error: false,
+					result: "done",
+				});
+				await expect(sent).rejects.toThrow();
+				fake.record({
+					type: "user",
+					isReplay: true,
+					message: { role: "user", content: request.text },
+				});
+				fake.finish();
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: {
+						code: "INPUT_UNCERTAIN",
+						message: "Claude acknowledgement missing",
+					},
+				};
+			},
+		});
+		const pumping = (async () => {
+			for await (const event of instance.events) emit(event);
+		})();
+		await bot.update(42, "/use sid");
+		await bot.update(42, "answer this");
+		await pumping;
+		expect(bot.api.sendChatAction).not.toHaveBeenCalled();
+		await adapter.stop();
+	});
+
 	it("edits one reply bubble with Pi tool activity, sends the final answer separately, then deletes the bubble", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Review task" }));
 		const bot = new MockBot();
