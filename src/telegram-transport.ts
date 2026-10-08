@@ -37,6 +37,13 @@ import {
 	redactDiagnosticText,
 	truncateDiagnostic,
 } from "./error-diagnostics.js";
+import { OVERFLOW_ID } from "./telegram-activity-ledger.js";
+import {
+	approvedSubagentRole,
+	localActivityTime,
+	updateActivityRow,
+	visibleActivityRows,
+} from "./telegram-activity-projection.js";
 import {
 	listDirectories,
 	listDirectoryEntries,
@@ -349,9 +356,8 @@ type SelectIntent = {
 };
 type ActivityTool = {
 	readonly id: string;
-	readonly summary: string;
+	summary: string;
 	status: "running" | "done" | "failed";
-	history: ("running" | "done" | "failed")[];
 };
 type LiveActivity = {
 	readonly chatId: number;
@@ -363,9 +369,12 @@ type LiveActivity = {
 	untrackedInputOverflow: boolean;
 	untrackedFailureOverflow: boolean;
 	readonly tools: ActivityTool[];
+	readonly childStatuses: Map<string, string>;
 	readonly notices: string[];
 	status: string;
 	subagentStatus?: string;
+	visibleModel?: string;
+	updatedAt?: string;
 	submittedWhileRunning: boolean;
 	thinking: boolean;
 	messageId?: number;
@@ -389,6 +398,8 @@ export interface TelegramTransportOptions {
 	readonly signal?: AbortSignal;
 	readonly onFatal?: () => void;
 	readonly botFactory?: BotFactory;
+	readonly activityClock?: () => Date;
+	readonly activityTimeFormatter?: (date: Date) => string;
 }
 
 export function telegramLockPath(
@@ -4032,7 +4043,9 @@ export class TelegramTransportAdapter
 			current.finishTimer = undefined;
 			current.submittedWhileRunning = this.runningSessions.has(sessionId);
 			if (startsIndependentTurn) {
+				current.tools.splice(0);
 				current.subagentStatus = undefined;
+				current.childStatuses.clear();
 				current.queuedInputs.splice(0, current.queuedInputs.length);
 				current.overflowInputIds.clear();
 				current.failedOverflowInputIds.clear();
@@ -4063,6 +4076,7 @@ export class TelegramTransportAdapter
 			untrackedInputOverflow: false,
 			untrackedFailureOverflow: false,
 			tools: [],
+			childStatuses: new Map(),
 			notices: [],
 			status: this.runningSessions.has(sessionId)
 				? "В очереди Pi"
@@ -4086,7 +4100,7 @@ export class TelegramTransportAdapter
 		return activity;
 	}
 
-	private liveActivityText(activity: LiveActivity): string {
+	private liveActivityModel(activity: LiveActivity): string {
 		const name = this.sessionNames.get(activity.sessionId);
 		const lines = [
 			`🔧 Pi activity · ${activitySessionLabel(activity.sessionId, name)}`,
@@ -4094,11 +4108,7 @@ export class TelegramTransportAdapter
 		if (activity.thinking) lines.push("• Думаю…");
 		for (const notice of activity.notices.slice(-4))
 			lines.push(`• ${truncateDiagnostic(notice, 180)}`);
-		for (const tool of activity.tools.slice(-10))
-			for (const state of tool.history)
-				lines.push(
-					`• ${truncateDiagnostic(tool.summary, 120)} ${state === "running" ? "…" : state === "failed" ? "❌" : "✓"}`,
-				);
+		lines.push(...visibleActivityRows(activity.tools, activity.childStatuses));
 		const visibleInputs = activity.queuedInputs.slice(-5);
 		const olderUnresolved = activity.queuedInputs
 			.slice(0, -visibleInputs.length)
@@ -4123,12 +4133,34 @@ export class TelegramTransportAdapter
 			? truncateDiagnostic(oneLine(live.effort), 60)
 			: "effort unavailable";
 		lines.push(
-			`⏳ ${activity.subagentStatus ?? activity.status} · ${compactUsage(live?.usage)} · ${model} · ${effort}`,
+			`⏳ ${activity.status} · ${compactUsage(live?.usage)} · ${model} · ${effort}`,
 		);
 		return truncateActivityText(lines.join("\n"));
 	}
 
-	private renderLiveActivity(activity: LiveActivity): void {
+	private liveActivityText(
+		activity: LiveActivity,
+		preserveUpdatedAtFor?: string,
+	): string {
+		const visibleModel = this.liveActivityModel(activity);
+		if (activity.visibleModel !== visibleModel) {
+			activity.visibleModel = visibleModel;
+			if (visibleModel !== preserveUpdatedAtFor) {
+				const now = this.options.activityClock?.() ?? new Date();
+				activity.updatedAt = (
+					this.options.activityTimeFormatter ?? localActivityTime
+				)(now);
+			}
+		}
+		return truncateActivityText(
+			`${visibleModel}\nОбновлено: ${activity.updatedAt ?? "00:00:00"}`,
+		);
+	}
+
+	private renderLiveActivity(
+		activity: LiveActivity,
+		preserveUpdatedAtFor?: string,
+	): void {
 		activity.renderQueue = activity.renderQueue
 			.then(async () => {
 				if (
@@ -4139,7 +4171,7 @@ export class TelegramTransportAdapter
 					) !== activity
 				)
 					return;
-				const text = this.liveActivityText(activity);
+				const text = this.liveActivityText(activity, preserveUpdatedAtFor);
 				if (activity.messageId === undefined) {
 					const sent = await this.telegramCall((signal) =>
 						this.bot.api.sendMessage(
@@ -5689,7 +5721,9 @@ export class TelegramTransportAdapter
 					)
 						this.associateInputWithTurn(record, turn);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
+					activity.tools.splice(0);
 					activity.subagentStatus = undefined;
+					activity.childStatuses.clear();
 					activity.status = "Pi выполняет ход сессии";
 					activity.thinking = false;
 					this.renderLiveActivity(activity);
@@ -5813,58 +5847,69 @@ export class TelegramTransportAdapter
 		}
 		if (activities.length === 0) return;
 		for (const activity of activities) {
+			let preserveUpdatedAtFor: string | undefined;
 			switch (event.type) {
 				case "thinking":
+					if (activity.thinking === event.active) continue;
 					activity.thinking = event.active;
 					break;
 				case "tool_start": {
-					const existing = activity.tools.find(
-						(tool) => tool.id === event.toolCallId,
+					const summary = truncateDiagnostic(
+						redactDiagnosticText(event.summary, [this.options.token]),
+						700,
 					);
-					if (existing) {
-						existing.status = "running";
-						existing.history.push("running");
-						if (existing.history.length > 4) existing.history.shift();
-					} else
-						activity.tools.push({
-							id: event.toolCallId,
-							summary: truncateDiagnostic(
-								redactDiagnosticText(event.summary, [this.options.token]),
-								700,
-							),
-							status: "running",
-							history: ["running"],
-						});
-					if (activity.tools.length > 40) activity.tools.shift();
+					const role = approvedSubagentRole(summary);
+					const overflowAlreadyVisible = activity.tools.some(
+						(row) => row.id === OVERFLOW_ID,
+					);
+					if (!updateActivityRow(activity.tools, event.toolCallId, summary))
+						continue;
+					if (role && activity.childStatuses.has(role)) {
+						if (
+							!overflowAlreadyVisible &&
+							activity.tools.some((row) => row.id === OVERFLOW_ID)
+						) {
+							preserveUpdatedAtFor = this.liveActivityModel(activity);
+							break;
+						}
+						continue;
+					}
 					activity.status = "Вызов инструмента";
 					void this.refreshLiveActivityStats(activity);
 					break;
 				}
 				case "tool_end": {
-					const tool = activity.tools.find(
-						(item) => item.id === event.toolCallId,
+					const previous = activity.tools.find(
+						(row) => row.id === event.toolCallId,
 					);
-					if (tool) {
-						tool.status = event.failed ? "failed" : "done";
-						tool.history.push(tool.status);
-						if (tool.history.length > 4) tool.history.shift();
-					}
+					const role = approvedSubagentRole(previous?.summary ?? "");
+					if (
+						!updateActivityRow(
+							activity.tools,
+							event.toolCallId,
+							undefined,
+							event.failed,
+						)
+					)
+						continue;
+					if (role && activity.childStatuses.has(role)) continue;
 					activity.status = "Pi выполняет ход сессии";
 					void this.refreshLiveActivityStats(activity);
 					break;
 				}
 				case "notification":
 					if (notification?.visibleText.trim()) {
-						activity.notices.push(
-							redactDiagnosticText(notification.visibleText, [
-								this.options.token,
-							]),
-						);
-						if (activity.notices.length > 12) activity.notices.shift();
+						const notice = redactDiagnosticText(notification.visibleText, [
+							this.options.token,
+						]);
+						if (!activity.notices.includes(notice)) {
+							activity.notices.push(notice);
+							if (activity.notices.length > 12) activity.notices.shift();
+						} else continue;
 					}
 					break;
 			}
-			this.renderLiveActivity(activity);
+			this.renderLiveActivity(activity, preserveUpdatedAtFor);
 		}
 	}
 
@@ -5909,7 +5954,9 @@ export class TelegramTransportAdapter
 					activityKey(record.chatId, record.sessionId),
 				);
 				if (activity) {
-					activity.subagentStatus = turn.subagentStatus;
+					const label =
+						/^Задача ([^:]+):/.exec(turn.subagentStatus)?.[1] ?? "Помощник";
+					activity.childStatuses.set(label, turn.subagentStatus);
 					this.renderLiveActivity(activity);
 				}
 			}
@@ -6086,10 +6133,11 @@ export class TelegramTransportAdapter
 		chats: ReadonlySet<number>,
 		status: string,
 	): void {
+		const label = /^Задача ([^:]+):/.exec(status)?.[1] ?? "Помощник";
 		for (const chatId of chats) {
 			const activity = this.liveActivities.get(activityKey(chatId, sessionId));
-			if (activity && activity.subagentStatus !== status) {
-				activity.subagentStatus = status;
+			if (activity && activity.childStatuses.get(label) !== status) {
+				activity.childStatuses.set(label, status);
 				this.renderLiveActivity(activity);
 			}
 		}

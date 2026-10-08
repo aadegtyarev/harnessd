@@ -579,6 +579,8 @@ async function startAdapter(
 		onFatal?: () => void;
 		initialCwd?: string;
 		dispatch?: (request: TransportEvent) => Promise<TransportResult>;
+		activityClock?: () => Date;
+		activityTimeFormatter?: (date: Date) => string;
 	} = {},
 ) {
 	let listener: ((event: HarnessEvent) => unknown) | undefined;
@@ -960,6 +962,67 @@ describe("Telegram transport", () => {
 		);
 		expect(answer?.text).toContain("All checks passed.");
 		expect(answer?.text).not.toContain("Pi activity");
+		await adapter.stop();
+	});
+
+	it("updates the local activity timestamp only for semantic tool-state changes", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `12:00:0${date.getSeconds()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track activity time");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Обновлено: 12:00:00"),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "opaque",
+				summary: "bash: test",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Обновлено: 12:00:01"),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const changedTimestamp = bot.edited
+			.at(-1)
+			?.text?.match(/Обновлено: (\d{2}:\d{2}:\d{2})/)?.[1];
+		expect(changedTimestamp).toBeDefined();
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "opaque",
+				summary: "bash: test",
+			},
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "tool_end", toolCallId: "missing", failed: false },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(bot.edited.at(-1)?.text).toContain(`Обновлено: ${changedTimestamp}`);
+		await new Promise((resolve) => setTimeout(resolve, 2500));
+		expect(bot.edited.at(-1)?.text).toContain(`Обновлено: ${changedTimestamp}`);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "tool_end", toolCallId: "opaque", failed: false },
+		});
+		await vi.waitFor(() => {
+			const terminalTimestamp = bot.edited
+				.at(-1)
+				?.text?.match(/Обновлено: (\d{2}:\d{2}:\d{2})/)?.[1];
+			expect(terminalTimestamp).not.toBe(changedTimestamp);
+		});
 		await adapter.stop();
 	});
 
@@ -5682,7 +5745,261 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("resets subagent status at each new agent run", async () => {
+	it("keeps the transport operation projection to six rows", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track bounded tools");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		for (let index = 0; index < 8; index++) {
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `bounded-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		}
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 2"),
+		);
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text.match(/^• read:/gm) ?? []).toHaveLength(6);
+		expect(text).toContain("Ещё выполняется: 2");
+		await adapter.stop();
+	});
+
+	it("keeps coalesced Worker tool events out of visible status and update time", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `12:00:0${date.getSeconds()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track coalesced worker");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
+		);
+		const before = bot.edited.at(-1)?.text;
+		for (const event of [
+			{
+				type: "tool_start" as const,
+				toolCallId: "worker-tool",
+				summary: "subagent · worker · task",
+			},
+			{ type: "tool_end" as const, toolCallId: "worker-tool", failed: false },
+		]) {
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: event,
+			});
+		}
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(bot.edited.at(-1)?.text).toBe(before);
+		await adapter.stop();
+	});
+
+	it("renders child-role overflow immediately without changing activity status or time", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `12:00:0${date.getSeconds()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track child overflow");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
+		);
+		for (let index = 0; index < 256; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `child-cap-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 251"),
+		);
+		const before = bot.edited.at(-1)?.text ?? "";
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "worker-over-cap",
+				summary: "subagent · worker · task",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"Дополнительные операции не отслеживаются",
+			),
+		);
+		const after = bot.edited.at(-1)?.text ?? "";
+		expect(after.split("\n")[0]).toBe(before.split("\n")[0]);
+		expect(after.match(/^⏳ .*$/m)?.[0]).toBe(before.match(/^⏳ .*$/m)?.[0]);
+		expect(after.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			before.match(/^Обновлено: .*$/m)?.[0],
+		);
+		const edits = bot.edited.length;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "worker-over-cap-duplicate",
+				summary: "subagent · worker · task",
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(bot.edited).toHaveLength(edits);
+		await adapter.stop();
+	});
+
+	it("advances activity time when thinking joins a queued child overflow warning", async () => {
+		const bot = new MockBot();
+		let ticks = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityClock: () => new Date(ticks++ * 1000),
+			activityTimeFormatter: (date) => `t${date.getTime()}`,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track coalesced worker thinking");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
+			),
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
+		);
+		for (let index = 0; index < 256; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `thinking-cap-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 251"),
+		);
+		const beforeTime = bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "thinking-over-cap",
+				summary: "subagent · worker · task",
+			},
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thinking", active: true },
+		});
+		await vi.waitFor(() => {
+			const text = bot.edited.at(-1)?.text ?? "";
+			expect(text).toContain("Дополнительные операции не отслеживаются");
+			expect(text).toContain("• Думаю…");
+		});
+		const afterTime = bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
+		expect(afterTime).not.toBe(beforeTime);
+		await adapter.stop();
+	});
+
+	it("publishes the activity overflow warning on its first over-cap tool", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "track activity overflow");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+		);
+		for (let index = 0; index < 256; index++)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: `cap-${index}`,
+					summary: `read: ${index}`,
+				},
+			});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 250"),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "cap-over",
+				summary: "read: overflow",
+			},
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"Дополнительные операции не отслеживаются",
+			),
+		);
+		const edits = bot.edited.length;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "tool_start",
+				toolCallId: "cap-over-2",
+				summary: "read: overflow again",
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(bot.edited).toHaveLength(edits);
+		await adapter.stop();
+	});
+
+	it("coalesces sequential Worker and Reviewer status without workflow spam", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -5695,17 +6012,36 @@ describe("Telegram transport", () => {
 			harnessEvent(
 				"sid",
 				"output",
-				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"scout","state":"running"}]}',
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
 			),
 		);
 		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Задача Scout: выполняется"),
+			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
 		);
-		emit(harnessEvent("sid", "status", "agent_start"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: {
+				type: "notification",
+				text: 'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"completed"},{"kind":"subagent","label":"reviewer","state":"running","id":"PRIVATE_REVIEW_ID"}]}',
+			},
+		});
 		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Pi выполняет ход сессии"),
+			expect(bot.edited.at(-1)?.text).toContain("Задача Reviewer: выполняется"),
 		);
-		expect(bot.edited.at(-1)?.text).not.toContain("Задача Scout: выполняется");
+		const visible = bot.edited.at(-1)?.text ?? "";
+		expect(visible).toContain("Задача Worker: завершён ✓");
+		expect(visible).toContain("Задача Reviewer: выполняется …");
+		expect(visible.match(/Задача Worker: завершён/g)).toHaveLength(1);
+		expect(visible.match(/Задача Reviewer: выполняется/g)).toHaveLength(1);
+		expect(
+			visible.match(
+				/^• (?!Задача Worker|Задача Reviewer|Input|Ещё|Pi activity|⏳)/gm,
+			) ?? [],
+		).toEqual([]);
+		expect(visible).not.toContain("workflow");
+		expect(visible).not.toContain("PRIVATE_REVIEW_ID");
+		expect(visible).not.toContain("subagent ·");
 		await adapter.stop();
 	});
 
