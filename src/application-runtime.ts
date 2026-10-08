@@ -17,6 +17,7 @@ import {
 } from "./core/session-store.js";
 import type { AdapterOptions, HarnessEvent } from "./core/types.js";
 import { describeError } from "./error-diagnostics.js";
+import { ClaudeCodeHarnessAdapter } from "./harness/claude-code-harness.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
 	PiControlError,
@@ -168,6 +169,7 @@ function safeOperationKind(value: string): string {
 
 export interface ApplicationRuntimeOptions {
 	readonly piExecutable: string;
+	readonly claudeExecutable?: string;
 	readonly executionMode?: ExecutionMode;
 	readonly processProvider?: ProcessProvider;
 	readonly piOptions?: Omit<
@@ -256,6 +258,12 @@ export class ApplicationRuntime {
 			const sessionManager = new SessionManager(
 				store,
 				options.harnesses ?? [
+					new ClaudeCodeHarnessAdapter(
+						processProvider ?? new NodeProcessProvider(),
+						{
+							executable: options.claudeExecutable ?? "claude",
+						},
+					),
 					new PiRpcHarnessAdapter(
 						processProvider ?? new NodeProcessProvider(),
 						{
