@@ -59,8 +59,8 @@ import {
 	TelegramInboxQuotaError,
 	TelegramInboxWorkspaceError,
 } from "./telegram-inbox.js";
-import { TelegramPanelStore } from "./telegram-panel-store.js";
 import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
+import { TelegramPanelStore } from "./telegram-panel-store.js";
 import { SubagentTextStream } from "./telegram-subagent-stream.js";
 
 const TELEGRAM_LIMIT = 4096;
@@ -1147,6 +1147,7 @@ export class TelegramTransportAdapter
 	private readonly reportedErrors = new Map<SessionId, Set<string>>();
 	private readonly liveActivities = new Map<string, LiveActivity>();
 	private readonly runningSessions = new Set<SessionId>();
+	private readonly reloadingSessions = new Set<SessionId>();
 	private readonly previews = new Map<number, SessionId>();
 	private readonly pendingNames = new Map<number, PendingNameFlow>();
 	private readonly staleNamePrompts = new Map<number, Set<number>>();
@@ -1170,6 +1171,7 @@ export class TelegramTransportAdapter
 	private readonly panelSemantic = new Map<number, string>();
 	private readonly panelUpdatedAt = new Map<number, string>();
 	private readonly panelPublished = new Map<number, string>();
+	private readonly panelUpdateQueues = new Map<number, Promise<unknown>>();
 	private readonly panelRefreshScheduler = new TelegramPanelRefreshScheduler();
 	private readonly welcomeIntents = new Map<string, WelcomeIntent>();
 	private readonly folderIntents = new Map<string, FolderIntent>();
@@ -2543,11 +2545,19 @@ export class TelegramTransportAdapter
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
-			const result = await this.request(sender, {
-				kind: "reload",
-				sessionId,
-				beforeDispatch: () => this.selected.get(chatId) === sessionId,
-			});
+			this.reloadingSessions.add(sessionId);
+			await this.refreshExistingPanel(chatId, sender);
+			let result: TransportResult;
+			try {
+				result = await this.request(sender, {
+					kind: "reload",
+					sessionId,
+					beforeDispatch: () => this.selected.get(chatId) === sessionId,
+				});
+			} finally {
+				this.reloadingSessions.delete(sessionId);
+				await this.refreshExistingPanel(chatId, sender);
+			}
 			if (result.ok) {
 				const name = this.sessionNames.get(sessionId);
 				const currentSelection = this.selected.get(chatId);
@@ -3470,15 +3480,10 @@ export class TelegramTransportAdapter
 				`Статус Pi: ${preview.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : preview.status === "stopped" ? "остановлен" : preview.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${preview.status})`,
 			);
 			lines.push(
-				`Состояние Pi: ${liveState === "busy" ? "занята" : liveState === "idle" ? "ожидает" : liveState === "stale" ? "состояние устарело" : liveState === "offline" ? "нет сессии" : liveState === "starting" ? "запускается" : liveState === "stopped" ? "остановлена" : "ошибка"}`,
+				`Состояние Pi: ${this.reloadingSessions.has(preview.id) ? "перезагружаются ресурсы" : liveState === "busy" ? "занята" : liveState === "idle" ? "ожидает" : liveState === "stale" ? "состояние устарело" : liveState === "offline" ? "нет сессии" : liveState === "starting" ? "запускается" : liveState === "stopped" ? "остановлена" : "ошибка"}`,
 			);
-			if (
-				!liveAvailable &&
-				preview.status !== "stopped" &&
-				preview.status !== "failed"
-			)
-				lines.push("Живые данные недоступны.");
-			if (status) lines.push(compactUsage(status.live?.usage));
+			if (!liveAvailable) lines.push("Живые данные недоступны.");
+			if (liveAvailable) lines.push(compactUsage(status?.live?.usage));
 			if (status?.live?.model)
 				lines.push(
 					`Модель: ${modelId(status.live.model)}${status.live.effort ? ` · ${oneLine(status.live.effort)}` : ""}`,
@@ -3575,7 +3580,26 @@ export class TelegramTransportAdapter
 		);
 	}
 
-	private async updatePanel(
+	private updatePanel(
+		chatId: number,
+		text: string,
+		replyMarkup: unknown,
+		messageId?: number,
+	): Promise<boolean> {
+		const previous = this.panelUpdateQueues.get(chatId) ?? Promise.resolve();
+		const update = previous
+			.catch(() => undefined)
+			.then(() => this.updatePanelNow(chatId, text, replyMarkup, messageId));
+		this.panelUpdateQueues.set(chatId, update);
+		const cleanup = () => {
+			if (this.panelUpdateQueues.get(chatId) === update)
+				this.panelUpdateQueues.delete(chatId);
+		};
+		void update.then(cleanup, cleanup);
+		return update;
+	}
+
+	private async updatePanelNow(
 		chatId: number,
 		text: string,
 		replyMarkup: unknown,
@@ -5749,6 +5773,10 @@ export class TelegramTransportAdapter
 				const previewId =
 					this.previews.get(chatId) ?? this.selected.get(chatId);
 				if (previewId !== event.sessionId) continue;
+				this.panelRenderRequests.set(
+					chatId,
+					(this.panelRenderRequests.get(chatId) ?? 0) + 1,
+				);
 				const sender = this.options.allowedUserIds[0];
 				if (sender !== undefined)
 					this.panelRefreshScheduler.schedule(

@@ -683,6 +683,51 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("renders null live metrics unavailable and a transient status failure generically", async () => {
+		const bot = new MockBot();
+		let queryFails = false;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				if (queryFails)
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: { code: "TEMPORARY", message: "private transient detail" },
+					};
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						live: {
+							usage: {
+								inputTokens: null,
+								outputTokens: null,
+								cacheReadTokens: null,
+								cacheWriteTokens: null,
+								costUsd: null,
+								contextTokens: null,
+								contextWindow: null,
+								contextPercent: null,
+							},
+						},
+					},
+				} as unknown as TransportResult;
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("↑— ↓— R— CH— —");
+		expect(bot.sent.at(-1)?.text).toContain("↑— ↓— R— CH— — ?/?/— (auto)");
+		queryFails = true;
+		await bot.update(42, "/menu");
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text).toContain("Живые данные недоступны");
+		expect(text).not.toContain("private transient detail");
+		await adapter.stop();
+	});
+
 	it("shows session name and full identity with Pi-reported context in status", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Focused task" }));
 		const bot = new MockBot();
