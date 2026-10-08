@@ -1148,6 +1148,7 @@ export class TelegramTransportAdapter
 	private readonly liveActivities = new Map<string, LiveActivity>();
 	private readonly runningSessions = new Set<SessionId>();
 	private readonly reloadingSessions = new Set<SessionId>();
+	private readonly recoveringSessions = new Set<SessionId>();
 	private readonly previews = new Map<number, SessionId>();
 	private readonly pendingNames = new Map<number, PendingNameFlow>();
 	private readonly staleNamePrompts = new Map<number, Set<number>>();
@@ -1171,8 +1172,14 @@ export class TelegramTransportAdapter
 	private readonly panelSemantic = new Map<number, string>();
 	private readonly panelUpdatedAt = new Map<number, string>();
 	private readonly panelPublished = new Map<number, string>();
+	private readonly panelPublicationTimes = new Map<number, number>();
 	private readonly panelUpdateQueues = new Map<number, Promise<unknown>>();
-	private readonly panelRefreshScheduler = new TelegramPanelRefreshScheduler();
+	private readonly panelRefreshScheduler = new TelegramPanelRefreshScheduler(
+		Date.now,
+		500,
+		2000,
+		(error) => this.reportError("Telegram panel refresh failed", error),
+	);
 	private readonly welcomeIntents = new Map<string, WelcomeIntent>();
 	private readonly folderIntents = new Map<string, FolderIntent>();
 	private readonly confirmationIntents = new Map<string, ConfirmationIntent>();
@@ -1241,6 +1248,10 @@ export class TelegramTransportAdapter
 				this.options.stateDirectory,
 				this.options.token,
 			);
+			for (const [chatId, messageId] of this.panelStore.panels()) {
+				this.panelMessageIds.set(chatId, messageId);
+				this.panelStaleChats.add(chatId);
+			}
 			await this.restoreSelectedSessions();
 			this.inbox = new TelegramInbox(this.options.stateDirectory);
 			if (this.options.signal?.aborted)
@@ -1334,6 +1345,13 @@ export class TelegramTransportAdapter
 				if (this.options.signal?.aborted)
 					throw new Error("Telegram startup aborted");
 				this.ready = true;
+				for (const chatId of this.panelMessageIds.keys()) {
+					const sender = this.options.allowedUserIds[0];
+					if (sender !== undefined)
+						this.panelRefreshScheduler.schedule(chatId, () =>
+							this.refreshExistingPanel(chatId, sender),
+						);
+				}
 				this.scheduleInboxSweep();
 			} finally {
 				this.options.signal?.removeEventListener("abort", abortPolling);
@@ -1454,6 +1472,12 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		this.panelRefreshScheduler.stop();
+		for (const chatId of this.panelRenderRequests.keys())
+			this.panelRenderRequests.set(
+				chatId,
+				(this.panelRenderRequests.get(chatId) ?? 0) + 1,
+			);
 		if (this.inboxSweepTimer) clearInterval(this.inboxSweepTimer);
 		this.inboxSweepTimer = undefined;
 		if (this.inboxSweepPromise)
@@ -2546,7 +2570,7 @@ export class TelegramTransportAdapter
 			if (!sessionId)
 				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
 			this.reloadingSessions.add(sessionId);
-			await this.refreshExistingPanel(chatId, sender);
+			this.refreshPanelsPreviewing(sessionId, sender, true);
 			let result: TransportResult;
 			try {
 				result = await this.request(sender, {
@@ -2556,7 +2580,7 @@ export class TelegramTransportAdapter
 				});
 			} finally {
 				this.reloadingSessions.delete(sessionId);
-				await this.refreshExistingPanel(chatId, sender);
+				this.refreshPanelsPreviewing(sessionId, sender, true);
 			}
 			if (result.ok) {
 				const name = this.sessionNames.get(sessionId);
@@ -2825,7 +2849,7 @@ export class TelegramTransportAdapter
 				selectionCleared = await this.clearSelected(chatId);
 				this.previews.delete(chatId);
 			}
-			if (result.ok) await this.refreshExistingPanel(chatId, sender);
+			if (result.ok) this.refreshPanelsPreviewing(sessionId, sender, true);
 			const selectedAfterStop = this.selected.get(chatId);
 			const selectionMessage =
 				selectedAfterStop === sessionId
@@ -2896,7 +2920,7 @@ export class TelegramTransportAdapter
 						this.previews.delete(selectedChat);
 					}
 				}
-				await this.refreshExistingPanel(chatId, sender);
+				this.refreshPanelsPreviewing(sessionId, sender, true);
 			}
 			const remainingTarget = this.selected.get(chatId);
 			return this.sendDirect(
@@ -3418,12 +3442,14 @@ export class TelegramTransportAdapter
 			(session) => session.id === previewId,
 		);
 		let status: HarnessSessionStatus | undefined;
+		let liveQueryFailed = false;
 		if (previewId) {
 			const result = await this.request(sender, {
 				kind: "session_status",
 				sessionId: previewId,
 			});
 			if (result.ok) status = result.value as HarnessSessionStatus;
+			else liveQueryFailed = true;
 		}
 		if (
 			this.panelRenderRequests.get(chatId) !== renderRequest ||
@@ -3436,13 +3462,17 @@ export class TelegramTransportAdapter
 		const preview = status?.session ?? previewFromList;
 		const liveAvailable = status?.live !== undefined;
 		const liveState = !preview
-			? "offline"
+			? listed.ok && sessions.length === 0
+				? "offline"
+				: "live unavailable"
 			: preview.status === "running"
-				? liveAvailable
-					? this.runningSessions.has(preview.id)
-						? "busy"
-						: "idle"
-					: "stale"
+				? liveQueryFailed
+					? "live unavailable"
+					: liveAvailable
+						? this.runningSessions.has(preview.id)
+							? "busy"
+							: "idle"
+						: "stale"
 				: preview.status === "starting"
 					? "starting"
 					: preview.status === "stopped"
@@ -3479,14 +3509,29 @@ export class TelegramTransportAdapter
 				`Статус Pi: ${preview.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : preview.status === "stopped" ? "остановлен" : preview.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${preview.status})`,
 			);
 			lines.push(
-				`Состояние Pi: ${this.reloadingSessions.has(preview.id) ? "перезагружаются ресурсы" : liveState === "busy" ? "занята" : liveState === "idle" ? "ожидает" : liveState === "stale" ? "состояние устарело" : liveState === "offline" ? "нет сессии" : liveState === "starting" ? "запускается" : liveState === "stopped" ? "остановлена" : "ошибка"}`,
+				`Состояние Pi: ${this.reloadingSessions.has(preview.id) ? "перезагружаются ресурсы" : this.recoveringSessions.has(preview.id) ? "восстанавливается" : liveState === "busy" ? "занята" : liveState === "idle" ? "ожидает" : liveState === "stale" ? "состояние устарело" : liveState === "live unavailable" ? "живое состояние недоступно" : liveState === "offline" ? "нет сессии" : liveState === "starting" ? "запускается" : liveState === "stopped" ? "остановлена" : "ошибка"}`,
 			);
-			if (!liveAvailable) lines.push("Живые данные недоступны.");
-			if (liveAvailable) lines.push(compactUsage(status?.live?.usage));
-			if (status?.live?.model)
+			if (!liveAvailable)
 				lines.push(
-					`Модель: ${modelId(status.live.model)}${status.live.effort ? ` · ${oneLine(status.live.effort)}` : ""}`,
+					liveQueryFailed
+						? "Живые данные недоступны: запрос завершился ошибкой."
+						: "Живые данные недоступны.",
 				);
+			if (liveAvailable) {
+				lines.push(compactUsage(status?.live?.usage));
+				if (status?.live?.model)
+					lines.push(`Модель: ${modelId(status.live.model)}`);
+				else lines.push("Модель: недоступна");
+				if (status?.live?.effort)
+					lines.push(`Усилие: ${oneLine(status.live.effort)}`);
+				else lines.push("Усилие: недоступно");
+				if (!status?.live?.usage) lines.push("Использование: недоступно");
+				if (
+					status?.live?.usage?.contextTokens == null &&
+					status?.live?.usage?.contextPercent == null
+				)
+					lines.push("Контекст: недоступен");
+			}
 		}
 		const rows: InlineButton[][] = [];
 		if (previewId && listed.ok)
@@ -3535,7 +3580,14 @@ export class TelegramTransportAdapter
 				]);
 			}
 		}
-		const semantic = JSON.stringify([lines, rows]);
+		const semantic = JSON.stringify({
+			preview: preview ? [preview.id, preview.status] : previewId,
+			state: liveState,
+			reloading: preview ? this.reloadingSessions.has(preview.id) : false,
+			recovering: preview ? this.recoveringSessions.has(preview.id) : false,
+			live: status?.live ?? null,
+			queryFailed: liveQueryFailed,
+		});
 		if (this.panelSemantic.get(chatId) !== semantic) {
 			this.panelSemantic.set(chatId, semantic);
 			const now = (this.options.activityClock ?? (() => new Date()))();
@@ -3554,6 +3606,24 @@ export class TelegramTransportAdapter
 		);
 	}
 
+	private refreshPanelsPreviewing(
+		sessionId: SessionId,
+		sender: number,
+		flush = true,
+	): void {
+		for (const chatId of this.panelMessageIds.keys()) {
+			if (
+				(this.previews.get(chatId) ?? this.selected.get(chatId)) !== sessionId
+			)
+				continue;
+			this.panelRefreshScheduler.schedule(
+				chatId,
+				() => this.refreshExistingPanel(chatId, sender),
+				flush,
+			);
+		}
+	}
+
 	private async refreshExistingPanel(
 		chatId: number,
 		sender: number,
@@ -3563,6 +3633,19 @@ export class TelegramTransportAdapter
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
 		if (messageId !== undefined)
 			await this.renderPanel(chatId, sender, messageId, hideStaleAction);
+	}
+
+	private async waitForPanelPublication(chatId: number): Promise<boolean> {
+		if (this.stopping) return false;
+		const previous = this.panelPublicationTimes.get(chatId);
+		if (previous !== undefined) {
+			const remaining = 500 - (Date.now() - previous);
+			if (remaining > 0)
+				await new Promise((resolve) => setTimeout(resolve, remaining));
+		}
+		if (this.stopping) return false;
+		this.panelPublicationTimes.set(chatId, Date.now());
+		return true;
 	}
 
 	private async notifyPanelStale(chatId: number): Promise<void> {
@@ -3592,7 +3675,7 @@ export class TelegramTransportAdapter
 			.catch(() => undefined)
 			.then(() =>
 				isCurrent()
-					? this.updatePanelNow(chatId, text, replyMarkup, messageId)
+					? this.updatePanelNow(chatId, text, replyMarkup, messageId, isCurrent)
 					: false,
 			);
 		this.panelUpdateQueues.set(chatId, update);
@@ -3608,7 +3691,8 @@ export class TelegramTransportAdapter
 		chatId: number,
 		text: string,
 		replyMarkup: unknown,
-		messageId?: number,
+		messageId: number | undefined,
+		isCurrent: () => boolean,
 	): Promise<boolean> {
 		const publication = JSON.stringify([text, replyMarkup]);
 		if (
@@ -3631,10 +3715,11 @@ export class TelegramTransportAdapter
 		for (const sessionId of retiredSessions)
 			this.retireConfirmationEpochIfUnused(sessionId);
 		const existing =
-			messageId ??
 			this.panelMessageIds.get(chatId) ??
-			this.panelStore?.get(chatId);
+			this.panelStore?.get(chatId) ??
+			messageId;
 		if (existing !== undefined) {
+			if (!(await this.waitForPanelPublication(chatId))) return false;
 			const edited = await this.telegramCall((signal) =>
 				this.bot.api.editMessageText(
 					chatId,
@@ -3650,6 +3735,7 @@ export class TelegramTransportAdapter
 				this.panelPublished.set(chatId, publication);
 				return true;
 			}
+			if (!isCurrent()) return false;
 			if (!isMessageNotFound(edited.error)) {
 				this.dropPanelGenerationIntents(chatId, generation);
 				this.panelStaleChats.add(chatId);
@@ -3667,6 +3753,7 @@ export class TelegramTransportAdapter
 				(intent) =>
 					intent.chatId === chatId && intent.generation === intentGeneration,
 			);
+		if (!(await this.waitForPanelPublication(chatId))) return false;
 		const sent = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
@@ -3682,7 +3769,7 @@ export class TelegramTransportAdapter
 			return false;
 		}
 		const createdMessageId = messageIdFrom(sent.value);
-		if (createdMessageId === undefined) {
+		if (createdMessageId === undefined || !isCurrent()) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
 			return false;
 		}
@@ -3696,6 +3783,7 @@ export class TelegramTransportAdapter
 			for (const intent of this.confirmationIntents.values())
 				if (intent.chatId === chatId && intent.generation === intentGeneration)
 					intent.messageId = createdMessageId;
+			if (!(await this.waitForPanelPublication(chatId))) return false;
 			const published = await this.telegramCall((signal) =>
 				this.bot.api.editMessageText(
 					chatId,
@@ -3710,6 +3798,7 @@ export class TelegramTransportAdapter
 				return false;
 			}
 		}
+		if (!(await this.waitForPanelPublication(chatId))) return false;
 		const pinned = await this.telegramCall((signal) =>
 			this.bot.api.pinChatMessage(chatId, createdMessageId, {}, signal),
 		);
@@ -5807,6 +5896,9 @@ export class TelegramTransportAdapter
 				event.text === "harness_recovered" ||
 				event.text === "harness_recovery_failed"
 			) {
+				if (event.text === "harness_restarting")
+					this.recoveringSessions.add(event.sessionId);
+				else this.recoveringSessions.delete(event.sessionId);
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
