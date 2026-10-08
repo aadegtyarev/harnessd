@@ -1351,8 +1351,8 @@ export class TelegramTransportAdapter
 				for (const [chatId, messageId] of this.panelMessageIds) {
 					const sender = this.options.allowedUserIds[0];
 					if (sender === undefined) continue;
-					await this.publishRestoredPanelStale(chatId, messageId);
 					const intent = this.panelIntents.current(chatId);
+					await this.publishRestoredPanelStale(chatId, messageId);
 					this.panelRefreshScheduler.schedule(chatId, () =>
 						this.panelIntents.isCurrent(chatId, intent)
 							? this.refreshExistingPanel(chatId, sender)

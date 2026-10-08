@@ -3761,10 +3761,13 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("serializes restored startup status with lifecycle and user refreshes", async () => {
+	it("keeps held restored startup refresh from replacing newer folder navigation", async () => {
 		const directory = await temp();
+		await mkdir(path.join(directory, "child"));
 		const firstBot = new MockBot();
-		const first = await startAdapter(firstBot, directory);
+		const first = await startAdapter(firstBot, directory, {
+			initialCwd: directory,
+		});
 		await firstBot.update(42, "/menu");
 		await first.adapter.stop();
 
@@ -3797,7 +3800,7 @@ describe("Telegram transport", () => {
 			token: "secret-token",
 			allowedUserIds: [42],
 			stateDirectory: directory,
-			initialCwd: "/work",
+			initialCwd: directory,
 			botFactory: () => bot as never,
 		});
 		const started = adapter.start(
@@ -3818,7 +3821,11 @@ describe("Telegram transport", () => {
 				panelIntents: { current(chatId: number): number };
 			}
 		).panelIntents.current(42);
-		const userRefresh = bot.update(42, "/menu");
+		const folderNavigation = bot.callback(
+			42,
+			"menu:folders",
+			bot.lastMessageId,
+		);
 		await vi.waitFor(() =>
 			expect(
 				(
@@ -3829,11 +3836,11 @@ describe("Telegram transport", () => {
 			).toBeGreaterThan(priorIntent),
 		);
 		releaseStartupEdit();
-		await Promise.all([started, userRefresh]);
-		await bot.update(42, "/menu");
+		await Promise.all([started, folderNavigation]);
 
 		expect(maximumActiveEdits).toBe(1);
-		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toContain("Папки");
+		await bot.update(42, "/menu");
 		expect(bot.edited.at(-1)?.text).toContain("Newest startup race");
 		await adapter.stop();
 	});
