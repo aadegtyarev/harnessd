@@ -66,6 +66,38 @@ describe("TelegramPanelRefreshScheduler", () => {
 		vi.useRealTimers();
 	});
 
+	it("bounds a sustained API-edit backlog to two seconds and terminal flushes at the boundary", async () => {
+		vi.useFakeTimers();
+		const scheduler = new TelegramPanelRefreshScheduler(() => Date.now());
+		const began = Date.now();
+		const apiEdit = vi.fn(async (_text: string) => {});
+		const publish = (text: string) => async () => apiEdit(text);
+		let finishFirst!: () => void;
+		scheduler.schedule(
+			8,
+			() =>
+				new Promise<void>((resolve) => {
+					finishFirst = resolve;
+				}),
+			true,
+		);
+		await vi.advanceTimersByTimeAsync(0);
+		for (let index = 0; index < 20; index++) {
+			await vi.advanceTimersByTimeAsync(100);
+			scheduler.schedule(8, publish(`backlog-${index}`));
+		}
+		finishFirst();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(apiEdit).toHaveBeenLastCalledWith("backlog-19");
+		expect(Date.now() - began).toBe(2000);
+		scheduler.schedule(8, publish("explicit-terminal"), true);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(apiEdit).toHaveBeenLastCalledWith("explicit-terminal");
+		expect(Date.now() - began).toBe(2000);
+		await scheduler.stop();
+		vi.useRealTimers();
+	});
+
 	it("flushes immediately and bounds continuous bursts by max wait", async () => {
 		vi.useFakeTimers();
 		const scheduler = new TelegramPanelRefreshScheduler(() => Date.now());

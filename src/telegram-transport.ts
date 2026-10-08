@@ -3562,6 +3562,10 @@ export class TelegramTransportAdapter
 				)
 					lines.push("Контекст: недоступен");
 			}
+		} else {
+			lines.push(
+				`Состояние Pi: ${liveState === "offline" ? "нет сессии" : "живое состояние недоступно"}`,
+			);
 		}
 		const rows: InlineButton[][] = [];
 		if (previewId && listed.ok)
@@ -3611,7 +3615,7 @@ export class TelegramTransportAdapter
 			}
 		}
 		const semantic = JSON.stringify({
-			preview: preview ? [preview.id, preview.status] : previewId,
+			preview: preview?.status ?? (previewId ? "unavailable" : "none"),
 			state: liveState,
 			reloading: preview ? this.reloadingSessions.has(preview.id) : false,
 			recovering: preview ? this.recoveringSessions.has(preview.id) : false,
@@ -5945,6 +5949,17 @@ export class TelegramTransportAdapter
 	}
 
 	private onEvent(event: HarnessEvent): void {
+		if (
+			event.kind === "status" &&
+			(event.text === "harness_restarting" ||
+				event.text === "harness_recovered" ||
+				event.text === "harness_recovery_failed")
+		) {
+			if (event.text === "harness_restarting")
+				this.recoveringSessions.add(event.sessionId);
+			else this.recoveringSessions.delete(event.sessionId);
+			this.runningSessions.delete(event.sessionId);
+		}
 		const terminalPanelEvent =
 			(event.kind === "error" && event.fatal === true) ||
 			(event.kind === "status" &&
@@ -5982,11 +5997,7 @@ export class TelegramTransportAdapter
 				event.text === "harness_recovered" ||
 				event.text === "harness_recovery_failed"
 			) {
-				if (event.text === "harness_restarting")
-					this.recoveringSessions.add(event.sessionId);
-				else this.recoveringSessions.delete(event.sessionId);
 				this.invalidateSessionConfirmations(event.sessionId);
-				this.runningSessions.delete(event.sessionId);
 				this.stopTyping(event.sessionId);
 			}
 			if (event.text === "agent_start") {

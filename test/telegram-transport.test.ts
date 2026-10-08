@@ -698,6 +698,17 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("shows offline only when the successful session list confirms no sessions", async () => {
+		const bot = new MockBot();
+		const known = [...sessions.entries()];
+		sessions.clear();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Состояние Pi: нет сессии");
+		await adapter.stop();
+		for (const [id, session] of known) sessions.set(id, session);
+	});
+
 	it("shows stale unavailable live state and only advances update time on semantic changes", async () => {
 		const bot = new MockBot();
 		let time = 0;
@@ -781,6 +792,45 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps live-status time stable across selection and creation-directory UI changes", async () => {
+		const bot = new MockBot();
+		let time = 0;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) =>
+				request.kind === "session_status"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: {
+								session: sessions.get(request.sessionId) as SessionSummary,
+								live: {},
+							},
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const initial = bot.sent.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
+		time = 1;
+		await bot.update(42, "/use other");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Выбрана (обычные сообщения →): #other",
+		);
+		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			initial,
+		);
+		time = 2;
+		await bot.update(42, "/cd /tmp");
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("папка создания: /tmp");
+		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
+			initial,
+		);
+		await adapter.stop();
+	});
+
 	it("advances panel update time for metric-only changes but not identical metrics", async () => {
 		const bot = new MockBot();
 		let tokens = 10;
@@ -814,6 +864,157 @@ describe("Telegram transport", () => {
 		expect(bot.edited.at(-1)?.text).toBe(changed);
 		expect(before).toContain("Обновлено: 00:00:00");
 		await adapter.stop();
+	});
+
+	it("renders availability, individual missing fields, and recovery transitions", async () => {
+		const bot = new MockBot();
+		let live: Record<string, unknown> | undefined = {};
+		let failStatus = false;
+		let time = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			activityTimeFormatter: () => `00:00:0${time}`,
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				if (failStatus)
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: { code: "INTERNAL", message: "unavailable" },
+					} as TransportResult;
+				return {
+					requestId: request.requestId,
+					ok: true,
+					value: {
+						session: sessions.get(request.sessionId) as SessionSummary,
+						...(live === undefined ? {} : { live }),
+					},
+				} as TransportResult;
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		let text = bot.sent.at(-1)?.text ?? "";
+		expect(text).toContain("Состояние Pi: ожидает");
+		expect(text).toContain("Модель: недоступна");
+		expect(text).toContain("Усилие: недоступно");
+		expect(text).toContain("Использование: недоступно");
+		expect(text).toContain("Контекст: недоступен");
+		live = {
+			model: { provider: "test", id: "m", name: "M" },
+			effort: "high",
+			usage: { inputTokens: 1, contextTokens: 2 },
+		};
+		time = 1;
+		await bot.update(42, "/menu");
+		text = bot.edited.at(-1)?.text ?? "";
+		expect(text).toContain("Модель: test/m");
+		expect(text).toContain("Усилие: high");
+		const completeLive = { ...live };
+		for (const [field, unavailable] of [
+			["model", "Модель: недоступна"],
+			["effort", "Усилие: недоступно"],
+			["usage", "Использование: недоступно"],
+			["context", "Контекст: недоступен"],
+		] as const) {
+			live = { ...completeLive };
+			if (field === "context") live.usage = { inputTokens: 1 };
+			else delete live[field];
+			time++;
+			await bot.update(42, "/menu");
+			expect(bot.edited.at(-1)?.text).toContain(unavailable);
+		}
+		live = {};
+		time = 2;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("Обновлено: 00:00:02");
+		failStatus = true;
+		time = 3;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Состояние Pi: живое состояние недоступно",
+		);
+		expect(bot.edited.at(-1)?.text).toContain("запрос завершился ошибкой");
+		failStatus = false;
+		live = undefined;
+		time = 4;
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Состояние Pi: состояние устарело",
+		);
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Состояние Pi: восстанавливается",
+		);
+		emit(harnessEvent("sid", "status", "harness_recovered"));
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(
+			(
+				adapter as unknown as { recoveringSessions: Set<string> }
+			).recoveringSessions.has("sid"),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("stops pending and in-flight live refreshes without post-stop queries or edits", async () => {
+		const bot = new MockBot();
+		let queryCount = 0;
+		const { adapter, emit, requests } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "session_status") queryCount++;
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		vi.useFakeTimers();
+		const beforeQueries = queryCount;
+		const beforeEdits = bot.api.editMessageText.mock.calls.length;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await adapter.stop();
+		await vi.advanceTimersByTimeAsync(2500);
+		expect(queryCount).toBe(beforeQueries);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(beforeEdits);
+		expect(
+			requests.filter((request) => request.kind === "session_status"),
+		).toHaveLength(beforeQueries);
+
+		vi.useRealTimers();
+		const inFlightBot = new MockBot();
+		let release!: () => void;
+		let holdStatus = false;
+		const inFlight = await startAdapter(inFlightBot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "session_status") return result(request);
+				queryCount++;
+				if (holdStatus)
+					return new Promise((_resolve, reject) => {
+						release = () => reject(new Error("late status failure"));
+					});
+				return result(request);
+			},
+		});
+		await inFlightBot.update(42, "/use sid");
+		await inFlightBot.update(42, "/menu");
+		vi.useFakeTimers();
+		const beforeInFlightEdits =
+			inFlightBot.api.editMessageText.mock.calls.length;
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown) => unhandled.push(error);
+		process.on("unhandledRejection", onUnhandled);
+		holdStatus = true;
+		inFlight.emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(500);
+		const stopping = inFlight.adapter.stop();
+		release();
+		await stopping;
+		process.off("unhandledRejection", onUnhandled);
+		await vi.advanceTimersByTimeAsync(2500);
+		expect(inFlightBot.api.editMessageText).toHaveBeenCalledTimes(
+			beforeInFlightEdits,
+		);
+		expect(unhandled).toEqual([]);
 	});
 
 	it("refreshes the preview on recovery and fatal process-exit events", async () => {
