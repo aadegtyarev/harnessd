@@ -6,7 +6,7 @@ Status: approved by the operator (2026-10-11); delivered in three PRs.
 
 Everything the operator needs stays at the bottom of the chat; nothing requires scrolling up to a pinned message. The operator can see where a long run is heading without asking for status.
 
-## Phase 1 — controls (delivered)
+## Phase 1 — controls (PR #51)
 
 - A persistent reply keyboard under the input field: `📊 Ход`, `📋 Панель`, `✋ Прервать`, `🗂 Сессии`. It is sent before the `/start` welcome and with the first `📋` in a process; `/menu` keeps refreshing the panel in place.
 - Button presses are handled as commands and the operator's button message is deleted (best effort). `📊` shows status (phase 2: the run card), `📋` shows the panel, `✋` asks for confirmation and then cancels the current input, `🗂` lists sessions.

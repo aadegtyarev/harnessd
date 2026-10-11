@@ -8,7 +8,7 @@ It is currently being tested from Git, not published to npm. The manifest and lo
 
 - Accepts commands and prompts from allowlisted Telegram users in private chats only.
 - Creates, lists, selects, inspects, resumes, cancels, and stops independent Pi sessions.
-- Provides a pinned session panel, optional session names, current-session usage, typing indicators, and whole-turn output with searchable session IDs.
+- Provides a bottom-anchored control keyboard and session panel, optional session names, current-session usage, typing indicators, and whole-turn output with searchable session IDs.
 - Watches Pi process exits and attempts bounded resume of the same native session while harnessd remains running.
 - Keeps supervisor metadata in SQLite under a private state directory, independently of each session workspace.
 
@@ -120,7 +120,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | Command | Purpose |
 | --- | --- |
 | `/help` | Show available commands. |
-| `/menu` | Open the pinned session panel to browse/select sessions, inspect usage, and manage session settings. |
+| `/menu` | Open or refresh the session panel to browse/select sessions, inspect usage, and manage session settings (`📋 Панель` posts it at the bottom). |
 | `/rename [sessionId] <name|--clear>` | Name the selected or explicit session, or clear its name. |
 | `/sessions` | List sessions. |
 | `/new [cwd]` | Create an unnamed session in `cwd`; defaults to the current folder. The `/menu` create flow can also set a name. |

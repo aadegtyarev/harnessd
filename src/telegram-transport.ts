@@ -889,6 +889,7 @@ function isSessionIdToken(value: string): boolean {
 	return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 }
 type InlineButton = { readonly text: string; readonly callback_data: string };
+const CANCEL_CONFIRMATION_TTL_MS = 120_000;
 const CONTROL_BUTTONS = {
 	status: "📊 Ход",
 	panel: "📋 Панель",
@@ -1337,7 +1338,13 @@ export class TelegramTransportAdapter
 	private readonly keyboardChats = new Set<number>();
 	private readonly cancelIntents = new Map<
 		string,
-		{ chatId: number; sender: number; sessionId: SessionId; messageId?: number }
+		{
+			chatId: number;
+			sender: number;
+			sessionId: SessionId;
+			createdAt: number;
+			messageId?: number;
+		}
 	>();
 	/** Message IDs of panels replaced in this process; their buttons must not re-adopt them. */
 	private readonly retiredPanelIds = new Map<number, Set<number>>();
@@ -2048,6 +2055,20 @@ export class TelegramTransportAdapter
 				await this.handleNameReply(chatId, sender, pending, text);
 				return;
 			}
+			// Keyboard labels are commands even when Telegram sends the tap as a reply.
+			const control = Object.values(CONTROL_BUTTONS).find(
+				(button) => button === text.trim(),
+			);
+			if (control) {
+				if (routedSessionId === undefined)
+					await this.handleControlButton(
+						chatId,
+						sender,
+						control,
+						ctx.message?.message_id,
+					);
+				return;
+			}
 			const knownReplyRoute =
 				replyTo === undefined
 					? undefined
@@ -2068,17 +2089,7 @@ export class TelegramTransportAdapter
 					chatId,
 					"Запрос имени устарел. Начните действие заново.",
 				);
-			const control = Object.values(CONTROL_BUTTONS).find(
-				(button) => button === text.trim(),
-			);
-			if (control && routedSessionId === undefined && replyTo === undefined) {
-				await this.handleControlButton(
-					chatId,
-					sender,
-					control,
-					ctx.message?.message_id,
-				);
-			} else if (text.startsWith("/")) {
+			if (text.startsWith("/")) {
 				await this.command(chatId, sender, text);
 			} else {
 				if (this.eventChannelDisabled(chatId))
@@ -5288,7 +5299,7 @@ export class TelegramTransportAdapter
 			await this.telegramCall((signal) =>
 				this.bot.api.answerCallbackQuery(
 					callback.id,
-					{ text: "Эта панель устарела. Используйте закреплённую панель." },
+					{ text: "Эта панель устарела. Нажмите «📋 Панель» для актуальной." },
 					signal,
 				),
 			);
@@ -5615,11 +5626,9 @@ export class TelegramTransportAdapter
 		const previous =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
 		if (previous !== undefined) {
-			this.retirePanel(chatId, previous);
+			// Detach the reference so the render publishes a new message instead of editing.
 			this.panelMessageIds.delete(chatId);
 			this.panelPublished.delete(chatId);
-			this.panelStaleChats.delete(chatId);
-			this.panelRepairChats.delete(chatId);
 			try {
 				await this.panelStore?.delete(chatId);
 			} catch (error) {
@@ -5630,10 +5639,21 @@ export class TelegramTransportAdapter
 			}
 		}
 		await this.renderPanel(chatId, sender);
-		if (previous !== undefined)
-			void this.telegramCall((signal) =>
-				this.bot.api.deleteMessage(chatId, previous, signal),
-			);
+		if (previous === undefined) return;
+		const current =
+			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
+		if (current === undefined) {
+			// No new panel was confirmed: keep the old one as the panel.
+			await this.savePanelReference(chatId, previous);
+			this.panelRepairChats.add(chatId);
+			return;
+		}
+		if (current === previous) return;
+		this.retirePanel(chatId, previous);
+		this.panelStaleChats.delete(chatId);
+		void this.telegramCall((signal) =>
+			this.bot.api.deleteMessage(chatId, previous, signal),
+		);
 	}
 
 	private retirePanel(chatId: number, messageId: number): void {
@@ -5652,8 +5672,14 @@ export class TelegramTransportAdapter
 			chatId: number;
 			sender: number;
 			sessionId: SessionId;
+			createdAt: number;
 			messageId?: number;
-		} = { chatId, sender, sessionId };
+		} = {
+			chatId,
+			sender,
+			sessionId,
+			createdAt: (this.options.panelClock ?? Date.now)(),
+		};
 		this.cancelIntents.set(token, intent);
 		while (this.cancelIntents.size > 32)
 			this.cancelIntents.delete(
@@ -5685,25 +5711,31 @@ export class TelegramTransportAdapter
 	): Promise<void> {
 		const [, answer, token] = data.split(":");
 		const intent = token ? this.cancelIntents.get(token) : undefined;
+		const edit = async (text: string) => {
+			await this.telegramCall((signal) =>
+				this.bot.api.editMessageText(chatId, messageId, text, {}, signal),
+			);
+		};
+		if (!intent) return edit("Подтверждение устарело; ход не прерывался.");
 		if (
-			!intent ||
 			intent.chatId !== chatId ||
 			intent.sender !== sender ||
 			intent.messageId !== messageId
 		)
 			return;
 		this.cancelIntents.delete(token as string);
-		const outcome =
-			answer !== "yes"
-				? "Ход не прерывался."
-				: this.selected.get(chatId) !== intent.sessionId
-					? "Выбор сессии изменился; ход не прерывался."
-					: "Прерывание запрошено.";
-		await this.telegramCall((signal) =>
-			this.bot.api.editMessageText(chatId, messageId, outcome, {}, signal),
-		);
-		if (outcome === "Прерывание запрошено.")
-			await this.command(chatId, sender, "/cancel");
+		if (answer !== "yes") return edit("Ход не прерывался.");
+		if (
+			(this.options.panelClock ?? Date.now)() - intent.createdAt >
+			CANCEL_CONFIRMATION_TTL_MS
+		)
+			return edit("Подтверждение устарело; ход не прерывался.");
+		if (this.selected.get(chatId) !== intent.sessionId)
+			return edit("Выбор сессии изменился; ход не прерывался.");
+		// Start the cancel before any await so the checked selection is the one cancelled.
+		const cancelling = this.command(chatId, sender, "/cancel");
+		await edit("Прерывание запрошено.");
+		await cancelling;
 	}
 
 	private async showStaleCallback(
@@ -8355,7 +8387,7 @@ export class TelegramTransportAdapter
 				queue.pendingCharacters + part.length >
 					MAX_QUEUED_CHARACTERS - INPUT_CHARACTER_RESERVE
 			) {
-				this.queueOverflow(queue, sessionId, background);
+				this.queueOverflow(queue, sessionId, background, silent);
 				break;
 			}
 			queue.messages.push({
@@ -8430,6 +8462,7 @@ export class TelegramTransportAdapter
 		queue: ChatQueue,
 		sessionId: SessionId,
 		background = false,
+		silent = false,
 	): void {
 		const overflowKey = JSON.stringify([sessionId, background]);
 		if (
@@ -8445,6 +8478,7 @@ export class TelegramTransportAdapter
 					this.eventFooter(sessionId),
 				)[0] ?? OVERFLOW_NOTICE,
 			...(background ? { background: true as const } : {}),
+			...(silent ? { silent: true as const } : {}),
 			overflow: true as const,
 			overflowKey,
 		};

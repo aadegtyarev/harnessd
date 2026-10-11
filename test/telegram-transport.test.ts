@@ -1609,8 +1609,75 @@ describe("Telegram transport", () => {
 		await bot.callback(42, no, confirmId);
 		expect(bot.edited.at(-1)?.text).toBe("Ход не прерывался.");
 		await bot.callback(42, yes, confirmId);
-		expect(bot.edited.at(-1)?.text).toBe("Ход не прерывался.");
+		expect(bot.edited.at(-1)?.text).toBe(
+			"Подтверждение устарело; ход не прерывался.",
+		);
 		expect(requests.some(({ kind }) => kind === "submit")).toBe(false);
+		await adapter.stop();
+	});
+
+	it("handles control buttons sent as replies and guards cancel confirmations", async () => {
+		let now = 0;
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp(), {
+			panelClock: () => now,
+		});
+		await bot.update(42, "/use sid");
+		const answerId = bot.lastMessageId as number;
+		await bot.update(42, "✋ Прервать", { replyToMessageId: answerId });
+		expect(bot.sent.at(-1)?.text).toContain("Прервать текущий ход");
+		expect(requests.some(({ kind }) => kind === "submit")).toBe(false);
+		const confirmId = bot.lastMessageId as number;
+		const yes = callbackData(bot.sendOptions.at(-1), "run-cancel:yes:");
+		const editsBefore = bot.edited.length;
+		await bot.callback(42, yes, confirmId, 43);
+		expect(bot.edited).toHaveLength(editsBefore);
+		now = 121_000;
+		await bot.callback(42, yes, confirmId);
+		expect(bot.edited.at(-1)?.text).toBe(
+			"Подтверждение устарело; ход не прерывался.",
+		);
+		now = 0;
+		await bot.update(42, "✋ Прервать");
+		const second = callbackData(bot.sendOptions.at(-1), "run-cancel:yes:");
+		const secondId = bot.lastMessageId as number;
+		await bot.update(42, "/use other");
+		await bot.callback(42, second, secondId);
+		expect(bot.edited.at(-1)?.text).toBe(
+			"Выбор сессии изменился; ход не прерывался.",
+		);
+		await bot.update(42, "/use sid");
+		await bot.update(42, "✋ Прервать");
+		const third = callbackData(bot.sendOptions.at(-1), "run-cancel:yes:");
+		await bot.callback(42, third, bot.lastMessageId as number);
+		expect(
+			bot.edited.some(({ text }) => text === "Прерывание запрошено."),
+		).toBe(true);
+		await bot.update(42, "📊 Ход");
+		expect(requests.some(({ kind }) => kind === "session_status")).toBe(true);
+		await adapter.stop();
+	});
+
+	it("keeps the old panel when publishing the bottom panel fails", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		await bot.update(42, "📋 Панель");
+		const current = bot.lastMessageId as number;
+		bot.api.sendMessage.mockRejectedValueOnce(new Error("deadline"));
+		await bot.update(42, "📋 Панель");
+		expect(
+			(
+				adapter as unknown as { panelMessageIds: Map<number, number> }
+			).panelMessageIds.get(42),
+		).toBe(current);
+		expect(bot.api.deleteMessage).not.toHaveBeenCalledWith(
+			42,
+			current,
+			expect.anything(),
+		);
+		expect(oldPanel).not.toBe(current);
 		await adapter.stop();
 	});
 
@@ -5389,7 +5456,7 @@ describe("Telegram transport", () => {
 		).toBe(newPanel);
 		expect(bot.api.answerCallbackQuery).toHaveBeenLastCalledWith(
 			"callback-id",
-			{ text: "Эта панель устарела. Используйте закреплённую панель." },
+			{ text: "Эта панель устарела. Нажмите «📋 Панель» для актуальной." },
 			expect.anything(),
 		);
 		await adapter.stop();
@@ -5507,7 +5574,7 @@ describe("Telegram transport", () => {
 		await bot.callback(42, staleFolder, originalId);
 		expect(bot.api.answerCallbackQuery).toHaveBeenLastCalledWith(
 			"callback-id",
-			{ text: "Эта панель устарела. Используйте закреплённую панель." },
+			{ text: "Эта панель устарела. Нажмите «📋 Панель» для актуальной." },
 			expect.anything(),
 		);
 		expect(
