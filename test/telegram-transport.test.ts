@@ -5143,30 +5143,76 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("does not resend after an uncertain panel edit and recovers a known-deleted panel", async () => {
+	it("retries transient panel edit failures silently and never resends after an uncertain edit", async () => {
+		const bot = new MockBot();
+		const delays: number[] = [];
+		const { adapter } = await startAdapter(bot, await temp(), {
+			panelSleep: async (milliseconds) => {
+				delays.push(milliseconds);
+			},
+		});
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		const sendsAfterCreate = bot.api.sendMessage.mock.calls.length;
+		sessions.set("sid", sessionWith("sid", { name: "changed once" }));
+		bot.api.editMessageText.mockRejectedValueOnce(new Error("deadline"));
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.messageId).toBe(panelId);
+		expect(bot.edited.at(-1)?.text).toContain("changed once");
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
+
+		sessions.set("sid", sessionWith("sid", { name: "rate limited" }));
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				description: "Too Many Requests: retry after 3",
+				parameters: { retry_after: 3 },
+			}),
+		);
+		await bot.update(42, "/menu");
+		expect(delays).toContain(3000);
+		expect(bot.edited.at(-1)?.text).toContain("rate limited");
+
+		sessions.set("sid", sessionWith("sid", { name: "network down" }));
+		const editsBefore = bot.api.editMessageText.mock.calls.length;
+		bot.api.editMessageText
+			.mockRejectedValueOnce(new Error("deadline"))
+			.mockRejectedValueOnce(new Error("deadline"))
+			.mockRejectedValueOnce(new Error("deadline"));
+		await bot.update(42, "/menu");
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(editsBefore + 3);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
+		expect(
+			bot.sent.some(({ text }) => text.includes("Telegram отклонил")),
+		).toBe(false);
+		await bot.update(42, "/menu");
+		expect(bot.edited.at(-1)?.text).toContain("network down");
+		await adapter.stop();
+	});
+
+	it("publishes a fresh pinned panel when Telegram definitively rejects editing the old one", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
 		const sendsAfterCreate = bot.api.sendMessage.mock.calls.length;
-		sessions.set("sid", sessionWith("sid", { name: "changed before failure" }));
-		bot.api.editMessageText.mockRejectedValueOnce(
-			new Error("temporary API failure"),
-		);
-		await bot.update(42, "/menu");
-		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
-		expect(bot.sent.at(-1)?.text).toContain("Не удалось обновить панель");
-		expect(callbackData(bot.sendOptions.at(-1), "panel:refresh")).toBe(
-			"panel:refresh",
-		);
-
-		bot.api.editMessageText.mockRejectedValueOnce(
-			Object.assign(new Error("Telegram rejected edit"), {
-				description: "Bad Request: message to edit not found",
-			}),
-		);
-		await bot.update(42, "/menu");
+		for (const description of [
+			"Bad Request: message to edit not found",
+			"Bad Request: message can't be edited",
+		]) {
+			sessions.set("sid", sessionWith("sid", { name: description }));
+			bot.api.editMessageText.mockRejectedValueOnce(
+				Object.assign(new Error("Telegram rejected edit"), {
+					error_code: 400,
+					description,
+				}),
+			);
+			await bot.update(42, "/menu");
+		}
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 2);
-		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(2);
+		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(3);
+		expect(
+			bot.sent.some(({ text }) => text.includes("Telegram отклонил")),
+		).toBe(false);
 		await bot.update(42, "/sessions");
 		expect(bot.sent.at(-1)?.text).toContain("#sid");
 		await adapter.stop();
@@ -5181,11 +5227,20 @@ describe("Telegram transport", () => {
 		).panelMessageIds.get(42);
 		const pinCount = bot.pinned.length;
 		sessions.set("sid", sessionWith("sid", { name: "changed before failure" }));
+		const rejected = (description: string) =>
+			Object.assign(new Error("Telegram rejected"), {
+				error_code: 400,
+				description,
+			});
 		bot.api.editMessageText.mockRejectedValueOnce(
-			new Error("temporary failure"),
+			rejected("Bad Request: message can't be edited"),
+		);
+		bot.api.sendMessage.mockRejectedValueOnce(
+			rejected("Bad Request: not enough rights to send text messages"),
 		);
 		await bot.update(42, "/menu");
 		const noticeId = bot.lastMessageId;
+		expect(bot.sent.at(-1)?.text).toContain("Telegram отклонил");
 		expect(noticeId).not.toBe(panelId);
 		const sentBeforeRefresh = bot.api.sendMessage.mock.calls.length;
 		await bot.callback(42, "panel:refresh", noticeId);
