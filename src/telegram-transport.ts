@@ -814,6 +814,22 @@ function splitHtmlBody(html: string, limit: number): string[] {
 function sessionLabel(session: Pick<SessionSummary, "id" | "name">): string {
 	return `${session.name ? `${oneLine(session.name)} · ` : ""}#${session.id}`;
 }
+/** Panel label: full name with an 8-character ID; the full ID stays in details and answer footers. */
+function panelSessionLabel(
+	session: Pick<SessionSummary, "id" | "name">,
+): string {
+	return `${session.name ? `${oneLine(session.name)} · ` : ""}#${session.id.slice(0, 8)}`;
+}
+const PANEL_SEPARATOR = "━━━━━━━━━━━━";
+function sessionStatusLabel(status: SessionSummary["status"]): string {
+	return status === "running"
+		? "записана как работающая (после аварийного перезапуска может быть устаревшей)"
+		: status === "stopped"
+			? "остановлена"
+			: status === "starting"
+				? "запускается или восстанавливается"
+				: "ошибка (статус может быть устаревшим)";
+}
 function shortSessionLabel(
 	session: Pick<SessionSummary, "id" | "name">,
 ): string {
@@ -1733,7 +1749,7 @@ export class TelegramTransportAdapter
 	): Promise<void> {
 		await this.updatePanel(
 			chatId,
-			"📌 Панель сессий\nСостояние Pi: устарело после перезапуска; проверяем актуальный статус.",
+			"📌 Панель сессий\nСтатус: проверяется после перезапуска harnessd…",
 			{},
 			messageId,
 		);
@@ -4680,44 +4696,51 @@ export class TelegramTransportAdapter
 						? "stopped"
 						: "failed";
 		const selectedLabel = selected
-			? sessionLabel(selected)
+			? panelSessionLabel(selected)
 			: selectedId
-				? sessionLabel({
+				? panelSessionLabel({
 						id: selectedId,
 						name: this.sessionNames.get(selectedId),
 					})
-				: "не выбрана";
+				: "никуда (сессия не выбрана)";
+		const previewLabel =
+			previewId && previewId === selectedId
+				? "та же сессия"
+				: preview
+					? panelSessionLabel(preview)
+					: previewId
+						? panelSessionLabel({
+								id: previewId,
+								name: this.sessionNames.get(previewId),
+							})
+						: "нет";
 		const lines = [
 			"📌 Панель сессий",
-			`Выбрана (обычные сообщения →): ${selectedLabel}`,
-			`Просмотр: ${preview ? sessionLabel(preview) : previewId ? activitySessionLabel(previewId, this.sessionNames.get(previewId)) : "нет"}`,
-			`Новая сессия · папка создания: ${boundedPathPresentation(this.currentDirectories.get(chatId) ?? this.options.initialCwd)}`,
+			`✉️ Сообщения → ${selectedLabel}`,
+			PANEL_SEPARATOR,
+			`👁 Просмотр: ${previewLabel}`,
 		];
-		if (selectionClearFailed)
-			lines.push(
-				"Не удалось сохранить очистку выбора; он может вернуться после перезапуска.",
-			);
-		if (!listed.ok)
-			lines.push(`Не удалось обновить список сессий: ${listed.error.message}`);
-		if (this.panelStaleChats.has(chatId))
-			lines.push(
-				"Операция завершена отдельно от панели; её обновление не удалось. Используйте «Обновить панель».",
-			);
 		if (preview) {
-			lines.push(
-				`Существует: да · Выбрана для сообщений: ${this.selected.get(chatId) === preview.id ? "да" : "нет"}`,
-				`Папка просмотра: ${panelPath(preview.cwd)}`,
-				`Статус Pi: ${preview.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : preview.status === "stopped" ? "остановлен" : preview.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${preview.status})`,
-			);
-			lines.push(
-				`Состояние Pi: ${this.reloadingSessions.has(preview.id) ? "перезагружаются ресурсы" : this.recoveringSessions.has(preview.id) ? "восстанавливается" : liveState === "busy" ? "занята" : liveState === "idle" ? "ожидает" : liveState === "stale" ? "состояние устарело" : liveState === "live unavailable" ? "живое состояние недоступно" : liveState === "offline" ? "нет сессии" : liveState === "starting" ? "запускается" : liveState === "stopped" ? "остановлена" : "ошибка"}`,
-			);
-			if (!liveAvailable)
-				lines.push(
-					liveQueryFailed
-						? "Живые данные недоступны: запрос завершился ошибкой."
-						: "Живые данные недоступны.",
-				);
+			const statusText = this.reloadingSessions.has(preview.id)
+				? "перезагружаются ресурсы"
+				: this.recoveringSessions.has(preview.id)
+					? "восстанавливается"
+					: liveState === "busy"
+						? "работает, выполняет ход"
+						: liveState === "idle"
+							? "работает, ожидает ввода"
+							: liveState === "stale"
+								? "записана как работающая, живое состояние не подтверждено"
+								: liveState === "live unavailable"
+									? "работает, живое состояние недоступно"
+									: liveState === "starting"
+										? "запускается"
+										: liveState === "stopped"
+											? "остановлена"
+											: "ошибка (статус может быть устаревшим)";
+			lines.push(`📁 ${panelPath(preview.cwd)}`, `Статус: ${statusText}`);
+			if (liveQueryFailed)
+				lines.push("Живые данные: запрос завершился ошибкой.");
 			if (liveAvailable) {
 				lines.push(compactUsage(status?.live?.usage));
 				if (status?.live?.model)
@@ -4735,9 +4758,23 @@ export class TelegramTransportAdapter
 			}
 		} else {
 			lines.push(
-				`Состояние Pi: ${liveState === "offline" ? "нет сессии" : "живое состояние недоступно"}`,
+				`Статус: ${liveState === "offline" ? "нет сессий" : "живое состояние недоступно"}`,
 			);
 		}
+		lines.push(
+			PANEL_SEPARATOR,
+			`Новые сессии создаются в: ${boundedPathPresentation(this.currentDirectories.get(chatId) ?? this.options.initialCwd)}`,
+		);
+		if (selectionClearFailed)
+			lines.push(
+				"Не удалось сохранить очистку выбора; он может вернуться после перезапуска.",
+			);
+		if (!listed.ok)
+			lines.push(`Не удалось обновить список сессий: ${listed.error.message}`);
+		if (this.panelStaleChats.has(chatId))
+			lines.push(
+				"Операция завершена отдельно от панели; её обновление не удалось. Используйте «Обновить панель».",
+			);
 		const rows: InlineButton[][] = [];
 		if (previewId && listed.ok)
 			rows.push([
@@ -4759,13 +4796,11 @@ export class TelegramTransportAdapter
 		if (previewId && preview) {
 			if (preview.status === "running" || preview.status === "stopped")
 				rows.push([
-					inlineButton("Модель просмотра", "menu:models"),
-					inlineButton("Усилие просмотра", "menu:efforts"),
+					inlineButton("Модель", "menu:models"),
+					inlineButton("Усилие", "menu:efforts"),
 				]);
 			if (preview.status === "running") {
-				rows.push([
-					inlineButton("Остановить просмотр", `session:stop:${previewId}`),
-				]);
+				rows.push([inlineButton("Остановить", `session:stop:${previewId}`)]);
 			} else if (preview.status === "stopped") {
 				rows.push([
 					inlineButton(
@@ -4773,9 +4808,7 @@ export class TelegramTransportAdapter
 						`session:resume-select:${previewId}`,
 					),
 				]);
-				rows.push([
-					inlineButton("Удалить просмотр…", `session:delete:${previewId}`),
-				]);
+				rows.push([inlineButton("Удалить…", `session:delete:${previewId}`)]);
 			} else {
 				rows.push([
 					inlineButton(
@@ -6263,7 +6296,7 @@ export class TelegramTransportAdapter
 		rows.push([inlineButton("К списку", "menu:sessions")]);
 		await this.updatePanel(
 			chatId,
-			`${sessionLabel(session)}\nСуществует: да · Выбрана для сообщений: ${this.selected.get(chatId) === session.id ? "да" : "нет"}\nСтатус Pi: ${session.status === "running" ? "записан как работающий (после аварийного перезапуска может быть устаревшим)" : session.status === "stopped" ? "остановлен" : session.status === "starting" ? "запускается или восстанавливается" : "ошибка/устаревший статус"} (${session.status})${session.status === "failed" ? "\nАвтоматическое переподключение и создание замены недоступны. Доступное действие: остановить сохранённую запись и затем выбрать другую сессию." : ""}\nПапка: ${panelPath(session.cwd)}`,
+			`${sessionLabel(session)}\nСообщения: ${this.selected.get(chatId) === session.id ? "идут в эту сессию" : "идут в другую сессию"}\nСтатус: ${sessionStatusLabel(session.status)}${session.status === "failed" ? "\nАвтоматическое переподключение и создание замены недоступны. Доступное действие: остановить сохранённую запись и затем выбрать другую сессию." : ""}\nПапка: ${panelPath(session.cwd)}`,
 			keyboard(rows),
 			messageId,
 			isCurrent,
@@ -6506,7 +6539,7 @@ export class TelegramTransportAdapter
 				rows.push([inlineButton("Назад", "menu:home")]);
 				return this.updatePanel(
 					chatId,
-					`Модель просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${String(current ?? "по умолчанию")}`,
+					`Модель · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${String(current ?? "по умолчанию")}`,
 					keyboard(rows),
 					messageId,
 					isCurrent,
@@ -6560,7 +6593,7 @@ export class TelegramTransportAdapter
 		rows.push([inlineButton("Назад", "menu:home")]);
 		await this.updatePanel(
 			chatId,
-			`Модель просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))}`,
+			`Модель · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))}`,
 			keyboard(rows),
 			messageId,
 			isCurrent,
@@ -6722,7 +6755,7 @@ export class TelegramTransportAdapter
 				rows.push([inlineButton("Назад", "menu:home")]);
 				return this.updatePanel(
 					chatId,
-					`Усилие просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${String(current ?? "по умолчанию")}`,
+					`Усилие · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${String(current ?? "по умолчанию")}`,
 					keyboard(rows),
 					messageId,
 					isCurrent,
@@ -6773,7 +6806,7 @@ export class TelegramTransportAdapter
 		rows.push([inlineButton("Назад", "menu:home")]);
 		await this.updatePanel(
 			chatId,
-			`Усилие просмотра · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${catalog.current ? oneLine(catalog.current) : "не задано"}`,
+			`Усилие · ${activitySessionLabel(sessionId, this.sessionNames.get(sessionId))} · ${catalog.current ? oneLine(catalog.current) : "не задано"}`,
 			keyboard(rows),
 			messageId,
 			isCurrent,

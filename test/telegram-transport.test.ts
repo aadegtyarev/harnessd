@@ -1474,7 +1474,9 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("other", "status", "agent_start"));
 		await vi.waitFor(() => expect(bot.edited.length).toBeGreaterThan(edits));
 		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
-		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: занята");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Статус: работает, выполняет ход",
+		);
 		const afterStart = bot.edited.length;
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1483,7 +1485,9 @@ describe("Telegram transport", () => {
 		await vi.waitFor(() =>
 			expect(bot.edited.length).toBeGreaterThan(afterStart),
 		);
-		expect(bot.edited.at(-1)?.text).toContain("Состояние Pi: ожидает");
+		expect(bot.edited.at(-1)?.text).toContain(
+			"Статус: работает, ожидает ввода",
+		);
 		await adapter.stop();
 	});
 
@@ -1536,13 +1540,39 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("lays out the panel with separated selection, preview, and creation folder", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const text = bot.sent.at(-1)?.text ?? "";
+		const lines = text.split("\n");
+		expect(lines[1]).toBe("✉️ Сообщения → #sid");
+		expect(lines[2]).toBe("━━━━━━━━━━━━");
+		expect(lines[3]).toBe("👁 Просмотр: та же сессия");
+		expect(lines.filter((line) => line === "━━━━━━━━━━━━")).toHaveLength(2);
+		expect(text).toMatch(/━━━━━━━━━━━━\nНовые сессии создаются в: /);
+		for (const legacy of [
+			"Существует",
+			"Выбрана для сообщений",
+			"Состояние Pi",
+			"Статус Pi",
+			"(running)",
+			"(stopped)",
+		])
+			expect(text).not.toContain(legacy);
+		const buttons = JSON.stringify(bot.sendOptions.at(-1));
+		expect(buttons).not.toContain("просмотр");
+		await adapter.stop();
+	});
+
 	it("shows offline only when the successful session list confirms no sessions", async () => {
 		const bot = new MockBot();
 		const known = [...sessions.entries()];
 		sessions.clear();
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
-		expect(bot.sent.at(-1)?.text).toContain("Состояние Pi: нет сессии");
+		expect(bot.sent.at(-1)?.text).toContain("Статус: нет сессий");
 		await adapter.stop();
 		for (const [id, session] of known) sessions.set(id, session);
 	});
@@ -1566,8 +1596,9 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/menu");
-		expect(bot.sent.at(-1)?.text).toContain("Состояние Pi: состояние устарело");
-		expect(bot.sent.at(-1)?.text).toContain("Живые данные недоступны");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Статус: записана как работающая, живое состояние не подтверждено",
+		);
 		expect(bot.sent.at(-1)?.text).toContain("Обновлено: 00:00:00");
 		time = 1;
 		await bot.update(42, "/menu");
@@ -1653,16 +1684,14 @@ describe("Telegram transport", () => {
 		time = 1;
 		await bot.update(42, "/use other");
 		await bot.update(42, "/menu");
-		expect(bot.edited.at(-1)?.text).toContain(
-			"Выбрана (обычные сообщения →): #other",
-		);
+		expect(bot.edited.at(-1)?.text).toContain("✉️ Сообщения → #other");
 		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
 			initial,
 		);
 		time = 2;
 		await bot.update(42, "/cd /tmp");
 		await bot.update(42, "/menu");
-		expect(bot.edited.at(-1)?.text).toContain("папка создания: /tmp");
+		expect(bot.edited.at(-1)?.text).toContain("Новые сессии создаются в: /tmp");
 		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
 			initial,
 		);
@@ -1835,7 +1864,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/menu");
 		let text = bot.sent.at(-1)?.text ?? "";
-		expect(text).toContain("Состояние Pi: ожидает");
+		expect(text).toContain("Статус: работает, ожидает ввода");
 		expect(text).toContain("Модель: недоступна");
 		expect(text).toContain("Усилие: недоступно");
 		expect(text).toContain("Использование: недоступно");
@@ -1872,7 +1901,7 @@ describe("Telegram transport", () => {
 		time = 3;
 		await bot.update(42, "/menu");
 		expect(bot.edited.at(-1)?.text).toContain(
-			"Состояние Pi: живое состояние недоступно",
+			"Статус: работает, живое состояние недоступно",
 		);
 		expect(bot.edited.at(-1)?.text).toContain("запрос завершился ошибкой");
 		failStatus = false;
@@ -1880,14 +1909,12 @@ describe("Telegram transport", () => {
 		time = 4;
 		await bot.update(42, "/menu");
 		expect(bot.edited.at(-1)?.text).toContain(
-			"Состояние Pi: состояние устарело",
+			"Статус: записана как работающая, живое состояние не подтверждено",
 		);
 		vi.useFakeTimers();
 		emit(harnessEvent("sid", "status", "harness_restarting"));
 		await vi.advanceTimersByTimeAsync(500);
-		expect(bot.edited.at(-1)?.text).toContain(
-			"Состояние Pi: восстанавливается",
-		);
+		expect(bot.edited.at(-1)?.text).toContain("Статус: восстанавливается");
 		emit(harnessEvent("sid", "status", "harness_recovered"));
 		await vi.advanceTimersByTimeAsync(2000);
 		expect(
@@ -2169,7 +2196,7 @@ describe("Telegram transport", () => {
 		queryFails = true;
 		await bot.update(42, "/menu");
 		const text = bot.edited.at(-1)?.text ?? "";
-		expect(text).toContain("Живые данные недоступны");
+		expect(text).toContain("Живые данные: запрос завершился ошибкой.");
 		expect(text).not.toContain("private transient detail");
 		await adapter.stop();
 	});
@@ -3658,7 +3685,7 @@ describe("Telegram transport", () => {
 		expect(panelMessageId).toBeDefined();
 		expect(bot.pinned).toEqual([{ chatId: 42, messageId: panelMessageId }]);
 		expect(bot.sent.at(-1)?.text).toContain(
-			"Выбрана (обычные сообщения →): не выбрана",
+			"✉️ Сообщения → никуда (сессия не выбрана)",
 		);
 		await bot.update(42, "/menu");
 		expect(bot.api.editMessageText).not.toHaveBeenCalled();
@@ -3667,7 +3694,7 @@ describe("Telegram transport", () => {
 		await bot.callback(42, "session:next", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
 		expect(bot.edited.at(-1)?.text).toContain(
-			"Выбрана (обычные сообщения →): не выбрана",
+			"✉️ Сообщения → никуда (сессия не выбрана)",
 		);
 		await bot.callback(42, "session:choose", panelMessageId);
 		await bot.update(42, "/model");
@@ -3676,7 +3703,7 @@ describe("Telegram transport", () => {
 			sessionId: "other",
 		});
 		await bot.callback(42, "menu:models", panelMessageId);
-		expect(bot.edited.at(-1)?.text).toContain("Модель просмотра · other");
+		expect(bot.edited.at(-1)?.text).toContain("Модель · other");
 		await bot.callback(42, "model:select:0", panelMessageId);
 		expect(
 			requests.some(
@@ -3722,8 +3749,8 @@ describe("Telegram transport", () => {
 		sessions.delete("sid");
 		await bot.update(42, "/menu");
 		const panelText = bot.edited.at(-1)?.text ?? bot.sent.at(-1)?.text ?? "";
-		expect(panelText).toContain("Выбрана (обычные сообщения →): не выбрана");
-		expect(panelText).not.toContain("Выбрана (обычные сообщения →): #sid");
+		expect(panelText).toContain("✉️ Сообщения → никуда (сессия не выбрана)");
+		expect(panelText).not.toContain("✉️ Сообщения → #sid");
 		await bot.update(42, "must not submit to the removed session");
 		expect(requests.at(-1)?.kind).not.toBe("submit");
 		await adapter.stop();
@@ -3773,9 +3800,7 @@ describe("Telegram transport", () => {
 		failList = true;
 		await bot.update(42, "/menu");
 		expect(bot.sent.at(-1)?.text).toContain("Temporary list failure");
-		expect(bot.sent.at(-1)?.text).toContain(
-			"Выбрана (обычные сообщения →): #sid",
-		);
+		expect(bot.sent.at(-1)?.text).toContain("✉️ Сообщения → #sid");
 		await bot.update(42, "still for selected");
 		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
 		await adapter.stop();
@@ -3798,7 +3823,7 @@ describe("Telegram transport", () => {
 		const panelMessageId = bot.lastMessageId;
 		await bot.callback(42, "session:next", panelMessageId);
 		const panel = bot.edited.at(-1)?.text ?? "";
-		expect(panel).toContain("Выбрана (обычные сообщения →): #sid");
+		expect(panel).toContain("✉️ Сообщения → #sid");
 		expect(panel).toContain("Просмотр: #other");
 		await bot.callback(42, "menu:models", panelMessageId);
 		expect(requests.at(-1)).toMatchObject({
@@ -3885,7 +3910,9 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/menu");
 		const panelMessageId = bot.lastMessageId;
-		expect(bot.sent.at(-1)?.text).toContain(`папка создания: ${directory}`);
+		expect(bot.sent.at(-1)?.text).toContain(
+			`Новые сессии создаются в: ${directory}`,
+		);
 		await bot.callback(42, "menu:new", panelMessageId);
 		expect(bot.sent.at(-1)?.text).toContain(
 			`Новая сессия будет создана в ${directory}`,
@@ -5580,7 +5607,7 @@ describe("Telegram transport", () => {
 		const secondBot = new MockBot();
 		const second = await startAdapter(secondBot, directory);
 		expect(secondBot.edited.at(-1)?.text).toContain(
-			"устарело после перезапуска",
+			"проверяется после перезапуска",
 		);
 		expect(second.requests).toEqual([]);
 		await secondBot.update(42, "/use");
@@ -9753,7 +9780,7 @@ describe("Telegram transport", () => {
 		const panelId = bot.lastMessageId;
 		await bot.callback(42, "menu:models", panelId);
 		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Модель просмотра"),
+			expect(bot.edited.at(-1)?.text).toContain("Модель · "),
 		);
 		await bot.callback(42, "model:select:1", panelId);
 		expect(optionUpdates[0]?.update).toEqual({ set: { model: "opus" } });
