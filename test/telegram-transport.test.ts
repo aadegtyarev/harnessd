@@ -5288,6 +5288,39 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("does not re-adopt a replaced panel when its old buttons are tapped", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		sessions.set("sid", sessionWith("sid", { name: "frozen" }));
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Telegram rejected edit"), {
+				error_code: 400,
+				description: "Bad Request: message can't be edited",
+			}),
+		);
+		await bot.update(42, "/menu");
+		const newPanel = bot.lastMessageId as number;
+		expect(newPanel).not.toBe(oldPanel);
+		const sends = bot.api.sendMessage.mock.calls.length;
+		const pins = bot.api.pinChatMessage.mock.calls.length;
+		await bot.callback(42, "session:next", oldPanel);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sends);
+		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(pins);
+		expect(
+			(
+				adapter as unknown as { panelMessageIds: Map<number, number> }
+			).panelMessageIds.get(42),
+		).toBe(newPanel);
+		expect(bot.api.answerCallbackQuery).toHaveBeenLastCalledWith(
+			"callback-id",
+			{ text: "Эта панель устарела. Используйте закреплённую панель." },
+			expect.anything(),
+		);
+		await adapter.stop();
+	});
+
 	it("keeps the stale notice for other definite edit rejections instead of replacing the panel", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
@@ -5398,7 +5431,16 @@ describe("Telegram transport", () => {
 		await bot.callback(42, replacementToken, replacementId);
 		expect(bot.edited.at(-1)?.text).toContain("Папки");
 		await bot.callback(42, staleFolder, originalId);
-		expect(bot.edited.at(-1)?.text).toContain("устарело");
+		expect(bot.api.answerCallbackQuery).toHaveBeenLastCalledWith(
+			"callback-id",
+			{ text: "Эта панель устарела. Используйте закреплённую панель." },
+			expect.anything(),
+		);
+		expect(
+			(
+				adapter as unknown as { panelMessageIds: Map<number, number> }
+			).panelMessageIds.get(42),
+		).toBe(replacementId);
 		await adapter.stop();
 	});
 

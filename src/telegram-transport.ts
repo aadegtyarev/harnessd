@@ -1299,6 +1299,8 @@ export class TelegramTransportAdapter
 	private readonly panelStaleChats = new Set<number>();
 	/** Panels that must be repainted after an uncertain Telegram failure, without user-visible text. */
 	private readonly panelRepairChats = new Set<number>();
+	/** Message IDs of panels replaced in this process; their buttons must not re-adopt them. */
+	private readonly retiredPanelIds = new Map<number, Set<number>>();
 	private readonly panelGenerations = new Map<number, number>();
 	private readonly panelIntents = new TelegramPanelIntent();
 	private readonly panelSemantic = new Map<number, string>();
@@ -5064,6 +5066,13 @@ export class TelegramTransportAdapter
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
 			return false;
 		}
+		if (existing !== undefined && existing !== createdMessageId) {
+			const retired = this.retiredPanelIds.get(chatId) ?? new Set<number>();
+			this.retiredPanelIds.set(chatId, retired);
+			if (retired.size >= 32)
+				retired.delete(retired.values().next().value as number);
+			retired.add(existing);
+		}
 		await this.savePanelReference(chatId, createdMessageId);
 		if (!referenceIsCurrent(createdMessageId)) return false;
 		this.panelStaleChats.delete(chatId);
@@ -5224,6 +5233,17 @@ export class TelegramTransportAdapter
 			messageId === undefined
 		)
 			return;
+		if (this.retiredPanelIds.get(chatId)?.has(messageId)) {
+			// A tap on a replaced panel never re-adopts it (that would spawn yet another panel).
+			await this.telegramCall((signal) =>
+				this.bot.api.answerCallbackQuery(
+					callback.id,
+					{ text: "Эта панель устарела. Используйте закреплённую панель." },
+					signal,
+				),
+			);
+			return this.refreshExistingPanel(chatId, sender);
+		}
 		this.invalidatePanelIntent(chatId);
 		await this.telegramCall((signal) =>
 			this.bot.api.answerCallbackQuery(callback.id, {}, signal),
