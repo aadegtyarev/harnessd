@@ -16,3 +16,7 @@ All notable changes to harnessd are recorded here. Entries under `Unreleased` ar
 ### Changed
 
 - Git-source installs build the CLI before npm installs the package.
+
+### Fixed
+
+- After a supervisor restart or host reboot, sessions left recorded as `running`/`starting` are reconciled to `stopped` at startup, so the next message resumes the saved native session instead of failing with `SessionNotFoundError`.

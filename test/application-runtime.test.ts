@@ -562,6 +562,73 @@ describe("application runtime", () => {
 		await runtime.close();
 	});
 
+	it("reconciles stale running sessions before any transport starts", async () => {
+		const stateDirectory = await state();
+		const instance = {
+			processId: "runtime-reconcile-process" as never,
+			exit: new Promise<{ code: number | null; signal: string | null }>(
+				() => {},
+			),
+			nativeSessionId: "native-runtime-reconcile",
+			events: (async function* () {})(),
+			async send() {},
+			async cancel() {},
+			async shutdown() {},
+		};
+		const harnesses: HarnessAdapter[] = [
+			{
+				descriptor: {
+					id: "runtime-reconcile" as never,
+					capabilities: ["harness.launch", "harness.stop", "harness.resume"],
+				},
+				async launch() {
+					return instance;
+				},
+				async resume() {
+					return instance;
+				},
+			},
+		];
+		const first = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory,
+			transports: [],
+			harnesses,
+		});
+		const session = sessionFrom(
+			await first.dispatch({
+				requestId: "runtime-reconcile-create",
+				principalId: "test",
+				kind: "create",
+				harnessId: "runtime-reconcile" as never,
+				cwd: os.tmpdir(),
+			}),
+		);
+		await first.close();
+		const store = await SqliteSessionStore.open(stateDirectory);
+		await store.setStatus(session.id, "running");
+		store.close();
+		let statusSeenByTransport: string | undefined;
+		const second = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory,
+			harnesses,
+			transports: [
+				{
+					descriptor: { id: "probe" as never, capabilities: [] },
+					async start(_dispatch, _subscribe, list) {
+						statusSeenByTransport = (await list?.())?.find(
+							(item) => item.id === session.id,
+						)?.status;
+					},
+					async stop() {},
+				},
+			],
+		});
+		expect(statusSeenByTransport).toBe("stopped");
+		await second.close();
+	});
+
 	it("returns actionable Pi startup errors and logs a useful redacted trace", async () => {
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const launchError = Object.assign(new Error("secret path detail"), {

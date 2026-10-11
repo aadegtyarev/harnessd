@@ -1137,6 +1137,133 @@ describe("SQLite session management", () => {
 		}
 	});
 
+	it("reconciles stale running and starting records after a supervisor restart", async () => {
+		const state = await temporaryDirectory();
+		const store = await SqliteSessionStore.open(state);
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "reconcile-harness" as AdapterId,
+				capabilities: ["harness.launch", "harness.stop", "harness.resume"],
+			},
+			async launch() {
+				return {
+					processId: "reconcile-initial" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-reconcile",
+					events: (async function* () {})(),
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume() {
+				throw new Error("reconcile must not resume eagerly");
+			},
+		};
+		const first = new SessionManager(store, [harness]);
+		const statuses = [
+			"running",
+			"starting",
+			"stopped",
+			"failed",
+			"uncertain",
+		] as const;
+		const ids: SessionId[] = [];
+		try {
+			for (const status of statuses) {
+				const session = await first.create({
+					harnessId: harness.descriptor.id,
+					cwd: os.tmpdir(),
+				});
+				await first.stop(session.id);
+				await store.setStatus(session.id, status);
+				ids.push(session.id);
+			}
+		} finally {
+			await first.close();
+		}
+		const second = new SessionManager(store, [harness]);
+		try {
+			await second.reconcileAfterRestart();
+			const after = await Promise.all(ids.map((id) => second.get(id)));
+			expect(after.map((session) => session.status)).toEqual([
+				"stopped",
+				"stopped",
+				"stopped",
+				"failed",
+				"uncertain",
+			]);
+		} finally {
+			await second.close();
+			store.close();
+		}
+	});
+
+	it("resumes a reconciled session from its saved native ID on the next submit", async () => {
+		const store = await SqliteSessionStore.open(await temporaryDirectory());
+		let launches = 0;
+		const resumedWith: string[] = [];
+		const delivered: string[] = [];
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "reconcile-resume-harness" as AdapterId,
+				capabilities: [
+					"harness.launch",
+					"harness.stop",
+					"harness.resume",
+					"input.submit",
+				],
+			},
+			async launch() {
+				launches++;
+				return {
+					processId: "reconcile-resume-initial" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: "native-reconcile-resume",
+					events: (async function* () {})(),
+					async send() {},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+			async resume(request) {
+				resumedWith.push(String(request.nativeSessionId));
+				return {
+					processId: "reconcile-resume-replacement" as never,
+					exit: new Promise(() => {}),
+					nativeSessionId: request.nativeSessionId,
+					events: (async function* () {})(),
+					async send(input) {
+						delivered.push(input.text);
+					},
+					async cancel() {},
+					async shutdown() {},
+				};
+			},
+		};
+		const first = new SessionManager(store, [harness]);
+		const created = await first.create({
+			harnessId: harness.descriptor.id,
+			cwd: os.tmpdir(),
+		});
+		await first.stop(created.id);
+		await store.setStatus(created.id, "running");
+		await first.close();
+		const second = new SessionManager(store, [harness]);
+		try {
+			await expect(second.submit(created.id, "before")).rejects.toThrow();
+			await second.reconcileAfterRestart();
+			await second.submit(created.id, "after restart");
+			expect(launches).toBe(1);
+			expect(resumedWith).toEqual(["native-reconcile-resume"]);
+			expect(delivered).toEqual(["after restart"]);
+			expect((await second.get(created.id)).status).toBe("running");
+		} finally {
+			await second.close();
+			store.close();
+		}
+	});
+
 	it("never fresh-launches or submits when a stopped session lacks its native ID", async () => {
 		const store = await SqliteSessionStore.open(await temporaryDirectory());
 		let launches = 0;

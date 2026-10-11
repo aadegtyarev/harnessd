@@ -318,6 +318,7 @@ export class ApplicationRuntime {
 				},
 			);
 			manager = sessionManager;
+			await sessionManager.reconcileAfterRestart();
 			const runtime = new ApplicationRuntime(
 				store,
 				sessionManager,

@@ -145,6 +145,20 @@ export class SessionManager {
 		return this.store.list();
 	}
 
+	async reconcileAfterRestart(): Promise<void> {
+		for (const session of await this.store.list()) {
+			if (session.status !== "running" && session.status !== "starting")
+				continue;
+			if (
+				this.instances.has(session.id) ||
+				this.launching.has(session.id) ||
+				this.recovery.has(session.id)
+			)
+				continue;
+			await this.store.setStatus(session.id, "stopped");
+		}
+	}
+
 	async get(id: SessionId): Promise<SessionSummary> {
 		const session = await this.store.get(id);
 		if (!session) throw new SessionNotFoundError(id);
