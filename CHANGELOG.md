@@ -21,3 +21,4 @@ All notable changes to harnessd are recorded here. Entries under `Unreleased` ar
 
 - After a supervisor restart or host reboot, sessions left recorded as `running`/`starting` are reconciled to `stopped` at startup, so the next message resumes the saved native session instead of failing with `SessionNotFoundError`.
 - Telegram delivers each Pi assistant message at its `message_end` instead of only when the run settles, so answers are no longer held back for hours by automatic task continuations; the output bound now applies per message, and stopping a session delivers already-buffered text as interrupted instead of discarding it.
+- Automatic panel refreshes no longer post a "panel could not be updated" notice on a transient Telegram failure: edits retry up to twice (honoring 429 `retry_after`), persistent transient failures mark the panel stale silently, and a definitively uneditable panel is replaced with a fresh pinned one.

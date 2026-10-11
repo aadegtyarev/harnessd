@@ -89,6 +89,9 @@ const MAX_OUTPUT_MESSAGES = 24;
 const MAX_INPUT_MESSAGES = 8;
 const MAX_OVERFLOW_NOTICES = 8;
 const MAX_QUEUED_CHARACTERS = 32_768;
+const PANEL_EDIT_RETRIES = 2;
+const PANEL_RETRY_BASE_DELAY_MS = 500;
+const PANEL_RETRY_MAX_DELAY_MS = 10_000;
 const TURN_OVERFLOW_NOTICE =
 	"[Additional output omitted because the response reached the queue limit.]";
 const INPUT_CHARACTER_RESERVE = 4096;
@@ -195,6 +198,12 @@ type TelegramBot = {
 			signal?: AbortSignal,
 		): Promise<unknown>;
 		pinChatMessage(
+			chatId: number,
+			messageId: number,
+			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
+		unpinChatMessage?(
 			chatId: number,
 			messageId: number,
 			other?: unknown,
@@ -988,6 +997,35 @@ function isMessageNotModified(error: unknown): boolean {
 			.includes("message is not modified") ?? false
 	);
 }
+function telegramErrorCode(error: unknown): number | undefined {
+	if (error === null || typeof error !== "object") return undefined;
+	if ("error_code" in error && typeof error.error_code === "number")
+		return error.error_code;
+	return undefined;
+}
+/** Rate limits, server errors, and failures without a Telegram verdict (deadline, network). */
+function isTransientTelegramError(error: unknown): boolean {
+	const code = telegramErrorCode(error);
+	if (code !== undefined) return code === 429 || code >= 500;
+	return apiErrorDescription(error) === undefined;
+}
+function telegramRetryAfterMs(error: unknown): number | undefined {
+	if (error === null || typeof error !== "object" || !("parameters" in error))
+		return undefined;
+	const parameters = error.parameters as { retry_after?: unknown } | undefined;
+	return typeof parameters?.retry_after === "number"
+		? parameters.retry_after * 1000
+		: undefined;
+}
+/** Edit rejections that mean the old panel message is gone or frozen, so a fresh panel replaces it. */
+function isReplaceablePanelEditError(error: unknown): boolean {
+	const description = apiErrorDescription(error)?.toLowerCase() ?? "";
+	return (
+		description.includes("message to edit not found") ||
+		description.includes("message can't be edited") ||
+		description.includes("message_id_invalid")
+	);
+}
 function isMessageNotFound(error: unknown): boolean {
 	const description = apiErrorDescription(error)?.toLowerCase() ?? "";
 	return description.includes("message to edit not found");
@@ -1257,7 +1295,10 @@ export class TelegramTransportAdapter
 	>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
+	/** Panels whose staleness is shown to the operator (notice posted, or restored after restart). */
 	private readonly panelStaleChats = new Set<number>();
+	/** Panels that must be repainted after an uncertain Telegram failure, without user-visible text. */
+	private readonly panelRepairChats = new Set<number>();
 	private readonly panelGenerations = new Map<number, number>();
 	private readonly panelIntents = new TelegramPanelIntent();
 	private readonly panelSemantic = new Map<number, string>();
@@ -4839,11 +4880,18 @@ export class TelegramTransportAdapter
 		return true;
 	}
 
+	private panelRetryDelay(milliseconds: number): Promise<void> {
+		return (
+			this.options.panelSleep ??
+			((delay) => new Promise((resolve) => setTimeout(resolve, delay)))
+		)(milliseconds);
+	}
+
 	private async notifyPanelStale(chatId: number): Promise<void> {
 		await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(
 				chatId,
-				"Не удалось обновить панель. Это не отменяет и не повторяет операцию; не нажимайте её повторно. Проверьте результат в панели после обновления или через /status.",
+				"Telegram отклонил публикацию панели. Последняя операция не отменена и не повторялась. Нажмите «Обновить панель» или /menu, результат можно проверить через /status.",
 				{
 					reply_markup: keyboard([
 						[inlineButton("Обновить панель", "panel:refresh")],
@@ -4891,7 +4939,8 @@ export class TelegramTransportAdapter
 		const publication = JSON.stringify([text, replyMarkup]);
 		if (
 			this.panelPublished.get(chatId) === publication &&
-			!this.panelStaleChats.has(chatId)
+			!this.panelStaleChats.has(chatId) &&
+			!this.panelRepairChats.has(chatId)
 		)
 			return true;
 		const generation = this.nextPanelGeneration(chatId);
@@ -4912,6 +4961,7 @@ export class TelegramTransportAdapter
 			this.panelMessageIds.get(chatId) ??
 			this.panelStore?.get(chatId) ??
 			messageId;
+		let replacedPanelId: number | undefined;
 		const referenceIsCurrent = (expected: number | undefined) =>
 			(this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId)) ===
 			expected;
@@ -4922,31 +4972,60 @@ export class TelegramTransportAdapter
 				!referenceIsCurrent(existing)
 			)
 				return false;
-			const edited = await this.telegramCall((signal) =>
-				this.bot.api.editMessageText(
-					chatId,
-					existing,
-					text,
-					{ reply_markup: replyMarkup },
-					signal,
-				),
-			);
+			const clock = this.options.panelClock ?? Date.now;
+			const edit = () =>
+				this.telegramCall((signal) =>
+					this.bot.api.editMessageText(
+						chatId,
+						existing,
+						text,
+						{ reply_markup: replyMarkup },
+						signal,
+					),
+				);
+			let edited = await edit();
+			// Re-editing is idempotent ("not modified" counts as success), so transient failures retry.
+			for (let attempt = 1; ; attempt++) {
+				if (edited.ok || isMessageNotModified(edited.error)) break;
+				if (!isTransientTelegramError(edited.error)) break;
+				// The failed edit may have landed: never let a later identical render be deduplicated.
+				this.panelRepairChats.add(chatId);
+				const delay =
+					telegramRetryAfterMs(edited.error) ??
+					PANEL_RETRY_BASE_DELAY_MS * attempt;
+				if (attempt > PANEL_EDIT_RETRIES || delay > PANEL_RETRY_MAX_DELAY_MS)
+					break;
+				await this.panelRetryDelay(delay);
+				if (this.stopping || !isCurrent() || !referenceIsCurrent(existing))
+					return false;
+				this.panelPublicationTimes.set(chatId, clock());
+				edited = await edit();
+			}
 			if (edited.ok || isMessageNotModified(edited.error)) {
 				if (!referenceIsCurrent(existing)) return false;
 				await this.savePanelReference(chatId, existing);
 				if (!referenceIsCurrent(existing)) return false;
 				this.panelStaleChats.delete(chatId);
+				this.panelRepairChats.delete(chatId);
 				this.panelPublished.set(chatId, publication);
 				return isCurrent();
 			}
 			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
-			if (!isMessageNotFound(edited.error)) {
+			if (isTransientTelegramError(edited.error)) {
+				// The edit may still have applied; the next refresh repairs it without a visible warning.
+				this.dropPanelGenerationIntents(chatId, generation);
+				this.panelRepairChats.add(chatId);
+				return false;
+			}
+			if (!isReplaceablePanelEditError(edited.error)) {
 				this.dropPanelGenerationIntents(chatId, generation);
 				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 				this.panelStaleChats.add(chatId);
 				await this.notifyPanelStale(chatId);
 				return false;
 			}
+			// The old panel is gone or frozen: publish a fresh panel instead.
+			replacedPanelId = isMessageNotFound(edited.error) ? undefined : existing;
 		}
 		const intentGeneration = this.panelGenerations.get(chatId);
 		const hasBoundIntents =
@@ -4971,6 +5050,11 @@ export class TelegramTransportAdapter
 		if (!sent.ok) {
 			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			// An uncertain send may have delivered the panel, so it is neither resent nor announced.
+			if (isTransientTelegramError(sent.error)) {
+				this.panelRepairChats.add(chatId);
+				return false;
+			}
 			this.panelStaleChats.add(chatId);
 			await this.notifyPanelStale(chatId);
 			return false;
@@ -4983,6 +5067,7 @@ export class TelegramTransportAdapter
 		await this.savePanelReference(chatId, createdMessageId);
 		if (!referenceIsCurrent(createdMessageId)) return false;
 		this.panelStaleChats.delete(chatId);
+		this.panelRepairChats.delete(chatId);
 		this.panelPublished.set(chatId, publication);
 		if (!isCurrent()) return false;
 		if (hasBoundIntents) {
@@ -5005,6 +5090,8 @@ export class TelegramTransportAdapter
 			);
 			if (!published.ok && !isMessageNotModified(published.error)) {
 				this.dropPanelGenerationIntents(chatId, intentGeneration);
+				// The keyboard edit failed after the panel was recorded as published: force a repaint.
+				this.panelRepairChats.add(chatId);
 				return false;
 			}
 		}
@@ -5023,6 +5110,22 @@ export class TelegramTransportAdapter
 				chatId,
 				"Панель открыта, но Telegram не закрепил её. Её можно обновить командой /menu.",
 			);
+		} else if (replacedPanelId !== undefined && this.bot.api.unpinChatMessage) {
+			// Best effort: the frozen predecessor should not stay pinned next to the new panel.
+			const unpinned = await this.telegramCall(
+				(signal) =>
+					this.bot.api.unpinChatMessage?.(
+						chatId,
+						replacedPanelId,
+						{},
+						signal,
+					) ?? Promise.resolve(true),
+			);
+			if (!unpinned.ok)
+				this.reportError(
+					"Replaced Telegram control panel could not be unpinned",
+					unpinned.error,
+				);
 		}
 		return true;
 	}
