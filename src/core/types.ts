@@ -92,6 +92,8 @@ export type HarnessActivityEvent =
 			readonly type: "notification";
 			readonly text: string;
 			readonly level?: string;
+			/** Widget key for widget updates; an empty text then means the widget was cleared. */
+			readonly widgetKey?: string;
 	  };
 
 export interface HarnessEvent {

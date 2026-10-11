@@ -53,10 +53,11 @@ import {
 	updateActivityRow,
 } from "./telegram-activity-projection.js";
 import {
-	type AgentRun,
+	type AgentSnapshot,
 	type AgentVerdict,
-	agentVerdict,
+	agentVerdicts,
 	latestAgentSnapshot,
+	MAX_AGENT_VERDICTS,
 	renderAgentBoard,
 	shortRunId,
 } from "./telegram-agent-board.js";
@@ -1370,11 +1371,11 @@ export class TelegramTransportAdapter
 	/** Panels that must be repainted after an uncertain Telegram failure, without user-visible text. */
 	private readonly panelRepairChats = new Set<number>();
 	/** Latest pi-subagents snapshot and reviewer verdicts per session. */
-	private readonly agentSnapshots = new Map<SessionId, AgentRun[]>();
-	private readonly agentVerdicts = new Map<
+	private readonly agentSnapshots = new Map<
 		SessionId,
-		Map<string, AgentVerdict>
+		{ readonly widgetKey?: string; readonly snapshot: AgentSnapshot }
 	>();
+	private readonly agentVerdicts = new Map<SessionId, AgentVerdict[]>();
 	/** Run cards by their button token. */
 	private readonly cardTokens = new Map<string, LiveActivity>();
 	/** Chats that received the persistent control keyboard in this process. */
@@ -3726,6 +3727,7 @@ export class TelegramTransportAdapter
 			if (result.ok) {
 				// Deliver buffered answers before clearing the selection they route to.
 				this.flushTurn(sessionId, true);
+				this.clearAgentBoard(sessionId);
 				await this.waitForEventQueue(chatId);
 				this.refreshMenusForSession(sessionId, false);
 				this.invalidateSessionConfirmations(sessionId);
@@ -6108,31 +6110,42 @@ export class TelegramTransportAdapter
 		);
 	}
 
+	private clearAgentBoard(sessionId: SessionId): void {
+		this.agentSnapshots.delete(sessionId);
+		this.agentVerdicts.delete(sessionId);
+	}
+
 	private agentBoardLines(activity: LiveActivity): string[] {
-		const runs = this.agentSnapshots.get(activity.sessionId) ?? [];
-		if (!runs.length) return [];
+		const snapshot = this.agentSnapshots.get(activity.sessionId)?.snapshot;
+		if (!snapshot?.runs.length) return [];
 		const byShortId = new Map(
-			runs
-				.flatMap((run) => [run, ...run.children])
+			snapshot.runs
+				.flatMap(function walk(run): (typeof snapshot.runs)[number][] {
+					return [run, ...run.children.flatMap(walk)];
+				})
 				.filter((run) => shortRunId(run))
 				.map((run) => [shortRunId(run), run]),
 		);
-		// "⏸ ждёт агентов #id" rows that are still running name whom the parent waits for.
-		const waitingFor = activity.events
-			.filter(
-				(event) => event.state === "running" && event.text.startsWith("⏸"),
-			)
-			.flatMap((event) => [...event.text.matchAll(/#([0-9a-z-]{4,8})/gi)])
+		// Running "⏸ ждёт агентов [#id]" rows name whom the parent waits for (only mid-run).
+		const waits = this.runningSessions.has(activity.sessionId)
+			? activity.events.filter(
+					(event) => event.state === "running" && event.text.startsWith("⏸"),
+				)
+			: [];
+		const waitingFor = waits
+			.flatMap((event) => [...event.text.matchAll(/#([0-9a-f]{8})\b/gi)])
 			.map((match) => {
 				const run = byShortId.get(match[1] ?? "");
 				return run ? `${run.label} #${shortRunId(run)}` : `#${match[1]}`;
 			});
-		return renderAgentBoard(
-			runs,
-			this.activityNowMs(),
-			this.agentVerdicts.get(activity.sessionId),
-			[...new Set(waitingFor)],
-		);
+		return renderAgentBoard(snapshot, this.activityNowMs(), {
+			verdicts: this.agentVerdicts.get(activity.sessionId) ?? [],
+			waitingFor: [...new Set(waitingFor)],
+			waitsForAll: waits.some((event) => !/#[0-9a-f]{8}\b/i.test(event.text)),
+			...(activity.startedAtMs !== undefined
+				? { finishedSince: activity.startedAtMs }
+				: {}),
+		});
 	}
 
 	/** Card buttons act only while the card's run is live in this chat. */
@@ -7812,6 +7825,7 @@ export class TelegramTransportAdapter
 			this.refreshPanelsPreviewing(sessionId, sender, true);
 			if (action === "stop") {
 				this.flushTurn(sessionId, true);
+				this.clearAgentBoard(sessionId);
 				await this.waitForEventQueue(chatId);
 				this.refreshMenusForSession(sessionId, false);
 				if (this.selected.get(chatId) === sessionId) {
@@ -7917,6 +7931,8 @@ export class TelegramTransportAdapter
 			if (event.text === "harness_restarting")
 				this.recoveringSessions.add(event.sessionId);
 			else this.recoveringSessions.delete(event.sessionId);
+			// Pi restarted: its async-agent snapshot no longer describes live runs.
+			this.clearAgentBoard(event.sessionId);
 			this.runningSessions.delete(event.sessionId);
 		}
 		const terminalPanelEvent =
@@ -8104,19 +8120,34 @@ export class TelegramTransportAdapter
 	): void {
 		const activities = this.activitiesForSession(sessionId);
 		if (event.type === "agent_notice") {
-			const verdict = agentVerdict(event.text);
-			if (!verdict) return;
-			const verdicts = this.agentVerdicts.get(sessionId) ?? new Map();
-			verdicts.set(verdict.agent, verdict);
-			this.agentVerdicts.set(sessionId, verdicts);
+			const parsed = agentVerdicts(event.text);
+			if (!parsed.length) return;
+			const verdicts = [
+				...(this.agentVerdicts.get(sessionId) ?? []),
+				...parsed,
+			];
+			this.agentVerdicts.set(sessionId, verdicts.slice(-MAX_AGENT_VERDICTS));
 			for (const activity of activities) this.renderLiveActivity(activity);
 			return;
 		}
 		if (event.type === "notification") {
 			const snapshot = latestAgentSnapshot(event.text);
+			const stored = this.agentSnapshots.get(sessionId);
 			if (snapshot) {
-				this.agentSnapshots.set(sessionId, snapshot);
+				this.agentSnapshots.set(sessionId, {
+					...(event.widgetKey ? { widgetKey: event.widgetKey } : {}),
+					snapshot,
+				});
 				for (const activity of activities) this.renderLiveActivity(activity);
+			} else if (
+				!event.text.trim() &&
+				event.widgetKey &&
+				stored?.widgetKey === event.widgetKey
+			) {
+				// The widget that carried the snapshot was cleared: no agents remain.
+				this.clearAgentBoard(sessionId);
+				for (const activity of activities) this.renderLiveActivity(activity);
+				return;
 			}
 		}
 		const notification =
@@ -8692,6 +8723,7 @@ export class TelegramTransportAdapter
 
 	private invalidateSession(sessionId: SessionId): void {
 		this.turnBuffers.delete(sessionId);
+		this.clearAgentBoard(sessionId);
 		for (const [inputId, record] of this.inputAttributions)
 			if (record.sessionId === sessionId)
 				this.inputAttributions.delete(inputId);

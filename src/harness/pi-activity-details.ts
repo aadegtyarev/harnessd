@@ -109,7 +109,7 @@ export function coordinationSummary(
 	return label ? `${label}${target ? ` ${target}` : ""}` : undefined;
 }
 
-const NOTICE_LIMIT = 2000;
+const NOTICE_LIMIT = 4000;
 
 /** Completion notice of a pi-subagents run ("subagent-notify" custom message), redacted. */
 export function subagentNotice(message: unknown): string | undefined {

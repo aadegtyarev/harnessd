@@ -1163,7 +1163,10 @@ class PiRpcInstance implements HarnessInstance {
 							(line): line is string => typeof line === "string",
 						)
 					: [];
-				if (lines.length)
+				const widgetKey =
+					typeof record.widgetKey === "string" ? record.widgetKey : undefined;
+				// An empty keyed widget is a clear; transports drop what it showed.
+				if (lines.length || widgetKey)
 					this.emit({
 						sessionId: this.sessionId,
 						kind: "activity",
@@ -1171,6 +1174,7 @@ class PiRpcInstance implements HarnessInstance {
 							type: "notification",
 							text: redactDiagnosticText(lines.join("\n")),
 							level: "status",
+							...(widgetKey ? { widgetKey } : {}),
 						},
 					});
 				return;
