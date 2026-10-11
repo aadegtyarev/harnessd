@@ -1295,7 +1295,10 @@ export class TelegramTransportAdapter
 	>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
+	/** Panels whose staleness is shown to the operator (notice posted, or restored after restart). */
 	private readonly panelStaleChats = new Set<number>();
+	/** Panels that must be repainted after an uncertain Telegram failure, without user-visible text. */
+	private readonly panelRepairChats = new Set<number>();
 	private readonly panelGenerations = new Map<number, number>();
 	private readonly panelIntents = new TelegramPanelIntent();
 	private readonly panelSemantic = new Map<number, string>();
@@ -4936,7 +4939,8 @@ export class TelegramTransportAdapter
 		const publication = JSON.stringify([text, replyMarkup]);
 		if (
 			this.panelPublished.get(chatId) === publication &&
-			!this.panelStaleChats.has(chatId)
+			!this.panelStaleChats.has(chatId) &&
+			!this.panelRepairChats.has(chatId)
 		)
 			return true;
 		const generation = this.nextPanelGeneration(chatId);
@@ -4985,7 +4989,7 @@ export class TelegramTransportAdapter
 				if (edited.ok || isMessageNotModified(edited.error)) break;
 				if (!isTransientTelegramError(edited.error)) break;
 				// The failed edit may have landed: never let a later identical render be deduplicated.
-				this.panelStaleChats.add(chatId);
+				this.panelRepairChats.add(chatId);
 				const delay =
 					telegramRetryAfterMs(edited.error) ??
 					PANEL_RETRY_BASE_DELAY_MS * attempt;
@@ -5002,14 +5006,15 @@ export class TelegramTransportAdapter
 				await this.savePanelReference(chatId, existing);
 				if (!referenceIsCurrent(existing)) return false;
 				this.panelStaleChats.delete(chatId);
+				this.panelRepairChats.delete(chatId);
 				this.panelPublished.set(chatId, publication);
 				return isCurrent();
 			}
 			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			if (isTransientTelegramError(edited.error)) {
-				// The edit may still have applied; the next refresh or the panel button repairs it.
+				// The edit may still have applied; the next refresh repairs it without a visible warning.
 				this.dropPanelGenerationIntents(chatId, generation);
-				this.panelStaleChats.add(chatId);
+				this.panelRepairChats.add(chatId);
 				return false;
 			}
 			if (!isReplaceablePanelEditError(edited.error)) {
@@ -5045,10 +5050,13 @@ export class TelegramTransportAdapter
 		if (!sent.ok) {
 			if (!isCurrent() || !referenceIsCurrent(existing)) return false;
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
-			this.panelStaleChats.add(chatId);
 			// An uncertain send may have delivered the panel, so it is neither resent nor announced.
-			if (!isTransientTelegramError(sent.error))
-				await this.notifyPanelStale(chatId);
+			if (isTransientTelegramError(sent.error)) {
+				this.panelRepairChats.add(chatId);
+				return false;
+			}
+			this.panelStaleChats.add(chatId);
+			await this.notifyPanelStale(chatId);
 			return false;
 		}
 		const createdMessageId = messageIdFrom(sent.value);
@@ -5059,6 +5067,7 @@ export class TelegramTransportAdapter
 		await this.savePanelReference(chatId, createdMessageId);
 		if (!referenceIsCurrent(createdMessageId)) return false;
 		this.panelStaleChats.delete(chatId);
+		this.panelRepairChats.delete(chatId);
 		this.panelPublished.set(chatId, publication);
 		if (!isCurrent()) return false;
 		if (hasBoundIntents) {

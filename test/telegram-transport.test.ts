@@ -5190,6 +5190,10 @@ describe("Telegram transport", () => {
 		).toBe(false);
 		await bot.update(42, "/menu");
 		expect(bot.edited.at(-1)?.text).toContain("network down");
+		expect(bot.edited.at(-1)?.text).not.toContain("обновление не удалось");
+		expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain(
+			"panel:refresh",
+		);
 		await adapter.stop();
 	});
 
@@ -5252,6 +5256,35 @@ describe("Telegram transport", () => {
 		const beforeRepaint = bot.api.editMessageText.mock.calls.length;
 		await panel.updatePanel(42, "published text", undefined);
 		expect(bot.api.editMessageText.mock.calls.length).toBe(beforeRepaint + 1);
+		await adapter.stop();
+	});
+
+	it("publishes a render built during a retry sleep without a failure warning", async () => {
+		const bot = new MockBot();
+		let concurrent: Promise<void> | undefined;
+		let editFailed = false;
+		const { adapter } = await startAdapter(bot, await temp(), {
+			panelSleep: async () => {
+				if (editFailed && !concurrent) concurrent = bot.update(42, "/menu");
+			},
+		});
+		await bot.update(42, "/menu");
+		sessions.set("sid", sessionWith("sid", { name: "glitch once" }));
+		bot.api.editMessageText.mockImplementationOnce(async () => {
+			editFailed = true;
+			throw new Error("deadline");
+		});
+		await bot.update(42, "/menu");
+		await concurrent;
+		await bot.update(42, "/menu");
+		const published = bot.edited.filter(({ text }) =>
+			text.includes("glitch once"),
+		);
+		expect(published.length).toBeGreaterThan(0);
+		for (const { text, options } of published) {
+			expect(text).not.toContain("обновление не удалось");
+			expect(JSON.stringify(options)).not.toContain("panel:refresh");
+		}
 		await adapter.stop();
 	});
 
