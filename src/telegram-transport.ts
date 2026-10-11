@@ -89,6 +89,8 @@ const MAX_OUTPUT_MESSAGES = 24;
 const MAX_INPUT_MESSAGES = 8;
 const MAX_OVERFLOW_NOTICES = 8;
 const MAX_QUEUED_CHARACTERS = 32_768;
+const TURN_OVERFLOW_NOTICE =
+	"[Additional output omitted because the response reached the queue limit.]";
 const INPUT_CHARACTER_RESERVE = 4096;
 const OUTPUT_COALESCE_MS = 40;
 const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
@@ -3571,6 +3573,9 @@ export class TelegramTransportAdapter
 			const wasSelected = this.selected.get(chatId) === sessionId;
 			const result = await this.request(sender, { kind: "stop", sessionId });
 			if (result.ok) {
+				// Deliver buffered answers before clearing the selection they route to.
+				this.flushTurn(sessionId, true);
+				await this.waitForEventQueue(chatId);
 				this.refreshMenusForSession(sessionId, false);
 				this.invalidateSessionConfirmations(sessionId);
 				this.refreshPanelsPreviewing(sessionId, sender, true);
@@ -7154,6 +7159,8 @@ export class TelegramTransportAdapter
 			this.invalidateSessionConfirmations(sessionId);
 			this.refreshPanelsPreviewing(sessionId, sender, true);
 			if (action === "stop") {
+				this.flushTurn(sessionId, true);
+				await this.waitForEventQueue(chatId);
 				this.refreshMenusForSession(sessionId, false);
 				if (this.selected.get(chatId) === sessionId) {
 					selectionPersistenceWarning = !(await this.clearSelected(chatId));
@@ -7344,6 +7351,10 @@ export class TelegramTransportAdapter
 				return;
 			}
 			if (event.text === "agent_end") return;
+			if (event.text === "message_end") {
+				this.flushTurnMessage(event.sessionId);
+				return;
+			}
 			if (event.text === "agent_settled") {
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
@@ -7864,24 +7875,58 @@ export class TelegramTransportAdapter
 		if (buffer.cancelled || (buffer.characters === 0 && !buffer.overflow))
 			return;
 		let text = buffer.chunks.join("");
-		const overflowNotice =
-			"[Additional output omitted because the response reached the queue limit.]";
 		if (!text.trim()) {
 			if (!buffer.overflow) return;
-			text = overflowNotice;
+			text = TURN_OVERFLOW_NOTICE;
 		} else {
 			if (buffer.interrupted)
 				text += "\n\n[Response interrupted before completion.]";
-			if (buffer.overflow) text += `\n\n${overflowNotice}`;
+			if (buffer.overflow) text += `\n\n${TURN_OVERFLOW_NOTICE}`;
 		}
+		this.deliverTurnText(sessionId, buffer.recipients, text);
+	}
+
+	/** Delivers the assistant message that just ended while its run continues. */
+	private flushTurnMessage(sessionId: SessionId): void {
+		const buffer = this.turnBuffers.get(sessionId);
+		if (!buffer || buffer.settled || buffer.cancelled) return;
+		this.appendSubagentResult(
+			sessionId,
+			buffer,
+			buffer.subagentStream.consume("", true),
+		);
+		let text = buffer.chunks.join("");
+		const overflow = buffer.overflow;
+		buffer.chunks.splice(0);
+		buffer.characters = 0;
+		buffer.overflow = false;
+		if (!text.trim()) {
+			if (!overflow) return;
+			text = TURN_OVERFLOW_NOTICE;
+		} else if (overflow) text += `\n\n${TURN_OVERFLOW_NOTICE}`;
+		const attributed = new Set(buffer.recipients);
+		for (const record of this.inputAttributions.values())
+			if (
+				record.turn === buffer &&
+				!record.terminal &&
+				record.chatId !== undefined &&
+				(record.state === "accepted" || record.state === "uncertain")
+			)
+				attributed.add(record.chatId);
+		this.deliverTurnText(sessionId, attributed, text);
+	}
+
+	private deliverTurnText(
+		sessionId: SessionId,
+		attributedChats: ReadonlySet<number>,
+		text: string,
+	): void {
 		const selectedChats = new Set<number>();
 		for (const [chatId, selectedId] of this.selected)
 			if (selectedId === sessionId) selectedChats.add(chatId);
-		const recipients = buffer.recipients.size
-			? buffer.recipients
-			: selectedChats;
+		const recipients = attributedChats.size ? attributedChats : selectedChats;
 		for (const chatId of recipients) {
-			const attributed = buffer.recipients.has(chatId);
+			const attributed = attributedChats.has(chatId);
 			this.enqueue(
 				chatId,
 				sessionId,

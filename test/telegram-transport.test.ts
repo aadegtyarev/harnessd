@@ -1484,6 +1484,55 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("delivers each assistant message at its end while the run continues", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "first answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("first answer"))).toBe(
+				true,
+			),
+		);
+		emit(harnessEvent("sid", "output", "second answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("second answer"))).toBe(
+				true,
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const answers = bot.sent.filter(({ text }) => text.includes("answer"));
+		expect(answers).toHaveLength(2);
+		expect(answers[1]?.text).not.toContain("first answer");
+		expect(bot.sent.some(({ text }) => text.includes("message_end"))).toBe(
+			false,
+		);
+		await adapter.stop();
+	});
+
+	it("delivers buffered output as interrupted when the session is stopped mid-run", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "unfinished work"));
+		await bot.update(42, "/stop");
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(
+					({ text }) =>
+						text.includes("unfinished work") &&
+						text.includes("[Response interrupted before completion.]"),
+				),
+			).toBe(true),
+		);
+		await adapter.stop();
+	});
+
 	it("shows offline only when the successful session list confirms no sessions", async () => {
 		const bot = new MockBot();
 		const known = [...sessions.entries()];
@@ -2697,6 +2746,47 @@ describe("Telegram transport", () => {
 				"action:select:",
 			),
 		).toMatch(/^action:select:/);
+		await adapter.stop();
+	});
+
+	it("delivers mid-run messages only to the submitting chat while its input is active", async () => {
+		const bot = new MockBot();
+		const { adapter, requests, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(42, "long task");
+		await vi.waitFor(() =>
+			expect(requests.filter(({ kind }) => kind === "submit")).toHaveLength(1),
+		);
+		await bot.update(42, "/use other");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "pending" },
+		});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "progress report"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(
+					({ chatId, text }) =>
+						chatId === 42 &&
+						text.includes("progress report") &&
+						text.startsWith("Фоновая сессия"),
+				),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.filter(
+				({ chatId, text }) => chatId === 43 && text.includes("progress report"),
+			),
+		).toHaveLength(0);
 		await adapter.stop();
 	});
 

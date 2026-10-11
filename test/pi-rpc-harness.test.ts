@@ -1717,6 +1717,29 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("emits a message_end status only for completed assistant messages", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		fake.stdout.write(
+			`${[
+				{ type: "message_end", message: { role: "user", content: "hi" } },
+				{ type: "message_end", message: { role: "assistant", content: [] } },
+				{ type: "agent_settled" },
+			]
+				.map((record) => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		const got = await collectEvents(instance, 2);
+		expect(got.map((event) => [event?.kind, event?.text])).toEqual([
+			["status", "message_end"],
+			["status", "agent_settled"],
+		]);
+		await instance.shutdown();
+	});
+
 	it("forwards tool activity and non-fatal extension diagnostics but never raw thinking text", async () => {
 		const fake = fakeProvider();
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
