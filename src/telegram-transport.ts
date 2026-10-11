@@ -5090,6 +5090,8 @@ export class TelegramTransportAdapter
 			);
 			if (!published.ok && !isMessageNotModified(published.error)) {
 				this.dropPanelGenerationIntents(chatId, intentGeneration);
+				// The keyboard edit failed after the panel was recorded as published: force a repaint.
+				this.panelRepairChats.add(chatId);
 				return false;
 			}
 		}
