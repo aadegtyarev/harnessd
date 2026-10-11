@@ -42,6 +42,12 @@ import {
 	AGENT_FILE_SEND_URL_ENV,
 } from "./agent-file-send-protocol.js";
 import { UncertainInputDeliveryError } from "./input-delivery-error.js";
+import {
+	bashExitDetail,
+	coordinationSummary,
+	taskActivity,
+	thoughtSummary,
+} from "./pi-activity-details.js";
 
 export interface PiRpcHarnessOptions {
 	readonly executable: string;
@@ -545,6 +551,8 @@ function toolActivitySummary(name: string, value: unknown): string {
 				? args.offset
 				: undefined;
 	const range = lines === undefined ? "" : ` (line ${lines})`;
+	const coordination = coordinationSummary(name, args);
+	if (coordination) return truncateDiagnostic(coordination, 700);
 	let summary = name;
 	if (name === "bash" && typeof args.command === "string")
 		summary = `bash: ${args.command}`;
@@ -564,6 +572,8 @@ function toolActivitySummary(name: string, value: unknown): string {
 	return truncateDiagnostic(redactDiagnosticText(summary), 700);
 }
 class PiRpcInstance implements HarnessInstance {
+	/** Tool names by call ID, so tool_end can describe tool-specific outcomes. */
+	private readonly toolNames = new Map<string, string>();
 	readonly processId: ManagedProcess["id"];
 	readonly exit: ManagedProcess["exit"];
 	readonly control: HarnessControl = {
@@ -1198,7 +1208,7 @@ class PiRpcInstance implements HarnessInstance {
 			else if (
 				update?.type === "thinking_start" ||
 				update?.type === "thinking_end"
-			)
+			) {
 				this.emit({
 					sessionId: this.sessionId,
 					kind: "activity",
@@ -1207,13 +1217,27 @@ class PiRpcInstance implements HarnessInstance {
 						active: update.type === "thinking_start",
 					},
 				});
+				const thought =
+					update.type === "thinking_end" && typeof update.content === "string"
+						? thoughtSummary(update.content)
+						: undefined;
+				if (thought)
+					this.emit({
+						sessionId: this.sessionId,
+						kind: "activity",
+						activityEvent: { type: "thought", text: thought },
+					});
+			}
 			return;
 		}
 		if (record.type === "tool_execution_start") {
 			if (
 				typeof record.toolCallId === "string" &&
 				typeof record.toolName === "string"
-			)
+			) {
+				this.toolNames.set(record.toolCallId, record.toolName);
+				if (this.toolNames.size > 512)
+					this.toolNames.delete(this.toolNames.keys().next().value as string);
 				this.emit({
 					sessionId: this.sessionId,
 					kind: "activity",
@@ -1223,10 +1247,26 @@ class PiRpcInstance implements HarnessInstance {
 						summary: toolActivitySummary(record.toolName, record.args),
 					},
 				});
+			}
+			return;
+		}
+		if (record.type === "entry_appended") {
+			const task = taskActivity(record.entry);
+			if (task)
+				this.emit({
+					sessionId: this.sessionId,
+					kind: "activity",
+					activityEvent: task,
+				});
 			return;
 		}
 		if (record.type === "tool_execution_end") {
-			if (typeof record.toolCallId === "string")
+			if (typeof record.toolCallId === "string") {
+				const toolName =
+					typeof record.toolName === "string"
+						? record.toolName
+						: this.toolNames.get(record.toolCallId);
+				this.toolNames.delete(record.toolCallId);
 				this.emit({
 					sessionId: this.sessionId,
 					kind: "activity",
@@ -1234,8 +1274,17 @@ class PiRpcInstance implements HarnessInstance {
 						type: "tool_end",
 						toolCallId: record.toolCallId,
 						failed: record.isError === true,
+						...(toolName === "bash"
+							? {
+									detail: bashExitDetail(
+										record.result,
+										record.isError === true,
+									),
+								}
+							: {}),
 					},
 				});
+			}
 			return;
 		}
 		if (["auto_compaction_start", "compaction_start"].includes(record.type))

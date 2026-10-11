@@ -66,6 +66,22 @@ export type HarnessActivityEvent =
 			readonly type: "tool_end";
 			readonly toolCallId: string;
 			readonly failed: boolean;
+			/** Short outcome such as a bash exit code. */
+			readonly detail?: string;
+	  }
+	| {
+			/** One-line reasoning summary (a title, never full reasoning). */
+			readonly type: "thought";
+			readonly text: string;
+	  }
+	| {
+			/** Bounded-task state published by the harness (for example Pi /task). */
+			readonly type: "task";
+			readonly goal: string;
+			readonly progress?: string;
+			readonly status: string;
+			readonly step: number;
+			readonly limit?: number;
 	  }
 	| {
 			readonly type: "notification";

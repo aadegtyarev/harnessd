@@ -1740,7 +1740,7 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
-	it("forwards tool activity and non-fatal extension diagnostics but never raw thinking text", async () => {
+	it("forwards tool activity, a one-line thought summary, and non-fatal extension diagnostics", async () => {
 		const fake = fakeProvider();
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
 			executable: "/bin/pi",
@@ -1756,14 +1756,16 @@ describe("PiRpcHarnessAdapter", () => {
 					type: "message_update",
 					assistantMessageEvent: {
 						type: "thinking_delta",
-						delta: "private reasoning",
+						delta:
+							"**Checking context usage**\n\nLong private reasoning follows.",
 					},
 				},
 				{
 					type: "message_update",
 					assistantMessageEvent: {
 						type: "thinking_end",
-						content: "private reasoning",
+						content:
+							"**Checking context usage**\n\nLong private reasoning follows.",
 					},
 				},
 				{
@@ -1795,7 +1797,7 @@ describe("PiRpcHarnessAdapter", () => {
 				.map((event) => JSON.stringify(event))
 				.join("\n")}\n`,
 		);
-		const events = await collectEvents(instance, 5);
+		const events = await collectEvents(instance, 6);
 		expect(events.filter((event) => event?.kind === "activity")).toEqual([
 			{
 				sessionId: "supervisor",
@@ -1806,6 +1808,11 @@ describe("PiRpcHarnessAdapter", () => {
 				sessionId: "supervisor",
 				kind: "activity",
 				activityEvent: { type: "thinking", active: false },
+			},
+			{
+				sessionId: "supervisor",
+				kind: "activity",
+				activityEvent: { type: "thought", text: "Checking context usage" },
 			},
 			{
 				sessionId: "supervisor",
@@ -1843,6 +1850,49 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(JSON.stringify([...events, ...error])).not.toContain(
 			"private reasoning",
 		);
+		await instance.shutdown();
+	});
+
+	it("forwards bash exit details and /task state entries", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		fake.stdout.write(
+			`${[
+				{
+					type: "tool_execution_start",
+					toolCallId: "b1",
+					toolName: "bash",
+					args: { command: "npm test" },
+				},
+				{
+					type: "tool_execution_end",
+					toolCallId: "b1",
+					result: {
+						content: [{ type: "text", text: "Command exited with code 1" }],
+					},
+					isError: true,
+				},
+				{
+					type: "entry_appended",
+					entry: {
+						type: "custom",
+						customType: "pi-ad-hooks-task",
+						data: { goal: "Ship", status: "active", continuations: 2 },
+					},
+				},
+			]
+				.map((event) => JSON.stringify(event))
+				.join("\n")}\n`,
+		);
+		const events = await collectEvents(instance, 3);
+		expect(events.map((event) => event?.activityEvent)).toEqual([
+			{ type: "tool_start", toolCallId: "b1", summary: "bash: npm test" },
+			{ type: "tool_end", toolCallId: "b1", failed: true, detail: "exit 1" },
+			{ type: "task", goal: "Ship", status: "active", step: 2 },
+		]);
 		await instance.shutdown();
 	});
 

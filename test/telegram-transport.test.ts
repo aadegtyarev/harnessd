@@ -2543,11 +2543,11 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "Handle this command");
 		await vi.waitFor(() =>
-			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+			expect(
+				bot.edited.some(({ text }) => text.startsWith("✅ Ход завершён")),
+			).toBe(true),
 		);
-		expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
-			true,
-		);
+		expect(bot.sent.some(({ text }) => text.includes("Ход · "))).toBe(true);
 		await adapter.stop();
 	});
 
@@ -2751,7 +2751,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("edits one reply bubble with Pi tool activity, sends the final answer separately, then deletes the bubble", async () => {
+	it("edits one reply card with Pi tool activity, sends the final answer separately, then collapses the card", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Review task" }));
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
@@ -2760,7 +2760,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "Run the requested checks");
 		await vi.waitFor(() =>
 			expect(bot.sent.at(-1)?.text).toContain(
-				"Pi activity · Review task · sid",
+				"Ход · Отправляю в Pi · Review task · #sid",
 			),
 		);
 		const bubbleId = bot.lastMessageId;
@@ -2775,9 +2775,9 @@ describe("Telegram transport", () => {
 			},
 		});
 		await vi.waitFor(() =>
-			expect(
-				bot.edited.some(({ text }) => text.includes("bash: npm test …")),
-			).toBe(true),
+			expect(bot.edited.some(({ text }) => text.includes("$ npm test …"))).toBe(
+				true,
+			),
 		);
 		emit({
 			sessionId: "sid" as SessionId,
@@ -2795,7 +2795,7 @@ describe("Telegram transport", () => {
 		});
 		await vi.waitFor(() =>
 			expect(
-				bot.edited.some(({ text }) => text.includes("grep: secret token …")),
+				bot.edited.some(({ text }) => text.includes("🔎 secret token …")),
 			).toBe(true),
 		);
 		emit({
@@ -2811,35 +2811,40 @@ describe("Telegram transport", () => {
 		});
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
-			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+			expect(
+				bot.edited.some(({ text }) => text.startsWith("✅ Ход завершён")),
+			).toBe(true),
 		);
 		expect(bot.api.sendMessage).toHaveBeenCalledWith(
 			42,
-			expect.stringContaining("Pi activity"),
+			expect.stringContaining("Ход · "),
 			expect.objectContaining({
 				reply_parameters: { message_id: sourceMessageId },
 			}),
 			expect.anything(),
 		);
+		expect(bot.edited.some(({ text }) => text.includes("$ npm test ✓"))).toBe(
+			true,
+		);
 		expect(
-			bot.edited.some(({ text }) => text.includes("bash: npm test ✓")),
-		).toBe(true);
-		expect(
-			bot.edited.some(({ text }) => text.includes("grep: secret token ❌")),
+			bot.edited.some(({ text }) => text.includes("🔎 secret token ❌")),
 		).toBe(true);
 		expect(
 			bot.edited.some(({ text }) => text.includes("53.3%/145k/272k (auto)")),
 		).toBe(true);
-		expect(bot.api.deleteMessage).toHaveBeenCalledWith(
-			42,
-			bubbleId,
-			expect.anything(),
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(
+					({ messageId, text }) =>
+						messageId === bubbleId && text.startsWith("✅ Ход завершён"),
+				),
+			).toBe(true),
 		);
 		const answer = bot.sent.find(({ text }) =>
 			text.includes("All checks passed."),
 		);
 		expect(answer?.text).toContain("All checks passed.");
-		expect(answer?.text).not.toContain("Pi activity");
+		expect(answer?.text).not.toContain("Ход · ");
 		await adapter.stop();
 	});
 
@@ -3624,7 +3629,9 @@ describe("Telegram transport", () => {
 				},
 			});
 		await vi.waitFor(() =>
-			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+			expect(
+				bot.edited.some(({ text }) => text.startsWith("✅ Ход завершён")),
+			).toBe(true),
 		);
 		expect((bot.edited.at(-1)?.text.length ?? 0) < 4096).toBe(true);
 		await adapter.stop();
@@ -3635,15 +3642,11 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "first session task");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		const firstBubble = bot.lastMessageId;
 		await bot.update(42, "/use other");
 		await bot.update(42, "second session task");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		const secondBubble = bot.lastMessageId;
 		emit({
 			sessionId: "sid" as SessionId,
@@ -3669,11 +3672,12 @@ describe("Telegram transport", () => {
 		});
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
-			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
-				42,
-				firstBubble,
-				expect.anything(),
-			),
+			expect(
+				bot.edited.some(
+					({ messageId, text }) =>
+						messageId === firstBubble && text.startsWith("✅ Ход завершён"),
+				),
+			).toBe(true),
 		);
 		expect(bot.api.deleteMessage).not.toHaveBeenCalledWith(
 			42,
@@ -3701,7 +3705,7 @@ describe("Telegram transport", () => {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(
 			bot.api.sendMessage.mock.calls.filter(([, text]) =>
-				String(text).includes("Pi activity"),
+				String(text).includes("Ход · "),
 			),
 		).toHaveLength(1);
 		journal.mockRestore();
@@ -3714,9 +3718,7 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "Run this once");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		bot.sendMessageBehavior = async () => {
 			if (
 				String(bot.api.sendMessage.mock.calls.at(-1)?.[1]).includes(
@@ -3761,24 +3763,22 @@ describe("Telegram transport", () => {
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		expect(
 			bot.api.sendMessage.mock.calls.filter(([, text]) =>
-				String(text).includes("Pi activity"),
+				String(text).includes("Ход · "),
 			),
 		).toHaveLength(1);
 		journal.mockRestore();
 		await adapter.stop();
 	});
 
-	it("keeps a failed deletion from resending the final answer", async () => {
+	it("keeps a failed card collapse from resending the final answer", async () => {
 		const bot = new MockBot();
 		const journal = vi.spyOn(console, "error").mockImplementation(() => {});
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "Run this once");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
-		bot.deleteMessageBehavior = async () => {
-			throw new Error("Telegram delete timed out");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		bot.editMessageBehavior = async () => {
+			throw new Error("Telegram edit timed out");
 		};
 		emit(harnessEvent("sid", "output", "Only once"));
 		emit({
@@ -3788,7 +3788,11 @@ describe("Telegram transport", () => {
 		});
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
-			expect(bot.api.deleteMessage).toHaveBeenCalledOnce(),
+			expect(
+				bot.api.editMessageText.mock.calls.some(([, , text]) =>
+					String(text).startsWith("✅ Ход завершён"),
+				),
+			).toBe(true),
 		);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -5876,12 +5880,10 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "create a reply target");
 		await vi.waitFor(() =>
-			expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
-				true,
-			),
+			expect(bot.sent.some(({ text }) => text.includes("Ход · "))).toBe(true),
 		);
 		const sourceId = bot.sent.find(({ text }) =>
-			text.includes("Pi activity"),
+			text.includes("Ход · "),
 		)?.message_id;
 		expect(sourceId).toBeDefined();
 		await bot.updateDocument(42, {
@@ -6683,11 +6685,9 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "create reply route");
 		await vi.waitFor(() =>
-			expect(bot.sent.some(({ text }) => text.includes("Pi activity"))).toBe(
-				true,
-			),
+			expect(bot.sent.some(({ text }) => text.includes("Ход · "))).toBe(true),
 		);
-		const source = bot.sent.find(({ text }) => text.includes("Pi activity"));
+		const source = bot.sent.find(({ text }) => text.includes("Ход · "));
 		await bot.update(42, "/use other");
 		const upload = bot.updateDocument(42, {
 			replyToMessageId: source?.message_id,
@@ -8545,9 +8545,7 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "run subagent work");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		const bubbleId = bot.lastMessageId;
 		emit(harnessEvent("sid", "status", "agent_start"));
 		const widget = `Pi: PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
@@ -8631,35 +8629,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("keeps the transport operation projection to six rows", async () => {
-		const bot = new MockBot();
-		const { adapter, emit } = await startAdapter(bot, await temp());
-		await bot.update(42, "/use sid");
-		await bot.update(42, "track bounded tools");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
-		for (let index = 0; index < 8; index++) {
-			emit({
-				sessionId: "sid" as SessionId,
-				kind: "activity",
-				activityEvent: {
-					type: "tool_start",
-					toolCallId: `bounded-${index}`,
-					summary: `read: ${index}`,
-				},
-			});
-		}
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 2"),
-		);
-		const text = bot.edited.at(-1)?.text ?? "";
-		expect(text.match(/^• read:/gm) ?? []).toHaveLength(6);
-		expect(text).toContain("Ещё выполняется: 2");
-		await adapter.stop();
-	});
-
-	it("keeps coalesced Worker tool events out of visible status and update time", async () => {
+	it("shows a subagent launch as a card event next to the child status", async () => {
 		const bot = new MockBot();
 		let ticks = 0;
 		const { adapter, emit } = await startAdapter(bot, await temp(), {
@@ -8668,9 +8638,7 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "track coalesced worker");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(
 			harnessEvent(
@@ -8697,191 +8665,10 @@ describe("Telegram transport", () => {
 				activityEvent: event,
 			});
 		}
-		await new Promise((resolve) => setTimeout(resolve, 30));
-		expect(bot.edited.at(-1)?.text).toBe(before);
-		await adapter.stop();
-	});
-
-	it("renders child-role overflow immediately without changing activity status or time", async () => {
-		const bot = new MockBot();
-		let ticks = 0;
-		const { adapter, emit } = await startAdapter(bot, await temp(), {
-			activityClock: () => new Date(ticks++ * 1000),
-			activityTimeFormatter: (date) => `12:00:0${date.getSeconds()}`,
-		});
-		await bot.update(42, "/use sid");
-		await bot.update(42, "track child overflow");
 		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
+			expect(bot.edited.at(-1)?.text).toContain("🚀 запустил Worker ✓"),
 		);
-		emit(harnessEvent("sid", "status", "agent_start"));
-		emit(
-			harnessEvent(
-				"sid",
-				"output",
-				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
-			),
-		);
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
-		);
-		for (let index = 0; index < 256; index++)
-			emit({
-				sessionId: "sid" as SessionId,
-				kind: "activity",
-				activityEvent: {
-					type: "tool_start",
-					toolCallId: `child-cap-${index}`,
-					summary: `read: ${index}`,
-				},
-			});
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 251"),
-		);
-		const before = bot.edited.at(-1)?.text ?? "";
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: {
-				type: "tool_start",
-				toolCallId: "worker-over-cap",
-				summary: "subagent · worker · task",
-			},
-		});
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain(
-				"Дополнительные операции не отслеживаются",
-			),
-		);
-		const after = bot.edited.at(-1)?.text ?? "";
-		expect(after.split("\n")[0]).toBe(before.split("\n")[0]);
-		expect(after.match(/^⏳ .*$/m)?.[0]).toBe(before.match(/^⏳ .*$/m)?.[0]);
-		expect(after.match(/^Обновлено: .*$/m)?.[0]).toBe(
-			before.match(/^Обновлено: .*$/m)?.[0],
-		);
-		const edits = bot.edited.length;
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: {
-				type: "tool_start",
-				toolCallId: "worker-over-cap-duplicate",
-				summary: "subagent · worker · task",
-			},
-		});
-		await new Promise((resolve) => setTimeout(resolve, 30));
-		expect(bot.edited).toHaveLength(edits);
-		await adapter.stop();
-	});
-
-	it("advances activity time when thinking joins a queued child overflow warning", async () => {
-		const bot = new MockBot();
-		let ticks = 0;
-		const { adapter, emit } = await startAdapter(bot, await temp(), {
-			activityClock: () => new Date(ticks++ * 1000),
-			activityTimeFormatter: (date) => `t${date.getTime()}`,
-		});
-		await bot.update(42, "/use sid");
-		await bot.update(42, "track coalesced worker thinking");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
-		emit(harnessEvent("sid", "status", "agent_start"));
-		emit(
-			harnessEvent(
-				"sid",
-				"output",
-				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"running"}]}',
-			),
-		);
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Задача Worker: выполняется"),
-		);
-		for (let index = 0; index < 256; index++)
-			emit({
-				sessionId: "sid" as SessionId,
-				kind: "activity",
-				activityEvent: {
-					type: "tool_start",
-					toolCallId: `thinking-cap-${index}`,
-					summary: `read: ${index}`,
-				},
-			});
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 251"),
-		);
-		const beforeTime = bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: {
-				type: "tool_start",
-				toolCallId: "thinking-over-cap",
-				summary: "subagent · worker · task",
-			},
-		});
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: { type: "thinking", active: true },
-		});
-		await vi.waitFor(() => {
-			const text = bot.edited.at(-1)?.text ?? "";
-			expect(text).toContain("Дополнительные операции не отслеживаются");
-			expect(text).toContain("• Думаю…");
-		});
-		const afterTime = bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
-		expect(afterTime).not.toBe(beforeTime);
-		await adapter.stop();
-	});
-
-	it("publishes the activity overflow warning on its first over-cap tool", async () => {
-		const bot = new MockBot();
-		const { adapter, emit } = await startAdapter(bot, await temp());
-		await bot.update(42, "/use sid");
-		await bot.update(42, "track activity overflow");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
-		for (let index = 0; index < 256; index++)
-			emit({
-				sessionId: "sid" as SessionId,
-				kind: "activity",
-				activityEvent: {
-					type: "tool_start",
-					toolCallId: `cap-${index}`,
-					summary: `read: ${index}`,
-				},
-			});
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Ещё выполняется: 250"),
-		);
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: {
-				type: "tool_start",
-				toolCallId: "cap-over",
-				summary: "read: overflow",
-			},
-		});
-		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain(
-				"Дополнительные операции не отслеживаются",
-			),
-		);
-		const edits = bot.edited.length;
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: {
-				type: "tool_start",
-				toolCallId: "cap-over-2",
-				summary: "read: overflow again",
-			},
-		});
-		await new Promise((resolve) => setTimeout(resolve, 30));
-		expect(bot.edited).toHaveLength(edits);
+		expect(before).toContain("Задача Worker: выполняется");
 		await adapter.stop();
 	});
 
@@ -8890,9 +8677,7 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "track status");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(
 			harnessEvent(
@@ -8916,18 +8701,227 @@ describe("Telegram transport", () => {
 			expect(bot.edited.at(-1)?.text).toContain("Задача Reviewer: выполняется"),
 		);
 		const visible = bot.edited.at(-1)?.text ?? "";
-		expect(visible).toContain("Задача Worker: завершён ✓");
-		expect(visible).toContain("Задача Reviewer: выполняется …");
+		expect(visible).toContain("Задача Worker: завершён");
+		expect(visible).toContain("Задача Reviewer: выполняется");
 		expect(visible.match(/Задача Worker: завершён/g)).toHaveLength(1);
 		expect(visible.match(/Задача Reviewer: выполняется/g)).toHaveLength(1);
-		expect(
-			visible.match(
-				/^• (?!Задача Worker|Задача Reviewer|Input|Ещё|Pi activity|⏳)/gm,
-			) ?? [],
-		).toEqual([]);
 		expect(visible).not.toContain("workflow");
 		expect(visible).not.toContain("PRIVATE_REVIEW_ID");
 		expect(visible).not.toContain("subagent ·");
+		await adapter.stop();
+	});
+
+	it("renders the run card with task, latest thought, recent events, and buttons", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "work on the task");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const cardId = bot.lastMessageId as number;
+		expect(JSON.stringify(bot.sendOptions.at(-1))).not.toContain("card:");
+		expect(bot.sendOptions.at(-1)).toMatchObject({
+			disable_notification: true,
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const activity = (event: Record<string, unknown>) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: event as never,
+			});
+		activity({
+			type: "task",
+			goal: "Ship v0.25.0",
+			progress: "Worker fixes backups",
+			status: "active",
+			step: 7,
+			limit: 40,
+		});
+		activity({ type: "thought", text: "Planning async scout launch" });
+		for (let index = 1; index <= 3; index++) {
+			activity({
+				type: "tool_start",
+				toolCallId: `read-${index}`,
+				summary: `read: src/file-${index}.ts`,
+			});
+			activity({
+				type: "tool_end",
+				toolCallId: `read-${index}`,
+				failed: false,
+			});
+		}
+		activity({
+			type: "tool_start",
+			toolCallId: "sh",
+			summary: "bash: npm test",
+		});
+		activity({
+			type: "tool_end",
+			toolCallId: "sh",
+			failed: true,
+			detail: "exit 1",
+		});
+		activity({
+			type: "tool_start",
+			toolCallId: "wait",
+			summary: "⏸ ждёт агентов #a6ff0d6b (до 10 мин)",
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("⏸ ждёт агентов #a6ff0d6b"),
+		);
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text.startsWith("⏸ Ход · ")).toBe(true);
+		expect(text).toContain("🎯 Ship v0.25.0 · шаг 7/40");
+		expect(text).toContain("📝 Worker fixes backups");
+		expect(text).toContain("💭 Planning async scout launch");
+		expect(text).toContain("📖 3× src/file-3.ts ✓");
+		expect(text).toContain("$ npm test → 1");
+		expect(bot.edited.at(-1)?.messageId).toBe(cardId);
+		activity({
+			type: "task",
+			goal: "Ship v0.25.0",
+			status: "blocked",
+			step: 8,
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("❓ ждёт вашего ответа"),
+		);
+		expect(bot.edited.at(-1)?.text.startsWith("❓ Ход · ")).toBe(true);
+		await adapter.stop();
+	});
+
+	it("freezes the card below a mid-run answer and opens a new one", async () => {
+		const bot = new MockBot();
+		const { adapter, emit, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "long run");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const firstCard = bot.lastMessageId as number;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", "progress note"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() => {
+			const answer = bot.sent.findIndex(({ text }) =>
+				text.includes("progress note"),
+			);
+			const nextCard = bot.sent.findIndex(
+				({ text, message_id }, index) =>
+					index > answer &&
+					answer >= 0 &&
+					text.includes("Ход · ") &&
+					message_id !== firstCard,
+			);
+			expect(nextCard).toBeGreaterThan(answer);
+		});
+		const frozen = bot.api.editMessageText.mock.calls.find(
+			([, messageId, , options]) =>
+				messageId === firstCard &&
+				JSON.stringify(options) === '{"reply_markup":{"inline_keyboard":[]}}',
+		);
+		expect(frozen).toBeDefined();
+		const newCard = bot.lastMessageId as number;
+		const report = callbackData(bot.sendOptions.at(-1), "card:report:");
+		await bot.callback(42, report, newCard);
+		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
+		await bot.callback(42, report, firstCard);
+		expect(requests.filter(({ kind }) => kind === "submit").length).toBe(2);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+				42,
+				firstCard,
+				expect.anything(),
+			),
+		);
+		await adapter.stop();
+	});
+
+	it("keeps workflow and management calls off the card and collapses repeated waits", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "coordinate");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const activity = (event: Record<string, unknown>) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: event as never,
+			});
+		activity({
+			type: "tool_start",
+			toolCallId: "wf",
+			summary: "subagent · workflow · secret plan",
+		});
+		activity({ type: "tool_start", toolCallId: "al", summary: "agent_list" });
+		for (const id of ["w1", "w2", "w3"]) {
+			activity({
+				type: "tool_start",
+				toolCallId: id,
+				summary: "⏸ ждёт агентов #a6ff0d6b (до 10 мин)",
+			});
+			activity({ type: "tool_end", toolCallId: id, failed: false });
+		}
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"3× ⏸ ждёт агентов #a6ff0d6b (до 10 мин) ✓",
+			),
+		);
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text).not.toContain("secret plan");
+		expect(text).not.toContain("workflow");
+		expect(text).not.toContain("agent_list");
+		await adapter.stop();
+	});
+
+	it("disables card buttons outside a live run and guards stop and report", async () => {
+		let capabilities: readonly import("../src/core/errors.js").Capability[] =
+			[];
+		const bot = new MockBot();
+		const { adapter, emit, requests } = await startAdapter(bot, await temp(), {
+			capabilitiesFor: () => capabilities,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "guarded run");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const cardId = bot.lastMessageId as number;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(JSON.stringify(bot.edited.at(-1)?.options)).toContain("card:"),
+		);
+		const options = bot.edited.at(-1)?.options;
+		const stop = callbackData(options, "card:stop:");
+		const report = callbackData(options, "card:report:");
+		await bot.callback(42, stop, cardId);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"Прерывание этой сессии не поддерживается.",
+			),
+		);
+		expect(requests.some(({ kind }) => kind === "cancel_current")).toBe(false);
+		capabilities = ["harness.cancel"];
+		await bot.callback(42, stop, cardId);
+		expect(requests.some(({ kind }) => kind === "cancel_current")).toBe(true);
+		const submits = () =>
+			requests.filter(({ kind }) => kind === "submit").length;
+		const before = submits();
+		await bot.callback(42, report, cardId);
+		await bot.callback(42, report, cardId);
+		expect(submits()).toBe(before + 1);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain("card:"),
+		);
+		await bot.callback(42, stop, cardId);
+		expect(
+			requests.filter(({ kind }) => kind === "cancel_current"),
+		).toHaveLength(1);
 		await adapter.stop();
 	});
 
@@ -8937,9 +8931,7 @@ describe("Telegram transport", () => {
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "attribute notification");
-		await vi.waitFor(() =>
-			expect(bot.sent.at(-1)?.text).toContain("Pi activity"),
-		);
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		const bubbleId = bot.lastMessageId;
 		emit(harnessEvent("sid", "status", "agent_start"));
 		const secret = "NOTIFICATION_SENTINEL_9274";
