@@ -8666,9 +8666,7 @@ describe("Telegram transport", () => {
 			});
 		}
 		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain(
-				"🚀 subagent · worker · task ✓",
-			),
+			expect(bot.edited.at(-1)?.text).toContain("🚀 запустил Worker ✓"),
 		);
 		expect(before).toContain("Задача Worker: выполняется");
 		await adapter.stop();
@@ -8720,9 +8718,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "work on the task");
 		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
 		const cardId = bot.lastMessageId as number;
-		expect(callbackData(bot.sendOptions.at(-1), "card:report:")).toMatch(
-			/^card:report:/,
-		);
+		expect(JSON.stringify(bot.sendOptions.at(-1))).not.toContain("card:");
 		expect(bot.sendOptions.at(-1)).toMatchObject({
 			disable_notification: true,
 		});
@@ -8819,7 +8815,8 @@ describe("Telegram transport", () => {
 		});
 		const frozen = bot.api.editMessageText.mock.calls.find(
 			([, messageId, , options]) =>
-				messageId === firstCard && JSON.stringify(options) === "{}",
+				messageId === firstCard &&
+				JSON.stringify(options) === '{"reply_markup":{"inline_keyboard":[]}}',
 		);
 		expect(frozen).toBeDefined();
 		const newCard = bot.lastMessageId as number;
@@ -8841,6 +8838,90 @@ describe("Telegram transport", () => {
 				expect.anything(),
 			),
 		);
+		await adapter.stop();
+	});
+
+	it("keeps workflow and management calls off the card and collapses repeated waits", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "coordinate");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const activity = (event: Record<string, unknown>) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: event as never,
+			});
+		activity({
+			type: "tool_start",
+			toolCallId: "wf",
+			summary: "subagent · workflow · secret plan",
+		});
+		activity({ type: "tool_start", toolCallId: "al", summary: "agent_list" });
+		for (const id of ["w1", "w2", "w3"]) {
+			activity({
+				type: "tool_start",
+				toolCallId: id,
+				summary: "⏸ ждёт агентов #a6ff0d6b (до 10 мин)",
+			});
+			activity({ type: "tool_end", toolCallId: id, failed: false });
+		}
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"3× ⏸ ждёт агентов #a6ff0d6b (до 10 мин) ✓",
+			),
+		);
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text).not.toContain("secret plan");
+		expect(text).not.toContain("workflow");
+		expect(text).not.toContain("agent_list");
+		await adapter.stop();
+	});
+
+	it("disables card buttons outside a live run and guards stop and report", async () => {
+		let capabilities: readonly import("../src/core/errors.js").Capability[] =
+			[];
+		const bot = new MockBot();
+		const { adapter, emit, requests } = await startAdapter(bot, await temp(), {
+			capabilitiesFor: () => capabilities,
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "guarded run");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const cardId = bot.lastMessageId as number;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(JSON.stringify(bot.edited.at(-1)?.options)).toContain("card:"),
+		);
+		const options = bot.edited.at(-1)?.options;
+		const stop = callbackData(options, "card:stop:");
+		const report = callbackData(options, "card:report:");
+		await bot.callback(42, stop, cardId);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain(
+				"Прерывание этой сессии не поддерживается.",
+			),
+		);
+		expect(requests.some(({ kind }) => kind === "cancel_current")).toBe(false);
+		capabilities = ["harness.cancel"];
+		await bot.callback(42, stop, cardId);
+		expect(requests.some(({ kind }) => kind === "cancel_current")).toBe(true);
+		const submits = () =>
+			requests.filter(({ kind }) => kind === "submit").length;
+		const before = submits();
+		await bot.callback(42, report, cardId);
+		await bot.callback(42, report, cardId);
+		expect(submits()).toBe(before + 1);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain("card:"),
+		);
+		await bot.callback(42, stop, cardId);
+		expect(
+			requests.filter(({ kind }) => kind === "cancel_current"),
+		).toHaveLength(1);
 		await adapter.stop();
 	});
 

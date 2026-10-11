@@ -49,6 +49,7 @@ import { OVERFLOW_ID } from "./telegram-activity-ledger.js";
 import {
 	approvedSubagentRole,
 	localActivityTime,
+	meaningfulToolSummary,
 	updateActivityRow,
 } from "./telegram-activity-projection.js";
 import {
@@ -77,6 +78,7 @@ import { TelegramPanelIntent } from "./telegram-panel-intent.js";
 import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
 import {
+	actionsLabel,
 	addThoughtEvent,
 	addToolEvent,
 	finishToolEvent,
@@ -478,6 +480,12 @@ type LiveActivity = {
 	task?: RunCardTask;
 	readonly frozenMessageIds: number[];
 	readonly cardToken: string;
+	/** Tool calls in this run (the event list itself is capped). */
+	actionCount: number;
+	reportRequestedAtMs?: number;
+	freezePending?: boolean;
+	/** Whether the last published card carried live buttons. */
+	lastButtons?: boolean;
 };
 
 export interface TelegramTransportOptions {
@@ -906,6 +914,7 @@ function isSessionIdToken(value: string): boolean {
 }
 type InlineButton = { readonly text: string; readonly callback_data: string };
 const CANCEL_CONFIRMATION_TTL_MS = 120_000;
+const RUN_REPORT_DEBOUNCE_MS = 60_000;
 const RUN_REPORT_PROMPT =
 	"Кратко (2–3 строки) доложи, что сейчас делаешь и что дальше, и продолжай работу.";
 const CONTROL_BUTTONS = {
@@ -5637,52 +5646,99 @@ export class TelegramTransportAdapter
 			!activity ||
 			activity.chatId !== chatId ||
 			activity.messageId !== messageId ||
-			this.liveActivities.get(activityKey(chatId, activity.sessionId)) !==
-				activity
+			!this.cardActionable(activity)
 		)
 			return;
-		if (action === "stop")
+		if (action === "stop") {
+			let supportsCancel = false;
+			try {
+				supportsCancel =
+					(await this.getSessionCapabilities?.(activity.sessionId))?.includes(
+						"harness.cancel",
+					) ?? false;
+			} catch {
+				supportsCancel = false;
+			}
+			if (!supportsCancel)
+				return this.updateLiveActivity(activity, {
+					notice: "Прерывание этой сессии не поддерживается.",
+				});
 			return this.cancelRunInputs(
 				chatId,
 				sender,
 				activity.sessionId,
 				undefined,
 			);
+		}
 		if (action !== "report") return;
-		const result = await this.request(sender, {
+		const now = this.activityNowMs();
+		if (
+			activity.reportRequestedAtMs !== undefined &&
+			now - activity.reportRequestedAtMs < RUN_REPORT_DEBOUNCE_MS
+		)
+			return;
+		activity.reportRequestedAtMs = now;
+		const result = await this.submitFromChat(chatId, sender, {
 			kind: "submit",
 			sessionId: activity.sessionId,
 			text: RUN_REPORT_PROMPT,
 		});
+		if (!result) return;
 		this.updateLiveActivity(activity, {
 			notice: result.ok
 				? "📋 Запрошен отчёт"
-				: `Отчёт не запрошен: ${safeResultError(result.error)}`,
+				: `Отчёт не запрошен: ${redactDiagnosticText(safeResultError(result.error), [this.options.token])}`,
 		});
 	}
 
 	/** Freezes the live card in place (no buttons) so the next render opens a new one below. */
 	private freezeLiveActivity(activity: LiveActivity): void {
+		if (activity.freezePending) return;
+		activity.freezePending = true;
 		activity.renderQueue = activity.renderQueue
 			.then(async () => {
-				await this.waitForEventQueue(activity.chatId);
+				const delivered = await this.waitForEventQueue(activity.chatId);
 				const messageId = activity.messageId;
-				if (messageId === undefined || activity.lastText === undefined) return;
-				await this.telegramCall((signal) =>
+				if (
+					!delivered ||
+					this.stopping ||
+					activity.unavailable ||
+					activity.finishing ||
+					messageId === undefined ||
+					activity.lastText === undefined ||
+					this.liveActivities.get(
+						activityKey(activity.chatId, activity.sessionId),
+					) !== activity
+				)
+					return;
+				const frozen = await this.telegramCall((signal) =>
 					this.bot.api.editMessageText(
 						activity.chatId,
 						messageId,
 						activity.lastText as string,
-						{},
+						{ reply_markup: { inline_keyboard: [] } },
 						signal,
 					),
 				);
-				activity.frozenMessageIds.push(messageId);
+				const gone = !frozen.ok && isMessageNotFound(frozen.error);
+				if (!frozen.ok && !gone && !isMessageNotModified(frozen.error)) {
+					// Keep the card where it is rather than stacking a second live card.
+					this.reportError(
+						"Telegram run card could not be frozen",
+						frozen.error,
+					);
+					return;
+				}
+				if (!gone) activity.frozenMessageIds.push(messageId);
 				activity.messageId = undefined;
 				activity.lastText = undefined;
+				activity.lastButtons = undefined;
 			})
 			.catch((error) => {
 				this.reportError("Telegram run card could not be frozen", error);
+			})
+			.finally(() => {
+				activity.freezePending = false;
 			});
 		this.renderLiveActivity(activity);
 	}
@@ -5902,6 +5958,8 @@ export class TelegramTransportAdapter
 			if (startsIndependentTurn) {
 				current.events.splice(0);
 				current.thought = undefined;
+				current.notices.splice(0);
+				current.actionCount = 0;
 				current.startedAtMs = this.activityNowMs();
 				current.tools.splice(0);
 				current.subagentStatus = undefined;
@@ -5953,6 +6011,7 @@ export class TelegramTransportAdapter
 			events: [],
 			frozenMessageIds: [],
 			cardToken: this.makeIntentToken(),
+			actionCount: 0,
 		};
 		this.cardTokens.set(activity.cardToken, activity);
 		this.liveActivities.set(activityKey(chatId, sessionId), activity);
@@ -6008,7 +6067,10 @@ export class TelegramTransportAdapter
 		return truncateActivityText(
 			renderRunCard({
 				stateIcon: runCardStateIcon({
-					task: activity.task,
+					...(activity.task &&
+					["active", "blocked", "paused"].includes(activity.task.status)
+						? { task: activity.task }
+						: {}),
 					events: activity.events,
 				}),
 				status: activity.status,
@@ -6016,7 +6078,10 @@ export class TelegramTransportAdapter
 				...(activity.startedAtMs !== undefined
 					? { elapsedMs: this.activityNowMs() - activity.startedAtMs }
 					: {}),
-				...(activity.task ? { task: activity.task } : {}),
+				...(activity.task &&
+				["active", "blocked", "paused"].includes(activity.task.status)
+					? { task: activity.task }
+					: {}),
 				...(activity.thought ? { thought: activity.thought } : {}),
 				notices,
 				events: activity.events,
@@ -6025,7 +6090,20 @@ export class TelegramTransportAdapter
 		);
 	}
 
+	/** Card buttons act only while the card's run is live in this chat. */
+	private cardActionable(activity: LiveActivity): boolean {
+		return (
+			this.runningSessions.has(activity.sessionId) &&
+			!activity.finishing &&
+			!activity.unavailable &&
+			this.liveActivities.get(
+				activityKey(activity.chatId, activity.sessionId),
+			) === activity
+		);
+	}
+
 	private runCardKeyboard(activity: LiveActivity): unknown {
+		if (!this.cardActionable(activity)) return { inline_keyboard: [] };
 		return keyboard([
 			[
 				inlineButton("📋 Отчёт", `card:report:${activity.cardToken}`),
@@ -6074,7 +6152,9 @@ export class TelegramTransportAdapter
 							activity.chatId,
 							text,
 							{
-								reply_markup: this.runCardKeyboard(activity),
+								...(this.cardActionable(activity)
+									? { reply_markup: this.runCardKeyboard(activity) }
+									: {}),
 								disable_notification: true,
 								...(activity.sourceMessageId === undefined ||
 								activity.frozenMessageIds.length > 0
@@ -6104,9 +6184,12 @@ export class TelegramTransportAdapter
 							activity.sessionId,
 						);
 					activity.lastText = text;
+					activity.lastButtons = this.cardActionable(activity);
 					return;
 				}
-				if (activity.lastText === text) return;
+				const buttons = this.cardActionable(activity);
+				if (activity.lastText === text && activity.lastButtons === buttons)
+					return;
 				const edited = await this.telegramCall((signal) =>
 					this.bot.api.editMessageText(
 						activity.chatId,
@@ -6121,6 +6204,15 @@ export class TelegramTransportAdapter
 						activity.messageId = undefined;
 						activity.lastText = undefined;
 						this.renderLiveActivity(activity);
+					} else if (
+						isTransientTelegramError(edited.error) &&
+						telegramErrorCode(edited.error) !== undefined
+					) {
+						// Rate limits and server errors: the next render retries the edit.
+						this.reportError(
+							"Telegram run card edit was deferred",
+							edited.error,
+						);
 					} else {
 						activity.unavailable = true;
 						this.reportError(
@@ -6131,6 +6223,7 @@ export class TelegramTransportAdapter
 					return;
 				}
 				activity.lastText = text;
+				activity.lastButtons = buttons;
 			})
 			.catch((error) => {
 				this.reportError("Telegram activity update failed", error);
@@ -6379,9 +6472,7 @@ export class TelegramTransportAdapter
 				);
 		}
 		if (activity.messageId === undefined) return;
-		const actions = activity.events
-			.filter((event) => event.kind !== "thought")
-			.reduce((sum, event) => sum + event.count, 0);
+		const actions = activity.actionCount;
 		const elapsed =
 			activity.startedAtMs !== undefined
 				? ` за ${formatDuration(this.activityNowMs() - activity.startedAtMs)}`
@@ -6389,7 +6480,7 @@ export class TelegramTransportAdapter
 		const cost = activity.liveStatus?.usage?.costUsd;
 		const summary = [
 			`✅ Ход завершён${elapsed}`,
-			...(actions ? [`${actions} действий`] : []),
+			...(actions ? [actionsLabel(actions)] : []),
 			...(cost !== undefined ? [`~$${cost.toFixed(2)}`] : []),
 		].join(" · ");
 		const edited = await this.telegramCall((signal) =>
@@ -7874,6 +7965,9 @@ export class TelegramTransportAdapter
 			if (event.text === "agent_settled") {
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
+				// Card buttons are only live during a run.
+				for (const activity of this.activitiesForSession(event.sessionId))
+					this.renderLiveActivity(activity);
 				this.stopTyping(event.sessionId);
 				const turn = this.turnBuffers.get(event.sessionId);
 				if (turn) this.settleInputAttributions(turn);
@@ -8015,14 +8109,24 @@ export class TelegramTransportAdapter
 						redactDiagnosticText(event.summary, [this.options.token]),
 						700,
 					);
-					addToolEvent(
-						activity.events,
-						event.toolCallId,
-						summary,
-						this.activityClockLabel(),
-						this.activityNowMs(),
-					);
 					const role = approvedSubagentRole(summary);
+					// Workflow and management calls stay off the card (same rule as before).
+					if (meaningfulToolSummary(summary)) {
+						const isNew = !activity.events.some(
+							(candidate) => candidate.id === event.toolCallId,
+						);
+						if (
+							addToolEvent(
+								activity.events,
+								event.toolCallId,
+								role ? `subagent: запустил ${role}` : summary,
+								this.activityClockLabel(),
+								this.activityNowMs(),
+							) &&
+							isNew
+						)
+							activity.actionCount++;
+					}
 					const overflowAlreadyVisible = activity.tools.some(
 						(row) => row.id === OVERFLOW_ID,
 					);
@@ -8461,10 +8565,14 @@ export class TelegramTransportAdapter
 			)
 				attributed.add(record.chatId);
 		// Mid-run answers arrive silently; the settled answer keeps the notification sound.
-		this.deliverTurnText(sessionId, attributed, text, true);
-		// Keep the live card below the answer: freeze it in place and open a new one.
+		const recipients = this.deliverTurnText(sessionId, attributed, text, true);
+		// Keep the live card below the answer in the chats that received it.
 		for (const activity of this.activitiesForSession(sessionId))
-			if (activity.messageId !== undefined && !activity.finishing)
+			if (
+				recipients.has(activity.chatId) &&
+				activity.messageId !== undefined &&
+				!activity.finishing
+			)
 				this.freezeLiveActivity(activity);
 	}
 
@@ -8473,7 +8581,7 @@ export class TelegramTransportAdapter
 		attributedChats: ReadonlySet<number>,
 		text: string,
 		silent = false,
-	): void {
+	): ReadonlySet<number> {
 		const selectedChats = new Set<number>();
 		for (const [chatId, selectedId] of this.selected)
 			if (selectedId === sessionId) selectedChats.add(chatId);
@@ -8492,6 +8600,7 @@ export class TelegramTransportAdapter
 				silent,
 			);
 		}
+		return recipients;
 	}
 
 	private eventChannelDisabled(chatId: number): boolean {

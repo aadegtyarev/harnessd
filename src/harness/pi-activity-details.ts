@@ -24,7 +24,7 @@ export function thoughtSummary(content: string): string | undefined {
 		oneLine(match[1] ?? ""),
 	);
 	const title = titles.filter(Boolean).at(-1);
-	const plain = oneLine(content.replace(/[*_`#>]/g, ""));
+	const plain = oneLine(content.replace(/[*`#>]/g, ""));
 	const firstSentence = /^(.+?[.!?])(\s|$)/.exec(plain)?.[1] ?? plain;
 	const summary = title ?? firstSentence;
 	if (!summary) return undefined;

@@ -26,11 +26,24 @@ export type RunCardTask = {
 
 export const RUN_CARD_EVENT_HISTORY = 40;
 export const RUN_CARD_VISIBLE_EVENTS = 5;
-const COLLAPSIBLE = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+const COLLAPSIBLE = new Set([
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"edit",
+	"write",
+	// Coordination rows from the harness (waits, status polls, steering).
+	"⏸",
+	"🔎",
+	"📨",
+	"▶",
+]);
 
 /** Tool kind used for icons and collapsing, from a harness tool summary. */
 export function toolKind(summary: string): string {
-	return /^([a-z_][\w-]*)(?::|\s|$)/i.exec(summary)?.[1]?.toLowerCase() ?? "";
+	const named = /^([a-z_][\w-]*)(?::|\s|$)/i.exec(summary)?.[1]?.toLowerCase();
+	return named ?? summary.trim().split(/\s/, 1)[0] ?? "";
 }
 
 /** Appends a tool start, collapsing consecutive same-kind reads/edits/searches. */
@@ -50,11 +63,12 @@ export function addToolEvent(
 	}
 	const kind = toolKind(summary);
 	const last = events.at(-1);
+	// Only a finished row absorbs the next call, so parallel calls keep their own outcome.
 	if (
 		last &&
 		COLLAPSIBLE.has(kind) &&
 		last.kind === kind &&
-		last.state !== "failed"
+		last.state === "done"
 	) {
 		Object.assign(last, {
 			id,
@@ -148,8 +162,7 @@ export function formatRunCardEvent(event: RunCardEvent): string {
 	const kind = event.kind;
 	let text = event.text;
 	if (kind === "bash") text = text.replace(/^bash:\s*/, "");
-	else if (ICONS[kind] && kind !== "subagent")
-		text = text.replace(/^[a-z_]+:\s*/i, "");
+	else if (ICONS[kind]) text = text.replace(/^[a-z_]+:\s*/i, "");
 	const icon = ICONS[kind] ? `${ICONS[kind]} ` : "";
 	const count = event.count > 1 ? `${event.count}× ` : "";
 	const duration =
@@ -216,14 +229,24 @@ export function renderRunCard(input: RunCardInput): string {
 
 /** Card header icon: needs-you and waiting win over plain working. */
 export function runCardStateIcon(options: {
-	readonly finished?: "done" | "failed";
 	readonly task?: RunCardTask;
 	readonly events: readonly RunCardEvent[];
 }): string {
-	if (options.finished === "done") return "✅";
-	if (options.finished === "failed") return "⛔";
 	if (options.task?.status === "blocked") return "❓";
 	const running = options.events.filter((event) => event.state === "running");
 	if (running.some((event) => event.text.startsWith("⏸"))) return "⏸";
 	return "⏳";
+}
+
+/** Russian plural for "действие". */
+export function actionsLabel(count: number): string {
+	const mod10 = count % 10;
+	const mod100 = count % 100;
+	const word =
+		mod10 === 1 && mod100 !== 11
+			? "действие"
+			: mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)
+				? "действия"
+				: "действий";
+	return `${count} ${word}`;
 }

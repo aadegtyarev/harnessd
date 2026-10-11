@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	actionsLabel,
 	addThoughtEvent,
 	addToolEvent,
 	finishToolEvent,
@@ -41,6 +42,26 @@ describe("run card", () => {
 		expect(events.filter((event) => event.kind === "thought")).toHaveLength(1);
 	});
 
+	it("pluralizes the action count in Russian", () => {
+		expect([1, 2, 5, 11, 21, 22, 112].map(actionsLabel)).toEqual([
+			"1 действие",
+			"2 действия",
+			"5 действий",
+			"11 действий",
+			"21 действие",
+			"22 действия",
+			"112 действий",
+		]);
+	});
+
+	it("keeps parallel same-kind calls as separate rows", () => {
+		const events: RunCardEvent[] = [];
+		addToolEvent(events, "r1", "read: a.ts", "10:00", 0);
+		addToolEvent(events, "r2", "read: b.ts", "10:00", 0);
+		finishToolEvent(events, "r1", true, undefined, 5);
+		expect(events.map((event) => event.state)).toEqual(["failed", "running"]);
+	});
+
 	it("formats durations and header state", () => {
 		expect(formatDuration(42_000)).toBe("42с");
 		expect(formatDuration(125_000)).toBe("2м 5с");
@@ -54,7 +75,7 @@ describe("run card", () => {
 				task: { goal: "g", status: "blocked", step: 1 },
 			}),
 		).toBe("❓");
-		expect(runCardStateIcon({ events: [], finished: "done" })).toBe("✅");
+		expect(runCardStateIcon({ events: [] })).toBe("⏳");
 		const card = renderRunCard({
 			stateIcon: "⏳",
 			status: "работает",
