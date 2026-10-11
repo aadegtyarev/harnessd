@@ -13,9 +13,9 @@ Everything the operator needs stays at the bottom of the chat; nothing requires 
 - `📋` publishes a fresh panel at the bottom and deletes the previous panel message; panels are no longer pinned. Automatic refreshes keep editing the current panel in place.
 - Mid-run assistant messages are sent without notification sound; the answer delivered at run settlement keeps the sound.
 
-## Phase 2 — run card (next PR)
+## Phase 2 — run card (this PR)
 
-One live card per run and chat, always the last message: header state (working / waiting for agents / needs you / done / error) with elapsed time, task goal and latest progress from `/task`, the latest model thought (reasoning-summary title, ≤160 chars, never full reasoning), the last five events (bash with exit code and duration), and the usage line. Edited at most every 3 s; re-posted silently below each delivered answer; collapses to a one-line summary at run end; re-sent with sound when operator attention is needed.
+One live card per run and chat, always the last message: header state (working / waiting for agents / needs you / done / error) with elapsed time, task goal and latest progress from `/task`, the latest model thought (reasoning-summary title, ≤160 chars, never full reasoning), the last five events (bash with exit code and duration), and the usage line. Card buttons `📋 Отчёт` and `⛔ Прервать` (from claude-orchestrator); repeated reads/edits collapse; elapsed time has minute resolution so the card is not re-edited every second; a delivered mid-run answer freezes the card in place and opens a new one below (frozen pieces are deleted at the end); collapses to a one-line summary at run end. Deferred: sound when attention is needed.
 
 ## Phase 3 — agents section (final PR)
 
