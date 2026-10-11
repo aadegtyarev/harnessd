@@ -203,6 +203,12 @@ type TelegramBot = {
 			other?: unknown,
 			signal?: AbortSignal,
 		): Promise<unknown>;
+		unpinChatMessage?(
+			chatId: number,
+			messageId: number,
+			other?: unknown,
+			signal?: AbortSignal,
+		): Promise<unknown>;
 		getFile(
 			fileId: string,
 			signal?: AbortSignal,
@@ -1008,8 +1014,17 @@ function telegramRetryAfterMs(error: unknown): number | undefined {
 		return undefined;
 	const parameters = error.parameters as { retry_after?: unknown } | undefined;
 	return typeof parameters?.retry_after === "number"
-		? Math.min(parameters.retry_after * 1000, PANEL_RETRY_MAX_DELAY_MS)
+		? parameters.retry_after * 1000
 		: undefined;
+}
+/** Edit rejections that mean the old panel message is gone or frozen, so a fresh panel replaces it. */
+function isReplaceablePanelEditError(error: unknown): boolean {
+	const description = apiErrorDescription(error)?.toLowerCase() ?? "";
+	return (
+		description.includes("message to edit not found") ||
+		description.includes("message can't be edited") ||
+		description.includes("message_id_invalid")
+	);
 }
 function isMessageNotFound(error: unknown): boolean {
 	const description = apiErrorDescription(error)?.toLowerCase() ?? "";
@@ -4942,6 +4957,7 @@ export class TelegramTransportAdapter
 			this.panelMessageIds.get(chatId) ??
 			this.panelStore?.get(chatId) ??
 			messageId;
+		let replacedPanelId: number | undefined;
 		const referenceIsCurrent = (expected: number | undefined) =>
 			(this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId)) ===
 			expected;
@@ -4952,6 +4968,7 @@ export class TelegramTransportAdapter
 				!referenceIsCurrent(existing)
 			)
 				return false;
+			const clock = this.options.panelClock ?? Date.now;
 			const edit = () =>
 				this.telegramCall((signal) =>
 					this.bot.api.editMessageText(
@@ -4964,20 +4981,20 @@ export class TelegramTransportAdapter
 				);
 			let edited = await edit();
 			// Re-editing is idempotent ("not modified" counts as success), so transient failures retry.
-			for (
-				let attempt = 1;
-				attempt <= PANEL_EDIT_RETRIES &&
-				!edited.ok &&
-				!isMessageNotModified(edited.error) &&
-				isTransientTelegramError(edited.error);
-				attempt++
-			) {
-				await this.panelRetryDelay(
+			for (let attempt = 1; ; attempt++) {
+				if (edited.ok || isMessageNotModified(edited.error)) break;
+				if (!isTransientTelegramError(edited.error)) break;
+				// The failed edit may have landed: never let a later identical render be deduplicated.
+				this.panelStaleChats.add(chatId);
+				const delay =
 					telegramRetryAfterMs(edited.error) ??
-						PANEL_RETRY_BASE_DELAY_MS * attempt,
-				);
+					PANEL_RETRY_BASE_DELAY_MS * attempt;
+				if (attempt > PANEL_EDIT_RETRIES || delay > PANEL_RETRY_MAX_DELAY_MS)
+					break;
+				await this.panelRetryDelay(delay);
 				if (this.stopping || !isCurrent() || !referenceIsCurrent(existing))
 					return false;
+				this.panelPublicationTimes.set(chatId, clock());
 				edited = await edit();
 			}
 			if (edited.ok || isMessageNotModified(edited.error)) {
@@ -4995,7 +5012,15 @@ export class TelegramTransportAdapter
 				this.panelStaleChats.add(chatId);
 				return false;
 			}
-			// A definite rejection (deleted, too old, not editable): publish a fresh panel instead.
+			if (!isReplaceablePanelEditError(edited.error)) {
+				this.dropPanelGenerationIntents(chatId, generation);
+				if (!isCurrent() || !referenceIsCurrent(existing)) return false;
+				this.panelStaleChats.add(chatId);
+				await this.notifyPanelStale(chatId);
+				return false;
+			}
+			// The old panel is gone or frozen: publish a fresh panel instead.
+			replacedPanelId = isMessageNotFound(edited.error) ? undefined : existing;
 		}
 		const intentGeneration = this.panelGenerations.get(chatId);
 		const hasBoundIntents =
@@ -5074,6 +5099,22 @@ export class TelegramTransportAdapter
 				chatId,
 				"Панель открыта, но Telegram не закрепил её. Её можно обновить командой /menu.",
 			);
+		} else if (replacedPanelId !== undefined && this.bot.api.unpinChatMessage) {
+			// Best effort: the frozen predecessor should not stay pinned next to the new panel.
+			const unpinned = await this.telegramCall(
+				(signal) =>
+					this.bot.api.unpinChatMessage?.(
+						chatId,
+						replacedPanelId,
+						{},
+						signal,
+					) ?? Promise.resolve(true),
+			);
+			if (!unpinned.ok)
+				this.reportError(
+					"Replaced Telegram control panel could not be unpinned",
+					unpinned.error,
+				);
 		}
 		return true;
 	}
