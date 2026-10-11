@@ -84,6 +84,11 @@ export type HarnessActivityEvent =
 			readonly limit?: number;
 	  }
 	| {
+			/** A subagent completion notice delivered to the parent session. */
+			readonly type: "agent_notice";
+			readonly text: string;
+	  }
+	| {
 			readonly type: "notification";
 			readonly text: string;
 			readonly level?: string;

@@ -108,3 +108,23 @@ export function coordinationSummary(
 	const label = labels[args.action];
 	return label ? `${label}${target ? ` ${target}` : ""}` : undefined;
 }
+
+const NOTICE_LIMIT = 2000;
+
+/** Completion notice of a pi-subagents run ("subagent-notify" custom message), redacted. */
+export function subagentNotice(message: unknown): string | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const record = message as {
+		role?: unknown;
+		customType?: unknown;
+		content?: unknown;
+	};
+	if (record.role !== "custom" || record.customType !== "subagent-notify")
+		return undefined;
+	const content =
+		typeof record.content === "string"
+			? record.content
+			: resultText({ content: record.content });
+	if (!content.trim()) return undefined;
+	return clip(redactDiagnosticText(content), NOTICE_LIMIT);
+}

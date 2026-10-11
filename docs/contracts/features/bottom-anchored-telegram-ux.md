@@ -17,7 +17,7 @@ Everything the operator needs stays at the bottom of the chat; nothing requires 
 
 One live card per run and chat, always the last message: header state (working / waiting for agents / needs you / done / error) with elapsed time, task goal and latest progress from `/task`, the latest model thought (reasoning-summary title, ≤160 chars, never full reasoning), the last five events (bash with exit code and duration), and the usage line. Card buttons `📋 Отчёт` and `⛔ Прервать` (from claude-orchestrator); repeated reads/edits collapse; elapsed time has minute resolution so the card is not re-edited every second; a delivered mid-run answer freezes the card in place and opens a new one below (frozen pieces are deleted at the end); collapses to a one-line summary at run end. Deferred: sound when attention is needed.
 
-## Phase 3 — agents section (final PR)
+## Phase 3 — agents section (this PR)
 
 One row per subagent run (parallel runs are separate rows), workflow steps indented under their parent, states queued/running/paused/asking/complete/partial/failed/stopped, elapsed time, current tool, reviewer verdict for finished reviewers, at most six rows with running/asking first, and "the parent waits for: …". Snapshot state `complete` is recognized.
 

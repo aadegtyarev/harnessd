@@ -53,6 +53,14 @@ import {
 	updateActivityRow,
 } from "./telegram-activity-projection.js";
 import {
+	type AgentRun,
+	type AgentVerdict,
+	agentVerdict,
+	latestAgentSnapshot,
+	renderAgentBoard,
+	shortRunId,
+} from "./telegram-agent-board.js";
+import {
 	extensionCommands,
 	isNativeTelegramCommand,
 	paginateTelegramHelp,
@@ -1361,6 +1369,12 @@ export class TelegramTransportAdapter
 	private readonly panelStaleChats = new Set<number>();
 	/** Panels that must be repainted after an uncertain Telegram failure, without user-visible text. */
 	private readonly panelRepairChats = new Set<number>();
+	/** Latest pi-subagents snapshot and reviewer verdicts per session. */
+	private readonly agentSnapshots = new Map<SessionId, AgentRun[]>();
+	private readonly agentVerdicts = new Map<
+		SessionId,
+		Map<string, AgentVerdict>
+	>();
 	/** Run cards by their button token. */
 	private readonly cardTokens = new Map<string, LiveActivity>();
 	/** Chats that received the persistent control keyboard in this process. */
@@ -6039,7 +6053,10 @@ export class TelegramTransportAdapter
 		const notices: string[] = [];
 		if (activity.thinking && !activity.thought) notices.push("Думаю…");
 		notices.push(...activity.notices.slice(-3));
-		for (const status of activity.childStatuses.values()) notices.push(status);
+		const agents = this.agentBoardLines(activity);
+		if (!agents.length)
+			for (const status of activity.childStatuses.values())
+				notices.push(status);
 		const visibleInputs = activity.queuedInputs.slice(-5);
 		const olderUnresolved = activity.queuedInputs
 			.slice(0, -visibleInputs.length)
@@ -6083,10 +6100,38 @@ export class TelegramTransportAdapter
 					? { task: activity.task }
 					: {}),
 				...(activity.thought ? { thought: activity.thought } : {}),
+				agents,
 				notices,
 				events: activity.events,
 				footer: `${compactUsage(live?.usage)} · ${model} · ${effort}`,
 			}),
+		);
+	}
+
+	private agentBoardLines(activity: LiveActivity): string[] {
+		const runs = this.agentSnapshots.get(activity.sessionId) ?? [];
+		if (!runs.length) return [];
+		const byShortId = new Map(
+			runs
+				.flatMap((run) => [run, ...run.children])
+				.filter((run) => shortRunId(run))
+				.map((run) => [shortRunId(run), run]),
+		);
+		// "⏸ ждёт агентов #id" rows that are still running name whom the parent waits for.
+		const waitingFor = activity.events
+			.filter(
+				(event) => event.state === "running" && event.text.startsWith("⏸"),
+			)
+			.flatMap((event) => [...event.text.matchAll(/#([0-9a-z-]{4,8})/gi)])
+			.map((match) => {
+				const run = byShortId.get(match[1] ?? "");
+				return run ? `${run.label} #${shortRunId(run)}` : `#${match[1]}`;
+			});
+		return renderAgentBoard(
+			runs,
+			this.activityNowMs(),
+			this.agentVerdicts.get(activity.sessionId),
+			[...new Set(waitingFor)],
 		);
 	}
 
@@ -8058,6 +8103,22 @@ export class TelegramTransportAdapter
 		event: HarnessActivityEvent,
 	): void {
 		const activities = this.activitiesForSession(sessionId);
+		if (event.type === "agent_notice") {
+			const verdict = agentVerdict(event.text);
+			if (!verdict) return;
+			const verdicts = this.agentVerdicts.get(sessionId) ?? new Map();
+			verdicts.set(verdict.agent, verdict);
+			this.agentVerdicts.set(sessionId, verdicts);
+			for (const activity of activities) this.renderLiveActivity(activity);
+			return;
+		}
+		if (event.type === "notification") {
+			const snapshot = latestAgentSnapshot(event.text);
+			if (snapshot) {
+				this.agentSnapshots.set(sessionId, snapshot);
+				for (const activity of activities) this.renderLiveActivity(activity);
+			}
+		}
 		const notification =
 			event.type === "notification"
 				? new SubagentTextStream().consume(event.text, true)

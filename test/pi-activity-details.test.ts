@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	bashExitDetail,
 	coordinationSummary,
+	subagentNotice,
 	taskActivity,
 	thoughtSummary,
 } from "../src/harness/pi-activity-details.js";
@@ -77,5 +78,19 @@ describe("Pi activity details", () => {
 			coordinationSummary("subagent", { agent: "worker" }),
 		).toBeUndefined();
 		expect(coordinationSummary("read", {})).toBeUndefined();
+	});
+
+	it("forwards only subagent completion notices", () => {
+		expect(
+			subagentNotice({
+				role: "custom",
+				customType: "subagent-notify",
+				content: "Background task completed: **reviewer** password=hunter2",
+			}),
+		).toBe("Background task completed: **reviewer** password=[REDACTED]");
+		expect(
+			subagentNotice({ role: "custom", customType: "other", content: "x" }),
+		).toBeUndefined();
+		expect(subagentNotice({ role: "assistant", content: "x" })).toBeUndefined();
 	});
 });
