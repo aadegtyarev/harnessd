@@ -1068,6 +1068,19 @@ class PiRpcInstance implements HarnessInstance {
 			this.captureCostResult(record.message);
 			return;
 		}
+		if (record.type === "message_end") {
+			// Message boundaries let transports deliver each answer before the run settles.
+			if (
+				(record.message as Record<string, unknown> | undefined)?.role ===
+				"assistant"
+			)
+				this.emit({
+					sessionId: this.sessionId,
+					kind: "status",
+					text: "message_end",
+				});
+			return;
+		}
 		if (record.type === "extension_error") {
 			if (this.reloadDispatched) {
 				this.reloadExtensionError = true;
