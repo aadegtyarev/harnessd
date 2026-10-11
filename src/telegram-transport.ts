@@ -5067,8 +5067,8 @@ export class TelegramTransportAdapter
 			return false;
 		}
 		if (existing !== undefined && existing !== createdMessageId) {
-			let retired = this.retiredPanelIds.get(chatId);
-			if (!retired) this.retiredPanelIds.set(chatId, (retired = new Set()));
+			const retired = this.retiredPanelIds.get(chatId) ?? new Set<number>();
+			this.retiredPanelIds.set(chatId, retired);
 			if (retired.size >= 32)
 				retired.delete(retired.values().next().value as number);
 			retired.add(existing);
