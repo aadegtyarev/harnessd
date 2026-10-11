@@ -1510,10 +1510,19 @@ describe("Telegram transport", () => {
 				true,
 			),
 		);
+		emit(harnessEvent("sid", "output", "final answer"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		const answers = bot.sent.filter(({ text }) => text.includes("answer"));
-		expect(answers).toHaveLength(2);
+		expect(answers).toHaveLength(3);
+		const optionsOf = (needle: string) =>
+			bot.sendOptions[bot.sent.findIndex(({ text }) => text.includes(needle))];
+		expect(optionsOf("first answer")).toMatchObject({
+			disable_notification: true,
+		});
+		expect(optionsOf("final answer")).not.toHaveProperty(
+			"disable_notification",
+		);
 		expect(answers[1]?.text).not.toContain("first answer");
 		expect(bot.sent.some(({ text }) => text.includes("message_end"))).toBe(
 			false,
@@ -1537,6 +1546,71 @@ describe("Telegram transport", () => {
 				),
 			).toBe(true),
 		);
+		await adapter.stop();
+	});
+
+	it("sends the persistent control keyboard before the welcome message", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/start");
+		const keyboardIndex = bot.sent.findIndex(({ text }) =>
+			text.includes("Кнопки управления"),
+		);
+		expect(keyboardIndex).toBeGreaterThanOrEqual(0);
+		expect(bot.sendOptions[keyboardIndex]).toMatchObject({
+			reply_markup: {
+				is_persistent: true,
+				keyboard: [
+					[{ text: "📊 Ход" }, { text: "📋 Панель" }],
+					[{ text: "✋ Прервать" }, { text: "🗂 Сессии" }],
+				],
+			},
+		});
+		expect(bot.sent.at(-1)?.text).toContain("Добро пожаловать");
+		await adapter.stop();
+	});
+
+	it("publishes the panel at the bottom from the panel button and deletes the old one", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		await bot.update(42, "📋 Панель");
+		const newPanel = bot.lastMessageId as number;
+		expect(newPanel).toBeGreaterThan(oldPanel);
+		expect(bot.sent.at(-1)?.text).toContain("📌 Панель сессий");
+		expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+			42,
+			oldPanel,
+			expect.anything(),
+		);
+		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
+		expect(requests.some(({ kind }) => kind === "submit")).toBe(false);
+		await bot.callback(42, "session:next", oldPanel);
+		expect(
+			(
+				adapter as unknown as { panelMessageIds: Map<number, number> }
+			).panelMessageIds.get(42),
+		).toBe(newPanel);
+		await adapter.stop();
+	});
+
+	it("routes control buttons as commands and confirms before cancelling", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "🗂 Сессии");
+		expect(bot.sent.at(-1)?.text).toContain("#sid");
+		await bot.update(42, "✋ Прервать");
+		expect(bot.sent.at(-1)?.text).toContain("Прервать текущий ход");
+		const confirmId = bot.lastMessageId as number;
+		const no = callbackData(bot.sendOptions.at(-1), "run-cancel:no:");
+		const yes = callbackData(bot.sendOptions.at(-1), "run-cancel:yes:");
+		await bot.callback(42, no, confirmId);
+		expect(bot.edited.at(-1)?.text).toBe("Ход не прерывался.");
+		await bot.callback(42, yes, confirmId);
+		expect(bot.edited.at(-1)?.text).toBe("Ход не прерывался.");
+		expect(requests.some(({ kind }) => kind === "submit")).toBe(false);
 		await adapter.stop();
 	});
 
@@ -3677,19 +3751,19 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("creates one pinned panel, browses sessions, selects explicitly, and guards callbacks", async () => {
+	it("creates one unpinned panel, browses sessions, selects explicitly, and guards callbacks", async () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
 		const panelMessageId = bot.lastMessageId;
 		expect(panelMessageId).toBeDefined();
-		expect(bot.pinned).toEqual([{ chatId: 42, messageId: panelMessageId }]);
+		expect(bot.pinned).toEqual([]);
 		expect(bot.sent.at(-1)?.text).toContain(
 			"✉️ Сообщения → никуда (сессия не выбрана)",
 		);
 		await bot.update(42, "/menu");
 		expect(bot.api.editMessageText).not.toHaveBeenCalled();
-		expect(bot.api.pinChatMessage).toHaveBeenCalledOnce();
+		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
 
 		await bot.callback(42, "session:next", panelMessageId);
 		expect(bot.edited.at(-1)?.text).toContain("Просмотр: #other");
@@ -5146,33 +5220,6 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("does not pin a replacement after its intent is invalidated", async () => {
-		const bot = new MockBot();
-		let releaseSleep!: () => void;
-		let enteredSleep!: () => void;
-		const entered = new Promise<void>((resolve) => {
-			enteredSleep = resolve;
-		});
-		const gate = new Promise<void>((resolve) => {
-			releaseSleep = resolve;
-		});
-		const { adapter } = await startAdapter(bot, await temp(), {
-			panelSleep: async () => {
-				enteredSleep();
-				await gate;
-			},
-		});
-		const menu = bot.update(42, "/menu");
-		await entered;
-		(
-			adapter as unknown as { panelIntents: { begin(chatId: number): number } }
-		).panelIntents.begin(42);
-		releaseSleep();
-		await menu;
-		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
-		await adapter.stop();
-	});
-
 	it("retries transient panel edit failures silently and never resends after an uncertain edit", async () => {
 		const bot = new MockBot();
 		const delays: number[] = [];
@@ -5363,7 +5410,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/menu");
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
 		expect(bot.sent.at(-1)?.text).toContain("Telegram отклонил");
-		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(1);
+		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
 		await adapter.stop();
 	});
 
@@ -5386,7 +5433,7 @@ describe("Telegram transport", () => {
 			await bot.update(42, "/menu");
 		}
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 2);
-		expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(3);
+		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
 		expect(bot.api.unpinChatMessage).toHaveBeenCalledOnce();
 		expect(
 			bot.sent.some(({ text }) => text.includes("Telegram отклонил")),
@@ -5552,18 +5599,6 @@ describe("Telegram transport", () => {
 		expect(
 			requests.filter((request) => request.kind === "delete"),
 		).toHaveLength(actions);
-		await adapter.stop();
-	});
-
-	it("keeps slash commands available when Telegram cannot pin the panel", async () => {
-		const bot = new MockBot();
-		const { adapter, requests } = await startAdapter(bot, await temp());
-		bot.api.pinChatMessage.mockRejectedValueOnce(new Error("pin unavailable"));
-		await bot.update(42, "/menu");
-		expect(bot.sent.at(-1)?.text).toContain("Telegram не закрепил");
-		await bot.update(42, "/sessions");
-		expect(requests.at(-1)).toMatchObject({ kind: "list" });
-		expect(bot.sent.at(-1)?.text).toContain("#sid");
 		await adapter.stop();
 	});
 
@@ -6971,7 +7006,7 @@ describe("Telegram transport", () => {
 				} else {
 					expect(panelId).toBeDefined();
 					expect(panelId).not.toBe(welcomeId);
-					expect(bot.pinned.at(-1)?.messageId).toBe(panelId);
+					expect(bot.pinned).toHaveLength(initialPins);
 					if (action === "sessions")
 						expect(bot.edited.at(-1)?.text).toContain("Сессии ·");
 				}
@@ -7071,8 +7106,8 @@ describe("Telegram transport", () => {
 		const panelId = store.get(42);
 		expect(panelId).toBeDefined();
 		expect(panelId).not.toBe(welcomeId);
-		expect(bot.pinned).toHaveLength(welcomePins + 1);
-		expect(bot.pinned.at(-1)?.messageId).toBe(panelId);
+		expect(bot.pinned).toHaveLength(welcomePins);
+
 		const selectOther = callbackData(
 			bot.edited.at(-1)?.options,
 			"session:select:other",
@@ -7092,7 +7127,7 @@ describe("Telegram transport", () => {
 			sessionId: "other",
 		});
 		expect(store.get(42)).toBe(panelId);
-		expect(bot.pinned.at(-1)?.messageId).toBe(panelId);
+		expect(bot.pinned).toEqual([]);
 		await adapter.stop();
 	});
 

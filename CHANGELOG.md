@@ -15,6 +15,7 @@ All notable changes to harnessd are recorded here. Entries under `Unreleased` ar
 
 ### Changed
 
+- Telegram controls are bottom-anchored: a persistent keyboard (`📊 Ход`, `📋 Панель`, `✋ Прервать` with confirmation, `🗂 Сессии`), `📋` posts the panel at the bottom and removes the old one, panels are no longer pinned, and mid-run answers arrive silently while the final answer keeps the sound.
 - The Telegram session panel reads more plainly: `✉️ Сообщения →` for the selected session and `👁 Просмотр` (or `та же сессия`) separated by a rule, short 8-character IDs, one combined Russian status line instead of duplicated English/Russian status fields, no redundant `Существует`/`Выбрана для сообщений` lines or live-data notice for stopped sessions, the creation folder at the bottom, and preview buttons without the word «просмотр».
 - Git-source installs build the CLI before npm installs the package.
 
