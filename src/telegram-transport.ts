@@ -2051,11 +2051,8 @@ export class TelegramTransportAdapter
 			const replyTo = ctx.message?.reply_to_message?.message_id;
 			const pending =
 				replyTo === undefined ? undefined : this.pendingNames.get(chatId);
-			if (pending && pending.promptMessageId === replyTo) {
-				await this.handleNameReply(chatId, sender, pending, text);
-				return;
-			}
-			// Keyboard labels are commands even when Telegram sends the tap as a reply.
+			// Keyboard labels are commands even when Telegram sends the tap as a reply
+			// (including to a name prompt), so a label never becomes a name or a prompt.
 			const control = Object.values(CONTROL_BUTTONS).find(
 				(button) => button === text.trim(),
 			);
@@ -2067,6 +2064,10 @@ export class TelegramTransportAdapter
 						control,
 						ctx.message?.message_id,
 					);
+				return;
+			}
+			if (pending && pending.promptMessageId === replyTo) {
+				await this.handleNameReply(chatId, sender, pending, text);
 				return;
 			}
 			const knownReplyRoute =

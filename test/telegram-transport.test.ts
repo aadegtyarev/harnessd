@@ -1658,6 +1658,18 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("never uses a control button label as a session name", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		await bot.callback(42, "menu:new", bot.lastMessageId);
+		const promptId = bot.lastForceReplyMessageId as number;
+		await bot.update(42, "📋 Панель", { replyToMessageId: promptId });
+		expect(requests.some(({ kind }) => kind === "create")).toBe(false);
+		expect(bot.sent.at(-1)?.text).toContain("📌 Панель сессий");
+		await adapter.stop();
+	});
+
 	it("keeps the old panel when publishing the bottom panel fails", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
