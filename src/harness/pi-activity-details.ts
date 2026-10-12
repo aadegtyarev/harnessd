@@ -110,6 +110,8 @@ export function coordinationSummary(
 }
 
 const NOTICE_LIMIT = 4000;
+const NOTICE_KEEP_LINE =
+	/^(?:\d+\. \S|Workflow run: |Retention-managed async directory: )/;
 
 /** Completion notice of a pi-subagents run ("subagent-notify" custom message), redacted. */
 export function subagentNotice(message: unknown): string | undefined {
@@ -126,5 +128,18 @@ export function subagentNotice(message: unknown): string | undefined {
 			? record.content
 			: resultText({ content: record.content });
 	if (!content.trim()) return undefined;
-	return clip(redactDiagnosticText(content), NOTICE_LIMIT);
+	const redacted = redactDiagnosticText(content);
+	const clipped = clip(redacted, NOTICE_LIMIT);
+	if (clipped === redacted) return clipped;
+	// Long previews push the run-ID lines past the limit; keep them (with their
+	// grouped block headers) so verdicts still pair with the exact run.
+	const tail = [...redacted]
+		.slice(NOTICE_LIMIT - 1)
+		.join("")
+		.split("\n")
+		.slice(1)
+		.filter((line) => NOTICE_KEEP_LINE.test(line))
+		// Grouped block headers keep the blank line that opens a block.
+		.map((line) => (/^\d+\. /.test(line) ? `\n${line}` : line));
+	return tail.length ? `${clipped}\n${tail.join("\n")}` : clipped;
 }

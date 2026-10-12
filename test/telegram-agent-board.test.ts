@@ -92,63 +92,118 @@ describe("agent board", () => {
 		expect(board.at(-1)).toBe("… ещё 5");
 	});
 
-	it("pairs verdicts with repeated, parallel, and grouped runs of the same agent", () => {
+	it("pairs verdicts with runs by the run ID each notice carries", () => {
+		const finished = (id: string, label: string, endedAt: number) => ({
+			id,
+			kind: "subagent",
+			label,
+			state: "complete",
+			startedAt: 0,
+			endedAt,
+		});
 		const runs = snapshot([
+			finished("11111111-a", "reviewer", 10),
+			finished("22222222-b", "reviewer", 20),
+			finished("33333333-c", "reviewer", 30),
+			finished("44444444-d", "worker", 40),
+		]);
+		const dir = (id: string) =>
+			`Retention-managed async directory: /home/u/.pi/async/${id}`;
+		const verdicts = [
+			// Arrives last but belongs to the oldest run.
+			...agentVerdicts(
+				`Background tasks completed (2): **reviewer**, **worker**\n\n1. reviewer\n## Reviewer verdict\n**REQUEST_CHANGES**\n\n1. Fix the parser\n2. worker is fine\n${dir("33333333-c")}\n\n2. worker\nDone.\n${dir("44444444-d")}`,
+			),
+			...agentVerdicts(
+				`Background task completed: **reviewer**\n\n## Review\n\n**APPROVE**\n\n${dir("22222222-b")}`,
+			),
+			...agentVerdicts(
+				`Background task completed: **reviewer**\n\n## Review\n\n**REQUEST_CHANGES**\n\n- **P1 — first run**\n\n${dir("11111111-a")}`,
+			),
+		];
+		expect(
+			verdicts.map(
+				({ agent, runId, verdict }) => `${agent}:${runId}:${verdict}`,
+			),
+		).toEqual([
+			"reviewer:33333333-c:REQUEST_CHANGES",
+			"worker:44444444-d:готово",
+			"reviewer:22222222-b:APPROVE",
+			"reviewer:11111111-a:REQUEST_CHANGES",
+		]);
+		const text = renderAgentBoard(runs, 100, { verdicts }).join("\n");
+		expect(text).toContain("✅ reviewer #33333333 · <1м · REQUEST_CHANGES");
+		expect(text).toContain("✅ reviewer #22222222 · <1м · APPROVE");
+		expect(text).toContain(
+			"✅ reviewer #11111111 · <1м · REQUEST_CHANGES: P1 — first run",
+		);
+		expect(
+			agentVerdicts(
+				"Background task failed: **worker**\n\nboom\n\nWorkflow run: wf-1",
+			),
+		).toEqual([{ agent: "worker", runId: "wf-1", verdict: "ошибка" }]);
+	});
+
+	it("shows no verdict when a notice without an ID is ambiguous", () => {
+		const runs = snapshot(
+			["11111111-a", "22222222-b"].map((id, index) => ({
+				id,
+				kind: "subagent",
+				label: "reviewer",
+				state: "complete",
+				startedAt: 0,
+				endedAt: index + 1,
+			})),
+		);
+		const verdicts = agentVerdicts(
+			"Background task completed: **reviewer**\n\n## Review\n**APPROVE**",
+		);
+		expect(renderAgentBoard(runs, 100, { verdicts }).join("\n")).not.toContain(
+			"APPROVE",
+		);
+		const one = snapshot([
 			{
 				id: "11111111-a",
 				kind: "subagent",
 				label: "reviewer",
 				state: "complete",
 				startedAt: 0,
-				endedAt: 10,
-			},
-			{
-				id: "22222222-b",
-				kind: "subagent",
-				label: "reviewer",
-				state: "complete",
-				startedAt: 0,
-				endedAt: 20,
-			},
-			{
-				id: "33333333-c",
-				kind: "subagent",
-				label: "reviewer, reviewer",
-				state: "complete",
-				startedAt: 0,
-				endedAt: 30,
+				endedAt: 1,
 			},
 		]);
-		const verdicts = [
-			...agentVerdicts(
-				"Background task completed: **reviewer**\n\n## Review\n\n**REQUEST_CHANGES**\n\n- **P1 — first run**",
-			),
-			...agentVerdicts(
-				"Background task completed: **reviewer**\n\n## Review\n\n**APPROVE**",
-			),
-			...agentVerdicts(
-				"Background tasks completed (2): **reviewer**, **worker**\n\n1. reviewer\n## Reviewer verdict\nNot APPROVED yet: **REQUEST_CHANGES**\n2. worker\nDone.",
-			),
-		];
-		expect(verdicts.map(({ agent, verdict }) => `${agent}:${verdict}`)).toEqual(
-			[
-				"reviewer:REQUEST_CHANGES",
-				"reviewer:APPROVE",
-				"reviewer:REQUEST_CHANGES",
-				"worker:готово",
-			],
+		expect(renderAgentBoard(one, 100, { verdicts }).join("\n")).toContain(
+			"✅ reviewer #11111111 · <1м · APPROVE",
 		);
-		const text = renderAgentBoard(runs, 100, { verdicts }).join("\n");
-		expect(text).toContain(
-			"✅ reviewer, reviewer #33333333 · <1м · REQUEST_CHANGES",
+	});
+
+	it("marks a run whose cut step asks the parent", () => {
+		const runs = snapshot(
+			Array.from({ length: 6 }, (_, index) => ({
+				id: `${index}`.repeat(8),
+				kind: index === 0 ? "workflow" : "subagent",
+				label: index === 0 ? "review-loop" : `agent-${index}`,
+				state: "running",
+				startedAt: index,
+				...(index === 0
+					? {
+							children: [
+								{
+									id: "s1",
+									kind: "step",
+									label: "reviewer",
+									state: "running",
+									activity: { state: "needs_attention" },
+								},
+							],
+						}
+					: {}),
+			})),
 		);
-		expect(text).toContain("✅ reviewer #22222222 · <1м · APPROVE");
-		expect(text).toContain(
-			"✅ reviewer #11111111 · <1м · REQUEST_CHANGES: P1 — first run",
+		const board = renderAgentBoard(runs, 10);
+		expect(board[1]).toBe(
+			"❓ review-loop #00000000 · <1м · reviewer спрашивает родителя",
 		);
-		expect(agentVerdicts("Background task failed: **worker**")).toEqual([
-			{ agent: "worker", verdict: "ошибка" },
-		]);
+		expect(board.at(-1)).toBe("… ещё 1");
 	});
 
 	it("bounds the wait line, waits for all without IDs, and hides old finished runs", () => {

@@ -32,6 +32,8 @@ export type AgentSnapshot = {
 /** Outcome of one finished run, taken from the parent's completion notice. */
 export type AgentVerdict = {
 	readonly agent: string;
+	/** Run ID from the notice's correlation lines, when it carries one. */
+	readonly runId?: string;
 	readonly verdict: string;
 	readonly finding?: string;
 };
@@ -141,10 +143,30 @@ const NOTICE_STATES: Record<string, string> = {
 	stopped: "остановлен",
 };
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Run ID of one notice block: the async directory name or the workflow run. */
+function noticeRunId(block: string): string | undefined {
+	const workflow = /^Workflow run: (\S+)\s*$/m.exec(block)?.[1];
+	if (workflow) return workflow;
+	const dir = /^Retention-managed async directory: (.+?)\s*$/m.exec(block)?.[1];
+	const name = dir?.split(/[\\/]/).filter(Boolean).at(-1);
+	return name && !name.endsWith("…") ? name : undefined;
+}
+
+function noticeVerdict(agent: string, block: string): AgentVerdict {
+	const runId = noticeRunId(block);
+	return { agent, ...(runId ? { runId } : {}), ...reviewVerdict(block) };
+}
+
 /**
  * Parses pi-subagents completion notices: single and detached notices
  * ("Background task completed: **reviewer**") and grouped ones
  * ("Background tasks completed (2): **a**, **b**" with "N. agent" blocks).
+ * Grouped blocks are split only at the "N. name" lines the header names, so
+ * numbered lists inside a result preview stay in their block.
  */
 export function agentVerdicts(notice: string): AgentVerdict[] {
 	const single =
@@ -153,19 +175,42 @@ export function agentVerdicts(notice: string): AgentVerdict[] {
 		);
 	if (single?.[1] && single[2]) {
 		const agent = single[2].trim();
-		if (single[1] !== "completed")
-			return [{ agent, verdict: NOTICE_STATES[single[1]] ?? single[1] }];
-		return [{ agent, ...reviewVerdict(notice) }];
+		if (single[1] === "completed") return [noticeVerdict(agent, notice)];
+		const runId = noticeRunId(notice);
+		return [
+			{
+				agent,
+				...(runId ? { runId } : {}),
+				verdict: NOTICE_STATES[single[1]] ?? single[1],
+			},
+		];
 	}
-	if (!/^Background tasks completed \(\d+\):/.test(notice)) return [];
-	const parts = notice.split(/^\d+\. ([\w.-]+)[^\n]*$/m);
-	const verdicts: AgentVerdict[] = [];
-	for (let index = 1; index + 1 < parts.length; index += 2)
-		verdicts.push({
-			agent: parts[index] as string,
-			...reviewVerdict(parts[index + 1] as string),
-		});
-	return verdicts;
+	const header = /^Background tasks completed \(\d+\): ([^\n]*)/.exec(notice);
+	if (!header?.[1]) return [];
+	const names = [...header[1].matchAll(/\*\*([^*]+)\*\*/g)].map((match) =>
+		(match[1] as string).trim(),
+	);
+	const starts: number[] = [];
+	let from = header[0].length;
+	for (const [index, name] of names.entries()) {
+		// Blocks follow a blank line; the header line is "N. name", optionally
+		// followed by task info or a schedule note, never by free text.
+		const marker = new RegExp(
+			`\\n\\n${index + 1}\\. ${escapeRegExp(name)}(?: ?\\(| — |\\n|$)`,
+			"g",
+		);
+		marker.lastIndex = from;
+		const match = marker.exec(notice);
+		if (!match) break;
+		starts.push(match.index);
+		from = match.index + match[0].length;
+	}
+	return starts.map((start, index) =>
+		noticeVerdict(
+			names[index] as string,
+			notice.slice(start, starts[index + 1] ?? notice.length),
+		),
+	);
 }
 
 const STATE_ICONS: Record<string, string> = {
@@ -226,34 +271,49 @@ function agentNames(label: string): string[] {
 }
 
 /**
- * Pairs verdicts (in arrival order) with finished runs of the same agent (in end order),
- * newest with newest, so repeated or parallel runs of one agent each keep their own verdict.
+ * Pairs verdicts with finished runs by the run ID the notice carries. A notice
+ * without an ID falls back to the agent name, and only when exactly one
+ * unpaired finished run and one such notice share that name, so an ambiguous
+ * pairing shows no verdict instead of a wrong one.
  */
 export function assignVerdicts(
 	runs: readonly AgentRun[],
 	verdicts: readonly AgentVerdict[],
 ): Map<AgentRun, AgentVerdict> {
 	const assigned = new Map<AgentRun, AgentVerdict>();
-	const finished = runs
-		.flatMap(allNodes)
-		.filter((run) => !isActive(run) && run.kind !== "workflow");
-	for (const agent of new Set(verdicts.map((verdict) => verdict.agent))) {
-		const matching = finished
-			.filter((run) =>
-				agentNames(run.label).some(
-					(name) => name === agent || agent.startsWith(name),
-				),
-			)
-			.sort((left, right) => (right.endedAt ?? 0) - (left.endedAt ?? 0));
-		const forAgent = verdicts
-			.filter((verdict) => verdict.agent === agent)
-			.reverse();
-		matching.forEach((run, index) => {
-			const verdict = forAgent[index];
-			if (verdict) assigned.set(run, verdict);
-		});
+	const finished = runs.flatMap(allNodes).filter((run) => !isActive(run));
+	const unpaired: AgentVerdict[] = [];
+	for (const verdict of verdicts) {
+		const run = verdict.runId
+			? finished.find((candidate) => candidate.id === verdict.runId)
+			: undefined;
+		if (run) assigned.set(run, verdict);
+		else if (!verdict.runId) unpaired.push(verdict);
+	}
+	for (const agent of new Set(unpaired.map((verdict) => verdict.agent))) {
+		const forAgent = unpaired.filter((verdict) => verdict.agent === agent);
+		const matching = finished.filter(
+			(run) =>
+				!assigned.has(run) &&
+				run.kind !== "workflow" &&
+				agentNames(run.label).includes(agent),
+		);
+		const [run] = matching;
+		const [verdict] = forAgent;
+		if (run && verdict && matching.length === 1 && forAgent.length === 1)
+			assigned.set(run, verdict);
 	}
 	return assigned;
+}
+
+/** First descendant that asks the parent, if any. */
+function askingDescendant(run: AgentRun): AgentRun | undefined {
+	for (const child of run.children) {
+		if (asks(child)) return child;
+		const deeper = askingDescendant(child);
+		if (deeper) return deeper;
+	}
+	return undefined;
 }
 
 function elapsedLabel(run: AgentRun, nowMs: number): string {
@@ -272,10 +332,13 @@ function runLine(
 	nowMs: number,
 	verdicts: ReadonlyMap<AgentRun, AgentVerdict>,
 ): string {
-	const icon = asks(run) ? "❓" : (STATE_ICONS[run.state] ?? "•");
+	// A run whose step asks is itself waiting on an answer, even when the step row is cut.
+	const asking = asks(run) ? undefined : askingDescendant(run);
+	const icon = asks(run) || asking ? "❓" : (STATE_ICONS[run.state] ?? "•");
 	const id = shortRunId(run) ? ` #${shortRunId(run)}` : "";
 	let detail = "";
 	if (asks(run)) detail = " · спрашивает родителя";
+	else if (asking) detail = ` · ${text(asking.label, 32)} спрашивает родителя`;
 	else if (isActive(run)) {
 		if (run.currentTool) detail += ` · ${run.currentTool}`;
 		if (run.toolCount) detail += ` · ${run.toolCount} выз.`;

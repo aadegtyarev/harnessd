@@ -6,6 +6,7 @@ import {
 	taskActivity,
 	thoughtSummary,
 } from "../src/harness/pi-activity-details.js";
+import { agentVerdicts } from "../src/telegram-agent-board.js";
 
 describe("Pi activity details", () => {
 	it("reduces thinking to the last summary title or the first sentence", () => {
@@ -92,5 +93,18 @@ describe("Pi activity details", () => {
 			subagentNotice({ role: "custom", customType: "other", content: "x" }),
 		).toBeUndefined();
 		expect(subagentNotice({ role: "assistant", content: "x" })).toBeUndefined();
+	});
+
+	it("keeps run-ID lines that a long notice preview pushes past the limit", () => {
+		const long = "x".repeat(5_000);
+		const notice = subagentNotice({
+			role: "custom",
+			customType: "subagent-notify",
+			content: `Background tasks completed (2): **reviewer**, **worker**\n\n1. reviewer\n${long}\nRetention-managed async directory: /a/11111111-a\n\n2. worker\n${long}\nRetention-managed async directory: /a/22222222-b`,
+		});
+		expect(notice?.length).toBeLessThan(4_300);
+		expect(agentVerdicts(notice ?? "").map((verdict) => verdict.runId)).toEqual(
+			["11111111-a", "22222222-b"],
+		);
 	});
 });
