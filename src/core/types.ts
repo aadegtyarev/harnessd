@@ -84,9 +84,16 @@ export type HarnessActivityEvent =
 			readonly limit?: number;
 	  }
 	| {
+			/** A subagent completion notice delivered to the parent session. */
+			readonly type: "agent_notice";
+			readonly text: string;
+	  }
+	| {
 			readonly type: "notification";
 			readonly text: string;
 			readonly level?: string;
+			/** Widget key for widget updates; an empty text then means the widget was cleared. */
+			readonly widgetKey?: string;
 	  };
 
 export interface HarnessEvent {

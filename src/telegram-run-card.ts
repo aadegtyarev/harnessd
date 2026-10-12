@@ -189,6 +189,8 @@ export type RunCardInput = {
 	readonly elapsedMs?: number;
 	readonly task?: RunCardTask;
 	readonly thought?: string;
+	/** Pre-rendered agents section (see telegram-agent-board). */
+	readonly agents?: readonly string[];
 	readonly notices: readonly string[];
 	readonly events: readonly RunCardEvent[];
 	readonly footer: string;
@@ -216,6 +218,7 @@ export function renderRunCard(input: RunCardInput): string {
 		if (input.task.progress) lines.push(`📝 ${clip(input.task.progress, 240)}`);
 	}
 	if (input.thought) lines.push(`💭 ${clip(input.thought, 160)}`);
+	if (input.agents?.length) lines.push("", ...input.agents);
 	for (const notice of input.notices) lines.push(`• ${clip(notice, 180)}`);
 	const visible = input.events.slice(-RUN_CARD_VISIBLE_EVENTS);
 	if (visible.length) {

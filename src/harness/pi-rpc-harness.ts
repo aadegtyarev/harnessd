@@ -45,6 +45,7 @@ import { UncertainInputDeliveryError } from "./input-delivery-error.js";
 import {
 	bashExitDetail,
 	coordinationSummary,
+	subagentNotice,
 	taskActivity,
 	thoughtSummary,
 } from "./pi-activity-details.js";
@@ -1079,6 +1080,13 @@ class PiRpcInstance implements HarnessInstance {
 			return;
 		}
 		if (record.type === "message_end") {
+			const notice = subagentNotice(record.message);
+			if (notice)
+				this.emit({
+					sessionId: this.sessionId,
+					kind: "activity",
+					activityEvent: { type: "agent_notice", text: notice },
+				});
 			// Message boundaries let transports deliver each answer before the run settles.
 			if (
 				(record.message as Record<string, unknown> | undefined)?.role ===
@@ -1155,7 +1163,10 @@ class PiRpcInstance implements HarnessInstance {
 							(line): line is string => typeof line === "string",
 						)
 					: [];
-				if (lines.length)
+				const widgetKey =
+					typeof record.widgetKey === "string" ? record.widgetKey : undefined;
+				// An empty keyed widget is a clear; transports drop what it showed.
+				if (lines.length || widgetKey)
 					this.emit({
 						sessionId: this.sessionId,
 						kind: "activity",
@@ -1163,6 +1174,7 @@ class PiRpcInstance implements HarnessInstance {
 							type: "notification",
 							text: redactDiagnosticText(lines.join("\n")),
 							level: "status",
+							...(widgetKey ? { widgetKey } : {}),
 						},
 					});
 				return;

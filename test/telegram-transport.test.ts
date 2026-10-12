@@ -8694,17 +8694,16 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: {
 				type: "notification",
-				text: 'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"completed"},{"kind":"subagent","label":"reviewer","state":"running","id":"PRIVATE_REVIEW_ID"}]}',
+				text: 'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[{"kind":"subagent","label":"worker","state":"complete"},{"kind":"subagent","label":"reviewer","state":"running","id":"PRIVATE_REVIEW_ID"}]}',
 			},
 		});
 		await vi.waitFor(() =>
-			expect(bot.edited.at(-1)?.text).toContain("Задача Reviewer: выполняется"),
+			expect(bot.edited.at(-1)?.text).toContain("🟢 reviewer"),
 		);
 		const visible = bot.edited.at(-1)?.text ?? "";
-		expect(visible).toContain("Задача Worker: завершён");
-		expect(visible).toContain("Задача Reviewer: выполняется");
-		expect(visible.match(/Задача Worker: завершён/g)).toHaveLength(1);
-		expect(visible.match(/Задача Reviewer: выполняется/g)).toHaveLength(1);
+		expect(visible).toContain("✅ worker");
+		expect(visible).toContain("🤖 Агенты · 1 работает");
+		expect(visible).not.toContain("Задача Worker");
 		expect(visible).not.toContain("workflow");
 		expect(visible).not.toContain("PRIVATE_REVIEW_ID");
 		expect(visible).not.toContain("subagent ·");
@@ -8925,6 +8924,130 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("shows parallel agents, whom the parent waits for, and a reviewer verdict on the card", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "parallel agents");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const activity = (event: Record<string, unknown>) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: event as never,
+			});
+		activity({
+			type: "notification",
+			text: `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+				kind: "pi-subagents.async-status-snapshot",
+				runs: [
+					{
+						id: "a6ff0d6b-1",
+						kind: "subagent",
+						label: "worker",
+						state: "running",
+					},
+					{
+						id: "b7120000-2",
+						kind: "subagent",
+						label: "worker",
+						state: "running",
+					},
+					{
+						id: "24fee3a4-3",
+						kind: "subagent",
+						label: "reviewer",
+						state: "complete",
+					},
+				],
+			})}`,
+			level: "status",
+		});
+		activity({
+			type: "tool_start",
+			toolCallId: "wait",
+			summary: "⏸ ждёт агентов #a6ff0d6b (до 10 мин)",
+		});
+		activity({
+			type: "agent_notice",
+			text: "Background task completed: **reviewer**\n\n## Review\n\n**APPROVE**",
+		});
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("✅ reviewer #24fee3a4"),
+		);
+		const text = bot.edited.at(-1)?.text ?? "";
+		expect(text).toContain("🤖 Агенты · 2 работают параллельно");
+		expect(text).toContain("🟢 worker #a6ff0d6b");
+		expect(text).toContain("🟢 worker #b7120000");
+		expect(text).toContain("APPROVE");
+		expect(text).toContain("⏸ родитель ждёт: worker #a6ff0d6b");
+		expect(text.startsWith("⏸ Ход · ")).toBe(true);
+		await adapter.stop();
+	});
+
+	it("clears the agents section when the snapshot widget is cleared or Pi restarts", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "board lifecycle");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		emit(harnessEvent("sid", "status", "agent_start"));
+		const widget = (text: string) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "notification",
+					text,
+					level: "status",
+					widgetKey: "subagent-async",
+				} as never,
+			});
+		widget(
+			`PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+				kind: "pi-subagents.async-status-snapshot",
+				runs: [
+					{
+						id: "a6ff0d6b-1",
+						kind: "subagent",
+						label: "worker",
+						state: "running",
+					},
+				],
+			})}`,
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("🟢 worker #a6ff0d6b"),
+		);
+		widget("");
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).not.toContain("🤖 Агенты"),
+		);
+		widget(
+			`PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+				kind: "pi-subagents.async-status-snapshot",
+				runs: [
+					{
+						id: "b7120000-1",
+						kind: "subagent",
+						label: "worker",
+						state: "running",
+					},
+				],
+			})}`,
+		);
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("🟢 worker #b7120000"),
+		);
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text ?? "").not.toContain("#b7120000"),
+		);
+		await adapter.stop();
+	});
+
 	it("redacts subagent status notifications into the attributed bubble only", async () => {
 		const log = vi.spyOn(console, "error").mockImplementation(() => {});
 		const bot = new MockBot();
@@ -8949,9 +9072,9 @@ describe("Telegram transport", () => {
 			},
 		});
 		await vi.waitFor(() =>
-			expect(
-				bot.edited.some(({ text }) => text.includes("Задача Worker: ожидает")),
-			).toBe(true),
+			expect(bot.edited.some(({ text }) => text.includes("⏳ worker"))).toBe(
+				true,
+			),
 		);
 		const payloads = [
 			...bot.api.sendMessage.mock.calls.map(([, text]) => String(text)),
