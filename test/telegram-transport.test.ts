@@ -127,6 +127,30 @@ function refreshPanel(
 	).refreshExistingPanel(chatId, sender);
 }
 
+/** Panel messages that were neither deleted nor stripped of their buttons. */
+function livePanels(bot: MockBot): number[] {
+	const deleted = new Set(
+		bot.api.deleteMessage.mock.settledResults.flatMap((outcome, index) =>
+			outcome.type === "fulfilled"
+				? [bot.api.deleteMessage.mock.calls[index]?.[1] as number]
+				: [],
+		),
+	);
+	return bot.sent
+		.filter(({ text }) => text.includes("📌 Панель сессий"))
+		.map(({ message_id }) => message_id as number)
+		.filter(
+			(id) =>
+				!deleted.has(id) &&
+				!bot.edited.some(
+					({ messageId, options }) =>
+						messageId === id &&
+						JSON.stringify(options) ===
+							JSON.stringify({ reply_markup: { inline_keyboard: [] } }),
+				),
+		);
+}
+
 function panelIdOf(adapter: unknown, chatId = 42): number | undefined {
 	return (
 		adapter as { panelMessageIds: Map<number, number> }
@@ -1887,7 +1911,7 @@ describe("Telegram transport", () => {
 			await adapter.stop();
 		});
 
-	it("retires the old panel when an overlapping publish confirms a new one first", async () => {
+	it("leaves one live panel when an overlapping publish starts while the first is being saved", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
@@ -1901,32 +1925,118 @@ describe("Telegram transport", () => {
 		const save = store.set.bind(store);
 		let releaseSave!: () => void;
 		let saving = false;
-		store.set = async (chatId, messageId) => {
-			if (!saving && messageId !== oldPanel) {
-				saving = true;
-				await new Promise<void>((resolve) => (releaseSave = resolve));
-			}
-			return save(chatId, messageId);
+		// The store updates its in-memory reference at once; only the disk write is held.
+		store.set = (chatId, messageId) => {
+			const saved = save(chatId, messageId);
+			if (saving || messageId === oldPanel) return saved;
+			saving = true;
+			return new Promise<void>((resolve) => (releaseSave = resolve)).then(
+				() => saved,
+			);
 		};
 		const older = bot.update(42, "/menu");
 		await vi.waitFor(() => expect(saving).toBe(true));
 		const firstNew = bot.lastMessageId as number;
 		const newer = bot.update(42, "📋 Панель");
+		await vi.waitFor(() => expect(bot.lastMessageId).not.toBe(firstNew));
 		releaseSave();
 		await Promise.all([older, newer]);
-		const current = panelIdOf(adapter);
-		expect(current).not.toBe(oldPanel);
-		expect(current).toBeGreaterThanOrEqual(firstNew);
-		expect(bot.api.deleteMessage).toHaveBeenCalledWith(
-			42,
-			oldPanel,
-			expect.anything(),
-		);
+		const live = livePanels(bot);
+		expect(live).toHaveLength(1);
+		expect(panelIdOf(adapter)).toBe(live[0]);
+		expect(live[0]).not.toBe(firstNew);
+		for (const replaced of [oldPanel, firstNew])
+			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+				42,
+				replaced,
+				expect.anything(),
+			);
+		expect(
+			bot.api.deleteMessage.mock.calls.filter(([, id]) => id === firstNew),
+		).toHaveLength(1);
 		expect(
 			bot.edited
 				.slice(editsBefore)
 				.some(({ messageId }) => messageId === oldPanel),
 		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("removes a panel whose send lands after the operator re-adopted the old panel", async () => {
+		for (const deletion of ["succeeds", "fails"] as const) {
+			const bot = new MockBot();
+			const { adapter } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			await bot.update(42, "/menu");
+			const oldPanel = bot.lastMessageId as number;
+			const send = bot.api.sendMessage.getMockImplementation();
+			if (!send) throw new Error("Missing send API mock");
+			let release!: () => void;
+			let landed = false;
+			bot.api.sendMessage.mockImplementationOnce(async (...args) => {
+				const value = await send(...args);
+				landed = true;
+				await new Promise<void>((resolve) => (release = resolve));
+				return value;
+			});
+			const menu = bot.update(42, "/menu");
+			await vi.waitFor(() => expect(landed).toBe(true));
+			const orphan = bot.lastMessageId as number;
+			if (deletion === "fails")
+				bot.api.deleteMessage.mockImplementation(async (_chatId, messageId) => {
+					if (messageId === orphan) throw new Error("Telegram rejected delete");
+					return true;
+				});
+			const tap = bot.callback(42, "menu:home", oldPanel);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			release();
+			await Promise.all([menu, tap]);
+			expect(panelIdOf(adapter)).toBe(oldPanel);
+			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+				42,
+				orphan,
+				expect.anything(),
+			);
+			expect(livePanels(bot)).toEqual([oldPanel]);
+			if (deletion === "fails")
+				expect(
+					bot.edited.find(({ messageId }) => messageId === orphan),
+				).toMatchObject({
+					messageId: orphan,
+					text: expect.stringContaining("📌 Панель сессий"),
+					options: { reply_markup: { inline_keyboard: [] } },
+				});
+			await bot.callback(42, "session:next", orphan);
+			expect(bot.api.answerCallbackQuery).toHaveBeenLastCalledWith(
+				"callback-id",
+				{ text: "Эта панель устарела. Нажмите «📋 Панель» для актуальной." },
+				expect.anything(),
+			);
+			expect(panelIdOf(adapter)).toBe(oldPanel);
+			await adapter.stop();
+		}
+	});
+
+	it("sends the reply keyboard before the first 📋 panel but not for /menu", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		expect(bot.sent.map(({ text }) => text)).toEqual([
+			expect.stringContaining("📌 Панель сессий"),
+		]);
+		await bot.update(42, "/menu");
+		expect(
+			bot.sent.some(({ text }) => text.includes("Кнопки управления")),
+		).toBe(false);
+		const sentBefore = bot.sent.length;
+		await bot.update(42, "📋 Панель");
+		expect(bot.sent.slice(sentBefore).map(({ text }) => text)).toEqual([
+			"⌨️ Кнопки управления — внизу, у поля ввода.",
+			expect.stringContaining("📌 Панель сессий"),
+		]);
+		expect(bot.sendOptions[sentBefore]).toMatchObject({
+			reply_markup: { is_persistent: true },
+		});
 		await adapter.stop();
 	});
 

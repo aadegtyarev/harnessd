@@ -5151,12 +5151,18 @@ export class TelegramTransportAdapter
 		const createdMessageId = messageIdFrom(sent.value);
 		if (createdMessageId === undefined || !referenceIsCurrent(existing)) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			// Another panel was adopted while this one was in flight: never leave two live panels.
+			if (createdMessageId !== undefined)
+				await this.removePanelMessage(chatId, createdMessageId, text);
 			return false;
 		}
 		if (existing !== undefined && existing !== createdMessageId)
 			this.retirePanel(chatId, existing);
 		await this.savePanelReference(chatId, createdMessageId);
-		if (!referenceIsCurrent(createdMessageId)) return false;
+		if (!referenceIsCurrent(createdMessageId)) {
+			await this.removePanelMessage(chatId, createdMessageId, text);
+			return false;
+		}
 		this.panelStaleChats.delete(chatId);
 		this.panelRepairChats.delete(chatId);
 		this.panelPublished.set(chatId, publication);
@@ -5902,37 +5908,40 @@ export class TelegramTransportAdapter
 		chatId: number,
 		messageId: number,
 	): Promise<void> {
-		this.retirePanel(chatId, messageId);
 		this.panelStaleChats.delete(chatId);
-		await this.removeRetiredPanel(chatId, messageId);
+		await this.removePanelMessage(chatId, messageId, RETIRED_PANEL_NOTE);
 	}
 
 	/**
-	 * Deletes a replaced panel; when Telegram refuses (e.g. older than 48 hours) the
-	 * message becomes a short note without buttons. If both fail, its taps still report
-	 * an outdated panel because the ID stays retired.
+	 * Retires a panel message that is no longer the chat's panel and deletes it. When
+	 * Telegram refuses the delete (e.g. older than 48 hours) the message is edited to
+	 * `fallbackText` without buttons; if both fail, its taps still report an outdated
+	 * panel because the ID stays retired. An already retired ID was handled before.
 	 */
-	private async removeRetiredPanel(
+	private async removePanelMessage(
 		chatId: number,
 		messageId: number,
+		fallbackText: string,
 	): Promise<void> {
+		if (this.retiredPanelIds.get(chatId)?.has(messageId)) return;
+		this.retirePanel(chatId, messageId);
 		const deleted = await this.telegramCall((signal) =>
 			this.bot.api.deleteMessage(chatId, messageId, signal),
 		);
 		if ((deleted.ok && deleted.value !== false) || this.stopping) return;
-		const noted = await this.telegramCall((signal) =>
+		const edited = await this.telegramCall((signal) =>
 			this.bot.api.editMessageText(
 				chatId,
 				messageId,
-				RETIRED_PANEL_NOTE,
+				fallbackText,
 				{ reply_markup: { inline_keyboard: [] } },
 				signal,
 			),
 		);
-		if (!noted.ok && !isMessageNotModified(noted.error))
+		if (!edited.ok && !isMessageNotModified(edited.error))
 			this.reportError(
 				"Replaced Telegram control panel could not be removed",
-				noted.error,
+				edited.error,
 			);
 	}
 
