@@ -9651,6 +9651,120 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("splits long assistant tables and blockquotes into balanced HTML chunks", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const rows = Array.from(
+			{ length: 60 },
+			(_, index) => `| **Ключ ${index}** | значение ${"x".repeat(40)} |`,
+		);
+		const quote = Array.from(
+			{ length: 60 },
+			(_, index) => `> строка цитаты ${index} ${"q".repeat(50)}`,
+		);
+		const assistantOutput = [
+			"### Таблица",
+			"| Параметр | Значение |",
+			"|---|---|",
+			...rows,
+			"",
+			...quote,
+		].join("\n");
+		emit(harnessEvent("sid", "output", assistantOutput));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		let chunks: typeof bot.sent = [];
+		await vi.waitFor(() => {
+			chunks = bot.sent.filter(({ text }) => hasSessionFooter(text, "sid"));
+			expect(chunks.length).toBeGreaterThanOrEqual(2);
+		});
+		for (const { text } of chunks) {
+			expect(telegramVisibleText(text).length).toBeLessThanOrEqual(4096);
+			const stack: string[] = [];
+			for (const [, closing, name] of text.matchAll(/<(\/?)([a-z]+)[^>]*>/g)) {
+				if (closing) expect(stack.pop()).toBe(name);
+				else stack.push(name ?? "");
+			}
+			expect(stack).toEqual([]);
+			expect(text).not.toContain("|---");
+			expect(text).not.toMatch(/(^|\n)&gt; /);
+		}
+		const all = chunks.map(({ text }) => text).join("");
+		expect(all).toContain("<b>Таблица</b>");
+		expect(all).toContain(`• <b>Ключ 59</b> — значение ${"x".repeat(40)}`);
+		expect(all).toContain("<blockquote>строка цитаты 0");
+		const quoted = chunks.filter(({ text }) => text.includes("строка цитаты"));
+		expect(quoted.length).toBeGreaterThanOrEqual(2);
+		for (const { text } of quoted) expect(text).toContain("<blockquote>");
+		await adapter.stop();
+	});
+
+	it("resends an answer as plain text once when Telegram cannot parse its HTML", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const original = bot.api.sendMessage.getMockImplementation();
+		let htmlAttempts = 0;
+		bot.api.sendMessage.mockImplementation(
+			async (chatId, text, other, signal) => {
+				const options = other as { parse_mode?: string } | undefined;
+				if (options?.parse_mode === "HTML" && text.includes("broken")) {
+					htmlAttempts++;
+					throw Object.assign(new Error("Bad Request"), {
+						error_code: 400,
+						description:
+							"Bad Request: can't parse entities: Unsupported start tag at byte offset 3",
+					});
+				}
+				return original?.(chatId, text, other, signal);
+			},
+		);
+		emit(harnessEvent("sid", "output", "### broken **answer** & <x>"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("broken"))).toBe(true),
+		);
+		expect(htmlAttempts).toBe(1);
+		const index = bot.sent.findIndex(({ text }) => text.includes("broken"));
+		expect(bot.sent[index]?.text).toBe("broken answer & <x>\n\nsid");
+		const options = bot.sendOptions[index] as {
+			parse_mode?: string;
+			entities?: readonly { type: string; offset: number; length: number }[];
+		};
+		expect(options.parse_mode).toBeUndefined();
+		expect(options.entities).toEqual([
+			{ type: "code", offset: "broken answer & <x>\n\n".length, length: 3 },
+		]);
+		emit(harnessEvent("sid", "output", "next **answer**"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("next <b>answer</b>")),
+			).toBe(true),
+		);
+		await adapter.stop();
+	});
+
+	it("does not resend as plain text for other Telegram rejections", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		let attempts = 0;
+		bot.api.sendMessage.mockImplementation(async () => {
+			attempts++;
+			throw Object.assign(new Error("Bad Request"), {
+				error_code: 400,
+				description: "Bad Request: chat not found",
+			});
+		});
+		emit(harnessEvent("sid", "output", "**answer**"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() => expect(attempts).toBe(1));
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(attempts).toBe(1);
+		await adapter.stop();
+	});
+
 	it("deduplicates identical session errors until successful recovery", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
