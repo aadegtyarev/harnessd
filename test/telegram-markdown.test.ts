@@ -38,6 +38,12 @@ describe("Telegram Markdown blocks", () => {
 		);
 	});
 
+	it("finishes on a fence glued to a quote marker", () => {
+		// «>```» is not a quote line; it used to keep the renderer from advancing.
+		for (const input of [">```\ncode\n```", "a\n>```\nx", ">```", "> a\n>```"])
+			expect(typeof renderTelegramMarkdown(input)).toBe("string");
+	});
+
 	it("renders headings of every level without the marker", () => {
 		for (const marker of ["#", "##", "###", "####", "#####", "######"])
 			expect(md(`${marker} Title *x* ##`)).toBe("<b>Title <i>x</i></b>");

@@ -18,7 +18,7 @@ export function renderTelegramMarkdown(markdown: string): string {
 		const quote = remaining.startsWith("```")
 			? quotedFenceBlock(body, textStart, offset)
 			: undefined;
-		if (quote) {
+		if (quote && quote.end > offset) {
 			html += renderBlocks(body.slice(textStart, quote.start), atLineStart);
 			const inner = renderTelegramMarkdown(quote.inner);
 			html += inner ? `<blockquote>${inner}</blockquote>` : "";
@@ -88,6 +88,9 @@ function quotedFenceBlock(
 	}
 	// Leave the newline that ends the quote for the following text.
 	if (end > start && body[end - 1] === "\n") end--;
+	// The fence line itself must be a quote line («>```» is not): otherwise
+	// nothing past the fence was consumed and the caller would not advance.
+	if (end <= offset) return undefined;
 	return { start, end, inner: inner.join("\n") };
 }
 
