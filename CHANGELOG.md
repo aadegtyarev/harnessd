@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to harnessd are recorded here. Entries under `Unreleased` are not a release and do not imply npm publication.
+All notable changes to harnessd are recorded here. Every behavior-changing pull request is a release with its own version; documentation-only changes may sit under `Unreleased`. Nothing here implies npm publication.
 
 ## [Unreleased]
 
