@@ -2,7 +2,7 @@
 
 harnessd is a **local supervisor for Pi coding-agent sessions**. You control it from a Telegram bot in private chats; it creates one Pi RPC process per session and keeps session metadata in a separate local state directory.
 
-It is currently being tested from Git, not published to npm. The manifest and lockfile remain at `0.1.0`; the first stable `1.0.0` release is deferred until owner testing is approved.
+It is currently being tested from Git, not published to npm. The manifest and lockfile are at `0.2.0`; the first stable `1.0.0` release is deferred until owner testing is approved.
 
 ## What it does
 
