@@ -2,15 +2,15 @@
 
 ## Boundary and ownership
 
-This surface defines the package identity, version compatibility promise, local installation, and release handoff for `harnessd`. `package.json` owns the package version and executable entry point; `package-lock.json` records the same root package version and dependency graph. Maintainers approve version changes and releases. This contract does not publish or deploy the service.
+This surface defines the package identity, version compatibility promise, local installation, and release handoff for `harnessd`. `package.json` owns the package version and executable entry point; `package-lock.json` records the same root package version and dependency graph. Maintainers set the release policy below; `MAJOR`, `1.0.0` and npm publication need their explicit approval. This contract does not publish or deploy the service.
 
 ## Version policy
 
 - Versions follow Semantic Versioning `MAJOR.MINOR.PATCH`, optionally with standard prerelease and build metadata identifiers.
 - `MAJOR` changes when an upgrade requires a consumer to adapt to an incompatible CLI, environment, package, or documented behavior change.
-- `MINOR` adds backward-compatible functionality; `PATCH` fixes backward-compatible defects. Pre-1.0 versions do not promise the stable compatibility guarantees of `1.0.0`.
+- `MINOR` adds backward-compatible functionality; `PATCH` fixes backward-compatible defects. Pre-1.0 versions do not promise the stable compatibility guarantees of `1.0.0`; below `1.0.0` an incompatible change bumps `MINOR`.
 - Prerelease identifiers such as `alpha.1`, `beta.1`, and `rc.1` identify a candidate and do not claim a stable release. Build metadata does not affect SemVer precedence.
-- Every pull request that changes runtime or installed package behavior is a release: it bumps the version (`PATCH` for a fix, `MINOR` for new or changed behavior) and adds a dated `CHANGELOG.md` entry for that version. Documentation-, test- or backlog-only pull requests don't bump it. `package.json.version`, `package-lock.json.version`, and `package-lock.json.packages[""].version` must agree.
+- Every pull request that changes runtime or installed package behavior is a release: it bumps the version (`PATCH` for a fix, `MINOR` for new or changed behavior) and adds a dated `CHANGELOG.md` entry for that version, moving any `Unreleased` items into it. Documentation-, test-, CI- or backlog-only pull requests don't bump it, even though documentation ships in the package; a dependency update that can change runtime behavior does. Review enforces this: `version:check` only checks that the manifest and lockfile agree. `package.json.version`, `package-lock.json.version`, and `package-lock.json.packages[""].version` must agree.
 
 ## Local installation and package contents
 
@@ -23,7 +23,7 @@ This surface defines the package identity, version compatibility promise, local 
 ## Release procedure
 
 1. The owner approved releasing with every behavior-changing pull request (2026-10-17); a `MAJOR` bump and the first stable `1.0.0` still require explicit owner signoff.
-2. In that pull request, use `npm version <major|minor|patch|prerelease> --no-git-tag-version`, review the matching manifest/lockfile updates, and add a dated `CHANGELOG.md` entry. Run the full project checks, version check, and package dry-run; obtain independent review.
+2. In that pull request, use `npm version <patch|minor> --no-git-tag-version` (`major` or a prerelease only with the signoff from step 1), review the matching manifest/lockfile updates, and add a dated `CHANGELOG.md` entry. Run the full project checks, version check, and package dry-run; obtain independent review.
 3. Merge the reviewed pull request. Create the annotated `vX.Y.Z` tag on the merged `main` commit and push it.
 4. npm publication is a separate, explicitly approved action. The current package is private (`private: true`); do not change visibility, registry access, or publish as part of ordinary version bumps.
 
