@@ -4,6 +4,8 @@ All notable changes to harnessd are recorded here. Entries under `Unreleased` ar
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
 ### Added
 
 - Optional `.env` configuration loading, `HARNESSD_HOME` for the initial Telegram working folder, and explicit Linux per-user systemd service install/uninstall commands.
