@@ -114,6 +114,25 @@ function replyCodeEntities(text?: string) {
 	const offset = text.slice(0, match.index).replace(/<[^>]+>/g, "").length;
 	return [{ type: "code", offset, length: (match[1] ?? "").length }];
 }
+/** Re-renders the stored panel in place, as automatic refreshes and in-panel navigation do. */
+function refreshPanel(
+	adapter: unknown,
+	chatId = 42,
+	sender = 42,
+): Promise<void> {
+	return (
+		adapter as {
+			refreshExistingPanel(chatId: number, sender: number): Promise<void>;
+		}
+	).refreshExistingPanel(chatId, sender);
+}
+
+function panelIdOf(adapter: unknown, chatId = 42): number | undefined {
+	return (
+		adapter as { panelMessageIds: Map<number, number> }
+	).panelMessageIds.get(chatId);
+}
+
 class MockBot {
 	botInfo = { id: 999 };
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
@@ -1449,9 +1468,9 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/menu");
 		sessions.set("sid", sessionWith("sid", { name: "First change" }));
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		sessions.set("sid", sessionWith("sid", { name: "Second change" }));
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(editTimes.length).toBeGreaterThanOrEqual(2);
 		for (let index = 1; index < editTimes.length; index++)
 			expect(editTimes[index] - editTimes[index - 1]).toBeGreaterThanOrEqual(
@@ -1693,6 +1712,224 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("publishes /menu at the bottom, deletes the old panel and the command, and refreshes the new one", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		const editsBefore = bot.edited.length;
+		const commandId = bot.nextMessageId;
+		await bot.update(42, "/menu");
+		const newPanel = bot.lastMessageId as number;
+		expect(newPanel).not.toBe(oldPanel);
+		expect(bot.sent.at(-1)?.text).toContain("📌 Панель сессий");
+		for (const deleted of [oldPanel, commandId])
+			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+				42,
+				deleted,
+				expect.anything(),
+			);
+		expect(bot.edited.slice(editsBefore)).toEqual([]);
+		expect(panelIdOf(adapter)).toBe(newPanel);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)).toMatchObject({
+				messageId: newPanel,
+				text: expect.stringContaining("выполняет ход"),
+			}),
+		);
+		expect(bot.edited.some(({ messageId }) => messageId === oldPanel)).toBe(
+			false,
+		);
+		expect(bot.pinned).toEqual([]);
+		await adapter.stop();
+	});
+
+	it("turns a replaced panel that cannot be deleted into a note without buttons", async () => {
+		for (const refusal of ["throws", "returns false"] as const) {
+			const bot = new MockBot();
+			const { adapter } = await startAdapter(bot, await temp());
+			await bot.update(42, "/menu");
+			const oldPanel = bot.lastMessageId as number;
+			bot.api.deleteMessage.mockImplementation(async (_chatId, messageId) => {
+				if (messageId !== oldPanel) return true;
+				if (refusal === "returns false") return false;
+				throw Object.assign(new Error("Telegram rejected delete"), {
+					error_code: 400,
+					description: "Bad Request: message can't be deleted for everyone",
+				});
+			});
+			await bot.update(42, "/menu");
+			const newPanel = bot.lastMessageId as number;
+			expect(
+				bot.edited.filter(({ messageId }) => messageId === oldPanel),
+			).toEqual([
+				{
+					chatId: 42,
+					messageId: oldPanel,
+					text: "Панель перенесена ниже ↓",
+					options: { reply_markup: { inline_keyboard: [] } },
+				},
+			]);
+			expect(panelIdOf(adapter)).toBe(newPanel);
+			await adapter.stop();
+		}
+	});
+
+	it("keeps answering taps on a replaced panel that can be neither deleted nor edited", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		const refusal = () =>
+			Object.assign(new Error("Telegram rejected"), {
+				error_code: 400,
+				description: "Bad Request: message can't be deleted",
+			});
+		bot.api.deleteMessage.mockImplementation(async (_chatId, messageId) => {
+			if (messageId === oldPanel) throw refusal();
+			return true;
+		});
+		const edit = bot.api.editMessageText.getMockImplementation();
+		if (!edit) throw new Error("Missing edit API mock");
+		bot.api.editMessageText.mockImplementation(async (...args) => {
+			if (args[1] === oldPanel) throw refusal();
+			return edit(...args);
+		});
+		await bot.update(42, "/menu");
+		const newPanel = bot.lastMessageId as number;
+		await bot.callback(42, "session:next", oldPanel);
+		expect(bot.api.answerCallbackQuery).toHaveBeenLastCalledWith(
+			"callback-id",
+			{ text: "Эта панель устарела. Нажмите «📋 Панель» для актуальной." },
+			expect.anything(),
+		);
+		expect(panelIdOf(adapter)).toBe(newPanel);
+		expect(bot.edited.some(({ messageId }) => messageId === oldPanel)).toBe(
+			false,
+		);
+		await adapter.stop();
+	});
+
+	it("keeps the old panel when /menu cannot publish a new one", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		bot.api.sendMessage.mockRejectedValueOnce(new Error("deadline"));
+		await bot.update(42, "/menu");
+		expect(panelIdOf(adapter)).toBe(oldPanel);
+		expect(bot.api.deleteMessage).not.toHaveBeenCalledWith(
+			42,
+			oldPanel,
+			expect.anything(),
+		);
+		expect(bot.edited.some(({ messageId }) => messageId === oldPanel)).toBe(
+			false,
+		);
+		await adapter.stop();
+	});
+
+	for (const order of ["older first", "newer first"] as const)
+		it(`leaves one bottom panel when /menu and 📋 overlap (${order} finishes)`, async () => {
+			const bot = new MockBot();
+			const gates: (() => void)[] = [];
+			let blockLists = false;
+			const directory = await temp();
+			const { adapter } = await startAdapter(bot, directory, {
+				dispatch: async (request) => {
+					if (request.kind === "list" && blockLists)
+						await new Promise<void>((resolve) => gates.push(resolve));
+					return result(request);
+				},
+			});
+			await bot.update(42, "/menu");
+			const oldPanel = bot.lastMessageId as number;
+			const editsBefore = bot.edited.length;
+			const sentBefore = bot.sent.length;
+			blockLists = true;
+			const older = bot.update(42, "/menu");
+			await vi.waitFor(() => expect(gates).toHaveLength(1));
+			const newer = bot.update(42, "📋 Панель");
+			await vi.waitFor(() => expect(gates).toHaveLength(2));
+			blockLists = false;
+			if (order === "older first") {
+				gates[0]?.();
+				await older;
+				gates[1]?.();
+				await newer;
+			} else {
+				gates[1]?.();
+				await newer;
+				gates[0]?.();
+				await older;
+			}
+			const panels = bot.sent
+				.slice(sentBefore)
+				.filter(({ text }) => text.includes("📌 Панель сессий"));
+			expect(panels).toHaveLength(1);
+			expect(panelIdOf(adapter)).toBe(panels[0]?.message_id);
+			expect(
+				(await TelegramPanelStore.open(directory, "secret-token")).get(42),
+			).toBe(panels[0]?.message_id);
+			expect(
+				bot.edited
+					.slice(editsBefore)
+					.some(({ messageId }) => messageId === oldPanel),
+			).toBe(false);
+			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+				42,
+				oldPanel,
+				expect.anything(),
+			);
+			expect(bot.pinned).toEqual([]);
+			await adapter.stop();
+		});
+
+	it("retires the old panel when an overlapping publish confirms a new one first", async () => {
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const oldPanel = bot.lastMessageId as number;
+		const editsBefore = bot.edited.length;
+		const store = (
+			adapter as unknown as {
+				panelStore: { set(chatId: number, messageId: number): Promise<void> };
+			}
+		).panelStore;
+		const save = store.set.bind(store);
+		let releaseSave!: () => void;
+		let saving = false;
+		store.set = async (chatId, messageId) => {
+			if (!saving && messageId !== oldPanel) {
+				saving = true;
+				await new Promise<void>((resolve) => (releaseSave = resolve));
+			}
+			return save(chatId, messageId);
+		};
+		const older = bot.update(42, "/menu");
+		await vi.waitFor(() => expect(saving).toBe(true));
+		const firstNew = bot.lastMessageId as number;
+		const newer = bot.update(42, "📋 Панель");
+		releaseSave();
+		await Promise.all([older, newer]);
+		const current = panelIdOf(adapter);
+		expect(current).not.toBe(oldPanel);
+		expect(current).toBeGreaterThanOrEqual(firstNew);
+		expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+			42,
+			oldPanel,
+			expect.anything(),
+		);
+		expect(
+			bot.edited
+				.slice(editsBefore)
+				.some(({ messageId }) => messageId === oldPanel),
+		).toBe(false);
+		await adapter.stop();
+	});
+
 	it("lays out the panel with separated selection, preview, and creation folder", async () => {
 		const bot = new MockBot();
 		const { adapter } = await startAdapter(bot, await temp());
@@ -1754,7 +1991,7 @@ describe("Telegram transport", () => {
 		);
 		expect(bot.sent.at(-1)?.text).toContain("Обновлено: 00:00:00");
 		time = 1;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited).toHaveLength(0);
 		await adapter.stop();
 	});
@@ -1789,9 +2026,9 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/use sid");
 		await bot.update(42, "/menu");
-		const olderRender = bot.update(42, "/menu");
+		const olderRender = refreshPanel(adapter);
 		await vi.waitFor(() => expect(statusCount).toBe(2));
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		const committed = bot.edited.length;
 		expect(bot.edited.at(-1)?.text).toContain("Модель: test/model-3");
 		releaseOld({
@@ -1836,14 +2073,14 @@ describe("Telegram transport", () => {
 		const initial = bot.sent.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0];
 		time = 1;
 		await bot.update(42, "/use other");
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("✉️ Сообщения → #other");
 		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
 			initial,
 		);
 		time = 2;
 		await bot.update(42, "/cd /tmp");
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("Новые сессии создаются в: /tmp");
 		expect(bot.edited.at(-1)?.text?.match(/^Обновлено: .*$/m)?.[0]).toBe(
 			initial,
@@ -1856,7 +2093,7 @@ describe("Telegram transport", () => {
 			idleWaiters: [],
 		});
 		time = 3;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(JSON.stringify(bot.edited.at(-1)?.options)).toContain(
 			"Включить канал для новых событий",
 		);
@@ -1890,12 +2127,12 @@ describe("Telegram transport", () => {
 		const before = bot.sent.at(-1)?.text ?? "";
 		tokens = 11;
 		time = 1;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		const changed = bot.edited.at(-1)?.text ?? "";
 		expect(changed).toContain("↑11");
 		expect(changed).toContain("Обновлено: 00:00:01");
 		time = 2;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toBe(changed);
 		expect(before).toContain("Обновлено: 00:00:00");
 		await adapter.stop();
@@ -1932,7 +2169,7 @@ describe("Telegram transport", () => {
 		totalTokens = 99_999;
 		costUsd = 1.23449;
 		time = 1;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited).toHaveLength(editCount);
 		expect(original).toContain("Обновлено: 00:00:00");
 		await adapter.stop();
@@ -1961,7 +2198,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("Использование: недоступно");
 		live = { usage: {} };
 		time = 1;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).not.toContain("Использование: недоступно");
 		expect(bot.edited.at(-1)?.text).toContain("Обновлено: 00:00:01");
 		await adapter.stop();
@@ -2028,7 +2265,7 @@ describe("Telegram transport", () => {
 			usage: { inputTokens: 1, contextTokens: 2 },
 		};
 		time = 1;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		text = bot.edited.at(-1)?.text ?? "";
 		expect(text).toContain("Модель: test/m");
 		expect(text).toContain("Усилие: high");
@@ -2043,16 +2280,16 @@ describe("Telegram transport", () => {
 			if (field === "context") live.usage = { inputTokens: 1 };
 			else delete live[field];
 			time++;
-			await bot.update(42, "/menu");
+			await refreshPanel(adapter);
 			expect(bot.edited.at(-1)?.text).toContain(unavailable);
 		}
 		live = {};
 		time = 2;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("Обновлено: 00:00:02");
 		failStatus = true;
 		time = 3;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain(
 			"Статус: работает, живое состояние недоступно",
 		);
@@ -2060,7 +2297,7 @@ describe("Telegram transport", () => {
 		failStatus = false;
 		live = undefined;
 		time = 4;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain(
 			"Статус: записана как работающая, живое состояние не подтверждено",
 		);
@@ -2293,12 +2530,12 @@ describe("Telegram transport", () => {
 			await blocked;
 		};
 		tokens = 11;
-		const firstEdit = bot.update(42, "/menu");
+		const firstEdit = refreshPanel(adapter);
 		await started;
 		tokens = 12;
-		const staleQueued = bot.update(42, "/menu");
+		const staleQueued = refreshPanel(adapter);
 		tokens = 13;
-		const newestQueued = bot.update(42, "/menu");
+		const newestQueued = refreshPanel(adapter);
 		releaseEdit();
 		await Promise.all([firstEdit, staleQueued, newestQueued]);
 		expect(bot.edited).toHaveLength(2);
@@ -2347,7 +2584,7 @@ describe("Telegram transport", () => {
 		expect(bot.sent.at(-1)?.text).toContain("↑— ↓— R— CH— —");
 		expect(bot.sent.at(-1)?.text).toContain("↑— ↓— R— CH— — ?/?/— (auto)");
 		queryFails = true;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		const text = bot.edited.at(-1)?.text ?? "";
 		expect(text).toContain("Живые данные: запрос завершился ошибкой.");
 		expect(text).not.toContain("private transient detail");
@@ -2429,7 +2666,7 @@ describe("Telegram transport", () => {
 		const owner = bot.update(42, "/reload");
 		await reloadStarted;
 		await bot.update(42, "/reload");
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("перезагружаются ресурсы");
 		finish();
 		await owner;
@@ -3838,13 +4075,21 @@ describe("Telegram transport", () => {
 		const bot = new MockBot();
 		const { adapter, requests } = await startAdapter(bot, await temp());
 		await bot.update(42, "/menu");
-		const panelMessageId = bot.lastMessageId;
-		expect(panelMessageId).toBeDefined();
+		const firstPanelId = bot.lastMessageId;
+		expect(firstPanelId).toBeDefined();
 		expect(bot.pinned).toEqual([]);
 		expect(bot.sent.at(-1)?.text).toContain(
 			"✉️ Сообщения → никуда (сессия не выбрана)",
 		);
 		await bot.update(42, "/menu");
+		const panelMessageId = bot.lastMessageId;
+		expect(panelMessageId).not.toBe(firstPanelId);
+		expect(bot.sent.at(-1)?.text).toContain("📌 Панель сессий");
+		expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+			42,
+			firstPanelId,
+			expect.anything(),
+		);
 		expect(bot.api.editMessageText).not.toHaveBeenCalled();
 		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
 
@@ -5051,7 +5296,7 @@ describe("Telegram transport", () => {
 			return { message_id: args[1] };
 		});
 		sessions.set("sid", sessionWith("sid", { name: "Temporary panel name" }));
-		const obsolete = bot.update(42, "/menu");
+		const obsolete = refreshPanel(adapter);
 		await entered;
 		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
 		const priorIntent = (
@@ -5107,7 +5352,7 @@ describe("Telegram transport", () => {
 			return { message_id };
 		});
 		sessions.set("sid", sessionWith("sid", { name: "Temporary panel name" }));
-		const obsolete = bot.update(42, "/menu");
+		const obsolete = refreshPanel(adapter);
 		await entered;
 		sessions.set("sid", sessionWith("sid", { name: "Original panel name" }));
 		const priorIntent = (
@@ -5221,7 +5466,7 @@ describe("Telegram transport", () => {
 
 		expect(maximumActiveEdits).toBe(1);
 		expect(bot.edited.at(-1)?.text).toContain("Папки");
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("Newest startup race");
 		await adapter.stop();
 	});
@@ -5251,7 +5496,7 @@ describe("Telegram transport", () => {
 				description: "Bad Request: message to edit not found",
 			});
 		});
-		const oldRefresh = bot.update(42, "/menu");
+		const oldRefresh = refreshPanel(adapter);
 		await entered;
 		const newerView = bot.callback(42, "menu:folders", panelId);
 		releaseEdit();
@@ -5290,7 +5535,7 @@ describe("Telegram transport", () => {
 				description: "Bad Request: message to edit not found",
 			});
 		});
-		const refresh = bot.update(42, "/menu");
+		const refresh = refreshPanel(adapter);
 		await entered;
 		panelIds.set(42, panelId + 100);
 		releaseEdit();
@@ -5316,7 +5561,7 @@ describe("Telegram transport", () => {
 		const sendsAfterCreate = bot.api.sendMessage.mock.calls.length;
 		sessions.set("sid", sessionWith("sid", { name: "changed once" }));
 		bot.api.editMessageText.mockRejectedValueOnce(new Error("deadline"));
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.messageId).toBe(panelId);
 		expect(bot.edited.at(-1)?.text).toContain("changed once");
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
@@ -5329,7 +5574,7 @@ describe("Telegram transport", () => {
 				parameters: { retry_after: 3 },
 			}),
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(delays).toContain(3000);
 		expect(bot.edited.at(-1)?.text).toContain("rate limited");
 
@@ -5339,13 +5584,13 @@ describe("Telegram transport", () => {
 			.mockRejectedValueOnce(new Error("deadline"))
 			.mockRejectedValueOnce(new Error("deadline"))
 			.mockRejectedValueOnce(new Error("deadline"));
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.api.editMessageText).toHaveBeenCalledTimes(editsBefore + 3);
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate);
 		expect(
 			bot.sent.some(({ text }) => text.includes("Telegram отклонил")),
 		).toBe(false);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("network down");
 		expect(bot.edited.at(-1)?.text).not.toContain("обновление не удалось");
 		expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain(
@@ -5372,7 +5617,7 @@ describe("Telegram transport", () => {
 				description: "Bad Gateway",
 			}),
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("server error");
 
 		sessions.set("sid", sessionWith("sid", { name: "long limit" }));
@@ -5384,10 +5629,10 @@ describe("Telegram transport", () => {
 				parameters: { retry_after: 60 },
 			}),
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.api.editMessageText).toHaveBeenCalledTimes(editsBefore + 1);
 		expect(delays).not.toContain(60_000);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.edited.at(-1)?.text).toContain("long limit");
 
 		const panel = adapter as unknown as {
@@ -5422,7 +5667,7 @@ describe("Telegram transport", () => {
 		let editFailed = false;
 		const { adapter } = await startAdapter(bot, await temp(), {
 			panelSleep: async () => {
-				if (editFailed && !concurrent) concurrent = bot.update(42, "/menu");
+				if (editFailed && !concurrent) concurrent = refreshPanel(adapter);
 			},
 		});
 		await bot.update(42, "/menu");
@@ -5431,9 +5676,9 @@ describe("Telegram transport", () => {
 			editFailed = true;
 			throw new Error("deadline");
 		});
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		await concurrent;
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		const published = bot.edited.filter(({ text }) =>
 			text.includes("glitch once"),
 		);
@@ -5457,7 +5702,7 @@ describe("Telegram transport", () => {
 				description: "Bad Request: message can't be edited",
 			}),
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		const newPanel = bot.lastMessageId as number;
 		expect(newPanel).not.toBe(oldPanel);
 		const sends = bot.api.sendMessage.mock.calls.length;
@@ -5490,7 +5735,7 @@ describe("Telegram transport", () => {
 				description: "Bad Request: BUTTON_DATA_INVALID",
 			}),
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 1);
 		expect(bot.sent.at(-1)?.text).toContain("Telegram отклонил");
 		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
@@ -5513,7 +5758,7 @@ describe("Telegram transport", () => {
 					description,
 				}),
 			);
-			await bot.update(42, "/menu");
+			await refreshPanel(adapter);
 		}
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterCreate + 2);
 		expect(bot.api.pinChatMessage).not.toHaveBeenCalled();
@@ -5546,7 +5791,7 @@ describe("Telegram transport", () => {
 		bot.api.sendMessage.mockRejectedValueOnce(
 			rejected("Bad Request: not enough rights to send text messages"),
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		const noticeId = bot.lastMessageId;
 		expect(bot.sent.at(-1)?.text).toContain("Telegram отклонил");
 		expect(noticeId).not.toBe(panelId);
@@ -5629,7 +5874,7 @@ describe("Telegram transport", () => {
 			publicationAttempt?.[3],
 			"folder:",
 		);
-		await bot.update(42, "/menu");
+		await refreshPanel(adapter);
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(sendsAfterReplacement);
 		expect(bot.api.editMessageText).toHaveBeenLastCalledWith(
 			42,
@@ -5695,9 +5940,28 @@ describe("Telegram transport", () => {
 		await first.adapter.stop();
 
 		const secondBot = new MockBot();
+		secondBot.nextMessageId = 2000;
 		const second = await startAdapter(secondBot, directory);
-		await secondBot.update(42, "/menu");
+		// Startup restores the saved panel in place.
 		expect(secondBot.edited[0]?.messageId).toBe(panelMessageId);
+		const editsBeforeMenu = secondBot.edited.length;
+		await secondBot.update(42, "/menu");
+		const bottomPanel = secondBot.lastMessageId;
+		expect(bottomPanel).not.toBe(panelMessageId);
+		expect(secondBot.sent.at(-1)?.text).toContain("📌 Панель сессий");
+		expect(
+			secondBot.edited
+				.slice(editsBeforeMenu)
+				.some(({ messageId }) => messageId === panelMessageId),
+		).toBe(false);
+		expect(secondBot.api.deleteMessage).toHaveBeenCalledWith(
+			42,
+			panelMessageId,
+			expect.anything(),
+		);
+		expect(
+			(await TelegramPanelStore.open(directory, "secret-token")).get(42),
+		).toBe(bottomPanel);
 		expect(secondBot.pinned).toHaveLength(0);
 		await second.adapter.stop();
 	});
@@ -7086,6 +7350,24 @@ describe("Telegram transport", () => {
 					expect(panelId).toBeDefined();
 					expect(panelId).not.toBe(welcomeId);
 					expect(bot.pinned).toHaveLength(initialPins);
+					if (action === "panel") {
+						// The panel action publishes at the bottom like /menu and 📋.
+						expect(bot.sent.at(-1)?.message_id).toBe(panelId);
+						expect(bot.sent.at(-1)?.text).toContain("📌 Панель сессий");
+						if (initialPanelId !== undefined) {
+							expect(panelId).not.toBe(initialPanelId);
+							expect(bot.api.deleteMessage).toHaveBeenCalledWith(
+								42,
+								initialPanelId,
+								expect.anything(),
+							);
+							expect(
+								bot.edited.some(
+									({ messageId }) => messageId === initialPanelId,
+								),
+							).toBe(false);
+						}
+					}
 					if (action === "sessions")
 						expect(bot.edited.at(-1)?.text).toContain("Сессии ·");
 				}
