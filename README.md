@@ -120,7 +120,7 @@ Only allowlisted users in private chats can interact. All allowlisted operators 
 | Command | Purpose |
 | --- | --- |
 | `/help` | Show available commands. |
-| `/menu` | Open or refresh the session panel to browse/select sessions, inspect usage, and manage session settings (`📋 Панель` posts it at the bottom). |
+| `/menu` | Post the session panel at the bottom of the chat (like `📋 Панель`, replacing the previous panel) to browse/select sessions, inspect usage, and manage session settings. |
 | `/rename [sessionId] <name|--clear>` | Name the selected or explicit session, or clear its name. |
 | `/sessions` | List sessions. |
 | `/new [cwd]` | Create an unnamed session in `cwd`; defaults to the current folder. The `/menu` create flow can also set a name. |
