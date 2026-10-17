@@ -122,6 +122,7 @@ const INBOX_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
+const RETIRED_PANEL_NOTE = "Панель перенесена ниже ↓";
 const NAME_PROMPT_MARKER = "Назовите сессию (запрос имени harnessd):";
 const NAME_PROMPT_ENVELOPE_PREFIX = `${NAME_PROMPT_MARKER}\n`;
 const CREATE_NAME_INSTRUCTIONS =
@@ -1399,6 +1400,12 @@ export class TelegramTransportAdapter
 	private readonly panelPublished = new Map<number, string>();
 	private readonly panelPublicationTimes = new Map<number, number>();
 	private readonly panelUpdateQueues = new Map<number, Promise<unknown>>();
+	/** In-flight bottom publishes per chat: the newest request and the panel it replaces. */
+	private readonly bottomPanelPublishes = new Map<
+		number,
+		{ latest: number; detached: number | undefined }
+	>();
+	private bottomPanelRequestCounter = 0;
 	private readonly panelRefreshScheduler = new TelegramPanelRefreshScheduler(
 		Date.now,
 		500,
@@ -2135,7 +2142,7 @@ export class TelegramTransportAdapter
 					"Запрос имени устарел. Начните действие заново.",
 				);
 			if (text.startsWith("/")) {
-				await this.command(chatId, sender, text);
+				await this.command(chatId, sender, text, ctx.message?.message_id);
 			} else {
 				if (this.eventChannelDisabled(chatId))
 					return this.sendDirect(
@@ -3048,6 +3055,7 @@ export class TelegramTransportAdapter
 		chatId: number,
 		sender: number,
 		raw: string,
+		messageId?: number,
 	): Promise<void> {
 		this.invalidatePanelIntent(chatId);
 		raw = raw.replace(/^\/(\S+)/, (token) => token.toLowerCase());
@@ -3093,8 +3101,14 @@ export class TelegramTransportAdapter
 				for (const token of tokens) this.welcomeIntents.delete(token);
 			return;
 		}
-		if (/^\/menu(?:@[^\s]+)?$/.test(raw))
-			return this.renderPanel(chatId, sender);
+		if (/^\/menu(?:@[^\s]+)?$/.test(raw)) {
+			// Like the 📋 button: the command is noise and the panel goes to the bottom.
+			if (messageId !== undefined)
+				void this.telegramCall((signal) =>
+					this.bot.api.deleteMessage(chatId, messageId, signal),
+				);
+			return this.showPanelAtBottom(chatId, sender);
+		}
 		const renameCommand = /^\/rename(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(raw);
 		if (renameCommand)
 			return this.renameCommand(chatId, sender, renameCommand[1] ?? "");
@@ -5137,12 +5151,18 @@ export class TelegramTransportAdapter
 		const createdMessageId = messageIdFrom(sent.value);
 		if (createdMessageId === undefined || !referenceIsCurrent(existing)) {
 			this.dropPanelGenerationIntents(chatId, intentGeneration);
+			// Another panel was adopted while this one was in flight: never leave two live panels.
+			if (createdMessageId !== undefined)
+				await this.removePanelMessage(chatId, createdMessageId, text);
 			return false;
 		}
 		if (existing !== undefined && existing !== createdMessageId)
 			this.retirePanel(chatId, existing);
 		await this.savePanelReference(chatId, createdMessageId);
-		if (!referenceIsCurrent(createdMessageId)) return false;
+		if (!referenceIsCurrent(createdMessageId)) {
+			await this.removePanelMessage(chatId, createdMessageId, text);
+			return false;
+		}
 		this.panelStaleChats.delete(chatId);
 		this.panelRepairChats.delete(chatId);
 		this.panelPublished.set(chatId, publication);
@@ -5385,7 +5405,8 @@ export class TelegramTransportAdapter
 		)
 			return;
 		this.welcomeIntents.delete(token);
-		if (intent.action === "panel") return this.renderPanel(chatId, sender);
+		if (intent.action === "panel")
+			return this.showPanelAtBottom(chatId, sender);
 		if (intent.action === "new") {
 			const cwd =
 				this.currentDirectories.get(chatId) ?? this.options.initialCwd;
@@ -5780,8 +5801,10 @@ export class TelegramTransportAdapter
 			void this.telegramCall((signal) =>
 				this.bot.api.deleteMessage(chatId, messageId, signal),
 			);
-		if (button === CONTROL_BUTTONS.panel)
+		if (button === CONTROL_BUTTONS.panel) {
+			await this.ensureControlKeyboard(chatId);
 			return this.showPanelAtBottom(chatId, sender);
+		}
 		if (button === CONTROL_BUTTONS.status)
 			return this.command(chatId, sender, "/status");
 		if (button === CONTROL_BUTTONS.sessions)
@@ -5789,15 +5812,47 @@ export class TelegramTransportAdapter
 		return this.confirmCancel(chatId, sender);
 	}
 
-	/** Publishes a fresh panel at the bottom of the chat and removes the previous one. */
+	/**
+	 * Publishes a fresh panel at the bottom of the chat and removes the previous one.
+	 * Overlapping publishes in one chat share the detached panel: only the newest
+	 * publish may restore it when no new panel was confirmed, so a superseded publish
+	 * can never re-attach (and let a newer render edit) the old panel.
+	 */
 	private async showPanelAtBottom(
 		chatId: number,
 		sender: number,
 	): Promise<void> {
-		await this.ensureControlKeyboard(chatId);
-		const previous =
+		if (this.stopping) return;
+		const request = ++this.bottomPanelRequestCounter;
+		const pending = this.bottomPanelPublishes.get(chatId);
+		const attached =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
-		if (previous !== undefined) {
+		const state = {
+			latest: request,
+			detached: attached ?? pending?.detached,
+		};
+		this.bottomPanelPublishes.set(chatId, state);
+		// An overlapping publish already confirmed the attached panel: its predecessor is replaced.
+		const replaced =
+			attached !== undefined &&
+			pending?.detached !== undefined &&
+			pending.detached !== attached
+				? this.retireReplacedPanel(chatId, pending.detached)
+				: undefined;
+		try {
+			await this.publishPanelAtBottom(chatId, sender, request, attached);
+		} finally {
+			await replaced;
+		}
+	}
+
+	private async publishPanelAtBottom(
+		chatId: number,
+		sender: number,
+		request: number,
+		attached: number | undefined,
+	): Promise<void> {
+		if (attached !== undefined) {
 			// Detach the reference so the render publishes a new message instead of editing.
 			this.panelMessageIds.delete(chatId);
 			this.panelPublished.delete(chatId);
@@ -5810,22 +5865,84 @@ export class TelegramTransportAdapter
 				);
 			}
 		}
-		await this.renderPanel(chatId, sender);
-		if (previous === undefined) return;
+		try {
+			await this.renderPanel(chatId, sender);
+		} finally {
+			await this.settleBottomPublish(chatId, request);
+		}
+	}
+
+	/** Restores or retires the detached panel once a bottom publish has finished. */
+	private async settleBottomPublish(
+		chatId: number,
+		request: number,
+	): Promise<void> {
 		const current =
 			this.panelMessageIds.get(chatId) ?? this.panelStore?.get(chatId);
+		const shared = this.bottomPanelPublishes.get(chatId);
+		const previous = shared?.detached;
+		if (shared?.latest !== request) {
+			// A newer publish is in flight: never restore, only retire a panel it replaced.
+			if (
+				shared === undefined ||
+				previous === undefined ||
+				current === undefined ||
+				current === previous
+			)
+				return;
+			shared.detached = undefined;
+			return this.retireReplacedPanel(chatId, previous);
+		}
+		this.bottomPanelPublishes.delete(chatId);
+		if (previous === undefined || current === previous) return;
 		if (current === undefined) {
 			// No new panel was confirmed: keep the old one as the panel.
 			await this.savePanelReference(chatId, previous);
 			this.panelRepairChats.add(chatId);
 			return;
 		}
-		if (current === previous) return;
-		this.retirePanel(chatId, previous);
+		return this.retireReplacedPanel(chatId, previous);
+	}
+
+	private async retireReplacedPanel(
+		chatId: number,
+		messageId: number,
+	): Promise<void> {
 		this.panelStaleChats.delete(chatId);
-		void this.telegramCall((signal) =>
-			this.bot.api.deleteMessage(chatId, previous, signal),
+		await this.removePanelMessage(chatId, messageId, RETIRED_PANEL_NOTE);
+	}
+
+	/**
+	 * Retires a panel message that is no longer the chat's panel and deletes it. When
+	 * Telegram refuses the delete (e.g. older than 48 hours) the message is edited to
+	 * `fallbackText` without buttons; if both fail, its taps still report an outdated
+	 * panel because the ID stays retired. An already retired ID was handled before.
+	 */
+	private async removePanelMessage(
+		chatId: number,
+		messageId: number,
+		fallbackText: string,
+	): Promise<void> {
+		if (this.retiredPanelIds.get(chatId)?.has(messageId)) return;
+		this.retirePanel(chatId, messageId);
+		const deleted = await this.telegramCall((signal) =>
+			this.bot.api.deleteMessage(chatId, messageId, signal),
 		);
+		if ((deleted.ok && deleted.value !== false) || this.stopping) return;
+		const edited = await this.telegramCall((signal) =>
+			this.bot.api.editMessageText(
+				chatId,
+				messageId,
+				fallbackText,
+				{ reply_markup: { inline_keyboard: [] } },
+				signal,
+			),
+		);
+		if (!edited.ok && !isMessageNotModified(edited.error))
+			this.reportError(
+				"Replaced Telegram control panel could not be removed",
+				edited.error,
+			);
 	}
 
 	private retirePanel(chatId: number, messageId: number): void {
