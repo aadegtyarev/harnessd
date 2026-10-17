@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { renderTelegramMarkdown } from "../src/telegram-markdown.js";
+import {
+	isTelegramParseError,
+	renderTelegramMarkdown,
+	telegramHtmlToPlainText,
+} from "../src/telegram-markdown.js";
 
 const md = (...lines: string[]) => renderTelegramMarkdown(lines.join("\n"));
 
@@ -109,13 +113,68 @@ describe("Telegram Markdown blocks", () => {
 	});
 
 	it("merges consecutive quote lines into one blockquote", () => {
-		expect(md("> first **b**", ">second", "> - item", "after")).toBe(
-			"<blockquote>first <b>b</b>\nsecond\n• item</blockquote>\nafter",
+		expect(md("> first **b**", ">", "> - item", "> 5 items", "after")).toBe(
+			"<blockquote>first <b>b</b>\n\n• item\n5 items</blockquote>\nafter",
 		);
 		expect(md("> one", "", "> two")).toBe(
 			"<blockquote>one</blockquote>\n\n<blockquote>two</blockquote>",
 		);
-		expect(md(">", "> ")).toBe("");
+		expect(md("> quote", ">no space")).toBe(
+			"<blockquote>quote</blockquote>\n&gt;no space",
+		);
+	});
+
+	it("keeps comparison-like lines as prose", () => {
+		expect(md("> 5 items", ">= 3", "> =x", ">", "> ")).toBe(
+			"&gt; 5 items\n&gt;= 3\n&gt; =x\n&gt;\n&gt; ",
+		);
+	});
+
+	it("renders a fence inside a quote as code within the blockquote", () => {
+		expect(
+			md("intro", "> see:", "> ```", "> - x | y", "> ```", "> done", "after"),
+		).toBe(
+			"intro\n<blockquote>see:\n<pre>- x | y\n</pre>\ndone</blockquote>\nafter",
+		);
+		expect(md("> ```", "> unclosed")).toBe(
+			"<blockquote><pre>unclosed</pre></blockquote>",
+		);
+	});
+
+	it("treats an unclosed fence as code to the end of the message", () => {
+		expect(
+			md(
+				"# Title",
+				"```ts",
+				"### not heading",
+				"| a | b |",
+				"|---|---|",
+				"- x",
+			),
+		).toBe(
+			"<b>Title</b>\n<pre>### not heading\n| a | b |\n|---|---|\n- x</pre>",
+		);
+		expect(md("use ``` inline", "- item")).toBe("use ``` inline\n• item");
+		expect(md("text", "```")).toBe("text\n```");
+	});
+
+	it("normalizes CRLF line endings before block rules", () => {
+		expect(
+			renderTelegramMarkdown(
+				"### Head\r\n| a | b |\r\n|---|---|\r\n| x | y |\r\n> q\r\n- i\r\n```\r\ncode\r\n```",
+			),
+		).toBe(
+			"<b>Head</b>\n• <b>x</b> — y\n<blockquote>q</blockquote>\n• i\n<pre>code\n</pre>",
+		);
+	});
+
+	it("keeps inline code inside bold headings and first cells", () => {
+		expect(md("## `config.json` layout")).toBe(
+			"<b><code>config.json</code> layout</b>",
+		);
+		expect(md("| key | value |", "|---|---|", "| `PORT` | 8080 |")).toBe(
+			"• <b><code>PORT</code></b> — 8080",
+		);
 	});
 
 	it("removes horizontal rules", () => {
@@ -162,5 +221,36 @@ describe("Telegram Markdown blocks", () => {
 				"• &lt;img src=x&gt;",
 			].join("\n"),
 		);
+	});
+
+	it("turns rendered HTML back into readable plain text", () => {
+		expect(
+			telegramHtmlToPlainText(
+				'<b>T</b> &lt;x&gt; &amp;amp; &quot;q&quot; &#39;a&#39; &#x1F642; <a href="https://e.com">l</a> &#99999999;',
+			),
+		).toBe("T <x> &amp; \"q\" 'a' 🙂 l &#99999999;");
+	});
+
+	it("recognizes only Telegram entity parse errors", () => {
+		expect(
+			isTelegramParseError({
+				error_code: 400,
+				description: "Bad Request: can't parse entities: Unexpected end tag",
+			}),
+		).toBe(true);
+		expect(
+			isTelegramParseError({
+				error_code: 400,
+				description: "Bad Request: chat not found",
+			}),
+		).toBe(false);
+		expect(
+			isTelegramParseError({
+				error_code: 429,
+				description: "can't parse entities",
+			}),
+		).toBe(false);
+		expect(isTelegramParseError(new Error("can't parse entities"))).toBe(false);
+		expect(isTelegramParseError(undefined)).toBe(false);
 	});
 });

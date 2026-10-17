@@ -8,12 +8,24 @@ import { escapeHtml } from "./error-diagnostics.js";
  * and inline rules (code, links, emphasis) inside each line. Every piece of
  * source text is HTML-escaped; only the tags produced here are emitted.
  */
-export function renderTelegramMarkdown(body: string): string {
+export function renderTelegramMarkdown(markdown: string): string {
+	const body = markdown.replace(/\r\n?/g, "\n");
 	let html = "";
 	let textStart = 0;
 	let atLineStart = true;
 	for (let offset = 0; offset < body.length; ) {
 		const remaining = body.slice(offset);
+		const quote = remaining.startsWith("```")
+			? quotedFenceBlock(body, textStart, offset)
+			: undefined;
+		if (quote) {
+			html += renderBlocks(body.slice(textStart, quote.start), atLineStart);
+			const inner = renderTelegramMarkdown(quote.inner);
+			html += inner ? `<blockquote>${inner}</blockquote>` : "";
+			offset = textStart = quote.end;
+			atLineStart = false;
+			continue;
+		}
 		const fence = remaining.match(FENCE);
 		if (fence) {
 			html += renderBlocks(body.slice(textStart, offset), atLineStart);
@@ -23,6 +35,15 @@ export function renderTelegramMarkdown(body: string): string {
 			atLineStart = false;
 			continue;
 		}
+		// An unclosed fence at line start (an interrupted reply) runs to the end.
+		const unclosed =
+			offset === 0 || body[offset - 1] === "\n"
+				? remaining.match(UNCLOSED_FENCE)
+				: null;
+		if (unclosed) {
+			html += renderBlocks(body.slice(textStart, offset), atLineStart);
+			return `${html}<pre>${escapeHtml(unclosed[1] ?? "")}</pre>`;
+		}
 		// Backticks inside inline code never open a fence.
 		const inlineCode = remaining.match(INLINE_CODE);
 		offset += inlineCode ? inlineCode[0].length : 1;
@@ -30,12 +51,89 @@ export function renderTelegramMarkdown(body: string): string {
 	return html + renderBlocks(body.slice(textStart), atLineStart);
 }
 
+/**
+ * A fence opened inside a quote (a `>` line starting with three backticks): the
+ * whole run of quote lines around it, markers stripped, rendered as one quote.
+ */
+function quotedFenceBlock(
+	body: string,
+	textStart: number,
+	offset: number,
+): { start: number; end: number; inner: string } | undefined {
+	let start = body.lastIndexOf("\n", offset - 1) + 1;
+	if (start < textStart || !/^ {0,3}>[ \t]*$/.test(body.slice(start, offset)))
+		return undefined;
+	while (start > textStart) {
+		const previous = body.lastIndexOf("\n", start - 2) + 1;
+		if (
+			previous < textStart ||
+			!QUOTE_LINE.test(body.slice(previous, start - 1))
+		)
+			break;
+		start = previous;
+	}
+	const inner: string[] = [];
+	let end = start;
+	while (end < body.length) {
+		const newline = body.indexOf("\n", end);
+		const lineEnd = newline < 0 ? body.length : newline;
+		const match = body.slice(end, lineEnd).match(QUOTE_LINE);
+		if (!match) break;
+		inner.push(match[1] ?? "");
+		if (newline < 0) {
+			end = body.length;
+			break;
+		}
+		end = lineEnd + 1;
+	}
+	// Leave the newline that ends the quote for the following text.
+	if (end > start && body[end - 1] === "\n") end--;
+	return { start, end, inner: inner.join("\n") };
+}
+
+/** Readable plain text for an HTML chunk Telegram refused to parse. */
+export function telegramHtmlToPlainText(html: string): string {
+	return html
+		.replace(/<[^>]*>/g, "")
+		.replace(/&(#\d+|#x[\da-f]+|amp|lt|gt|quot);/gi, (entity, name: string) => {
+			const lower = name.toLowerCase();
+			if (lower.startsWith("#x"))
+				return safeCodePoint(Number.parseInt(lower.slice(2), 16), entity);
+			if (lower.startsWith("#"))
+				return safeCodePoint(Number.parseInt(lower.slice(1), 10), entity);
+			return { amp: "&", lt: "<", gt: ">", quot: '"' }[lower] ?? entity;
+		});
+}
+
+function safeCodePoint(value: number, fallback: string): string {
+	return Number.isInteger(value) && value >= 0 && value <= 0x10ffff
+		? String.fromCodePoint(value)
+		: fallback;
+}
+
+/** Telegram's 400 verdict for markup it cannot parse under parse_mode. */
+export function isTelegramParseError(error: unknown): boolean {
+	if (error === null || typeof error !== "object") return false;
+	const { error_code: code, description } = error as {
+		error_code?: unknown;
+		description?: unknown;
+	};
+	return (
+		code === 400 &&
+		typeof description === "string" &&
+		/can't parse entities/i.test(description)
+	);
+}
+
 const FENCE = /^```[^\n]*\n([\s\S]*?)```/;
+const UNCLOSED_FENCE = /^```[^\n`]*\n([\s\S]*)$/;
 const INLINE_CODE = /^`([^`\n]+)`/;
 const HEADING = /^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/;
 const RULE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const BULLET = /^([ \t]*)[-*+][ \t]+(\S.*)$/;
-const QUOTE = /^ {0,3}>[ \t]?(.*)$/;
+/** A quote starts with `> ` and text that is not a digit or `=` (`> 5`, `>= 3` stay prose). */
+const QUOTE_START = /^ {0,3}>[ \t]+(?=[^\s\d=])/;
+const QUOTE_LINE = /^ {0,3}>(?:[ \t](.*))?$/;
 const SEPARATOR_CELL = /^:?-+:?$/;
 
 /**
@@ -59,10 +157,10 @@ function renderBlocks(text: string, atLineStart: boolean): string {
 			index = table.next;
 			continue;
 		}
-		if (QUOTE.test(line)) {
+		if (QUOTE_START.test(line)) {
 			const quoted: string[] = [];
 			while (index < lines.length) {
-				const match = (lines[index] ?? "").match(QUOTE);
+				const match = (lines[index] ?? "").match(QUOTE_LINE);
 				if (!match) break;
 				quoted.push(renderLine(match[1] ?? ""));
 				index++;

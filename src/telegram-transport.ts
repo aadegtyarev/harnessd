@@ -83,7 +83,11 @@ import {
 	TelegramInboxQuotaError,
 	TelegramInboxWorkspaceError,
 } from "./telegram-inbox.js";
-import { renderTelegramMarkdown } from "./telegram-markdown.js";
+import {
+	isTelegramParseError,
+	renderTelegramMarkdown,
+	telegramHtmlToPlainText,
+} from "./telegram-markdown.js";
 import { TelegramPanelIntent } from "./telegram-panel-intent.js";
 import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
@@ -9023,31 +9027,46 @@ export class TelegramTransportAdapter
 				message.background && !backgroundDelivery
 					? message.text.replace(/^Фоновая сессия · [^\n]+\n\n/, "")
 					: message.text;
+			const switchButton =
+				backgroundDelivery && token
+					? {
+							reply_markup: keyboard([
+								[
+									inlineButton(
+										"Переключиться на эту сессию",
+										`action:select:${token}`,
+									),
+								],
+							]),
+						}
+					: undefined;
+			const silent = message.silent ? { disable_notification: true } : {};
+			const plainText = message.output
+				? telegramHtmlToPlainText(text)
+				: undefined;
 			const delivered = await this.sendWithDeadline(
 				chatId,
 				text,
 				{
 					...(message.output ? { parse_mode: "HTML" } : {}),
-					...(message.silent ? { disable_notification: true } : {}),
-					...(backgroundDelivery && token
-						? {
-								reply_markup: keyboard([
-									[
-										inlineButton(
-											"Переключиться на эту сессию",
-											`action:select:${token}`,
-										),
-									],
-								]),
-							}
-						: !message.output
-							? sessionIdEntity(text, message.sessionId)
-							: {}),
+					...silent,
+					...(switchButton ??
+						(!message.output ? sessionIdEntity(text, message.sessionId) : {})),
 				},
 				message.output ? message.sessionId : undefined,
 				(messageId) => {
 					if (token) this.bindSelectMessage(token, messageId);
 				},
+				plainText === undefined
+					? undefined
+					: {
+							text: plainText,
+							other: {
+								...silent,
+								...(switchButton ??
+									sessionIdEntity(plainText, message.sessionId)),
+							},
+						},
 			);
 			if (!delivered) {
 				queue.failed = true;
@@ -9064,10 +9083,27 @@ export class TelegramTransportAdapter
 		other?: unknown,
 		correlatedSessionId?: SessionId,
 		onSent?: (messageId: number | undefined) => void,
+		plainFallback?: { readonly text: string; readonly other: unknown },
 	): Promise<boolean> {
 		return this.telegramCall((signal) =>
 			this.bot.api.sendMessage(chatId, text, other, signal),
-		).then((result) => {
+		).then(async (first) => {
+			let result = first;
+			if (!result.ok && plainFallback && isTelegramParseError(result.error)) {
+				// A formatting defect must not lose the reply: resend it once as plain text.
+				this.reportError(
+					"Telegram rejected HTML formatting; resending as plain text",
+					result.error,
+				);
+				result = await this.telegramCall((signal) =>
+					this.bot.api.sendMessage(
+						chatId,
+						plainFallback.text,
+						plainFallback.other,
+						signal,
+					),
+				);
+			}
 			if (!result.ok) {
 				this.reportError("Telegram message delivery failed", result.error);
 				return false;
