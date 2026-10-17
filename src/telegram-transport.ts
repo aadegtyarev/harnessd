@@ -83,6 +83,7 @@ import {
 	TelegramInboxQuotaError,
 	TelegramInboxWorkspaceError,
 } from "./telegram-inbox.js";
+import { renderTelegramMarkdown } from "./telegram-markdown.js";
 import { TelegramPanelIntent } from "./telegram-panel-intent.js";
 import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
@@ -729,49 +730,7 @@ function escapeHtml(value: string): string {
 function markdownToTelegramHtml(message: string, sessionId: SessionId): string {
 	const footerStart = message.lastIndexOf("\n\n");
 	const body = footerStart < 0 ? message : message.slice(0, footerStart);
-	let text = "";
-	for (let offset = 0; offset < body.length; ) {
-		const remaining = body.slice(offset);
-		const fence = remaining.match(/^```[^\n]*\n([\s\S]*?)```/);
-		if (fence) {
-			text += `<pre>${escapeHtml(fence[1] ?? "")}</pre>`;
-			offset += fence[0].length;
-			continue;
-		}
-		const inlineCode = remaining.match(/^`([^`\n]+)`/);
-		if (inlineCode) {
-			text += `<code>${escapeHtml(inlineCode[1] ?? "")}</code>`;
-			offset += inlineCode[0].length;
-			continue;
-		}
-		const link = remaining.match(/^\[([^\]\n]+)\]\(([^()\n]+)\)/);
-		if (link) {
-			const href = (link[2] ?? "").trim();
-			let safe = false;
-			try {
-				const url = new URL(href);
-				safe = ["http:", "https:", "mailto:"].includes(url.protocol);
-			} catch {
-				/* Malformed destinations remain readable, non-clickable text. */
-			}
-			text += safe
-				? `<a href="${escapeHtml(href)}">${escapeHtml(link[1] ?? "")}</a>`
-				: escapeHtml(link[1] ?? link[0]);
-			offset += link[0].length;
-			continue;
-		}
-		const emphasis = remaining.match(/^(\*\*|__|~~|\*|_)([^*_~\n]+?)\1/);
-		if (emphasis) {
-			const marker = emphasis[1];
-			const tag = marker === "~~" ? "s" : marker.length === 2 ? "b" : "i";
-			text += `<${tag}>${escapeHtml(emphasis[2] ?? "")}</${tag}>`;
-			offset += emphasis[0].length;
-			continue;
-		}
-		const point = String.fromCodePoint(body.codePointAt(offset) ?? 0);
-		text += escapeHtml(point);
-		offset += point.length;
-	}
+	const text = renderTelegramMarkdown(body);
 	if (footerStart < 0) return text;
 	const escapedFooter = escapeHtml(message.slice(footerStart + 2));
 	const escapedSessionId = escapeHtml(sessionId);
@@ -838,7 +797,10 @@ function splitHtmlBody(html: string, limit: number): string[] {
 		}
 		part += token;
 		visible += visibleCount;
-		if (tagName && ["b", "i", "s", "a", "code", "pre"].includes(tagName)) {
+		if (
+			tagName &&
+			["b", "i", "s", "a", "code", "pre", "blockquote"].includes(tagName)
+		) {
 			if (closing) stack.pop();
 			else if (!/\/>$/.test(token)) stack.push({ name: tagName, open: token });
 		}

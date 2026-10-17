@@ -9651,6 +9651,54 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("splits long assistant tables and blockquotes into balanced HTML chunks", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const rows = Array.from(
+			{ length: 60 },
+			(_, index) => `| **Ключ ${index}** | значение ${"x".repeat(40)} |`,
+		);
+		const quote = Array.from(
+			{ length: 60 },
+			(_, index) => `> строка цитаты ${index} ${"q".repeat(50)}`,
+		);
+		const assistantOutput = [
+			"### Таблица",
+			"| Параметр | Значение |",
+			"|---|---|",
+			...rows,
+			"",
+			...quote,
+		].join("\n");
+		emit(harnessEvent("sid", "output", assistantOutput));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		let chunks: typeof bot.sent = [];
+		await vi.waitFor(() => {
+			chunks = bot.sent.filter(({ text }) => hasSessionFooter(text, "sid"));
+			expect(chunks.length).toBeGreaterThanOrEqual(2);
+		});
+		for (const { text } of chunks) {
+			expect(telegramVisibleText(text).length).toBeLessThanOrEqual(4096);
+			const stack: string[] = [];
+			for (const [, closing, name] of text.matchAll(/<(\/?)([a-z]+)[^>]*>/g)) {
+				if (closing) expect(stack.pop()).toBe(name);
+				else stack.push(name ?? "");
+			}
+			expect(stack).toEqual([]);
+			expect(text).not.toContain("|---");
+			expect(text).not.toMatch(/(^|\n)&gt; /);
+		}
+		const all = chunks.map(({ text }) => text).join("");
+		expect(all).toContain("<b>Таблица</b>");
+		expect(all).toContain(`• <b>Ключ 59</b> — значение ${"x".repeat(40)}`);
+		expect(all).toContain("<blockquote>строка цитаты 0");
+		const quoted = chunks.filter(({ text }) => text.includes("строка цитаты"));
+		expect(quoted.length).toBeGreaterThanOrEqual(2);
+		for (const { text } of quoted) expect(text).toContain("<blockquote>");
+		await adapter.stop();
+	});
+
 	it("deduplicates identical session errors until successful recovery", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
