@@ -314,7 +314,12 @@ describe("failure causes", () => {
 			status: "stopped",
 			failureReason: "unexpected_exit",
 		});
+		// The one-tap restore path: stop (above), then resume the same native session.
 		const resumed = await manager.resume(session.id);
+		expect(resumed).toMatchObject({
+			status: "running",
+			nativeSessionId: "native-exact",
+		});
 		expect(resumed.failureReason).toBeUndefined();
 		expect(resumed.failedAt).toBeUndefined();
 		const stored = await store.get(session.id);

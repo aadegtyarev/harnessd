@@ -641,6 +641,7 @@ async function startAdapter(
 		harnesses?: readonly HarnessRegistryEntry[];
 		panelClock?: () => number;
 		panelSleep?: (milliseconds: number) => Promise<void>;
+		allowedUserIds?: readonly number[];
 	} = {},
 ) {
 	let listener: ((event: HarnessEvent) => unknown) | undefined;
@@ -8224,12 +8225,32 @@ describe("Telegram transport", () => {
 		const recoveryMessages = sidMessages.map(({ text }) => telegramBody(text));
 		expect(recoveryMessages).toContain("Супервизор перезапускается.");
 		expect(recoveryMessages).toContain("Супервизор восстановлен.");
-		expect(recoveryMessages).toContain("Не удалось восстановить супервизор.");
+		const failureNotice =
+			"Сессия остановилась с ошибкой: причина не сохранена. Нажмите «Восстановить», чтобы продолжить ту же сессию Pi.";
+		await vi.waitFor(() =>
+			expect(
+				bot.sent
+					.filter(({ chatId }) => chatId === 42)
+					.map(({ text }) => telegramBody(text)),
+			).toContain(failureNotice),
+		);
+		const sidMessagesAfterNotice = bot.sent.filter(
+			({ chatId, text }) => chatId === 42 && hasSessionFooter(text, "sid"),
+		);
+		recoveryMessages.splice(
+			0,
+			recoveryMessages.length,
+			...sidMessagesAfterNotice.map(({ text }) => telegramBody(text)),
+		);
+		// The owner-wide notice replaces the old selected-session failure line.
+		expect(recoveryMessages).not.toContain(
+			"Не удалось восстановить супервизор.",
+		);
 		expect(
 			recoveryMessages.indexOf("Супервизор перезапускается."),
 		).toBeLessThan(recoveryMessages.indexOf("Супервизор восстановлен."));
 		expect(recoveryMessages.indexOf("Супервизор восстановлен.")).toBeLessThan(
-			recoveryMessages.indexOf("Не удалось восстановить супервизор."),
+			recoveryMessages.indexOf(failureNotice),
 		);
 		expect(recoveryMessages).toContain("Статус сессии изменился.");
 		expect(
@@ -10614,5 +10635,183 @@ describe("Telegram transport", () => {
 			acquireTelegramPollingLock("known-token", dir),
 		).rejects.toThrow("recovery is unavailable");
 		expect(await readFile(recoveryMarker, "utf8")).toBe("123");
+	});
+});
+
+describe("Telegram session failure notice and restore", () => {
+	const failedSid = () =>
+		sessionWith("sid", {
+			name: "Night build",
+			status: "failed",
+			nativeSessionId: "native-sid",
+			failureReason: "unexpected_exit",
+			failedAt: "2026-10-19T12:34:56.000Z",
+		});
+	const noticesFor = (bot: MockBot, chatId: number) =>
+		bot.sent.filter(
+			({ chatId: target, text }) =>
+				target === chatId && text.includes("Сессия остановилась с ошибкой"),
+		);
+
+	it("notifies every authorized private chat exactly once per failure", async () => {
+		sessions.set("sid", failedSid());
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			allowedUserIds: [42, 43],
+		});
+		// Chat 42 has the failed session selected, chat 43 another one, chat 44 none.
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use other", { userId: 43 });
+		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		await vi.waitFor(() => {
+			expect(noticesFor(bot, 42)).toHaveLength(1);
+			expect(noticesFor(bot, 43)).toHaveLength(1);
+		});
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(noticesFor(bot, 42)).toHaveLength(1);
+		expect(noticesFor(bot, 43)).toHaveLength(1);
+		const notice = noticesFor(bot, 43)[0]?.text ?? "";
+		expect(notice).toContain(
+			"Pi неожиданно завершился, и автоматическое восстановление не удалось (unexpected_exit)",
+		);
+		expect(notice).toContain("Night build · sid");
+		// No second, selected-session status line for the same failure.
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Не удалось восстановить супервизор."),
+			),
+		).toBe(false);
+		const index = bot.sent.indexOf(noticesFor(bot, 43)[0] as never);
+		expect(callbackData(bot.sendOptions[index], "restore:")).toMatch(
+			/^restore:[0-9a-f]{32}$/,
+		);
+		// A later failure after a recovery notifies again.
+		emit(harnessEvent("sid", "status", "harness_restarting"));
+		emit(harnessEvent("sid", "status", "harness_recovered"));
+		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		await vi.waitFor(() => {
+			expect(noticesFor(bot, 42)).toHaveLength(2);
+			expect(noticesFor(bot, 43)).toHaveLength(2);
+		});
+		await adapter.stop();
+	});
+
+	it("restores a failed session with one bound, one-time tap", async () => {
+		sessions.set("sid", failedSid());
+		const bot = new MockBot();
+		const { adapter, emit, requests } = await startAdapter(bot, await temp(), {
+			allowedUserIds: [42, 43],
+		});
+		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		await vi.waitFor(() => expect(noticesFor(bot, 42)).toHaveLength(1));
+		const notice = noticesFor(bot, 42)[0];
+		const index = bot.sent.indexOf(notice as never);
+		const restore = callbackData(bot.sendOptions[index], "restore:");
+		const before = requests.length;
+		// Another sender, or the same token in another chat, cannot use the button.
+		await bot.callback(42, restore, notice?.message_id, 43);
+		await bot.callback(43, restore, notice?.message_id, 43);
+		expect(
+			requests
+				.slice(before)
+				.filter(({ kind }) => kind === "stop" || kind === "resume"),
+		).toEqual([]);
+		await bot.callback(42, restore, notice?.message_id);
+		expect(
+			requests
+				.slice(before)
+				.filter(({ kind }) => kind === "stop" || kind === "resume")
+				.map((request) => [
+					request.kind,
+					"sessionId" in request ? request.sessionId : undefined,
+				]),
+		).toEqual([
+			["stop", "sid"],
+			["resume", "sid"],
+		]);
+		expect(sessions.get("sid")?.status).toBe("running");
+		expect(bot.sent.at(-1)?.text).toContain("восстановлена и работает");
+		// One-time: a second tap does nothing.
+		const afterRestore = requests.length;
+		await bot.callback(42, restore, notice?.message_id);
+		expect(
+			requests
+				.slice(afterRestore)
+				.some(({ kind }) => kind === "stop" || kind === "resume"),
+		).toBe(false);
+		expect(bot.sent.at(-1)?.text).toContain("устарело");
+		await adapter.stop();
+	});
+
+	it("reports a failed restore and leaves the session stopped", async () => {
+		sessions.set("sid", failedSid());
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "resume"
+					? {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "SESSION_NOT_RESUMABLE",
+								message: "Session cannot be resumed",
+							},
+						}
+					: result(request),
+		});
+		emit(harnessEvent("sid", "status", "harness_recovery_failed"));
+		await vi.waitFor(() => expect(noticesFor(bot, 42)).toHaveLength(1));
+		const notice = noticesFor(bot, 42)[0];
+		const restore = callbackData(
+			bot.sendOptions[bot.sent.indexOf(notice as never)],
+			"restore:",
+		);
+		await bot.callback(42, restore, notice?.message_id);
+		expect(sessions.get("sid")?.status).toBe("stopped");
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("Не удалось восстановить сессию"),
+			),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("shows the cause in the card and /status and offers Restore on the card", async () => {
+		sessions.set("sid", failedSid());
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId as number;
+		await bot.callback(42, "menu:sessions", panelId);
+		await bot.callback(42, "session:details:sid", panelId);
+		const card = bot.edited.at(-1);
+		expect(card?.text).toContain(
+			"Последняя ошибка: Pi неожиданно завершился, и автоматическое восстановление не удалось (unexpected_exit), 2026-10-19 12:34 UTC",
+		);
+		expect(card?.text).not.toContain("выбрать другую сессию");
+		const restore = callbackData(card?.options, "restore:");
+		await bot.callback(42, restore, panelId);
+		expect(
+			requests
+				.filter(({ kind }) => kind === "stop" || kind === "resume")
+				.map(({ kind }) => kind),
+		).toEqual(["stop", "resume"]);
+		await bot.update(42, "/use sid");
+		sessions.set("sid", failedSid());
+		await bot.update(42, "/status");
+		expect(bot.sent.at(-1)?.text).toContain(
+			"Последняя ошибка: Pi неожиданно завершился",
+		);
+		// Core clears the cause once the session runs again.
+		const {
+			failureReason: _reason,
+			failedAt: _at,
+			...running
+		} = sessionWith("sid", { status: "running" });
+		sessions.set("sid", running);
+		await bot.update(42, "/status");
+		expect(bot.sent.at(-1)?.text).not.toContain("Последняя ошибка");
+		await adapter.stop();
 	});
 });
