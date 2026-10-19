@@ -9427,15 +9427,26 @@ describe("Telegram transport", () => {
 			),
 		);
 		expect(requests.some(({ kind }) => kind === "cancel_current")).toBe(false);
+		// A repeated ordinary notice is shown again, not swallowed as a duplicate.
+		await bot.callback(42, report, cardId);
+		await bot.callback(42, stop, cardId);
+		await vi.waitFor(() =>
+			expect(
+				(bot.edited.at(-1)?.text ?? "").split(
+					"Прерывание этой сессии не поддерживается.",
+				).length - 1,
+			).toBe(2),
+		);
 		capabilities = ["harness.cancel"];
 		await bot.callback(42, stop, cardId);
 		expect(requests.some(({ kind }) => kind === "cancel_current")).toBe(true);
 		const submits = () =>
 			requests.filter(({ kind }) => kind === "submit").length;
 		const before = submits();
+		// The report above started the 60 s debounce window.
 		await bot.callback(42, report, cardId);
 		await bot.callback(42, report, cardId);
-		expect(submits()).toBe(before + 1);
+		expect(submits()).toBe(before);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(JSON.stringify(bot.edited.at(-1)?.options)).not.toContain("card:"),
@@ -10002,7 +10013,7 @@ describe("Telegram transport", () => {
 				"Журнал: harnessd, ref aaaa0001.",
 			].join("\n"),
 			[
-				"Процесс сессии остановлен: процесс завершился (SIGKILL).",
+				"Сессия остановлена: процесс завершился (SIGKILL).",
 				"Последняя запись RPC оборвалась (agent_end, 300 Б) и пропущена.",
 				"Журнал: harnessd, ref cccc0001.",
 			].join("\n"),
@@ -10089,6 +10100,7 @@ describe("Telegram transport", () => {
 			kind: "error",
 			text: "Claude protocol error",
 			fatal: true,
+			stop: { reason: "stream_corrupted" },
 		});
 		await vi.waitFor(() =>
 			expect(
@@ -10100,7 +10112,7 @@ describe("Telegram transport", () => {
 			.map(({ text }) => telegramBody(text))
 			.join("\n");
 		expect(bodies).toContain(
-			"Процесс сессии остановлен: Claude protocol error.",
+			"Сессия остановлена: поток протокола сессии повреждён.",
 		);
 		expect(bodies).not.toMatch(/\bPi\b/);
 		await adapter.stop();
@@ -10148,6 +10160,60 @@ describe("Telegram transport", () => {
 			expect(card).toContain(`Ввод ${inputId}: ${line}`);
 			expect(card).not.toContain("Pi не принял сообщение");
 			expect(card).not.toContain("some English detail");
+			await adapter.stop();
+		},
+	);
+
+	it.each(["event first", "result first"] as const)(
+		"shows a not-delivered input line once on the card (%s)",
+		async (order) => {
+			const bot = new MockBot();
+			const inputId = "input-once" as InputId;
+			const failure: InputFailure = { reason: "hold_timeout" };
+			let emitEvent!: (event: HarnessEvent) => void;
+			const failed = () =>
+				emitEvent({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: {
+						inputId,
+						state: "failed",
+						detail: "English detail",
+						failure,
+					},
+				});
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind !== "submit") return result(request);
+					emitEvent({
+						sessionId: "sid" as SessionId,
+						kind: "input",
+						inputEvent: { inputId, state: "pending" },
+					});
+					if (order === "event first") failed();
+					else setTimeout(failed, 20);
+					return {
+						requestId: request.requestId,
+						ok: false,
+						error: {
+							code: "INPUT_NOT_DELIVERED",
+							message: "English detail",
+							inputId,
+							failure,
+						},
+					};
+				},
+			});
+			emitEvent = emit;
+			await bot.update(42, "/use sid");
+			await bot.update(42, "held text");
+			const line = `Ввод ${inputId}: не отправлен — Pi слишком долго сжимал контекст`;
+			await vi.waitFor(() =>
+				expect(bot.edited.some(({ text }) => text.includes(line))).toBe(true),
+			);
+			await new Promise((resolve) => setTimeout(resolve, 1200));
+			const card = bot.edited.at(-1)?.text ?? "";
+			expect(card.split(line).length - 1).toBe(1);
 			await adapter.stop();
 		},
 	);

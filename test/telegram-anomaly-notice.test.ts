@@ -144,7 +144,7 @@ describe("stop and input-failure wording", () => {
 			),
 		).toBe(
 			[
-				"Процесс сессии остановлен: процесс завершился (SIGKILL).",
+				"Сессия остановлена: процесс завершился (SIGKILL).",
 				"Последняя запись RPC оборвалась (agent_end, 300 Б) и пропущена.",
 				"Журнал: harnessd, ref abcd1234.",
 			].join("\n"),
@@ -161,14 +161,14 @@ describe("stop and input-failure wording", () => {
 				},
 			),
 		).toBe(
-			"Процесс сессии остановлен: поток RPC повреждён, больше 20 некорректных записей подряд.\nЖурнал: harnessd, ref abcd1234.",
+			"Сессия остановлена: поток протокола сессии повреждён.\nБольше 20 некорректных записей RPC подряд.\nЖурнал: harnessd, ref abcd1234.",
 		);
 	});
 
 	it.each<[HarnessStop, string]>([
-		[{ reason: "process_exited" }, "процесс завершился"],
+		[{ reason: "process_exited" }, "процесс завершился (неизвестно)"],
 		[{ reason: "process_exited", exit: "1" }, "процесс завершился (1)"],
-		[{ reason: "stream_corrupted" }, "поток RPC повреждён"],
+		[{ reason: "stream_corrupted" }, "поток протокола сессии повреждён"],
 		[{ reason: "stdout_not_closed" }, "вывод не закрылся"],
 		[{ reason: "stdout_closed_early" }, "вывод процесса закрылся раньше"],
 		[{ reason: "channel_failed", channel: "stdin" }, "ошибка канала stdin"],
@@ -185,7 +185,7 @@ describe("stop and input-failure wording", () => {
 
 	it("falls back to the English detail for a stop without a reason, without naming Pi", () => {
 		expect(stopNoticeText("Claude protocol error")).toBe(
-			"Процесс сессии остановлен: Claude protocol error.",
+			"Сессия остановлена: Claude protocol error.",
 		);
 	});
 

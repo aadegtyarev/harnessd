@@ -2293,6 +2293,8 @@ export class TelegramTransportAdapter
 						notice: redactDiagnosticText(submitFailureNotice(result.error), [
 							this.options.token,
 						]),
+						// The input event may already have put this line on the card.
+						noticeOnce: result.error.code === "INPUT_NOT_DELIVERED",
 					});
 					await this.presentSubmitFailure(
 						chatId,
@@ -3075,6 +3077,8 @@ export class TelegramTransportAdapter
 						notice: redactDiagnosticText(submitFailureNotice(submitted.error), [
 							this.options.token,
 						]),
+						// The input event may already have put this line on the card.
+						noticeOnce: submitted.error.code === "INPUT_NOT_DELIVERED",
 					});
 					return this.presentSubmitFailure(
 						chatId,
@@ -6537,10 +6541,18 @@ export class TelegramTransportAdapter
 
 	private updateLiveActivity(
 		activity: LiveActivity,
-		update: { readonly status?: string; readonly notice?: string },
+		update: {
+			readonly status?: string;
+			readonly notice?: string;
+			/** Skip the notice if the card already has it (a not-delivered input line). */
+			readonly noticeOnce?: boolean;
+		},
 	): void {
 		if (update.status !== undefined) activity.status = update.status;
-		if (update.notice && !activity.notices.includes(update.notice))
+		if (
+			update.notice &&
+			!(update.noticeOnce && activity.notices.includes(update.notice))
+		)
 			activity.notices.push(update.notice);
 		if (activity.notices.length > 12) activity.notices.shift();
 		this.renderLiveActivity(activity);

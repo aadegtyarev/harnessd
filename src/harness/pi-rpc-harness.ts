@@ -768,8 +768,9 @@ class PiRpcInstance implements HarnessInstance {
 			this.childExited = true;
 			void this.fileSendBridge?.close().catch(() => {});
 			if (this.eventsClosed) return;
-			this.exitState = String(exit.code ?? exit.signal ?? "unknown");
-			this.exitDetail = `Pi process exited (${this.exitState})`;
+			const state = exit.code ?? exit.signal;
+			this.exitState = state === null ? undefined : String(state);
+			this.exitDetail = `Pi process exited (${this.exitState ?? "unknown"})`;
 			if (this.stdoutEnded) queueMicrotask(() => this.finalizeChildExit(false));
 			else this.scheduleExitDrain();
 		});

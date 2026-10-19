@@ -129,10 +129,8 @@ export function anomalyNoticeText(
 const STOP_REASON_TEXT: Readonly<
 	Record<HarnessStopReason, (stop: HarnessStop) => string>
 > = {
-	process_exited: (stop) =>
-		stop.exit ? `процесс завершился (${stop.exit})` : "процесс завершился",
-	stream_corrupted: () =>
-		"поток RPC повреждён, больше 20 некорректных записей подряд",
+	process_exited: (stop) => `процесс завершился (${stop.exit ?? "неизвестно"})`,
+	stream_corrupted: () => "поток протокола сессии повреждён",
 	stdout_not_closed: () => "процесс завершился, но его вывод не закрылся",
 	stdout_closed_early: () => "вывод процесса закрылся раньше самого процесса",
 	channel_failed: (stop) =>
@@ -153,9 +151,12 @@ export function stopNoticeText(
 ): string {
 	const reason = stop ? STOP_REASON_TEXT[stop.reason](stop) : detail;
 	return [
-		`Процесс сессии остановлен: ${reason}.`,
+		`Сессия остановлена: ${reason}.`,
 		...(folded?.kind === "truncated_record"
 			? [`Последняя запись RPC оборвалась${facts(folded)} и пропущена.`]
+			: []),
+		...(folded?.kind === "corrupted_stream"
+			? ["Больше 20 некорректных записей RPC подряд."]
 			: []),
 		...(folded ? [`Журнал: harnessd, ref ${folded.ref}.`] : []),
 	].join("\n");
