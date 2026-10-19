@@ -9920,6 +9920,52 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("presents harness anomalies in Russian to the selected chat, coalesced per kind", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const anomaly = (
+			kind: "oversized_record" | "invalid_json",
+			ref: string,
+		): HarnessEvent => ({
+			sessionId: "sid" as SessionId,
+			kind: "anomaly",
+			anomalyEvent: {
+				kind,
+				action: kind === "oversized_record" ? "handled" : "skipped",
+				harnessRunning: true,
+				ref,
+				recordType: "agent_end",
+				bytes: 5 * 1024 * 1024,
+				head: "journal only head",
+			},
+		});
+		emit(anomaly("oversized_record", "aaaa0001"));
+		emit(anomaly("oversized_record", "aaaa0002"));
+		emit(anomaly("oversized_record", "aaaa0003"));
+		emit(anomaly("invalid_json", "bbbb0001"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.filter(({ text }) => text.includes("Журнал: harnessd")),
+			).toHaveLength(2),
+		);
+		const notices = bot.sent
+			.map(({ text }) => text)
+			.filter((text) => text.includes("Журнал: harnessd"));
+		expect(telegramBody(notices[0] ?? "")).toBe(
+			[
+				"Pi прислал запись RPC больше лимита (agent_end, 5,0 МБ).",
+				"harnessd обработал событие по началу записи, остальное отброшено.",
+				"Pi продолжает работать.",
+				"Журнал: harnessd, ref aaaa0001.",
+			].join("\n"),
+		);
+		expect(hasSessionFooter(notices[0] ?? "", "sid")).toBe(true);
+		expect(notices[1]).toContain("ref bbbb0001");
+		expect(notices.join("\n")).not.toContain("journal only head");
+		await adapter.stop();
+	});
+
 	it("keeps repeated input states in event order with intervening output and status", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());

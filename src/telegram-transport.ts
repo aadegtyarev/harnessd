@@ -62,6 +62,7 @@ import {
 	renderAgentBoard,
 	shortRunId,
 } from "./telegram-agent-board.js";
+import { AnomalyNoticeCoalescer } from "./telegram-anomaly-notice.js";
 import {
 	extensionCommands,
 	isNativeTelegramCommand,
@@ -1375,6 +1376,14 @@ export class TelegramTransportAdapter
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
 	private readonly reportedErrors = new Map<SessionId, Set<string>>();
+	/** Coalesced plain-Russian notices for tolerated harness anomalies. */
+	private readonly anomalyNotices = new AnomalyNoticeCoalescer(
+		(sessionId, text) =>
+			this.enqueueForSelected(
+				sessionId,
+				redactDiagnosticText(text, [this.options.token]),
+			),
+	);
 	private readonly liveActivities = new Map<string, LiveActivity>();
 	private readonly runningSessions = new Set<SessionId>();
 	private readonly reloadingSessions = new Map<SessionId, symbol>();
@@ -1815,6 +1824,7 @@ export class TelegramTransportAdapter
 		for (const controller of this.pendingSends) controller.abort();
 		for (const timer of this.typingTimers.values()) clearInterval(timer);
 		this.typingTimers.clear();
+		this.anomalyNotices.stop();
 		this.typingChats.clear();
 		this.activeTypingSessions.clear();
 		for (const queue of this.queues.values()) {
@@ -8225,6 +8235,10 @@ export class TelegramTransportAdapter
 			this.updateLiveActivityFromEvent(event.sessionId, event.activityEvent);
 			return;
 		}
+		if (event.kind === "anomaly" && event.anomalyEvent) {
+			this.anomalyNotices.push(event.sessionId, event.anomalyEvent);
+			return;
+		}
 		if (event.kind === "status") {
 			if (event.text === "harness_recovered")
 				this.reportedErrors.delete(event.sessionId);
@@ -9066,6 +9080,7 @@ export class TelegramTransportAdapter
 		this.sessionNames.delete(sessionId);
 		this.sessionCwds.delete(sessionId);
 		this.reportedErrors.delete(sessionId);
+		this.anomalyNotices.forget(sessionId);
 		this.announcedFailures.delete(sessionId);
 		for (const [token, intent] of this.restoreIntents)
 			if (intent.sessionId === sessionId) this.restoreIntents.delete(token);

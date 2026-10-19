@@ -23,6 +23,7 @@ import type {
 } from "../core/ports.js";
 import type {
 	AdapterId,
+	HarnessAnomaly,
 	HarnessEvent,
 	Input,
 	InputEvent,
@@ -49,6 +50,15 @@ import {
 	taskActivity,
 	thoughtSummary,
 } from "./pi-activity-details.js";
+import {
+	anomaly,
+	anomalyDetail,
+	anomalyText,
+	MAX_CONSECUTIVE_ANOMALIES,
+	OVERSIZED_HEAD_CHARS,
+	safeToken,
+} from "./pi-rpc-anomaly.js";
+import { scanRecordHead } from "./pi-rpc-record-head.js";
 
 export interface PiRpcHarnessOptions {
 	readonly executable: string;
@@ -59,6 +69,8 @@ export interface PiRpcHarnessOptions {
 	readonly commandTimeoutMs?: number;
 	readonly shutdownTimeoutMs?: number;
 	readonly exitDrainTimeoutMs?: number;
+	/** How long a prompt submitted during Pi compaction is held before it fails. */
+	readonly compactionHoldTimeoutMs?: number;
 	readonly maxRecordBytes?: number;
 }
 
@@ -269,6 +281,7 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			["commandTimeoutMs", options.commandTimeoutMs],
 			["shutdownTimeoutMs", options.shutdownTimeoutMs],
 			["exitDrainTimeoutMs", options.exitDrainTimeoutMs],
+			["compactionHoldTimeoutMs", options.compactionHoldTimeoutMs],
 		] as const) {
 			if (
 				value !== undefined &&
@@ -472,6 +485,8 @@ interface ActiveInput {
 	uncertain: boolean;
 	uncertainReported: boolean;
 	canceling: boolean;
+	/** Waiting for Pi compaction to finish; not yet written. */
+	held?: boolean;
 }
 function recordValue(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -589,6 +604,19 @@ function toolActivitySummary(name: string, value: unknown): string {
 	}
 	return truncateDiagnostic(redactDiagnosticText(summary), 700);
 }
+/** "Pi rejected the prompt" plus Pi's own redacted, bounded reason when it sent one. */
+function promptRejection(
+	response: Record<string, unknown>,
+	redactions: readonly (string | undefined)[],
+): string {
+	const reason =
+		typeof response.error === "string" && response.error.trim()
+			? anomalyDetail(response.error, redactions)
+			: "";
+	return reason
+		? `Pi rejected the prompt: ${reason}`
+		: "Pi rejected the prompt";
+}
 class PiRpcInstance implements HarnessInstance {
 	/** Tool names by call ID, so tool_end can describe tool-specific outcomes. */
 	private readonly toolNames = new Map<string, string>();
@@ -634,7 +662,15 @@ class PiRpcInstance implements HarnessInstance {
 	private stderrRaw = "";
 	private stderrTruncated = false;
 	private readonly stdoutEndWaiters: (() => void)[] = [];
+	/** Partial stdout line, bounded by the record-size limit. */
 	private buffer = "";
+	private bufferBytes = 0;
+	/** Set while discarding the rest of an oversized line; keeps only a bounded head. */
+	private oversized?: { head: string; bytes: number };
+	/** Partial record left at stdout EOF, reported when the process stops. */
+	private eofLeftover?: { bytes: number; head?: string };
+	private consecutiveAnomalies = 0;
+	private readonly compactionWaiters: (() => void)[] = [];
 	private writeChain: Promise<void> = Promise.resolve();
 	private cleanup?: Promise<void>;
 	private failureReported = false;
@@ -659,9 +695,8 @@ class PiRpcInstance implements HarnessInstance {
 		stdout.on("end", () => {
 			this.stdoutEnded = true;
 			for (const resolve of this.stdoutEndWaiters.splice(0)) resolve();
-			if (this.buffer.length) this.protocolFailure();
-			else if (this.childExited)
-				queueMicrotask(() => this.finalizeChildExit(false));
+			this.keepEofLeftover();
+			if (this.childExited) queueMicrotask(() => this.finalizeChildExit(false));
 			else this.scheduleExitDrain();
 		});
 		stdin.on("error", () => this.failProcess("Pi stdin failed"));
@@ -1008,35 +1043,251 @@ class PiRpcInstance implements HarnessInstance {
 			inputEvent: { inputId, state, ...(detail ? { detail } : {}) },
 		});
 	}
+	private get maxRecordBytes(): number {
+		return this.options.maxRecordBytes ?? 1024 * 1024;
+	}
+	/**
+	 * Split stdout into LF-delimited records. A line over the record limit is not
+	 * collected: only a bounded head is kept and the rest is discarded as it arrives.
+	 */
 	private consume(chunk: string): void {
-		if (this.eventsClosed) return;
-		this.buffer += chunk;
-		for (;;) {
-			const at = this.buffer.indexOf("\n");
-			if (at < 0) break;
-			let line = this.buffer.slice(0, at);
-			this.buffer = this.buffer.slice(at + 1);
+		let start = 0;
+		while (!this.eventsClosed) {
+			const at = chunk.indexOf("\n", start);
+			const piece = at < 0 ? chunk.slice(start) : chunk.slice(start, at);
+			this.appendPiece(piece);
+			if (at < 0) return;
+			start = at + 1;
+			const oversized = this.oversized;
+			if (oversized) {
+				this.oversized = undefined;
+				try {
+					this.handleOversized(oversized.head, oversized.bytes);
+				} catch (error) {
+					this.reportAnomaly({
+						kind: "handler_error",
+						action: "skipped",
+						harnessRunning: true,
+						bytes: oversized.bytes,
+						recordType:
+							safeToken(scanRecordHead(oversized.head).get("type")) ??
+							"unknown",
+						detail: anomalyDetail(
+							error instanceof Error ? `${error.name}: ${error.message}` : "",
+							this.redactions,
+						),
+					});
+					this.countAnomaly();
+				}
+				continue;
+			}
+			let line = this.buffer;
+			this.buffer = "";
+			this.bufferBytes = 0;
 			if (line.endsWith("\r")) line = line.slice(0, -1);
-			if (
-				Buffer.byteLength(line, "utf8") >
-				(this.options.maxRecordBytes ?? 1024 * 1024)
-			) {
-				this.protocolFailure();
-				return;
-			}
-			try {
-				this.record(JSON.parse(line) as Record<string, unknown>);
-			} catch {
-				this.protocolFailure();
-				return;
-			}
-			if (this.eventsClosed) return;
+			this.handleLine(line);
 		}
+	}
+	private appendPiece(piece: string): void {
+		if (!piece) return;
+		const bytes = Buffer.byteLength(piece, "utf8");
+		if (this.oversized) {
+			this.oversized.bytes += bytes;
+			return;
+		}
+		if (this.bufferBytes + bytes <= this.maxRecordBytes) {
+			this.buffer += piece;
+			this.bufferBytes += bytes;
+			return;
+		}
+		// Over the limit: keep only a head for type/ID extraction and start discarding.
+		const head =
+			this.buffer.length >= OVERSIZED_HEAD_CHARS
+				? this.buffer.slice(0, OVERSIZED_HEAD_CHARS)
+				: this.buffer +
+					piece.slice(0, OVERSIZED_HEAD_CHARS - this.buffer.length);
+		this.oversized = { head, bytes: this.bufferBytes + bytes };
+		this.buffer = "";
+		this.bufferBytes = 0;
+	}
+	private handleLine(line: string): void {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			this.streamAnomaly("invalid_json", line);
+			return;
+		}
+		const record = recordValue(parsed);
+		if (!record || typeof record.type !== "string") {
+			this.streamAnomaly("missing_type", line);
+			return;
+		}
+		let valid: boolean;
+		try {
+			valid = this.record(record, line);
+		} catch (error) {
+			this.streamAnomaly("handler_error", line, {
+				recordType: safeToken(record.type) ?? "unknown",
+				detail: anomalyDetail(
+					error instanceof Error ? `${error.name}: ${error.message}` : "",
+					this.redactions,
+				),
+			});
+			return;
+		}
+		if (valid) this.consecutiveAnomalies = 0;
+	}
+	private get redactions(): readonly (string | undefined)[] {
+		return [this.fileSendBridge?.token];
+	}
+	private reportAnomaly(report: Omit<HarnessAnomaly, "ref">): void {
+		if (this.eventsClosed) return;
+		this.emit({
+			sessionId: this.sessionId,
+			kind: "anomaly",
+			anomalyEvent: anomaly(report),
+		});
+	}
+	/**
+	 * Report a skipped or mishandled stdout record. Too many in a row mean the stream is
+	 * corrupted, which is the only stream anomaly that still stops Pi.
+	 */
+	private streamAnomaly(
+		kind: HarnessAnomaly["kind"],
+		line: string,
+		extra: Partial<HarnessAnomaly> = {},
+		action: HarnessAnomaly["action"] = "skipped",
+	): void {
+		const head = scanRecordHead(line);
+		const recordType = extra.recordType ?? safeToken(head.get("type"));
+		this.reportAnomaly({
+			kind,
+			action,
+			harnessRunning: true,
+			bytes: Buffer.byteLength(line, "utf8"),
+			head: anomalyText(line, this.redactions),
+			...(recordType ? { recordType } : {}),
+			...extra,
+		});
+		this.countAnomaly();
+	}
+	private countAnomaly(): void {
+		this.consecutiveAnomalies++;
+		if (this.consecutiveAnomalies <= MAX_CONSECUTIVE_ANOMALIES) return;
+		this.reportAnomaly({
+			kind: "corrupted_stream",
+			action: "stopped",
+			harnessRunning: false,
+		});
+		this.protocolFailure(
+			`Pi RPC stdout is corrupted: more than ${MAX_CONSECUTIVE_ANOMALIES} consecutive invalid records`,
+		);
+	}
+	/** Handle a line over the record limit from its bounded head only. */
+	private handleOversized(headText: string, bytes: number): void {
+		const head = scanRecordHead(headText);
+		const type = safeToken(head.get("type"));
+		let handled = false;
+		let action: HarnessAnomaly["action"] = "skipped";
+		let command: string | undefined;
 		if (
-			Buffer.byteLength(this.buffer, "utf8") >
-			(this.options.maxRecordBytes ?? 1024 * 1024)
-		)
-			this.protocolFailure();
+			type &&
+			[
+				"agent_start",
+				"agent_end",
+				"agent_settled",
+				"turn_start",
+				"turn_end",
+			].includes(type)
+		) {
+			this.event({ type });
+			handled = true;
+		} else if (
+			type === "tool_execution_end" &&
+			typeof head.get("toolCallId") === "string"
+		) {
+			// The result (and so a bash exit code) lies past the head; only a failure
+			// flag read from the head is reported.
+			const toolCallId = head.get("toolCallId") as string;
+			const failed = head.get("isError") === true;
+			const toolName =
+				safeToken(head.get("toolName")) ?? this.toolNames.get(toolCallId);
+			this.toolNames.delete(toolCallId);
+			this.emit({
+				sessionId: this.sessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_end",
+					toolCallId,
+					failed,
+					...(toolName === "bash" && failed ? { detail: "error" } : {}),
+				},
+			});
+			handled = true;
+		} else if (
+			type === "message_end" &&
+			head.get("message.role") === "assistant"
+		) {
+			this.event({ type, message: { role: "assistant" } });
+			handled = true;
+		} else if (type === "response" && typeof head.get("id") === "string") {
+			const id = head.get("id") as string;
+			const item = this.pending.get(id);
+			command = safeToken(head.get("command")) ?? item?.command;
+			if (item) {
+				this.failPending(
+					id,
+					new Error(
+						`Pi RPC ${item.command} response exceeded the record size limit`,
+					),
+				);
+				action = "failed_command";
+			}
+			// A late response to a finished command is ignored as usual.
+			handled = true;
+		} else if (type === "message_end" || type === "message_update") {
+			// Readable message events whose content is not needed here are dropped as handled.
+			handled = type === "message_update" || head.has("message.role");
+		}
+		if (handled && action === "skipped" && type !== "response")
+			action = "handled";
+		this.reportAnomaly({
+			kind: "oversized_record",
+			action,
+			harnessRunning: true,
+			bytes,
+			...(type ? { recordType: type } : {}),
+			...(command ? { command } : {}),
+		});
+		if (handled) this.consecutiveAnomalies = 0;
+		else this.countAnomaly();
+	}
+	/** Fail one pending command without touching the process. */
+	private failPending(id: string, error: Error): void {
+		const item = this.pending.get(id);
+		if (!item) return;
+		this.pending.delete(id);
+		if (item.timer) clearTimeout(item.timer);
+		if (item.isReload) {
+			this.reloadPending = false;
+			this.reloadDispatched = false;
+			this.reloadTimedOut = false;
+		}
+		item.reject(error);
+	}
+	/** Keep (bounded) any partial record left at stdout EOF; reported when Pi stops. */
+	private keepEofLeftover(): void {
+		const oversized = this.oversized;
+		if (oversized) this.eofLeftover = { bytes: oversized.bytes };
+		else if (this.buffer.length)
+			this.eofLeftover = {
+				bytes: this.bufferBytes,
+				head: anomalyText(this.buffer, this.redactions),
+			};
+		this.oversized = undefined;
+		this.buffer = "";
+		this.bufferBytes = 0;
 	}
 	private scheduleExitDrain(): void {
 		if (this.eventsClosed || this.exitDrainTimer) return;
@@ -1049,10 +1300,6 @@ class PiRpcInstance implements HarnessInstance {
 		if (this.eventsClosed) return;
 		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
 		this.exitDrainTimer = undefined;
-		if (this.buffer.length) {
-			this.protocolFailure();
-			return;
-		}
 		if (this.childExited && this.stdoutEnded) {
 			if (this.shuttingDown) this.closeEvents("Pi harness shut down");
 			else this.closeEvents(this.exitDetail ?? "Pi process exited");
@@ -1068,51 +1315,88 @@ class PiRpcInstance implements HarnessInstance {
 		if (this.stdoutEnded) return Promise.resolve();
 		return new Promise((resolve) => this.stdoutEndWaiters.push(resolve));
 	}
-	private protocolFailure(): void {
+	private protocolFailure(text: string): void {
 		if (this.failureReported) return;
 		this.failureReported = true;
 		this.emit({
 			sessionId: this.sessionId,
 			kind: "error",
-			text: "Malformed or oversized Pi RPC stdout record",
+			text,
 			fatal: true,
 		});
 		this.failProcess("Malformed Pi RPC protocol");
 	}
-	private record(record: Record<string, unknown>): void {
-		if (this.eventsClosed) return;
-		if (!record || typeof record.type !== "string") {
-			this.protocolFailure();
-			return;
+	/**
+	 * Apply one parsed record. Returns false when the record was an anomaly (reported
+	 * here); throws only on a harnessd handling bug, which the caller reports.
+	 */
+	private record(record: Record<string, unknown>, line: string): boolean {
+		if (this.eventsClosed) return true;
+		if (record.type === "response") return this.response(record, line);
+		this.event(record);
+		return true;
+	}
+	private response(record: Record<string, unknown>, line: string): boolean {
+		const command = safeToken(record.command);
+		if (typeof record.id !== "string") {
+			// For example Pi's id-less `parse` error for a line it could not read.
+			this.streamAnomaly("response_without_id", line, {
+				...(command ? { command } : {}),
+				...(typeof record.error === "string"
+					? { detail: anomalyDetail(record.error, this.redactions) }
+					: {}),
+			});
+			return false;
 		}
-		if (record.type === "response") {
-			if (
-				typeof record.id !== "string" ||
-				typeof record.command !== "string" ||
-				typeof record.success !== "boolean"
-			) {
-				this.protocolFailure();
-				return;
-			}
-			const item = this.pending.get(record.id);
-			if (!item) return;
-			if (record.command !== item.command) {
-				this.protocolFailure();
-				return;
-			}
-			this.pending.delete(record.id);
-			if (item.timer) clearTimeout(item.timer);
-			if (item.isReload) {
-				this.reloadPending = false;
-				this.reloadDispatched = false;
-			}
-			if (item.command === "prompt")
-				this.applyPromptResponse(record, item.inputId);
-			else if (item.command === "abort")
-				this.applyAbortResponse(record, item.inputId);
-			item.resolve(record);
-			return;
+		const item = this.pending.get(record.id);
+		if (!item) return true;
+		if (
+			typeof record.command !== "string" ||
+			typeof record.success !== "boolean"
+		) {
+			this.failPending(
+				record.id,
+				new Error(`Malformed Pi RPC ${item.command} response`),
+			);
+			this.streamAnomaly(
+				"malformed_response",
+				line,
+				{ command: item.command },
+				"failed_command",
+			);
+			return false;
 		}
+		if (record.command !== item.command) {
+			this.failPending(
+				record.id,
+				new Error(`Pi RPC ${item.command} response named another command`),
+			);
+			this.streamAnomaly(
+				"response_mismatch",
+				line,
+				{
+					command: item.command,
+					...(command ? { detail: `Pi answered as ${command}` } : {}),
+				},
+				"failed_command",
+			);
+			return false;
+		}
+		this.pending.delete(record.id);
+		if (item.timer) clearTimeout(item.timer);
+		if (item.isReload) {
+			this.reloadPending = false;
+			this.reloadDispatched = false;
+		}
+		if (item.command === "prompt")
+			this.applyPromptResponse(record, item.inputId);
+		else if (item.command === "abort")
+			this.applyAbortResponse(record, item.inputId);
+		item.resolve(record);
+		return true;
+	}
+	private event(record: Record<string, unknown>): void {
+		if (typeof record.type !== "string") return;
 		if (record.type === "message_start") {
 			this.captureCostResult(record.message);
 			return;
@@ -1194,7 +1478,8 @@ class PiRpcInstance implements HarnessInstance {
 					});
 				return;
 			}
-			if (method === "setTitle") return;
+			// Title and editor-text requests have no Telegram counterpart; ignore them silently.
+			if (method === "setTitle" || method === "set_editor_text") return;
 			if (method === "setWidget") {
 				const lines = Array.isArray(record.widgetLines)
 					? record.widgetLines.filter(
@@ -1339,8 +1624,10 @@ class PiRpcInstance implements HarnessInstance {
 		}
 		if (["auto_compaction_start", "compaction_start"].includes(record.type))
 			this.compacting = true;
-		if (["auto_compaction_end", "compaction_end"].includes(record.type))
+		if (["auto_compaction_end", "compaction_end"].includes(record.type)) {
 			this.compacting = false;
+			this.releaseCompactionWaiters();
+		}
 		if (["agent_start", "agent_end", "agent_settled"].includes(record.type)) {
 			this.emit({
 				sessionId: this.sessionId,
@@ -1371,7 +1658,16 @@ class PiRpcInstance implements HarnessInstance {
 		if (!active) return;
 		if (response.success !== true) {
 			this.activeInputs.delete(active.id);
-			this.delivery(active.id, "failed", "Pi rejected the prompt");
+			const detail = promptRejection(response, this.redactions);
+			this.reportAnomaly({
+				kind: "prompt_rejected",
+				action: "failed_input",
+				harnessRunning: true,
+				...(typeof response.error === "string"
+					? { detail: anomalyDetail(response.error, this.redactions) }
+					: {}),
+			});
+			this.delivery(active.id, "failed", detail);
 			return;
 		}
 		active.accepted = true;
@@ -1561,10 +1857,9 @@ class PiRpcInstance implements HarnessInstance {
 		while (this.abortInFlight) await this.abortInFlight.promise;
 		if (this.eventsClosed) throw new Error("Pi harness is closed");
 		if (this.reloadPending) throw new PiControlError("RELOAD_BUSY");
-		const sendAsSteer = this.agentRunning || this.activeInputs.size > 0;
 		const active: ActiveInput = {
 			id: input.id,
-			sentAsSteer: sendAsSteer,
+			sentAsSteer: false,
 			accepted: false,
 			settled: false,
 			uncertain: false,
@@ -1573,13 +1868,22 @@ class PiRpcInstance implements HarnessInstance {
 		};
 		this.activeInputs.set(input.id, active);
 		this.delivery(input.id, "pending");
+		if (this.compacting) {
+			await this.holdDuringCompaction(active);
+			// An abort that started while the prompt was held still gates it.
+			await this.waitForAbortGate();
+			if (this.eventsClosed) throw new Error("Pi harness is closed");
+		}
+		active.sentAsSteer = this.agentRunning || this.activeInputs.size > 1;
 		let response: Record<string, unknown>;
 		try {
 			response = await this.command(
 				"prompt",
 				{
 					message: input.text,
-					...(sendAsSteer ? { streamingBehavior: "steer" } : {}),
+					// Always steer: Pi ignores it when idle, and a prompt racing an unseen
+					// agent_start is then queued instead of rejected.
+					streamingBehavior: "steer",
 					...(input.images?.length
 						? {
 								images: input.images.map((image) => ({
@@ -1606,7 +1910,57 @@ class PiRpcInstance implements HarnessInstance {
 			}
 			throw new UncertainInputDeliveryError(input.id, { cause: error });
 		}
-		if (response.success !== true) throw new Error("Pi rejected the prompt");
+		if (response.success !== true)
+			throw new Error(promptRejection(response, this.redactions));
+	}
+	/**
+	 * Pi rejects prompts while it compacts, so hold this one until compaction ends.
+	 * The wait is bounded; on timeout or process stop the input fails without being sent.
+	 */
+	private async holdDuringCompaction(active: ActiveInput): Promise<void> {
+		active.held = true;
+		this.reportAnomaly({
+			kind: "prompt_held",
+			action: "held_prompt",
+			harnessRunning: true,
+		});
+		let release!: () => void;
+		const ended = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.compactionWaiters.push(release);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut = await Promise.race([
+			ended.then(() => false),
+			new Promise<boolean>((resolve) => {
+				timer = setTimeout(
+					() => resolve(true),
+					this.options.compactionHoldTimeoutMs ?? 300_000,
+				);
+			}),
+		]);
+		if (timer) clearTimeout(timer);
+		active.held = false;
+		const waiter = this.compactionWaiters.indexOf(release);
+		if (waiter >= 0) this.compactionWaiters.splice(waiter, 1);
+		if (this.eventsClosed) throw new Error("Pi harness is closed");
+		if (!timedOut) return;
+		this.activeInputs.delete(active.id);
+		const detail =
+			"Pi compaction did not finish in time; the input was not sent";
+		this.reportAnomaly({
+			kind: "prompt_hold_timeout",
+			action: "failed_input",
+			harnessRunning: true,
+		});
+		this.delivery(active.id, "failed", detail);
+		throw new Error(detail);
+	}
+	private async waitForAbortGate(): Promise<void> {
+		while (this.abortInFlight) await this.abortInFlight.promise;
+	}
+	private releaseCompactionWaiters(): void {
+		for (const release of this.compactionWaiters.splice(0)) release();
 	}
 	private completeActive(inputId: InputId): void {
 		const active = this.activeInputs.get(inputId);
@@ -1741,7 +2095,25 @@ class PiRpcInstance implements HarnessInstance {
 	}
 	private closeEvents(detail: string): void {
 		if (this.eventsClosed) return;
+		const leftover = this.eofLeftover;
+		this.eofLeftover = undefined;
+		if (leftover)
+			// A record cut by the process stopping is reported as that stop, not as malformed input.
+			this.reportAnomaly({
+				kind: "truncated_record",
+				action: "skipped",
+				harnessRunning: false,
+				bytes: leftover.bytes,
+				...(leftover.head ? { head: leftover.head } : {}),
+				detail: anomalyDetail(
+					this.shuttingDown
+						? "Pi harness shut down"
+						: (this.exitDetail ?? detail),
+					this.redactions,
+				),
+			});
 		this.eventsClosed = true;
+		this.releaseCompactionWaiters();
 		this.reloadPending = false;
 		this.reloadDispatched = false;
 		this.reloadTimedOut = false;
@@ -1749,7 +2121,14 @@ class PiRpcInstance implements HarnessInstance {
 		if (this.exitDrainTimer) clearTimeout(this.exitDrainTimer);
 		this.exitDrainTimer = undefined;
 		for (const active of this.activeInputs.values()) {
-			if (!active.uncertainReported)
+			if (active.held)
+				// A held prompt was never written, so its failure is definite.
+				this.delivery(
+					active.id,
+					"failed",
+					"Pi stopped before the held input was sent",
+				);
+			else if (!active.uncertainReported)
 				this.delivery(active.id, "uncertain", detail);
 		}
 		this.activeInputs.clear();

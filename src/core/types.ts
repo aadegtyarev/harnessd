@@ -112,11 +112,65 @@ export type HarnessActivityEvent =
 			readonly widgetKey?: string;
 	  };
 
+/** Fixed kinds of harness protocol/delivery anomalies that harnessd tolerated or acted on. */
+export type HarnessAnomalyKind =
+	| "oversized_record"
+	| "invalid_json"
+	| "missing_type"
+	| "response_without_id"
+	| "response_mismatch"
+	| "malformed_response"
+	| "handler_error"
+	| "truncated_record"
+	| "corrupted_stream"
+	| "prompt_held"
+	| "prompt_hold_timeout"
+	| "prompt_rejected";
+
+/** What harnessd did about an anomaly. */
+export type HarnessAnomalyAction =
+	| "skipped"
+	| "handled"
+	| "failed_command"
+	| "held_prompt"
+	| "failed_input"
+	| "stopped";
+
+/**
+ * A safe, typed anomaly report. Text fields are already redacted and bounded by the
+ * harness; `head` is journal-only diagnostic context and is never shown in chats.
+ */
+export interface HarnessAnomaly {
+	readonly kind: HarnessAnomalyKind;
+	readonly action: HarnessAnomalyAction;
+	/** Whether the harness process keeps running after this anomaly. */
+	readonly harnessRunning: boolean;
+	/** Short correlation reference shared by the journal line and chat notice. */
+	readonly ref: string;
+	/** Record type when known (a short safe token). */
+	readonly recordType?: string;
+	/** Correlated command name when known (a short safe token). */
+	readonly command?: string;
+	/** Byte length of the offending record when known. */
+	readonly bytes?: number;
+	/** Redacted, bounded head of a non-oversized record (journal only). */
+	readonly head?: string;
+	/** Redacted, bounded detail such as Pi's own error text or the exit state. */
+	readonly detail?: string;
+}
+
 export interface HarnessEvent {
 	readonly sessionId: SessionId;
-	readonly kind: "output" | "status" | "error" | "input" | "activity";
+	readonly kind:
+		| "output"
+		| "status"
+		| "error"
+		| "input"
+		| "activity"
+		| "anomaly";
 	readonly text?: string;
 	readonly fatal?: boolean;
 	readonly inputEvent?: InputEvent;
 	readonly activityEvent?: HarnessActivityEvent;
+	readonly anomalyEvent?: HarnessAnomaly;
 }

@@ -6,6 +6,7 @@ import {
 	mergeAdapterOptions,
 	validateAdapterOptions,
 } from "./adapter-options.js";
+import { AnomalyJournal } from "./anomaly-journal.js";
 import type { Capability } from "./errors.js";
 import {
 	DuplicateAdapterIdError,
@@ -120,6 +121,7 @@ export class SessionManager {
 	>();
 	private readonly stabilityWindowMs: number;
 	private readonly journal: SessionJournal;
+	private readonly anomalyJournal: AnomalyJournal;
 
 	constructor(
 		private readonly store: SessionStore,
@@ -134,6 +136,7 @@ export class SessionManager {
 		} = {},
 	) {
 		this.journal = options.journal ?? ((line) => console.error(line));
+		this.anomalyJournal = new AnomalyJournal((line) => this.journal(line));
 		this.stabilityWindowMs =
 			options.stabilityWindowMs ?? DEFAULT_STABILITY_WINDOW_MS;
 		const registered = new Map<AdapterId, HarnessAdapter>();
@@ -238,6 +241,7 @@ export class SessionManager {
 		this.attempts.delete(id);
 		this.cancelBudgetReset(id);
 		this.lastExits.delete(id);
+		this.anomalyJournal.forget(id);
 		this.lastDiagnostics.delete(id);
 	}
 
@@ -1461,6 +1465,8 @@ export class SessionManager {
 					return;
 				}
 				const event = { ...next.result.value, sessionId: id };
+				if (event.kind === "anomaly" && event.anomalyEvent)
+					this.anomalyJournal.record(id, event.anomalyEvent);
 				if (event.kind === "input" && event.inputEvent) {
 					const state = event.inputEvent.state;
 					if (["completed", "failed", "uncertain"].includes(state))
