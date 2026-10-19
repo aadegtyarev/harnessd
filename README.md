@@ -111,6 +111,8 @@ Installation creates a user unit, enables it for the user's `default.target`, an
 "$HOME/.local/share/harnessd/node_modules/.bin/harnessd" service uninstall
 ```
 
+The unit stops harnessd with `KillMode=mixed`: `SIGTERM` reaches only harnessd, which stops its Pi sessions itself, so a service stop is not mistaken for a Pi crash. **Upgrading from a version before 0.3.0:** re-run `harnessd service install` from the same working directory (the one with `.env`) to replace the old harnessd-managed unit with the new one; the old unit lets systemd kill Pi directly on stop.
+
 Package installation itself never creates a service. The service unit uses the installation command's current directory and loads `.env` there. Its unit location follows `XDG_CONFIG_HOME` from the invoking shell, or `~/.config` when unset; use the same shell setting when uninstalling. Values from `.env` do not change the user-manager path. See the [user-service contract](docs/contracts/surfaces/user-service.md) for ownership and failure behavior.
 
 ## Telegram commands
@@ -149,7 +151,9 @@ Plain text goes to the selected session. For each Telegram-triggered turn, one e
 
 ## Sessions, recovery, and uncertainty
 
-While harnessd is alive, the core watches explicit Pi process exit, drains final events, and may attempt native-session resume up to three times per session after 250 ms, 1 s, and 4 s. It uses the exact saved native session ID and never starts a fresh session as a fallback.
+While harnessd is alive, the core watches explicit Pi process exit, drains final events, and attempts native-session resume up to three times after each unexpected exit, after 250 ms, 1 s, and 4 s. The attempt count starts again after a successful recovery, resume, or stop. It uses the exact saved native session ID and never starts a fresh session as a fallback.
+
+If a session still ends up `failed`, every authorized Telegram user gets one notice naming the session and the cause, with a **Восстановить** button that stops it if needed and resumes the same Pi session. `/status` and the session card show the last cause and time until the session runs again. The journal (`journalctl --user -u harnessd.service`) gets one `harnessd: session <id> …` line per failed recovery attempt and per failure, with the exit code or signal and the last ~2 KB of Pi's stderr; that stderr never goes to Telegram or the database. At startup a `failed` session that still has a saved native session ID becomes `stopped`, so the next message resumes it.
 
 An operator can resume a deliberately stopped session with `/resume [sessionId]`; it reuses the stored native Pi session ID. If prompt delivery is uncertain, harnessd reports the original `InputId` and **does not resend the prompt**. A later manual submission is new work and could duplicate an operation if Pi completed the original prompt. After an unclean supervisor exit, stored session rows may be stale; this CLI does not reattach or restart prior Pi processes. An unclassified request failure includes a short reference; use it to locate the matching `harnessd.service` journal entry. The entry records the request kind, an allowlisted error type, and source filename/line, but not the raw exception message, full stack, prompt, or secret values.
 

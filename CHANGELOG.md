@@ -4,6 +4,25 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-19
+
+### Added
+
+- Session failure notice in Telegram: one message per failure to every authorized private chat, naming the session and the cause, with a one-tap **Восстановить** button (also on the session card) that stops the session if needed and resumes the same Pi session.
+- Durable failure cause: `failed` sessions store a fixed reason (`launch_failed`, `unexpected_exit`, `resume_unavailable`, `native_id_mismatch`, `options_replacement_failed`) and time, shown in `/status` and the session card and cleared when the session runs again. **Schema migration:** startup adds the nullable `failure_reason` and `failed_at` columns to the `sessions` table (idempotent).
+- One `harnessd:` journal line per failed recovery attempt and per failure, with session ID, reason, attempt number, Pi exit code/signal, and a bounded, redacted Pi stderr tail (journal only).
+
+### Changed
+
+- The automatic-recovery budget (three attempts after 250 ms, 1 s, 4 s) now resets after a successful recovery, resume, or stop, so repeated transient Pi exits no longer exhaust it for the rest of the process lifetime.
+- At startup a `failed` session with a saved native session ID becomes `stopped` (keeping its cause), so the next message or `/resume` resumes it.
+- The generated user unit sets `KillMode=mixed`. Existing installs: re-run `harnessd service install` from the working directory to replace the unit.
+- The `failed` session card no longer tells the operator to choose another session.
+
+### Fixed
+
+- A Pi exit during harnessd shutdown (for example `systemctl --user stop`) is no longer treated as a crash: the manager is marked closing before transports stop, so the session ends `stopped` instead of `failed`.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

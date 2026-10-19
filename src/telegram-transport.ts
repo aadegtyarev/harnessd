@@ -8992,6 +8992,9 @@ export class TelegramTransportAdapter
 		this.sessionNames.delete(sessionId);
 		this.sessionCwds.delete(sessionId);
 		this.reportedErrors.delete(sessionId);
+		this.announcedFailures.delete(sessionId);
+		for (const [token, intent] of this.restoreIntents)
+			if (intent.sessionId === sessionId) this.restoreIntents.delete(token);
 		for (const [chatId, previewId] of this.previews) {
 			if (previewId === sessionId) this.previews.delete(chatId);
 		}

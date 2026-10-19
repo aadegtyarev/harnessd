@@ -1,6 +1,6 @@
 # Feature contract: sessions do not fail silently
 
-Status: approved by the owner 2026-10-19; in implementation.
+Status: approved by the owner 2026-10-19; implemented, ready for verification.
 
 ## Goal and user-visible behavior
 
