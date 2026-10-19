@@ -3,7 +3,8 @@ import { meaningfulToolSummary } from "./telegram-activity-summary.js";
 export type ActivityRow = {
 	readonly id: string;
 	summary: string;
-	status: "running" | "done" | "failed";
+	/** `finished`: ended with an outcome the harness could not read. */
+	status: "running" | "done" | "failed" | "finished";
 };
 
 export const MAX_EXACT_ACTIVITY_ROWS = 256;
@@ -15,7 +16,7 @@ export function updateActivityRow(
 	rows: ActivityRow[],
 	id: string,
 	summary: string | undefined,
-	failed?: boolean,
+	failed?: boolean | "unknown",
 ): boolean {
 	const existing = rows.find((row) => row.id === id);
 	if (summary !== undefined) {
@@ -41,6 +42,7 @@ export function updateActivityRow(
 		return false;
 	}
 	if (existing?.status !== "running" || failed === undefined) return false;
-	existing.status = failed ? "failed" : "done";
+	existing.status =
+		failed === "unknown" ? "finished" : failed ? "failed" : "done";
 	return true;
 }

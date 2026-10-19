@@ -57,10 +57,12 @@ export function visibleActivityRows(
 	const visible = ranked.slice(0, 6);
 	const lines = visible.map(
 		({ row }) =>
-			`• ${truncateDiagnostic(row.summary, 120)} ${row.status === "running" ? "…" : row.status === "failed" ? "❌" : "✓"}`,
+			`• ${truncateDiagnostic(row.summary, 120)}${row.status === "running" ? " …" : row.status === "failed" ? " ❌" : row.status === "done" ? " ✓" : ""}`,
 	);
 	const omitted = ranked.slice(6);
-	const done = omitted.filter(({ row }) => row.status === "done").length;
+	const done = omitted.filter(
+		({ row }) => row.status === "done" || row.status === "finished",
+	).length;
 	const running = omitted.filter(({ row }) => row.status === "running").length;
 	const failed = omitted.filter(({ row }) => row.status === "failed").length;
 	if (done) lines.push(`• Ещё завершено: ${done}`);

@@ -4,6 +4,26 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-19
+
+### Added
+
+- Pi RPC anomaly reports: every tolerated protocol anomaly writes one `harnessd: … harness_anomaly` journal line (kind, action, record type, size, reference, redacted head). The chat hears only about real problems (a skipped record, a failed command, a harnessd handling error, Pi stopping), in plain Russian, coalesced to at most one notice per kind and minute with a repeat count; healthy tolerance stays in the journal.
+
+### Changed
+
+- Every Pi prompt carries `streamingBehavior: "steer"`, so a prompt racing an unseen `agent_start` is queued instead of rejected.
+- A prompt submitted during manual Pi compaction is held and sent after it ends; automatic compaction holds nothing. The hold is bounded: on timeout harnessd asks Pi whether it still compacts and either sends the prompt or fails it explicitly. A held prompt can be cancelled and is then never sent.
+- A rejected or unsent prompt is reported once, in Russian, with Pi's own redacted reason (`Ввод …: не принят — Pi отклонил сообщение: …`), instead of an English status line plus a separate error reply.
+- The message for a Pi process that stopped is Russian and includes any record cut by the stop or a corrupted-stream cause with its journal reference.
+- Pi extension `set_editor_text` requests are ignored silently instead of reported as unsupported.
+
+### Fixed
+
+- A long Pi run no longer gets Pi killed at its end: a stdout line over the 1 MiB record limit (such as `agent_end` carrying the whole run) is streamed with only a 16 KiB head kept and handled by its type, so the run settles and its answer is delivered. Oversized compaction events are handled too, so a large compaction summary no longer leaves prompts and reload waiting.
+- Non-JSON lines, records without a type, id-less or mismatched responses, and harnessd handling errors are skipped and reported instead of stopping Pi; only stream errors, EOF/exit, or more than 20 consecutive stream anomalies (handling errors excluded) stop it. A partial record at EOF is reported as the process stopping.
+- A large tool result no longer shows the tool as succeeded when its outcome could not be read; it is shown as finished without ✓ or ❌.
+
 ## [0.3.1] - 2026-10-19
 
 ### Added

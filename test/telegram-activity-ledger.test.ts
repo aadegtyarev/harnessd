@@ -6,6 +6,15 @@ import {
 } from "../src/telegram-activity-ledger.js";
 
 describe("Telegram activity ledger", () => {
+	it("records an end with an unreadable outcome as finished, not done", () => {
+		const rows: ActivityRow[] = [];
+		updateActivityRow(rows, "big", "write: big.txt");
+		expect(updateActivityRow(rows, "big", undefined, "unknown")).toBe(true);
+		expect(rows).toEqual([
+			{ id: "big", summary: "write: big.txt", status: "finished" },
+		]);
+	});
+
 	it("updates one exact tool call and ignores duplicates, regressions, and unknown ends", () => {
 		const rows: ActivityRow[] = [];
 		expect(updateActivityRow(rows, "opaque", "bash: npm test")).toBe(true);

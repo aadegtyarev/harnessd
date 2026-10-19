@@ -9920,6 +9920,143 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("notifies only real anomalies, coalesced per kind, and folds stops into one Russian message", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const anomaly = (
+			fields: Partial<NonNullable<HarnessEvent["anomalyEvent"]>>,
+		): HarnessEvent => ({
+			sessionId: "sid" as SessionId,
+			kind: "anomaly",
+			anomalyEvent: {
+				kind: "invalid_json",
+				action: "skipped",
+				harnessRunning: true,
+				ref: "ref00000",
+				head: "journal only head",
+				...fields,
+			},
+		});
+		const start = bot.sent.length;
+		// Healthy tolerance: journal only.
+		emit(
+			anomaly({
+				kind: "oversized_record",
+				action: "handled",
+				recordType: "agent_end",
+				bytes: 5 * 1024 * 1024,
+			}),
+		);
+		emit(anomaly({ kind: "prompt_held", action: "held_prompt" }));
+		// A real problem: one notice for three occurrences within the minute.
+		emit(anomaly({ ref: "aaaa0001", bytes: 12 }));
+		emit(anomaly({ ref: "aaaa0002" }));
+		emit(anomaly({ ref: "aaaa0003" }));
+		// Pi stopping: the cut record is folded into the single stop message.
+		emit(
+			anomaly({
+				kind: "truncated_record",
+				harnessRunning: false,
+				ref: "cccc0001",
+				recordType: "agent_end",
+				bytes: 300,
+			}),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "error",
+			text: "Pi process exited (SIGKILL)",
+			fatal: true,
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.slice(start).some(({ text }) => text.includes("cccc0001")),
+			).toBe(true),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		const bodies = bot.sent.slice(start).map(({ text }) => telegramBody(text));
+		expect(bodies).toEqual([
+			[
+				"Pi прислал строку RPC, которая не является JSON (12 Б).",
+				"harnessd пропустил эту запись.",
+				"Pi продолжает работать.",
+				"Журнал: harnessd, ref aaaa0001.",
+			].join("\n"),
+			[
+				"Pi остановлен: процесс завершился (SIGKILL).",
+				"Последняя запись RPC оборвалась (agent_end, 300 Б) и пропущена.",
+				"Журнал: harnessd, ref cccc0001.",
+			].join("\n"),
+		]);
+		expect(bodies.join("\n")).not.toContain("journal only head");
+		await adapter.stop();
+	});
+
+	it("reports a prompt Pi rejected with exactly one Russian chat message", async () => {
+		const bot = new MockBot();
+		let emitEvent!: (event: HarnessEvent) => void;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind !== "submit") return result(request);
+				const inputId = "input-rejected" as InputId;
+				emitEvent({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId, state: "pending" },
+				});
+				emitEvent({
+					sessionId: "sid" as SessionId,
+					kind: "anomaly",
+					anomalyEvent: {
+						kind: "prompt_rejected",
+						action: "failed_input",
+						harnessRunning: true,
+						ref: "dddd0001",
+						detail: "Agent is busy",
+					},
+				});
+				emitEvent({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: {
+						inputId,
+						state: "failed",
+						detail: "Pi rejected the prompt: Agent is busy",
+					},
+				});
+				return {
+					requestId: request.requestId,
+					ok: false,
+					error: {
+						code: "INPUT_NOT_DELIVERED",
+						message: "Pi rejected the prompt: Agent is busy",
+						inputId,
+					},
+				};
+			},
+		});
+		emitEvent = emit;
+		await bot.update(42, "/use sid");
+		const start = bot.sent.length;
+		await bot.update(42, "please answer");
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.slice(start).some(({ text }) => text.includes("отклонил")),
+			).toBe(true),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const messages = bot.sent
+			.slice(start)
+			.map(({ text }) => telegramBody(text))
+			// The live run card is edited in place, not a chat message about the failure.
+			.filter((text) => !text.startsWith("⏳ Ход"));
+		expect(messages).toEqual([
+			"Ввод input-rejected: не принят — Pi отклонил сообщение: Agent is busy",
+		]);
+		await adapter.stop();
+	});
+
 	it("keeps repeated input states in event order with intervening output and status", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());

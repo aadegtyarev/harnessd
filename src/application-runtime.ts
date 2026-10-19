@@ -21,6 +21,7 @@ import { describeError } from "./error-diagnostics.js";
 import { ClaudeCodeHarnessAdapter } from "./harness/claude-code-harness.js";
 import type { PiRpcHarnessOptions } from "./harness/pi-rpc-harness.js";
 import {
+	InputNotDeliveredError,
 	PiControlError,
 	PiRpcHarnessAdapter,
 	PiStartupError,
@@ -92,6 +93,7 @@ const safeErrorMessages = new Map([
 		"Pi did not start successfully; check its CLI, runtime, and authentication.",
 	],
 	["UNCERTAIN_INPUT_DELIVERY", "Input delivery is uncertain"],
+	["INPUT_NOT_DELIVERED", "Input was not delivered"],
 	[
 		"PI_CONTROL_FAILED",
 		"Pi did not confirm this control request; check /status before retrying.",
@@ -581,7 +583,8 @@ export class ApplicationRuntime {
 				`harnessd: request failure ${JSON.stringify(diagnostic)}\n${detail}`,
 			);
 			const inputId =
-				error instanceof UncertainInputDeliveryError
+				error instanceof UncertainInputDeliveryError ||
+				error instanceof InputNotDeliveredError
 					? error.inputId
 					: undefined;
 			return {
@@ -589,9 +592,15 @@ export class ApplicationRuntime {
 				ok: false,
 				error: {
 					code,
-					message: `${safeErrorMessages.get(code) ?? (reference ? `Operation failed (ref ${reference})` : "Operation failed")}\n\n${detail}`,
+					// A non-delivery carries only the harness's safe, redacted reason.
+					message:
+						error instanceof InputNotDeliveredError
+							? error.message
+							: `${safeErrorMessages.get(code) ?? (reference ? `Operation failed (ref ${reference})` : "Operation failed")}\n\n${detail}`,
 					...(request.kind === "submit" && resumed ? { resumed: true } : {}),
-					...(code === "UNCERTAIN_INPUT_DELIVERY" && inputId
+					...((code === "UNCERTAIN_INPUT_DELIVERY" ||
+						code === "INPUT_NOT_DELIVERED") &&
+					inputId
 						? { inputId }
 						: {}),
 				},
