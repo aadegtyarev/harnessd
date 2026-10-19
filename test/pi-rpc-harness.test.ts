@@ -1694,6 +1694,32 @@ describe("PiRpcHarnessAdapter", () => {
 		expect(String((failure as Error).message)).not.toContain("model provider");
 	});
 
+	it("redacts the stderr tail before bounding it, including the file-send token", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			agentFileSend: async () => ({
+				fileName: "x",
+				delivered: 1,
+				recipients: 1,
+			}),
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const bridgeToken = String(
+			fake.launchRequest?.env?.[AGENT_FILE_SEND_TOKEN_ENV],
+		);
+		// The assignment prefix lies outside the last 2 KB; the value reaches into it.
+		fake.stderr.write(
+			`password=${"s".repeat(3000)}\nbridge ${bridgeToken} end\n`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const tail = instance.diagnosticTail?.() ?? "";
+		expect(tail).not.toContain("sss");
+		expect(tail).not.toContain(bridgeToken);
+		expect(tail).toContain("bridge [REDACTED] end");
+		await instance.shutdown();
+	});
+
 	it("keeps a bounded, redacted stderr tail per instance", async () => {
 		const fake = fakeProvider();
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {

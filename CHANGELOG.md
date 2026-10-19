@@ -14,7 +14,8 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ### Changed
 
-- The automatic-recovery budget (three attempts after 250 ms, 1 s, 4 s) now resets after a successful recovery, resume, or stop, so repeated transient Pi exits no longer exhaust it for the rest of the process lifetime.
+- The automatic-recovery budget (three attempts after 250 ms, 1 s, 4 s) now resets on stop, and after a successful recovery, resume, or option change once the session has stayed up for 60 s, so repeated transient Pi exits no longer exhaust it for the rest of the process lifetime while a crash loop still ends `failed`.
+- Shutdown waits at most 5 s for in-flight requests before stopping sessions.
 - At startup a `failed` session with a saved native session ID becomes `stopped` (keeping its cause), so the next message or `/resume` resumes it.
 - The generated user unit sets `KillMode=mixed`. Existing installs: re-run `harnessd service install` from the working directory to replace the unit.
 - The `failed` session card no longer tells the operator to choose another session.

@@ -65,6 +65,8 @@ export interface PiRpcHarnessOptions {
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
 const STDERR_TAIL_LIMIT = 2048;
+/** Raw stderr kept for redaction; larger than the tail so a cut secret is redacted first. */
+const STDERR_RAW_LIMIT = 4 * STDERR_TAIL_LIMIT;
 const RELOAD_COMMAND_ENV = "HARNESSD_PI_RELOAD_COMMAND";
 const RELOAD_COMMAND_DESCRIPTION = "harnessd internal reload command";
 const COST_REPORT_CUSTOM_TYPE = "pi-ad-session-usage:report";
@@ -629,7 +631,8 @@ class PiRpcInstance implements HarnessInstance {
 	private exitDrainTimer?: ReturnType<typeof setTimeout>;
 	private exitDetail?: string;
 	/** Bounded Pi stderr tail; journal-only diagnostics, never forwarded or stored. */
-	private stderrTail = "";
+	private stderrRaw = "";
+	private stderrTruncated = false;
 	private readonly stdoutEndWaiters: (() => void)[] = [];
 	private buffer = "";
 	private writeChain: Promise<void> = Promise.resolve();
@@ -664,7 +667,9 @@ class PiRpcInstance implements HarnessInstance {
 		stdin.on("error", () => this.failProcess("Pi stdin failed"));
 		stderr.setEncoding("utf8");
 		stderr.on("data", (chunk: string) => {
-			this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
+			const combined = this.stderrRaw + chunk;
+			if (combined.length > STDERR_RAW_LIMIT) this.stderrTruncated = true;
+			this.stderrRaw = combined.slice(-STDERR_RAW_LIMIT);
 		});
 		stderr.on("error", () => this.failProcess("Pi stderr failed"));
 		void child.exit.then((exit) => {
@@ -680,8 +685,17 @@ class PiRpcInstance implements HarnessInstance {
 		return this.nativeId;
 	}
 	diagnosticTail(): string | undefined {
-		const tail = this.stderrTail.trim();
-		return tail ? redactDiagnosticText(tail) : undefined;
+		let raw = this.stderrRaw;
+		if (this.stderrTruncated) {
+			// Drop the partial first line so a cut-off secret cannot escape redaction.
+			const newline = raw.indexOf("\n");
+			if (newline >= 0) raw = raw.slice(newline + 1);
+		}
+		// Redact first, then bound, so truncation never splits an unredacted secret.
+		const tail = redactDiagnosticText(raw, [this.fileSendBridge?.token])
+			.slice(-STDERR_TAIL_LIMIT)
+			.trim();
+		return tail || undefined;
 	}
 	private async controlData(
 		command: string,

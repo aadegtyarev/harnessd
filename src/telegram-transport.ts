@@ -300,8 +300,6 @@ type QueuedMessage = {
 	readonly output?: true;
 	readonly background?: true;
 	readonly silent?: true;
-	/** Failure notice: delivered whatever the chat selects, with a restore button. */
-	readonly restoreNotice?: true;
 	readonly inputId?: string;
 	inputState?: string;
 	overflow?: true;
@@ -1257,14 +1255,14 @@ const SELECTION_NOT_SAVED_WARNING =
 	" Сейчас сессия выбрана, но сохранить выбор для следующего запуска не удалось.";
 
 const FAILURE_REASON_TEXT: Readonly<Record<SessionFailureReason, string>> = {
-	launch_failed: "Pi не запустился",
+	launch_failed: "процесс сессии не запустился",
 	unexpected_exit:
-		"Pi неожиданно завершился, и автоматическое восстановление не удалось",
+		"процесс сессии неожиданно завершился, и автоматическое восстановление не удалось",
 	resume_unavailable:
-		"продолжить сессию Pi нельзя: нет сохранённого ID сессии или поддержки возобновления",
-	native_id_mismatch: "при восстановлении Pi открыл другую сессию",
+		"продолжить сессию нельзя: нет сохранённого ID сессии или поддержки возобновления",
+	native_id_mismatch: "при восстановлении открылась другая сессия",
 	options_replacement_failed:
-		"не удалось перезапустить Pi с новыми настройками",
+		"не удалось перезапустить процесс сессии с новыми настройками",
 };
 function failureReasonText(reason: SessionFailureReason | undefined): string {
 	return reason
@@ -1283,8 +1281,40 @@ function failureCauseLine(session: SessionSummary): string | undefined {
 	const time = failureTimeText(session.failedAt);
 	return `Последняя ошибка: ${failureReasonText(session.failureReason)}${time ? `, ${time}` : ""}`;
 }
+/** Restore resumes the same native session; without one it cannot help. */
+function isRestorable(session: SessionSummary | undefined): boolean {
+	return session?.failureReason !== "resume_unavailable";
+}
+const NOT_RESTORABLE_HINT =
+	"Восстановить эту сессию нельзя. Создайте новую сессию в той же папке командой /new.";
 function failureNoticeText(session: SessionSummary | undefined): string {
-	return `Сессия остановилась с ошибкой: ${failureReasonText(session?.failureReason)}. Нажмите «Восстановить», чтобы продолжить ту же сессию Pi.`;
+	const cause = `Сессия остановилась с ошибкой: ${failureReasonText(session?.failureReason)}.`;
+	if (isRestorable(session))
+		return `${cause} Нажмите «Восстановить», чтобы продолжить ту же сессию.`;
+	return `${cause} ${NOT_RESTORABLE_HINT}${session ? `\nПапка: ${panelPath(session.cwd)}` : ""}`;
+}
+const RESTORE_ERROR_TEXT: Readonly<Record<string, string>> = {
+	SESSION_NOT_RESUMABLE:
+		"сессию нельзя продолжить: она не остановлена или у неё нет сохранённого ID сессии",
+	UNSUPPORTED_CAPABILITY: "харнесс этой сессии не поддерживает возобновление",
+	SESSION_NOT_FOUND: "сессия не найдена",
+	SESSION_STORE_ERROR: "не удалось сохранить состояние сессии",
+	HARNESS_OPTIONS_BUSY: "у сессии сейчас меняются настройки, попробуйте позже",
+	RUNTIME_CLOSING: "harnessd останавливается",
+	PI_EXECUTABLE_NOT_FOUND: "исполняемый файл харнесса не найден",
+	PI_EXECUTABLE_NOT_ACCESSIBLE: "исполняемый файл харнесса нельзя запустить",
+	PI_RPC_STARTUP_TIMEOUT: "процесс сессии не ответил вовремя при запуске",
+	PI_EXITED_BEFORE_READY: "процесс сессии завершился до готовности",
+	PI_STARTUP_FAILED: "процесс сессии не запустился",
+};
+/** Russian restore failure text from a safe error code; never core's English message. */
+function restoreErrorText(error: {
+	readonly code: string;
+	readonly message: string;
+}): string {
+	const known = RESTORE_ERROR_TEXT[error.code];
+	const reference = /\(ref ([A-Za-z0-9-]{1,32})\)/.exec(error.message)?.[1];
+	return `${known ?? "операция не удалась"} (${error.code}${reference ? `, ref ${reference}` : ""}). Подробности — в журнале harnessd.`;
 }
 
 function statusMessage(value: string | undefined): string {
@@ -6927,13 +6957,17 @@ export class TelegramTransportAdapter
 				),
 			]);
 		else if (session.status === "failed")
-			rows.push([
-				inlineButton(
-					"Восстановить",
-					`restore:${this.createRestoreIntent(chatId, sender, session.id)}`,
-				),
-				inlineButton("Остановить…", `session:stop:${session.id}`),
-			]);
+			rows.push(
+				isRestorable(session)
+					? [
+							inlineButton(
+								"Восстановить",
+								`restore:${this.createRestoreIntent(chatId, sender, session.id)}`,
+							),
+							inlineButton("Остановить…", `session:stop:${session.id}`),
+						]
+					: [inlineButton("Остановить…", `session:stop:${session.id}`)],
+			);
 		else if (session.status === "starting")
 			rows.push([
 				inlineButton("Остановить/восстановить…", `session:stop:${session.id}`),
@@ -6943,7 +6977,7 @@ export class TelegramTransportAdapter
 		rows.push([inlineButton("К списку", "menu:sessions")]);
 		await this.updatePanel(
 			chatId,
-			`${sessionLabel(session)}\nСообщения: ${this.selected.get(chatId) === session.id ? "идут в эту сессию" : "идут в другую сессию"}\nСтатус: ${sessionStatusLabel(session.status)}${failureCauseLine(session) ? `\n${failureCauseLine(session)}` : ""}\nПапка: ${panelPath(session.cwd)}`,
+			`${sessionLabel(session)}\nСообщения: ${this.selected.get(chatId) === session.id ? "идут в эту сессию" : "идут в другую сессию"}\nСтатус: ${sessionStatusLabel(session.status)}${failureCauseLine(session) ? `\n${failureCauseLine(session)}` : ""}${session.status === "failed" && !isRestorable(session) ? `\n${NOT_RESTORABLE_HINT}` : ""}\nПапка: ${panelPath(session.cwd)}`,
 			keyboard(rows),
 			messageId,
 			isCurrent,
@@ -7519,11 +7553,19 @@ export class TelegramTransportAdapter
 		await this.renderPanel(chatId, sender, messageId);
 	}
 
+	/** One live token per chat, sender and session, shared by its notice and card. */
 	private createRestoreIntent(
 		chatId: number,
 		sender: number,
 		sessionId: SessionId,
 	): string {
+		for (const [existing, intent] of this.restoreIntents)
+			if (
+				intent.chatId === chatId &&
+				intent.sender === sender &&
+				intent.sessionId === sessionId
+			)
+				return existing;
 		const token = this.makeIntentToken();
 		this.restoreIntents.set(token, { chatId, sender, sessionId });
 		while (this.restoreIntents.size > 128)
@@ -7562,7 +7604,15 @@ export class TelegramTransportAdapter
 					kind: "stop",
 					sessionId,
 				});
-				if (!stopped.ok) return stopped;
+				if (!stopped.ok) {
+					// Stop may report earlier recovery errors although the record is now stopped.
+					const after = await this.dispatchRequest(sender, {
+						kind: "inspect",
+						sessionId,
+					});
+					if (!after.ok || (after.value as SessionSummary).status !== "stopped")
+						return stopped;
+				}
 			}
 			return this.dispatchRequest(sender, { kind: "resume", sessionId });
 		});
@@ -7571,7 +7621,7 @@ export class TelegramTransportAdapter
 			this.refreshPanelsPreviewing(sessionId, sender, true);
 			await this.sendDirect(
 				chatId,
-				`Не удалось восстановить сессию ${this.sessionFooter(sessionId)}: ${outcome.error.message}`,
+				`Не удалось восстановить сессию ${this.sessionFooter(sessionId)}: ${restoreErrorText(outcome.error)}`,
 			);
 			return;
 		}
@@ -8931,33 +8981,51 @@ export class TelegramTransportAdapter
 		}
 		if (session) this.rememberSession(session);
 		const text = failureNoticeText(session);
+		const restorable = isRestorable(session);
 		// A private chat with an authorized user has that user's ID.
-		for (const chatId of this.authorized)
-			this.enqueueRestoreNotice(chatId, sessionId, text);
+		await Promise.all(
+			[...this.authorized].map((chatId) =>
+				this.deliverFailureNotice(chatId, sessionId, text, restorable),
+			),
+		);
 	}
 
-	private enqueueRestoreNotice(
+	/**
+	 * Send a failure notice outside the event-queue failure rules: it waits behind
+	 * output already queued for the chat, but is sent even when that chat's event
+	 * channel is disabled, and its own failure never disables the channel.
+	 */
+	private async deliverFailureNotice(
 		chatId: number,
 		sessionId: SessionId,
 		text: string,
-	): void {
-		let queue = this.queues.get(chatId);
-		if (!queue) {
-			queue = {
-				messages: [],
-				pendingCharacters: 0,
-				failed: false,
-				overflowNotices: new Set(),
-				idleWaiters: [],
-			};
-			this.queues.set(chatId, queue);
-		}
-		if (queue.failed || this.stopping) return;
-		const part =
+		restorable: boolean,
+	): Promise<void> {
+		if (this.stopping) return;
+		const queue = this.queues.get(chatId);
+		if (queue && !queue.failed) await this.waitForEventQueue(chatId);
+		const body =
 			splitMessageWithFooter(text, this.eventFooter(sessionId))[0] ?? text;
-		queue.messages.push({ sessionId, text: part, restoreNotice: true });
-		queue.pendingCharacters += part.length;
-		this.scheduleDrain(chatId, queue);
+		const other = {
+			...sessionIdEntity(body, sessionId),
+			...(restorable
+				? {
+						reply_markup: keyboard([
+							[
+								inlineButton(
+									"Восстановить",
+									`restore:${this.createRestoreIntent(chatId, chatId, sessionId)}`,
+								),
+							],
+						]),
+					}
+				: {}),
+		};
+		const sent = await this.telegramCall((signal) =>
+			this.bot.api.sendMessage(chatId, body, other, signal),
+		);
+		if (!sent.ok)
+			this.reportError("Telegram failure notice delivery failed", sent.error);
 	}
 
 	private enqueueForSelected(
@@ -9196,23 +9264,10 @@ export class TelegramTransportAdapter
 				message.background && this.selected.get(chatId) !== message.sessionId;
 			if (
 				!message.background &&
-				!message.restoreNotice &&
 				this.selected.get(chatId) !== message.sessionId
 			)
 				continue;
 			const sender = this.authorizedChatPrincipals.get(chatId);
-			const restoreButton = message.restoreNotice
-				? {
-						reply_markup: keyboard([
-							[
-								inlineButton(
-									"Восстановить",
-									`restore:${this.createRestoreIntent(chatId, sender ?? chatId, message.sessionId)}`,
-								),
-							],
-						]),
-					}
-				: undefined;
 			const token =
 				backgroundDelivery && sender !== undefined
 					? this.createSelectIntent(chatId, sender, message.sessionId)
@@ -9246,7 +9301,6 @@ export class TelegramTransportAdapter
 					...silent,
 					...(switchButton ??
 						(!message.output ? sessionIdEntity(text, message.sessionId) : {})),
-					...(restoreButton ?? {}),
 				},
 				message.output ? message.sessionId : undefined,
 				(messageId) => {

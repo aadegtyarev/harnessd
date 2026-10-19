@@ -50,6 +50,8 @@ import type {
 
 /** Delays before each automatic recovery `resume` attempt. */
 const RECOVERY_DELAYS_MS = [250, 1000, 4000] as const;
+/** How long a recovered or resumed instance must stay up before its recovery budget resets. */
+const DEFAULT_STABILITY_WINDOW_MS = 60_000;
 
 /** Writes one supervisor journal line (stderr under systemd). */
 export type SessionJournal = (line: string) => void;
@@ -112,6 +114,11 @@ export class SessionManager {
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
 	private readonly lastExits = new Map<SessionId, ExitInfo>();
 	private readonly lastDiagnostics = new Map<SessionId, string>();
+	private readonly stabilityTimers = new Map<
+		SessionId,
+		ReturnType<typeof setTimeout>
+	>();
+	private readonly stabilityWindowMs: number;
 	private readonly journal: SessionJournal;
 
 	constructor(
@@ -122,9 +129,13 @@ export class SessionManager {
 			readonly adapterOptions?: AdapterOptions;
 			readonly toolPermissionHandler?: ToolPermissionHandler;
 			readonly journal?: SessionJournal;
+			/** Uptime after which a recovered/resumed instance resets the recovery budget. */
+			readonly stabilityWindowMs?: number;
 		} = {},
 	) {
 		this.journal = options.journal ?? ((line) => console.error(line));
+		this.stabilityWindowMs =
+			options.stabilityWindowMs ?? DEFAULT_STABILITY_WINDOW_MS;
 		const registered = new Map<AdapterId, HarnessAdapter>();
 		for (const harness of harnesses) {
 			const id = harness.descriptor.id;
@@ -225,6 +236,7 @@ export class SessionManager {
 		this.unsettledInputs.delete(id);
 		this.recoveryErrors.delete(id);
 		this.attempts.delete(id);
+		this.cancelBudgetReset(id);
 		this.lastExits.delete(id);
 		this.lastDiagnostics.delete(id);
 	}
@@ -369,11 +381,13 @@ export class SessionManager {
 	 */
 	beginClose(): void {
 		this.closing = true;
+		for (const id of [...this.stabilityTimers.keys()])
+			this.cancelBudgetReset(id);
 	}
 
 	close(): Promise<void> {
 		if (!this.closePromise) {
-			this.closing = true;
+			this.beginClose();
 			this.closePromise = this.closeAll();
 		}
 		return this.closePromise;
@@ -481,6 +495,7 @@ export class SessionManager {
 			}
 		}
 		// An operator stop resets the automatic-recovery budget.
+		this.cancelBudgetReset(id);
 		this.attempts.delete(id);
 		if (failures.length)
 			throw new AggregateError(
@@ -628,7 +643,7 @@ export class SessionManager {
 			}
 			throw new SessionNotResumableError(id);
 		}
-		this.attempts.delete(id);
+		this.scheduleBudgetReset(id, replacement);
 		this.startEventPump(id, replacement);
 		this.watchExit(id, replacement);
 		return running;
@@ -1035,6 +1050,7 @@ export class SessionManager {
 			throw error;
 		}
 		this.instances.set(session.id, replacement);
+		this.scheduleBudgetReset(session.id, replacement);
 		this.startEventPump(session.id, replacement);
 		this.watchExit(session.id, replacement);
 		return running;
@@ -1153,6 +1169,7 @@ export class SessionManager {
 	private watchExit(id: SessionId, instance: HarnessInstance): void {
 		void instance.exit
 			.then(async (exit) => {
+				if (this.instances.get(id) === instance) this.cancelBudgetReset(id);
 				if (
 					this.instances.get(id) !== instance ||
 					this.optionOwnedShutdowns.has(instance) ||
@@ -1203,6 +1220,28 @@ export class SessionManager {
 				await task;
 			})
 			.catch(() => {});
+	}
+
+	/**
+	 * Reset the recovery budget once `instance` has stayed the live instance for the
+	 * stability window, so a harness that dies right after readiness cannot loop forever.
+	 */
+	private scheduleBudgetReset(id: SessionId, instance: HarnessInstance): void {
+		this.cancelBudgetReset(id);
+		if (this.closing) return;
+		const timer = setTimeout(() => {
+			if (this.stabilityTimers.get(id) !== timer) return;
+			this.stabilityTimers.delete(id);
+			if (this.instances.get(id) === instance) this.attempts.delete(id);
+		}, this.stabilityWindowMs);
+		timer.unref?.();
+		this.stabilityTimers.set(id, timer);
+	}
+
+	private cancelBudgetReset(id: SessionId): void {
+		const timer = this.stabilityTimers.get(id);
+		if (timer !== undefined) clearTimeout(timer);
+		this.stabilityTimers.delete(id);
 	}
 
 	private recordExit(
@@ -1265,7 +1304,17 @@ export class SessionManager {
 		error?: unknown,
 	): Promise<void> {
 		if (this.terminal.has(id) || this.closing) return;
-		await this.markFailed(id, reason, error);
+		try {
+			await this.markFailed(id, reason, error);
+		} catch (statusError) {
+			// Already journaled; keep the error for stop and still tell observers.
+			this.recoveryErrors.set(
+				id,
+				error === undefined
+					? statusError
+					: new AggregateError([error, statusError], "Recovery failed"),
+			);
+		}
 		if (!this.terminal.has(id) && !this.closing) this.publishRecoveryFailed(id);
 	}
 
@@ -1350,8 +1399,8 @@ export class SessionManager {
 				this.instances.delete(id);
 				return;
 			}
-			// A successful automatic recovery resets the budget for the next crash.
-			this.attempts.delete(id);
+			// The budget resets only once the recovered instance stays up.
+			this.scheduleBudgetReset(id, replacement);
 			this.startEventPump(id, replacement);
 			this.watchExit(id, replacement);
 			this.publishEvent({

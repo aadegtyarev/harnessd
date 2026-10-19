@@ -107,7 +107,7 @@ function startupError(tail: string): Error {
 }
 
 describe("recovery budget", () => {
-	it("recovers four crash cycles in one manager lifetime, each after 250 ms", async () => {
+	it("recovers four crash cycles spaced beyond the stability window, each after 250 ms", async () => {
 		vi.useFakeTimers();
 		const harness = crashingHarness(async () => {
 			const exit = deferred<Exit>();
@@ -124,11 +124,51 @@ describe("recovery budget", () => {
 			await flush();
 			expect(harness.exits).toHaveLength(cycle + 2);
 			expect((await store.get(session.id))?.status).toBe("running");
+			// Staying up for the stability window resets the budget.
+			await vi.advanceTimersByTimeAsync(60_000);
 		}
 		expect(events.filter((text) => text === "harness_recovered")).toHaveLength(
 			4,
 		);
 		expect(events).not.toContain("harness_recovery_failed");
+		await manager.close();
+		store.close();
+	});
+
+	it("ends an immediate-crash loop as failed with unexpected_exit and one failure event", async () => {
+		vi.useFakeTimers();
+		const harness = crashingHarness(async () =>
+			// Each resumed instance dies right after readiness.
+			instance(Promise.resolve({ code: 1, signal: null })),
+		);
+		let resumes = 0;
+		const counted: HarnessAdapter = {
+			...harness,
+			async resume(request) {
+				resumes++;
+				return (harness.resume as NonNullable<HarnessAdapter["resume"]>)(
+					request,
+				);
+			},
+		};
+		const { manager, store, session, events } = await setup(counted);
+		harness.exits[0]?.resolve({ code: 1, signal: null });
+		await flush();
+		await vi.advanceTimersByTimeAsync(250 + 1000 + 4000 + 1000);
+		await flush();
+		expect(resumes).toBe(3);
+		expect(await store.get(session.id)).toMatchObject({
+			status: "failed",
+			failureReason: "unexpected_exit",
+		});
+		expect(events.filter((text) => text === "harness_recovered")).toHaveLength(
+			3,
+		);
+		expect(events.filter((text) => text === "harness_recovery_failed")).toEqual(
+			["harness_recovery_failed"],
+		);
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(resumes).toBe(3);
 		await manager.close();
 		store.close();
 	});
@@ -253,6 +293,49 @@ describe("failure causes", () => {
 		second.store.close();
 	});
 
+	it("journals once and still notifies when the failed write itself fails", async () => {
+		const directory = await temporaryDirectory();
+		const base = await SqliteSessionStore.open(directory);
+		const store: SessionStore = {
+			create: (session) => base.create(session),
+			list: () => base.list(),
+			get: (id) => base.get(id),
+			delete: (id) => base.delete(id),
+			setName: (id, name) => base.setName(id, name),
+			update: (session) => base.update(session),
+			async setStatus(id, status, failure) {
+				if (status === "failed") throw new Error("disk full");
+				await base.setStatus(id, status, failure);
+			},
+		};
+		const journal: string[] = [];
+		const events: string[] = [];
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "no-resume" as never,
+				capabilities: ["harness.launch", "harness.stop"],
+			},
+			async launch() {
+				return instance(Promise.resolve({ code: 1, signal: null }));
+			},
+		};
+		const manager = new SessionManager(store, [harness], {
+			journal: (line) => journal.push(line),
+		});
+		manager.subscribe((event) => {
+			if (event.kind === "status" && event.text) events.push(event.text);
+		});
+		await manager.create({ harnessId: "no-resume" as never, cwd: directory });
+		await flush();
+		expect(journal).toHaveLength(1);
+		expect(journal[0]).toContain("reason=resume_unavailable");
+		expect(events.filter((text) => text === "harness_recovery_failed")).toEqual(
+			["harness_recovery_failed"],
+		);
+		await manager.close().catch(() => {});
+		base.close();
+	});
+
 	it("records launch_failed for a failed create", async () => {
 		const directory = await temporaryDirectory();
 		const store = await SqliteSessionStore.open(directory);
@@ -370,6 +453,58 @@ describe("failure causes", () => {
 });
 
 describe("runtime shutdown", () => {
+	it("bounds the wait for in-flight requests before closing sessions", async () => {
+		const directory = await temporaryDirectory();
+		const sendGate = deferred<void>();
+		let sendEntered = false;
+		const harness: HarnessAdapter = {
+			descriptor: {
+				id: "stuck" as never,
+				capabilities: ["harness.launch", "harness.stop", "input.submit"],
+			},
+			async launch() {
+				return {
+					...instance(new Promise(() => {})),
+					async send() {
+						sendEntered = true;
+						await sendGate.promise;
+					},
+					async shutdown() {
+						// Closing the session is what releases the stuck request.
+						sendGate.resolve();
+					},
+				};
+			},
+		};
+		const runtime = await ApplicationRuntime.start({
+			piExecutable: "/unused/pi",
+			stateDirectory: directory,
+			transports: [],
+			harnesses: [harness],
+			requestDrainTimeoutMs: 50,
+		});
+		const created = await runtime.dispatch({
+			requestId: "create",
+			principalId: "test",
+			kind: "create",
+			harnessId: "stuck" as never,
+			cwd: directory,
+		});
+		if (!created.ok) throw new Error("create failed");
+		const submit = runtime.dispatch({
+			requestId: "submit",
+			principalId: "test",
+			kind: "submit",
+			sessionId: (created.value as { id: SessionId }).id,
+			text: "hello",
+		});
+		await vi.waitFor(() => expect(sendEntered).toBe(true));
+		const began = Date.now();
+		await runtime.close();
+		expect(Date.now() - began).toBeLessThan(2_000);
+		await submit;
+	});
+
 	it("treats a harness exit during transport stop as shutdown, not a crash", async () => {
 		const directory = await temporaryDirectory();
 		const base = await SqliteSessionStore.open(directory);
