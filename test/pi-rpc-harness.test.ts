@@ -1675,6 +1675,74 @@ describe("PiRpcHarnessAdapter", () => {
 		).rejects.toMatchObject({ code: "PI_EXITED_BEFORE_READY" });
 	});
 
+	it("attaches a journal-only stderr tail to a startup failure", async () => {
+		const fake = fakeProvider({ exitOnGetState: true });
+		fake.stderr.write("Error: model provider unavailable\n");
+		const failure = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+			shutdownTimeoutMs: 5,
+		})
+			.launch(request)
+			.catch((error: unknown) => error);
+		expect(failure).toMatchObject({ code: "PI_EXITED_BEFORE_READY" });
+		const tail = (failure as { diagnosticTail?: unknown }).diagnosticTail;
+		expect(tail).toBe("Error: model provider unavailable");
+		// Non-enumerable, so the tail is not serialized with the error.
+		expect(Object.keys(failure as object)).not.toContain("diagnosticTail");
+		expect(JSON.stringify(failure)).not.toContain("model provider");
+		expect(String((failure as Error).message)).not.toContain("model provider");
+	});
+
+	it("redacts the stderr tail before bounding it, including the file-send token", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			agentFileSend: async () => ({
+				fileName: "x",
+				delivered: 1,
+				recipients: 1,
+			}),
+			startupTimeoutMs: 100,
+		}).launch(request);
+		const bridgeToken = String(
+			fake.launchRequest?.env?.[AGENT_FILE_SEND_TOKEN_ENV],
+		);
+		// The assignment prefix lies outside the last 2 KB; the value reaches into it.
+		fake.stderr.write(
+			`password=${"s".repeat(3000)}\nbridge ${bridgeToken} end\n`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const tail = instance.diagnosticTail?.() ?? "";
+		expect(tail).not.toContain("sss");
+		expect(tail).not.toContain(bridgeToken);
+		expect(tail).toContain("bridge [REDACTED] end");
+		await instance.shutdown();
+	});
+
+	it("keeps a bounded, redacted stderr tail per instance", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		expect(instance.diagnosticTail?.()).toBeUndefined();
+		fake.stderr.write("x".repeat(5000));
+		fake.stderr.write("\napi_key=sk-private-value fatal: out of memory\n");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const tail = instance.diagnosticTail?.() ?? "";
+		expect(tail.length).toBeLessThanOrEqual(2048);
+		expect(tail.endsWith("fatal: out of memory")).toBe(true);
+		expect(tail).not.toContain("sk-private-value");
+		const events = instance.events[Symbol.asyncIterator]();
+		await instance.shutdown();
+		for (;;) {
+			const next = await events.next();
+			if (next.done) break;
+			expect(JSON.stringify(next.value)).not.toContain("out of memory");
+		}
+	});
+
 	it("classifies the get_state command timeout as a startup timeout", async () => {
 		const fake = fakeProvider({ holdGetState: true });
 		await expect(

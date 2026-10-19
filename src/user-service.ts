@@ -81,6 +81,7 @@ Type=simple
 WorkingDirectory=${escapeUnitPath(options.cwd)}
 ExecStart=${quoteExecExecutable(options.nodeExecutable)} ${quoteExecArgument(options.cliEntryPoint)}
 KillSignal=SIGTERM
+KillMode=mixed
 TimeoutStopSec=30s
 
 [Install]

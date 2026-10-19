@@ -203,7 +203,15 @@ export interface ApplicationRuntimeOptions {
 	readonly adapterOptions?: AdapterOptions;
 	readonly stateDirectory?: string;
 	readonly store?: SessionStore & { close(): void };
+	/**
+	 * Upper bound on waiting for in-flight requests during shutdown before the
+	 * session manager is closed (default 5 s), keeping a service stop well under
+	 * systemd's `TimeoutStopSec`.
+	 */
+	readonly requestDrainTimeoutMs?: number;
 }
+
+const DEFAULT_REQUEST_DRAIN_TIMEOUT_MS = 5_000;
 
 export class ApplicationRuntime {
 	private readonly manager: SessionManager;
@@ -214,11 +222,14 @@ export class ApplicationRuntime {
 	private state: "starting" | "running" | "closing" | "closed" = "starting";
 	private readonly inFlight = new Set<Promise<ApplicationResult>>();
 	private closePromise: Promise<void> | undefined;
+	private readonly requestDrainTimeoutMs: number;
 	private constructor(
 		store: SessionStore & { close(): void },
 		manager: SessionManager,
 		transports: readonly TransportAdapter[],
+		requestDrainTimeoutMs = DEFAULT_REQUEST_DRAIN_TIMEOUT_MS,
 	) {
+		this.requestDrainTimeoutMs = requestDrainTimeoutMs;
 		this.store = store;
 		this.manager = manager;
 		this.transports = transports;
@@ -323,6 +334,7 @@ export class ApplicationRuntime {
 				store,
 				sessionManager,
 				options.transports,
+				options.requestDrainTimeoutMs,
 			);
 			runtimeToClose = runtime;
 			const subscribeEvents: TransportEventSubscription = (listener) =>
@@ -341,6 +353,7 @@ export class ApplicationRuntime {
 			return runtime;
 		} catch (error) {
 			const failures: unknown[] = [error];
+			manager?.beginClose();
 			for (const transport of started.reverse())
 				try {
 					await transport.stop();
@@ -607,6 +620,8 @@ export class ApplicationRuntime {
 
 	private async closeAll(): Promise<void> {
 		const failures: unknown[] = [];
+		// From here on a harness exit is shutdown, not a crash to recover from.
+		this.manager.beginClose();
 		for (const transport of [...this.transports].reverse())
 			try {
 				await transport.stop();
@@ -614,7 +629,15 @@ export class ApplicationRuntime {
 				failures.push(error);
 			}
 		this.clearListeners();
-		await Promise.allSettled([...this.inFlight]);
+		// Bounded: manager close stops the sessions that a stuck request may wait on.
+		let drainTimer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			Promise.allSettled([...this.inFlight]),
+			new Promise<void>((resolve) => {
+				drainTimer = setTimeout(resolve, this.requestDrainTimeoutMs);
+			}),
+		]);
+		if (drainTimer !== undefined) clearTimeout(drainTimer);
 		try {
 			await this.manager.close();
 		} catch (error) {

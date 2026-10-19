@@ -50,6 +50,8 @@ describe("per-user systemd service", () => {
 		expect(contents).toContain("WantedBy=default.target");
 		expect(contents).not.toContain("TELEGRAM_BOT_TOKEN");
 		expect(contents).not.toContain("Restart=");
+		// SIGTERM reaches only harnessd, which stops its Pi children itself.
+		expect(contents).toContain("KillSignal=SIGTERM\nKillMode=mixed\n");
 		const unusualPath = renderUserServiceUnit({
 			cwd: '/home/operator/work %literal\\backslash"quote\ttab',
 			nodeExecutable: "/home/operator/node/bin/node",

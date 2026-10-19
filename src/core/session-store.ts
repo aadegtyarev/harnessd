@@ -6,6 +6,8 @@ import { validateAdapterOptions } from "./adapter-options.js";
 import { InvalidStateDirectoryError, SessionStoreError } from "./errors.js";
 import type {
 	AdapterId,
+	SessionFailure,
+	SessionFailureReason,
 	SessionId,
 	SessionStatus,
 	SessionSummary,
@@ -16,7 +18,15 @@ export interface SessionStore {
 	list(): Promise<readonly SessionSummary[]>;
 	get(id: SessionId): Promise<SessionSummary | undefined>;
 	delete(id: SessionId): Promise<boolean>;
-	setStatus(id: SessionId, status: SessionStatus): Promise<void>;
+	/**
+	 * Persist a lifecycle status. `failed` stores the given failure cause and time,
+	 * `running` clears any stored cause, and other statuses leave it unchanged.
+	 */
+	setStatus(
+		id: SessionId,
+		status: SessionStatus,
+		failure?: SessionFailure,
+	): Promise<void>;
 	setName(id: SessionId, name?: string): Promise<void>;
 	setAdapterOptions?(
 		id: SessionId,
@@ -133,6 +143,10 @@ export class SqliteSessionStore implements SessionStore {
 				database.exec("ALTER TABLE sessions ADD COLUMN name TEXT");
 			if (!columns.some((column) => column.name === "adapter_options"))
 				database.exec("ALTER TABLE sessions ADD COLUMN adapter_options TEXT");
+			if (!columns.some((column) => column.name === "failure_reason"))
+				database.exec("ALTER TABLE sessions ADD COLUMN failure_reason TEXT");
+			if (!columns.some((column) => column.name === "failed_at"))
+				database.exec("ALTER TABLE sessions ADD COLUMN failed_at TEXT");
 			return new SqliteSessionStore(stateDirectory, database);
 		} catch (error) {
 			try {
@@ -176,7 +190,7 @@ export class SqliteSessionStore implements SessionStore {
 		try {
 			const rows = this.database
 				.prepare(
-					"SELECT id, harness_id, cwd, native_session_id, status, name, adapter_options FROM sessions ORDER BY created_at, id",
+					"SELECT id, harness_id, cwd, native_session_id, status, name, adapter_options, failure_reason, failed_at FROM sessions ORDER BY created_at, id",
 				)
 				.all() as SessionRow[];
 			return rows.map(fromRow);
@@ -189,7 +203,7 @@ export class SqliteSessionStore implements SessionStore {
 		try {
 			const row = this.database
 				.prepare(
-					"SELECT id, harness_id, cwd, native_session_id, status, name, adapter_options FROM sessions WHERE id = ?",
+					"SELECT id, harness_id, cwd, native_session_id, status, name, adapter_options, failure_reason, failed_at FROM sessions WHERE id = ?",
 				)
 				.get(id) as SessionRow | undefined;
 			return row ? fromRow(row) : undefined;
@@ -252,11 +266,18 @@ export class SqliteSessionStore implements SessionStore {
 
 	async update(session: SessionSummary): Promise<void> {
 		try {
-			const result = this.database
-				.prepare(
-					"UPDATE sessions SET native_session_id = ?, status = ? WHERE id = ?",
-				)
-				.run(session.nativeSessionId ?? null, session.status, session.id);
+			const result =
+				session.status === "running"
+					? this.database
+							.prepare(
+								"UPDATE sessions SET native_session_id = ?, status = ?, failure_reason = NULL, failed_at = NULL WHERE id = ?",
+							)
+							.run(session.nativeSessionId ?? null, session.status, session.id)
+					: this.database
+							.prepare(
+								"UPDATE sessions SET native_session_id = ?, status = ? WHERE id = ?",
+							)
+							.run(session.nativeSessionId ?? null, session.status, session.id);
 			if (result.changes !== 1)
 				throw new Error("session record does not exist");
 		} catch (error) {
@@ -266,11 +287,28 @@ export class SqliteSessionStore implements SessionStore {
 		}
 	}
 
-	async setStatus(id: SessionId, status: SessionStatus): Promise<void> {
+	async setStatus(
+		id: SessionId,
+		status: SessionStatus,
+		failure?: SessionFailure,
+	): Promise<void> {
 		try {
-			const result = this.database
-				.prepare("UPDATE sessions SET status = ? WHERE id = ?")
-				.run(status, id);
+			const result =
+				status === "failed" && failure
+					? this.database
+							.prepare(
+								"UPDATE sessions SET status = ?, failure_reason = ?, failed_at = ? WHERE id = ?",
+							)
+							.run(status, failure.reason, failure.at, id)
+					: status === "running"
+						? this.database
+								.prepare(
+									"UPDATE sessions SET status = ?, failure_reason = NULL, failed_at = NULL WHERE id = ?",
+								)
+								.run(status, id)
+						: this.database
+								.prepare("UPDATE sessions SET status = ? WHERE id = ?")
+								.run(status, id);
 			if (result.changes !== 1)
 				throw new Error("session record does not exist");
 		} catch (error) {
@@ -299,7 +337,17 @@ interface SessionRow {
 	status: SessionStatus;
 	name: string | null;
 	adapter_options: string | null;
+	failure_reason: string | null;
+	failed_at: string | null;
 }
+
+const FAILURE_REASONS: ReadonlySet<string> = new Set<SessionFailureReason>([
+	"launch_failed",
+	"unexpected_exit",
+	"resume_unavailable",
+	"native_id_mismatch",
+	"options_replacement_failed",
+]);
 
 function fromRow(row: SessionRow): SessionSummary {
 	return {
@@ -318,5 +366,9 @@ function fromRow(row: SessionRow): SessionSummary {
 			? {}
 			: { nativeSessionId: row.native_session_id }),
 		status: row.status,
+		...(row.failure_reason !== null && FAILURE_REASONS.has(row.failure_reason)
+			? { failureReason: row.failure_reason as SessionFailureReason }
+			: {}),
+		...(row.failed_at === null ? {} : { failedAt: row.failed_at }),
 	};
 }

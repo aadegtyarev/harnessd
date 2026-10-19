@@ -416,6 +416,11 @@ export interface HarnessInstance {
 	readonly events: AsyncIterable<HarnessEvent>;
 	readonly control?: HarnessControl;
 	isIdle?(): boolean;
+	/**
+	 * Bounded, redacted tail of the harness process's diagnostic output (for Pi, stderr).
+	 * It is for the supervisor journal only: never persisted or sent to transports.
+	 */
+	diagnosticTail?(): string | undefined;
 	send(input: Input): Promise<void>;
 	cancel(inputId: InputId): Promise<void>;
 	cancelCurrent?(): Promise<void>;
@@ -424,6 +429,10 @@ export interface HarnessInstance {
 
 export interface HarnessAdapter {
 	readonly descriptor: PortDescriptor;
+	/**
+	 * A rejected launch/resume may carry a non-enumerable string `diagnosticTail`
+	 * with the same journal-only meaning as `HarnessInstance.diagnosticTail()`.
+	 */
 	launch(request: HarnessLaunchRequest): Promise<HarnessInstance>;
 	resume?(request: HarnessLaunchRequest): Promise<HarnessInstance>;
 }
