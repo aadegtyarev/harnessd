@@ -2078,6 +2078,111 @@ describe("Telegram transport", () => {
 		for (const [id, session] of known) sessions.set(id, session);
 	});
 
+	it.each([
+		{ status: "running", row: ["Модель", "Усилие", "Переименовать"] },
+		{ status: "stopped", row: ["Модель", "Усилие", "Переименовать"] },
+		{ status: "failed", row: ["Переименовать"] },
+		{ status: "starting", row: ["Переименовать"] },
+	] as const)(
+		"offers the session-card rename flow for the $status panel preview",
+		async ({ status, row }) => {
+			sessions.set("sid", sessionWith("sid", { status }));
+			const bot = new MockBot();
+			const { adapter, requests } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind === "rename") {
+						const renamed = sessionWith("sid", { name: request.name });
+						sessions.set("sid", renamed);
+					}
+					return result(request);
+				},
+			});
+			await bot.update(42, "/use sid");
+			await bot.update(42, "/menu");
+			const cardPanelId = bot.lastMessageId;
+			await bot.callback(42, "session:details:sid", cardPanelId);
+			await bot.callback(42, "session:rename:sid", cardPanelId);
+			const cardPromptId = bot.lastForceReplyMessageId;
+			const cardPrompt = bot.sent.find(
+				({ message_id }) => message_id === cardPromptId,
+			)?.text;
+			expect(cardPrompt).toContain("Переименовать #sid (#sid)");
+
+			await bot.update(42, "/menu");
+			const panelId = bot.lastMessageId;
+			const keyboard = (
+				bot.sendOptions.at(-1) as {
+					reply_markup: {
+						inline_keyboard: readonly (readonly {
+							text: string;
+							callback_data: string;
+						}[])[];
+					};
+				}
+			).reply_markup.inline_keyboard;
+			const renameRow = keyboard.find((buttons) =>
+				buttons.some(({ text }) => text === "Переименовать"),
+			);
+			expect(renameRow?.map(({ text }) => text)).toEqual(row);
+			expect(
+				renameRow?.find(({ text }) => text === "Переименовать")?.callback_data,
+			).toBe("session:rename:sid");
+
+			await bot.callback(42, "session:rename:sid", panelId);
+			const panelPromptId = bot.lastForceReplyMessageId;
+			expect(panelPromptId).not.toBe(cardPromptId);
+			const panelPrompt = bot.sent.find(
+				({ message_id }) => message_id === panelPromptId,
+			);
+			expect(panelPrompt?.text).toBe(cardPrompt);
+			expect(bot.sendOptions[bot.sent.indexOf(panelPrompt as never)]).toEqual(
+				bot.sendOptions[
+					bot.sent.findIndex(({ message_id }) => message_id === cardPromptId)
+				],
+			);
+
+			await bot.update(42, "Panel name", { replyToMessageId: panelPromptId });
+			expect(requests.filter(({ kind }) => kind === "rename")).toMatchObject([
+				{ sessionId: "sid", name: "Panel name" },
+			]);
+			expect(bot.edited.at(-1)?.messageId).toBe(panelId);
+			expect(bot.edited.at(-1)?.text).toContain("Panel name · #sid");
+			await adapter.stop();
+		},
+	);
+
+	it("applies rename not-found handling when the panel session was deleted", async () => {
+		const bot = new MockBot();
+		const { adapter, requests } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "/menu");
+		const panelId = bot.lastMessageId;
+		expect(JSON.stringify(bot.sendOptions.at(-1))).toContain(
+			"session:rename:sid",
+		);
+		sessions.delete("sid");
+		await bot.callback(42, "session:rename:sid", panelId);
+		expect(bot.lastForceReplyMessageId).toBeUndefined();
+		expect(bot.sent.at(-1)?.text).toBe("Session was not found");
+		expect(requests.some(({ kind }) => kind === "rename")).toBe(false);
+		await adapter.stop();
+	});
+
+	it("omits the panel rename button when no session is shown", async () => {
+		sessions.clear();
+		const bot = new MockBot();
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/menu");
+		expect(bot.sent.at(-1)?.text).toContain("Статус: нет сессий");
+		expect(JSON.stringify(bot.sendOptions.at(-1))).not.toContain(
+			"Переименовать",
+		);
+		expect(JSON.stringify(bot.sendOptions.at(-1))).not.toContain(
+			"session:rename:",
+		);
+		await adapter.stop();
+	});
+
 	it("shows stale unavailable live state and only advances update time on semantic changes", async () => {
 		const bot = new MockBot();
 		let time = 0;

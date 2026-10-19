@@ -4887,11 +4887,17 @@ export class TelegramTransportAdapter
 				inlineButton("Включить канал для новых событий", "events:enable"),
 			]);
 		if (previewId && preview) {
+			const renameButton = inlineButton(
+				"Переименовать",
+				`session:rename:${previewId}`,
+			);
 			if (preview.status === "running" || preview.status === "stopped")
 				rows.push([
 					inlineButton("Модель", "menu:models"),
 					inlineButton("Усилие", "menu:efforts"),
+					renameButton,
 				]);
+			else rows.push([renameButton]);
 			if (preview.status === "running") {
 				rows.push([inlineButton("Остановить", `session:stop:${previewId}`)]);
 			} else if (preview.status === "stopped") {
