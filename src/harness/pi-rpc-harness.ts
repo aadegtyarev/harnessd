@@ -25,8 +25,11 @@ import type {
 	AdapterId,
 	HarnessAnomaly,
 	HarnessEvent,
+	HarnessStop,
 	Input,
 	InputEvent,
+	InputFailure,
+	InputFailureReason,
 	InputId,
 	SessionId,
 } from "../core/types.js";
@@ -43,6 +46,7 @@ import {
 	AGENT_FILE_SEND_URL_ENV,
 } from "./agent-file-send-protocol.js";
 import {
+	INPUT_CANCELED_DETAIL,
 	InputNotDeliveredError,
 	UncertainInputDeliveryError,
 } from "./input-delivery-error.js";
@@ -610,21 +614,45 @@ function toolActivitySummary(name: string, value: unknown): string {
 	}
 	return truncateDiagnostic(redactDiagnosticText(summary), 700);
 }
-const HELD_INPUT_TIMEOUT =
-	"Pi compaction did not finish in time; the input was not sent";
-const HELD_INPUT_STOPPED = "Pi stopped before the held input was sent";
+/** English journal/fallback detail for each non-delivery harnessd decides itself. */
+const INPUT_FAILURE_DETAIL = {
+	hold_timeout: "Pi compaction did not finish in time; the input was not sent",
+	held_and_stopped: "Pi stopped before the held input was sent",
+	canceled: INPUT_CANCELED_DETAIL,
+} as const satisfies Partial<Record<InputFailureReason, string>>;
+type HarnessdInputFailure = keyof typeof INPUT_FAILURE_DETAIL;
+interface InputNonDelivery {
+	readonly detail: string;
+	readonly failure: InputFailure;
+}
+function nonDelivery(reason: HarnessdInputFailure): InputNonDelivery {
+	return { detail: INPUT_FAILURE_DETAIL[reason], failure: { reason } };
+}
+function notDeliveredError(
+	inputId: InputId,
+	reason: HarnessdInputFailure,
+): InputNotDeliveredError {
+	const { detail, failure } = nonDelivery(reason);
+	return new InputNotDeliveredError(inputId, detail, failure);
+}
 /** "Pi rejected the prompt" plus Pi's own redacted, bounded reason when it sent one. */
 function promptRejection(
 	response: Record<string, unknown>,
 	redactions: readonly (string | undefined)[],
-): string {
+): InputNonDelivery {
 	const reason =
 		typeof response.error === "string" && response.error.trim()
 			? anomalyDetail(response.error, redactions)
 			: "";
 	return reason
-		? `Pi rejected the prompt: ${reason}`
-		: "Pi rejected the prompt";
+		? {
+				detail: `Pi rejected the prompt: ${reason}`,
+				failure: { reason: "prompt_rejected", text: reason },
+			}
+		: {
+				detail: "Pi rejected the prompt",
+				failure: { reason: "prompt_rejected" },
+			};
 }
 class PiRpcInstance implements HarnessInstance {
 	/** Tool names by call ID, so tool_end can describe tool-specific outcomes. */
@@ -670,6 +698,8 @@ class PiRpcInstance implements HarnessInstance {
 	private stdoutEnded = false;
 	private exitDrainTimer?: ReturnType<typeof setTimeout>;
 	private exitDetail?: string;
+	/** Exit code or signal of the child, once it exited. */
+	private exitState?: string;
 	/** Bounded Pi stderr tail; journal-only diagnostics, never forwarded or stored. */
 	private stderrRaw = "";
 	private stderrTruncated = false;
@@ -703,7 +733,12 @@ class PiRpcInstance implements HarnessInstance {
 			throw new Error("Pi RPC requires all pipe streams");
 		stdout.setEncoding("utf8");
 		stdout.on("data", (chunk: string) => this.consume(chunk));
-		stdout.on("error", () => this.failProcess("Pi stdout failed"));
+		stdout.on("error", () =>
+			this.failProcess("Pi stdout failed", {
+				reason: "channel_failed",
+				channel: "stdout",
+			}),
+		);
 		stdout.on("end", () => {
 			this.stdoutEnded = true;
 			for (const resolve of this.stdoutEndWaiters.splice(0)) resolve();
@@ -711,19 +746,30 @@ class PiRpcInstance implements HarnessInstance {
 			if (this.childExited) queueMicrotask(() => this.finalizeChildExit(false));
 			else this.scheduleExitDrain();
 		});
-		stdin.on("error", () => this.failProcess("Pi stdin failed"));
+		stdin.on("error", () =>
+			this.failProcess("Pi stdin failed", {
+				reason: "channel_failed",
+				channel: "stdin",
+			}),
+		);
 		stderr.setEncoding("utf8");
 		stderr.on("data", (chunk: string) => {
 			const combined = this.stderrRaw + chunk;
 			if (combined.length > STDERR_RAW_LIMIT) this.stderrTruncated = true;
 			this.stderrRaw = combined.slice(-STDERR_RAW_LIMIT);
 		});
-		stderr.on("error", () => this.failProcess("Pi stderr failed"));
+		stderr.on("error", () =>
+			this.failProcess("Pi stderr failed", {
+				reason: "channel_failed",
+				channel: "stderr",
+			}),
+		);
 		void child.exit.then((exit) => {
 			this.childExited = true;
 			void this.fileSendBridge?.close().catch(() => {});
 			if (this.eventsClosed) return;
-			this.exitDetail = `Pi process exited (${exit.code ?? exit.signal ?? "unknown"})`;
+			this.exitState = String(exit.code ?? exit.signal ?? "unknown");
+			this.exitDetail = `Pi process exited (${this.exitState})`;
 			if (this.stdoutEnded) queueMicrotask(() => this.finalizeChildExit(false));
 			else this.scheduleExitDrain();
 		});
@@ -1048,12 +1094,22 @@ class PiRpcInstance implements HarnessInstance {
 		inputId: InputId,
 		state: InputEvent["state"],
 		detail?: string,
+		failure?: InputFailure,
 	): void {
 		this.emit({
 			sessionId: this.sessionId,
 			kind: "input",
-			inputEvent: { inputId, state, ...(detail ? { detail } : {}) },
+			inputEvent: {
+				inputId,
+				state,
+				...(detail ? { detail } : {}),
+				...(failure ? { failure } : {}),
+			},
 		});
+	}
+	/** Report a definite non-delivery with its English detail and fixed reason code. */
+	private failInput(inputId: InputId, failed: InputNonDelivery): void {
+		this.delivery(inputId, "failed", failed.detail, failed.failure);
 	}
 	private get maxRecordBytes(): number {
 		return this.options.maxRecordBytes ?? 1024 * 1024;
@@ -1204,6 +1260,7 @@ class PiRpcInstance implements HarnessInstance {
 		});
 		this.protocolFailure(
 			`Pi RPC stdout is corrupted: more than ${MAX_CONSECUTIVE_ANOMALIES} consecutive invalid records`,
+			{ reason: "stream_corrupted" },
 		);
 	}
 	/** Handle a line over the record limit from its bounded head only. */
@@ -1340,20 +1397,28 @@ class PiRpcInstance implements HarnessInstance {
 		this.exitDrainTimer = undefined;
 		if (this.childExited && this.stdoutEnded) {
 			if (this.shuttingDown) this.closeEvents("Pi harness shut down");
-			else this.closeEvents(this.exitDetail ?? "Pi process exited");
+			else
+				this.closeEvents(this.exitDetail ?? "Pi process exited", {
+					reason: "process_exited",
+					...(this.exitState ? { exit: this.exitState } : {}),
+				});
 			return;
 		}
 		if (!drainTimedOut) return;
-		const detail = this.childExited
-			? "Pi stdout did not close after process exit"
-			: "Pi stdout closed before process exit";
-		this.failProcess(detail);
+		if (this.childExited)
+			this.failProcess("Pi stdout did not close after process exit", {
+				reason: "stdout_not_closed",
+			});
+		else
+			this.failProcess("Pi stdout closed before process exit", {
+				reason: "stdout_closed_early",
+			});
 	}
 	private waitForStdoutEnd(): Promise<void> {
 		if (this.stdoutEnded) return Promise.resolve();
 		return new Promise((resolve) => this.stdoutEndWaiters.push(resolve));
 	}
-	private protocolFailure(text: string): void {
+	private protocolFailure(text: string, stop: HarnessStop): void {
 		if (this.failureReported) return;
 		this.failureReported = true;
 		this.emit({
@@ -1361,6 +1426,7 @@ class PiRpcInstance implements HarnessInstance {
 			kind: "error",
 			text,
 			fatal: true,
+			stop,
 		});
 		this.failProcess("Malformed Pi RPC protocol");
 	}
@@ -1702,7 +1768,7 @@ class PiRpcInstance implements HarnessInstance {
 		if (!active) return;
 		if (response.success !== true) {
 			this.activeInputs.delete(active.id);
-			const detail = promptRejection(response, this.redactions);
+			const rejected = promptRejection(response, this.redactions);
 			this.reportAnomaly({
 				kind: "prompt_rejected",
 				action: "failed_input",
@@ -1711,7 +1777,7 @@ class PiRpcInstance implements HarnessInstance {
 					? { detail: anomalyDetail(response.error, this.redactions) }
 					: {}),
 			});
-			this.delivery(active.id, "failed", detail);
+			this.failInput(active.id, rejected);
 			return;
 		}
 		active.accepted = true;
@@ -1730,7 +1796,7 @@ class PiRpcInstance implements HarnessInstance {
 		if (!active?.canceling) return;
 		if (response.success === true) {
 			this.activeInputs.delete(active.id);
-			this.delivery(active.id, "failed", "Input canceled");
+			this.failInput(active.id, nonDelivery("canceled"));
 			return;
 		}
 		active.canceling = false;
@@ -1917,7 +1983,7 @@ class PiRpcInstance implements HarnessInstance {
 			// An abort that started while the prompt was held still gates it.
 			await this.waitForAbortGate();
 			if (this.eventsClosed)
-				throw new InputNotDeliveredError(input.id, HELD_INPUT_STOPPED);
+				throw notDeliveredError(input.id, "held_and_stopped");
 		}
 		active.sentAsSteer = this.agentRunning || this.activeInputs.size > 1;
 		let response: Record<string, unknown>;
@@ -1955,17 +2021,21 @@ class PiRpcInstance implements HarnessInstance {
 			}
 			throw new UncertainInputDeliveryError(input.id, { cause: error });
 		}
-		if (response.success !== true)
+		if (response.success !== true) {
+			const rejected = promptRejection(response, this.redactions);
 			throw new InputNotDeliveredError(
 				input.id,
-				promptRejection(response, this.redactions),
+				rejected.detail,
+				rejected.failure,
 			);
+		}
 	}
 	/**
 	 * Pi rejects prompts during manual compaction, so hold this one until it ends.
 	 * The hold is bounded: on timeout Pi's state is rechecked once and the input is sent
 	 * if compaction has in fact ended (a lost end event); otherwise, and on cancel or
-	 * process stop, the input fails without being sent.
+	 * process stop, the input fails without being sent. The input stays held until the
+	 * recheck finishes, so a cancel or stop in that window still finds it held.
 	 */
 	private async holdDuringCompaction(active: ActiveInput): Promise<void> {
 		this.reportAnomaly({
@@ -1975,30 +2045,38 @@ class PiRpcInstance implements HarnessInstance {
 		});
 		let outcome = await this.waitForCompactionEnd(active);
 		if (outcome === "timeout" && !this.eventsClosed) {
+			let canceled = false;
+			active.held = (heldOutcome) => {
+				if (heldOutcome === "canceled") canceled = true;
+			};
 			let stillCompacting = true;
 			try {
 				const state = await this.command("get_state");
 				stillCompacting = recordValue(state.data)?.isCompacting !== false;
 			} catch {
 				/* unknown: keep failing safe */
+			} finally {
+				active.held = undefined;
 			}
 			// A lost end event: Pi says it is idle, so stop waiting for it.
 			if (!stillCompacting) this.endCompaction();
-			if (!this.manualCompaction) outcome = "ended";
+			if (canceled) outcome = "canceled";
+			else if (!this.manualCompaction) outcome = "ended";
 		}
+		// A stop already reported the held input as not sent; send() throws for it.
 		if (outcome === "ended" || this.eventsClosed) return;
 		this.activeInputs.delete(active.id);
 		if (outcome === "canceled") {
-			this.delivery(active.id, "failed", "Input canceled");
-			throw new InputNotDeliveredError(active.id, "Input canceled");
+			this.failInput(active.id, nonDelivery("canceled"));
+			throw notDeliveredError(active.id, "canceled");
 		}
 		this.reportAnomaly({
 			kind: "prompt_hold_timeout",
 			action: "failed_input",
 			harnessRunning: true,
 		});
-		this.delivery(active.id, "failed", HELD_INPUT_TIMEOUT);
-		throw new InputNotDeliveredError(active.id, HELD_INPUT_TIMEOUT);
+		this.failInput(active.id, nonDelivery("hold_timeout"));
+		throw notDeliveredError(active.id, "hold_timeout");
 	}
 	private async waitForCompactionEnd(
 		active: ActiveInput,
@@ -2125,7 +2203,7 @@ class PiRpcInstance implements HarnessInstance {
 			}
 			if (this.activeInputs.has(inputId)) {
 				this.activeInputs.delete(inputId);
-				this.delivery(inputId, "failed", "Input canceled");
+				this.failInput(inputId, nonDelivery("canceled"));
 			}
 		} finally {
 			if (!holdAbortGate) this.releaseAbortGate(abortGate);
@@ -2165,8 +2243,8 @@ class PiRpcInstance implements HarnessInstance {
 		})();
 		return this.cleanup;
 	}
-	private failProcess(detail: string): void {
-		if (!this.eventsClosed) this.closeEvents(detail);
+	private failProcess(detail: string, stop?: HarnessStop): void {
+		if (!this.eventsClosed) this.closeEvents(detail, stop);
 		if (!this.childExited && !this.cleanup) {
 			const cleanup = terminateChild(
 				this.child,
@@ -2178,7 +2256,7 @@ class PiRpcInstance implements HarnessInstance {
 			void cleanup.catch(() => {});
 		}
 	}
-	private closeEvents(detail: string): void {
+	private closeEvents(detail: string, stop?: HarnessStop): void {
 		if (this.eventsClosed) return;
 		const leftover = this.eofLeftover;
 		this.eofLeftover = undefined;
@@ -2210,7 +2288,7 @@ class PiRpcInstance implements HarnessInstance {
 		for (const active of this.activeInputs.values()) {
 			if (active.held)
 				// A held prompt was never written, so its failure is definite.
-				this.delivery(active.id, "failed", HELD_INPUT_STOPPED);
+				this.failInput(active.id, nonDelivery("held_and_stopped"));
 			else if (!active.uncertainReported)
 				this.delivery(active.id, "uncertain", detail);
 		}
@@ -2227,6 +2305,7 @@ class PiRpcInstance implements HarnessInstance {
 				kind: "error",
 				text: redactDiagnosticText(detail),
 				fatal: true,
+				...(stop ? { stop } : {}),
 			});
 		}
 		for (const waiter of this.waiters.splice(0))

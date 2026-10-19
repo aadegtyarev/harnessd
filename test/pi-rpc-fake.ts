@@ -18,6 +18,8 @@ import type { PiRpcHarnessAdapter } from "../src/harness/index.js";
 export interface FakeOptions {
 	readonly holdPrompt?: boolean;
 	readonly holdGetState?: boolean;
+	/** Answer only the readiness get_state; later ones stay unanswered. */
+	readonly holdLaterGetState?: boolean;
 	readonly exitOnGetState?: boolean;
 	readonly holdAbort?: boolean;
 	readonly malformedPromptAck?: boolean;
@@ -129,6 +131,12 @@ export function fakeProvider(options: FakeOptions = {}) {
 			commands.push(command);
 			if (command.type === "extension_ui_response") continue;
 			if (command.type === "get_state" && options.holdGetState) continue;
+			if (
+				command.type === "get_state" &&
+				options.holdLaterGetState &&
+				commands.filter((item) => item.type === "get_state").length > 1
+			)
+				continue;
 			if (command.type === "get_state" && options.exitOnGetState) {
 				complete(1, null);
 				continue;

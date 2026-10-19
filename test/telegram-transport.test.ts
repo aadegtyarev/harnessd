@@ -21,6 +21,7 @@ import type {
 } from "../src/core/ports.js";
 import type {
 	HarnessEvent,
+	InputFailure,
 	InputId,
 	SessionId,
 	SessionSummary,
@@ -3633,6 +3634,7 @@ describe("Telegram transport", () => {
 				inputId: "input-2" as never,
 				state: "failed",
 				detail: "Input canceled",
+				failure: { reason: "canceled" },
 			},
 		});
 		const waitForEventQueue = (
@@ -3867,6 +3869,7 @@ describe("Telegram transport", () => {
 				inputId: "cancel-owner" as never,
 				state: "failed",
 				detail: "Input canceled",
+				failure: { reason: "canceled" },
 			},
 		});
 		emit({
@@ -3993,6 +3996,7 @@ describe("Telegram transport", () => {
 				inputId: "active-a" as never,
 				state: "failed",
 				detail: "Input canceled",
+				failure: { reason: "canceled" },
 			},
 		});
 		await vi.waitFor(() =>
@@ -8279,6 +8283,7 @@ describe("Telegram transport", () => {
 				inputId: "cancelled-input" as never,
 				state: "failed",
 				detail: "Input canceled",
+				failure: { reason: "canceled" },
 			},
 		});
 		await vi.waitFor(() =>
@@ -9949,6 +9954,17 @@ describe("Telegram transport", () => {
 			}),
 		);
 		emit(anomaly({ kind: "prompt_held", action: "held_prompt" }));
+		// A record cut while harnessd itself stops Pi: journal only.
+		emit(
+			anomaly({
+				kind: "truncated_record",
+				harnessRunning: false,
+				stopRequested: true,
+				ref: "eeee0001",
+				recordType: "agent_end",
+				bytes: 100,
+			}),
+		);
 		// A real problem: one notice for three occurrences within the minute.
 		emit(anomaly({ ref: "aaaa0001", bytes: 12 }));
 		emit(anomaly({ ref: "aaaa0002" }));
@@ -9966,8 +9982,10 @@ describe("Telegram transport", () => {
 		emit({
 			sessionId: "sid" as SessionId,
 			kind: "error",
-			text: "Pi process exited (SIGKILL)",
+			// The Russian text comes from the reason code, not this English detail.
+			text: "Pi went away with SIGKILL (reworded)",
 			fatal: true,
+			stop: { reason: "process_exited", exit: "SIGKILL" },
 		});
 		await vi.waitFor(() =>
 			expect(
@@ -9984,12 +10002,13 @@ describe("Telegram transport", () => {
 				"Журнал: harnessd, ref aaaa0001.",
 			].join("\n"),
 			[
-				"Pi остановлен: процесс завершился (SIGKILL).",
+				"Процесс сессии остановлен: процесс завершился (SIGKILL).",
 				"Последняя запись RPC оборвалась (agent_end, 300 Б) и пропущена.",
 				"Журнал: harnessd, ref cccc0001.",
 			].join("\n"),
 		]);
 		expect(bodies.join("\n")).not.toContain("journal only head");
+		expect(bodies.join("\n")).not.toContain("eeee0001");
 		await adapter.stop();
 	});
 
@@ -10022,7 +10041,9 @@ describe("Telegram transport", () => {
 					inputEvent: {
 						inputId,
 						state: "failed",
-						detail: "Pi rejected the prompt: Agent is busy",
+						// Reworded English detail: Russian text comes from the reason code.
+						detail: "Prompt refused by Pi (Agent is busy)",
+						failure: { reason: "prompt_rejected", text: "Agent is busy" },
 					},
 				});
 				return {
@@ -10030,8 +10051,9 @@ describe("Telegram transport", () => {
 					ok: false,
 					error: {
 						code: "INPUT_NOT_DELIVERED",
-						message: "Pi rejected the prompt: Agent is busy",
+						message: "Prompt refused by Pi (Agent is busy)",
 						inputId,
+						failure: { reason: "prompt_rejected", text: "Agent is busy" },
 					},
 				};
 			},
@@ -10056,6 +10078,79 @@ describe("Telegram transport", () => {
 		]);
 		await adapter.stop();
 	});
+
+	it("presents a fatal stop of a non-Pi session without naming Pi", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const start = bot.sent.length;
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "error",
+			text: "Claude protocol error",
+			fatal: true,
+		});
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.slice(start).some(({ text }) => text.includes("остановлен")),
+			).toBe(true),
+		);
+		const bodies = bot.sent
+			.slice(start)
+			.map(({ text }) => telegramBody(text))
+			.join("\n");
+		expect(bodies).toContain(
+			"Процесс сессии остановлен: Claude protocol error.",
+		);
+		expect(bodies).not.toMatch(/\bPi\b/);
+		await adapter.stop();
+	});
+
+	it.each<[InputFailure, string, string]>([
+		[{ reason: "canceled" }, "Отменено пользователем", "отменён пользователем"],
+		[
+			{ reason: "hold_timeout" },
+			"Не отправлено: Pi долго сжимал контекст",
+			"не отправлен — Pi слишком долго сжимал контекст",
+		],
+		[
+			{ reason: "held_and_stopped" },
+			"Не отправлено: Pi остановился",
+			"не отправлен — Pi остановился, пока сообщение ждало конца сжатия",
+		],
+	])(
+		"shows the run-card status of a not-delivered input by its reason %o",
+		async (failure, status, line) => {
+			const bot = new MockBot();
+			const inputId = "input-unsent" as InputId;
+			const { adapter } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) =>
+					request.kind === "submit"
+						? {
+								requestId: request.requestId,
+								ok: false,
+								error: {
+									code: "INPUT_NOT_DELIVERED",
+									message: "some English detail",
+									inputId,
+									failure,
+								},
+							}
+						: result(request),
+			});
+			await bot.update(42, "/use sid");
+			await bot.update(42, "held text");
+			await vi.waitFor(() =>
+				expect(bot.edited.some(({ text }) => text.includes(status))).toBe(true),
+			);
+			const card = bot.edited.at(-1)?.text ?? "";
+			expect(card).toContain(status);
+			expect(card).toContain(`Ввод ${inputId}: ${line}`);
+			expect(card).not.toContain("Pi не принял сообщение");
+			expect(card).not.toContain("some English detail");
+			await adapter.stop();
+		},
+	);
 
 	it("keeps repeated input states in event order with intervening output and status", async () => {
 		const bot = new MockBot();

@@ -7,6 +7,7 @@ import type {
 	HarnessEvent,
 	Input,
 	InputEvent,
+	InputFailure,
 	InputId,
 	ProcessId,
 	SessionId,
@@ -274,6 +275,8 @@ export type TransportResult =
 				readonly code: string;
 				readonly message: string;
 				readonly inputId?: InputId;
+				/** Structured cause of an `INPUT_NOT_DELIVERED` failure. */
+				readonly failure?: InputFailure;
 				readonly resumed?: true;
 			};
 	  };

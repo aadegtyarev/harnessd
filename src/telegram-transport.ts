@@ -37,6 +37,7 @@ import type {
 	HarnessAnomaly,
 	HarnessEvent,
 	InputDeliveryState,
+	InputFailure,
 	InputId,
 	SessionFailureReason,
 	SessionId,
@@ -66,6 +67,7 @@ import {
 import {
 	AnomalyNoticeCoalescer,
 	anomalyRoute,
+	inputFailureStatus,
 	inputFailureText,
 	stopNoticeText,
 } from "./telegram-anomaly-notice.js";
@@ -1247,18 +1249,51 @@ function splitChunks(text: string, limit: number): string[] {
 function uncertainDeliveryNotice(inputId?: string): string {
 	return `Pi мог принять ввод, но подтверждение не получено; автоматической повторной отправки не было${inputId ? `; InputId ${inputId}` : ""}`;
 }
-function safeResultError(error: {
+interface SubmitError {
 	readonly code: string;
 	readonly message: string;
 	readonly inputId?: string;
-}): string {
+	readonly failure?: InputFailure;
+}
+function safeResultError(error: SubmitError): string {
 	if (error.code === "UNCERTAIN_INPUT_DELIVERY")
 		return `Статус доставки ввода неизвестен (${uncertainDeliveryNotice(error.inputId)})${error.message ? `\n${error.message}` : ""}`;
 	if (error.code === "INPUT_NOT_DELIVERED")
-		return error.message === "Input canceled"
+		return error.failure?.reason === "canceled"
 			? "Отменено пользователем"
-			: (inputFailureText(error.message) ?? "Сообщение не доставлено");
+			: (inputFailureText(error.failure) ?? "Сообщение не доставлено");
 	return error.message;
+}
+/**
+ * Live run-card notice for a failed submission. A not-delivered input with a known
+ * reason uses the same line as its input event, so the card shows it once.
+ */
+function submitFailureNotice(error: SubmitError): string {
+	if (error.code === "UNCERTAIN_INPUT_DELIVERY")
+		return uncertainDeliveryNotice(error.inputId);
+	const notDelivered =
+		error.code === "INPUT_NOT_DELIVERED"
+			? inputFailureText(error.failure)
+			: undefined;
+	return notDelivered && error.inputId
+		? `Ввод ${error.inputId}: ${notDelivered}`
+		: safeResultError(error);
+}
+/** Live run-card status for a failed submission, matching the actual reason. */
+function submitFailureStatus(
+	error: SubmitError,
+	subject: "сообщение" | "вложение",
+): string {
+	if (error.code === "UNCERTAIN_INPUT_DELIVERY")
+		return "Статус доставки неизвестен";
+	if (error.code === "INPUT_NOT_DELIVERED")
+		return (
+			inputFailureStatus(error.failure, subject) ??
+			(subject === "вложение"
+				? "Вложение не доставлено"
+				: "Сообщение не доставлено")
+		);
+	return `Pi не принял ${subject}`;
 }
 const NO_SESSION_SELECTED_MESSAGE =
 	"Сессия не выбрана. Найдите её через /sessions и выберите командой /use <sessionId> или откройте /menu.";
@@ -2254,19 +2289,10 @@ export class TelegramTransportAdapter
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
-						status:
-							result.error.code === "UNCERTAIN_INPUT_DELIVERY"
-								? "Статус доставки неизвестен"
-								: "Pi не принял сообщение",
-						notice:
-							result.error.code === "UNCERTAIN_INPUT_DELIVERY"
-								? redactDiagnosticText(
-										uncertainDeliveryNotice(result.error.inputId),
-										[this.options.token],
-									)
-								: redactDiagnosticText(safeResultError(result.error), [
-										this.options.token,
-									]),
+						status: submitFailureStatus(result.error, "сообщение"),
+						notice: redactDiagnosticText(submitFailureNotice(result.error), [
+							this.options.token,
+						]),
 					});
 					await this.presentSubmitFailure(
 						chatId,
@@ -3045,19 +3071,10 @@ export class TelegramTransportAdapter
 					this.finishActivitySubmission(activity);
 					this.stopLiveActivityStats(activity);
 					this.updateLiveActivity(activity, {
-						status:
-							submitted.error.code === "UNCERTAIN_INPUT_DELIVERY"
-								? "Статус доставки неизвестен"
-								: "Pi не принял вложение",
-						notice:
-							submitted.error.code === "UNCERTAIN_INPUT_DELIVERY"
-								? redactDiagnosticText(
-										uncertainDeliveryNotice(submitted.error.inputId),
-										[this.options.token],
-									)
-								: redactDiagnosticText(safeResultError(submitted.error), [
-										this.options.token,
-									]),
+						status: submitFailureStatus(submitted.error, "вложение"),
+						notice: redactDiagnosticText(submitFailureNotice(submitted.error), [
+							this.options.token,
+						]),
 					});
 					return this.presentSubmitFailure(
 						chatId,
@@ -4360,21 +4377,14 @@ export class TelegramTransportAdapter
 		chatId: number,
 		sender: number,
 		sessionId: SessionId,
-		error: {
-			readonly code: string;
-			readonly message: string;
-			readonly inputId?: string;
-		},
+		error: SubmitError,
 		inputText?: string,
 	): Promise<void> {
 		if (error.code === "INPUT_NOT_DELIVERED") {
 			// The input event already told the chats selecting this session; only a chat
 			// that submitted to another session (a reply route) needs its own line.
 			if (this.selected.get(chatId) === sessionId) return;
-			const text =
-				error.message === "Input canceled"
-					? "отменён пользователем"
-					: (inputFailureText(error.message) ?? "не доставлен");
+			const text = inputFailureText(error.failure) ?? "не доставлен";
 			return this.sendDirect(
 				chatId,
 				redactDiagnosticText(
@@ -6530,7 +6540,8 @@ export class TelegramTransportAdapter
 		update: { readonly status?: string; readonly notice?: string },
 	): void {
 		if (update.status !== undefined) activity.status = update.status;
-		if (update.notice) activity.notices.push(update.notice);
+		if (update.notice && !activity.notices.includes(update.notice))
+			activity.notices.push(update.notice);
 		if (activity.notices.length > 12) activity.notices.shift();
 		this.renderLiveActivity(activity);
 	}
@@ -6539,7 +6550,7 @@ export class TelegramTransportAdapter
 		activity: LiveActivity,
 		inputId: string,
 		state: string,
-		detail?: string,
+		failure?: InputFailure,
 	): void {
 		const existing = activity.queuedInputs.find(
 			(input) => input.inputId === inputId,
@@ -6585,17 +6596,20 @@ export class TelegramTransportAdapter
 			)
 				activity.untrackedFailureOverflow = true;
 		}
-		const canceledByUser =
-			state === "failed" && detail?.toLowerCase() === "input canceled";
+		const notDelivered =
+			state === "failed" ? inputFailureText(failure) : undefined;
+		const inputNotice = notDelivered
+			? redactDiagnosticText(`Ввод ${inputId}: ${notDelivered}`, [
+					this.options.token,
+				])
+			: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`;
 		if (
 			(state === "failed" || state === "uncertain") &&
-			previousState !== state
+			previousState !== state &&
+			// The submit result may already have put the same line on the card.
+			!activity.notices.includes(inputNotice)
 		)
-			activity.notices.push(
-				canceledByUser
-					? `Ввод ${inputId}: отменён пользователем`
-					: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`,
-			);
+			activity.notices.push(inputNotice);
 		if (activity.notices.length > 12) activity.notices.shift();
 		if (state === "pending")
 			activity.status = activity.submittedWhileRunning
@@ -6606,9 +6620,7 @@ export class TelegramTransportAdapter
 			activity.status =
 				state === "uncertain"
 					? "Статус доставки неизвестен"
-					: canceledByUser
-						? "Отменено пользователем"
-						: "Ошибка отправки";
+					: (inputFailureStatus(failure) ?? "Ошибка отправки");
 		}
 		this.renderLiveActivity(activity);
 	}
@@ -8383,7 +8395,7 @@ export class TelegramTransportAdapter
 			if (event.fatal) this.stopAnomalies.delete(event.sessionId);
 			// Pi stopping gets one Russian message, with any stop anomaly folded in.
 			const presented = event.fatal
-				? stopNoticeText(detail, folded)
+				? stopNoticeText(detail, event.stop, folded)
 				: `Pi error: ${detail}`;
 			let seen = this.reportedErrors.get(event.sessionId);
 			if (!seen) {
@@ -8410,30 +8422,27 @@ export class TelegramTransportAdapter
 		}
 		if (event.kind === "input" && event.inputEvent) {
 			const { inputId, state, detail } = event.inputEvent;
-			const canceledByUser =
-				state === "failed" && detail?.toLowerCase() === "input canceled";
+			const failure = state === "failed" ? event.inputEvent.failure : undefined;
+			const canceledByUser = failure?.reason === "canceled";
 			this.trackInputEvent(event.sessionId, inputId, state, canceledByUser);
-			const notDelivered =
-				state === "failed" ? inputFailureText(detail) : undefined;
-			const inputPresentation = canceledByUser
-				? `Ввод ${inputId}: отменён пользователем`
-				: notDelivered
-					? `Ввод ${inputId}: ${redactDiagnosticText(notDelivered, [this.options.token])}`
-					: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`;
+			const notDelivered = inputFailureText(failure);
+			const inputPresentation = notDelivered
+				? `Ввод ${inputId}: ${redactDiagnosticText(notDelivered, [this.options.token])}`
+				: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`;
 			if (state === "failed" || state === "uncertain")
 				this.stopTyping(event.sessionId);
 			if (state === "accepted") return;
 			const activities = this.activitiesForSession(event.sessionId);
 			if (activities.length) {
 				for (const activity of activities) {
-					this.updateActivityInput(activity, inputId, state, detail);
+					this.updateActivityInput(activity, inputId, state, failure);
 					if (state === "completed")
 						this.scheduleLiveActivityFinish(event.sessionId, true);
 				}
 				if (state === "failed" || state === "uncertain")
 					this.enqueueForSelected(
 						event.sessionId,
-						`${inputPresentation}${!canceledByUser && !notDelivered && detail ? ` · ${redactDiagnosticText(detail, [this.options.token])}` : ""}`,
+						`${inputPresentation}${!notDelivered && detail ? ` · ${redactDiagnosticText(detail, [this.options.token])}` : ""}`,
 						{ inputId, state },
 					);
 				return;

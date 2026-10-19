@@ -868,6 +868,7 @@ describe("application runtime", () => {
 							throw new InputNotDeliveredError(
 								input.id,
 								"Pi rejected the prompt: Agent is busy",
+								{ reason: "prompt_rejected", text: "Agent is busy" },
 							);
 						if (input.text === "resumed rejected prompt")
 							throw new Error("delivery rejected after resume");
@@ -1126,6 +1127,7 @@ describe("application runtime", () => {
 				code: "INPUT_NOT_DELIVERED",
 				message: "Pi rejected the prompt: Agent is busy",
 				inputId: expect.any(String),
+				failure: { reason: "prompt_rejected", text: "Agent is busy" },
 			},
 		});
 		expect(JSON.stringify(notDelivered)).not.toContain(

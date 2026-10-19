@@ -1,4 +1,11 @@
-import type { HarnessAnomaly, SessionId } from "./core/types.js";
+import type {
+	HarnessAnomaly,
+	HarnessStop,
+	HarnessStopReason,
+	InputFailure,
+	InputFailureReason,
+	SessionId,
+} from "./core/types.js";
 
 /** At most one chat notice per session and anomaly kind in this window. */
 export const ANOMALY_NOTICE_WINDOW_MS = 60_000;
@@ -23,8 +30,9 @@ export type AnomalyRoute = "notice" | "journal" | "stop";
 /**
  * Chats hear only about real problems: a skipped record, a failed command, a harnessd
  * bug, or Pi stopping. Healthy tolerance (an oversized record handled by type, a prompt
- * held during compaction) is journal only; failures that already have a chat message
- * (input failures, Pi stopping) are folded into that message instead of duplicated.
+ * held during compaction, a record cut while harnessd itself stops Pi) is journal only;
+ * failures that already have a chat message (input failures, Pi stopping) are folded
+ * into that message instead of duplicated.
  */
 export function anomalyRoute(anomaly: HarnessAnomaly): AnomalyRoute {
 	switch (anomaly.kind) {
@@ -35,7 +43,7 @@ export function anomalyRoute(anomaly: HarnessAnomaly): AnomalyRoute {
 		case "corrupted_stream":
 			return "stop";
 		case "truncated_record":
-			return anomaly.stopRequested ? "notice" : "stop";
+			return anomaly.stopRequested ? "journal" : "stop";
 		case "oversized_record":
 			return anomaly.action === "handled" ? "journal" : "notice";
 		default:
@@ -99,10 +107,7 @@ function did(anomaly: HarnessAnomaly): string {
 }
 
 function running(anomaly: HarnessAnomaly): string {
-	if (anomaly.harnessRunning) return "Pi продолжает работать.";
-	return anomaly.stopRequested
-		? "Pi остановлен по запросу harnessd; восстанавливать нечего."
-		: "Pi остановлен.";
+	return anomaly.harnessRunning ? "Pi продолжает работать." : "Pi остановлен.";
 }
 
 /** Plain-Russian chat notice: what happened, what harnessd did, and whether Pi keeps running. */
@@ -121,45 +126,34 @@ export function anomalyNoticeText(
 	].join("\n");
 }
 
-const STOP_DETAILS: readonly [RegExp, (match: RegExpExecArray) => string][] = [
-	[
-		/^Pi process exited \(([^)]{1,32})\)$/,
-		(m) => `процесс завершился (${m[1]})`,
-	],
-	[
-		/^Pi RPC stdout is corrupted/,
-		() => "поток RPC повреждён, больше 20 некорректных записей подряд",
-	],
-	[
-		/^Pi stdout did not close after process exit$/,
-		() => "процесс завершился, но его вывод не закрылся",
-	],
-	[
-		/^Pi stdout closed before process exit$/,
-		() => "вывод процесса закрылся раньше самого процесса",
-	],
-	[/^Pi (stdout|stdin|stderr) failed$/, (m) => `ошибка канала ${m[1]}`],
-	[/^Harness event stream failed$/, () => "поток событий сессии прервался"],
-];
+const STOP_REASON_TEXT: Readonly<
+	Record<HarnessStopReason, (stop: HarnessStop) => string>
+> = {
+	process_exited: (stop) =>
+		stop.exit ? `процесс завершился (${stop.exit})` : "процесс завершился",
+	stream_corrupted: () =>
+		"поток RPC повреждён, больше 20 некорректных записей подряд",
+	stdout_not_closed: () => "процесс завершился, но его вывод не закрылся",
+	stdout_closed_early: () => "вывод процесса закрылся раньше самого процесса",
+	channel_failed: (stop) =>
+		stop.channel ? `ошибка канала ${stop.channel}` : "ошибка канала процесса",
+	event_stream_failed: () => "поток событий сессии прервался",
+};
 
 /**
- * The one chat message for Pi stopping, in Russian, with a folded stop anomaly
- * (a record cut by the stop, or a corrupted stream) and its journal reference.
+ * The one chat message for a session's process stopping, in harness-neutral Russian
+ * picked by the stop reason code (the English detail is only the fallback), with a
+ * folded stop anomaly (a record cut by the stop, or a corrupted stream) and its
+ * journal reference.
  */
 export function stopNoticeText(
 	detail: string,
+	stop?: HarnessStop,
 	folded?: HarnessAnomaly,
 ): string {
-	let reason = detail;
-	for (const [pattern, render] of STOP_DETAILS) {
-		const match = pattern.exec(detail);
-		if (match) {
-			reason = render(match);
-			break;
-		}
-	}
+	const reason = stop ? STOP_REASON_TEXT[stop.reason](stop) : detail;
 	return [
-		`Pi остановлен: ${reason}.`,
+		`Процесс сессии остановлен: ${reason}.`,
 		...(folded?.kind === "truncated_record"
 			? [`Последняя запись RPC оборвалась${facts(folded)} и пропущена.`]
 			: []),
@@ -167,19 +161,39 @@ export function stopNoticeText(
 	].join("\n");
 }
 
-/** Russian wording for a definite input non-delivery the harness explained, if known. */
+const INPUT_FAILURE_TEXT: Readonly<
+	Record<InputFailureReason, (failure: InputFailure) => string>
+> = {
+	prompt_rejected: (failure) =>
+		`не принят — Pi отклонил сообщение${failure.text ? `: ${failure.text}` : ""}`,
+	hold_timeout: () => "не отправлен — Pi слишком долго сжимал контекст",
+	held_and_stopped: () =>
+		"не отправлен — Pi остановился, пока сообщение ждало конца сжатия",
+	canceled: () => "отменён пользователем",
+};
+
+/** Russian wording for a definite input non-delivery, picked by its reason code. */
 export function inputFailureText(
-	detail: string | undefined,
+	failure: InputFailure | undefined,
 ): string | undefined {
-	if (!detail) return undefined;
-	const rejected = /^Pi rejected the prompt(?:: ([\s\S]+))?$/.exec(detail);
-	if (rejected)
-		return `не принят — Pi отклонил сообщение${rejected[1] ? `: ${rejected[1]}` : ""}`;
-	if (detail === "Pi compaction did not finish in time; the input was not sent")
-		return "не отправлен — Pi слишком долго сжимал контекст";
-	if (detail === "Pi stopped before the held input was sent")
-		return "не отправлен — Pi остановился, пока сообщение ждало конца сжатия";
-	return undefined;
+	return failure ? INPUT_FAILURE_TEXT[failure.reason](failure) : undefined;
+}
+
+const INPUT_FAILURE_STATUS: Readonly<
+	Record<InputFailureReason, (subject: "сообщение" | "вложение") => string>
+> = {
+	prompt_rejected: (subject) => `Pi не принял ${subject}`,
+	hold_timeout: () => "Не отправлено: Pi долго сжимал контекст",
+	held_and_stopped: () => "Не отправлено: Pi остановился",
+	canceled: () => "Отменено пользователем",
+};
+
+/** Short live run-card status for a definite input non-delivery, by its reason code. */
+export function inputFailureStatus(
+	failure: InputFailure | undefined,
+	subject: "сообщение" | "вложение" = "сообщение",
+): string | undefined {
+	return failure ? INPUT_FAILURE_STATUS[failure.reason](subject) : undefined;
 }
 
 interface KindState {

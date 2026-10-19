@@ -1481,6 +1481,7 @@ export class SessionManager {
 					kind: "error",
 					text: "Harness event stream failed",
 					fatal: true,
+					stop: { reason: "event_stream_failed" },
 				});
 			}
 		}

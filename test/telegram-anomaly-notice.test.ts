@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { HarnessAnomaly, SessionId } from "../src/core/types.js";
+import type {
+	HarnessAnomaly,
+	HarnessStop,
+	InputFailure,
+	SessionId,
+} from "../src/core/types.js";
 import {
 	AnomalyNoticeCoalescer,
 	anomalyNoticeText,
 	anomalyRoute,
+	inputFailureStatus,
 	inputFailureText,
 	stopNoticeText,
 } from "../src/telegram-anomaly-notice.js";
@@ -71,7 +77,7 @@ describe("anomalyNoticeText", () => {
 				recordType: "agent_end",
 				bytes: 2048,
 			},
-			"Последняя запись RPC оборвалась при остановке Pi (agent_end, 2 КБ).\nharnessd пропустил эту запись.\nPi остановлен по запросу harnessd; восстанавливать нечего.",
+			"Последняя запись RPC оборвалась при остановке Pi (agent_end, 2 КБ).\nharnessd пропустил эту запись.\nPi остановлен.",
 		],
 		[
 			{
@@ -111,9 +117,10 @@ describe("anomalyRoute", () => {
 		[{ kind: "handler_error", action: "skipped" }, "notice"],
 		[{ kind: "corrupted_stream", action: "stopped" }, "stop"],
 		[{ kind: "truncated_record", action: "skipped" }, "stop"],
+		// A record cut while harnessd itself stops Pi needs no chat message.
 		[
 			{ kind: "truncated_record", action: "skipped", stopRequested: true },
-			"notice",
+			"journal",
 		],
 	])("routes %o to %s", (fields, route) => {
 		expect(anomalyRoute({ ...base, ...fields } as HarnessAnomaly)).toBe(route);
@@ -121,19 +128,23 @@ describe("anomalyRoute", () => {
 });
 
 describe("stop and input-failure wording", () => {
-	it("presents Pi stopping in Russian with a folded cut record and its journal ref", () => {
+	it("presents a session stop in harness-neutral Russian with a folded cut record and its journal ref", () => {
 		expect(
-			stopNoticeText("Pi process exited (SIGKILL)", {
-				...base,
-				kind: "truncated_record",
-				action: "skipped",
-				harnessRunning: false,
-				recordType: "agent_end",
-				bytes: 300,
-			}),
+			stopNoticeText(
+				"Pi process exited (SIGKILL)",
+				{ reason: "process_exited", exit: "SIGKILL" },
+				{
+					...base,
+					kind: "truncated_record",
+					action: "skipped",
+					harnessRunning: false,
+					recordType: "agent_end",
+					bytes: 300,
+				},
+			),
 		).toBe(
 			[
-				"Pi остановлен: процесс завершился (SIGKILL).",
+				"Процесс сессии остановлен: процесс завершился (SIGKILL).",
 				"Последняя запись RPC оборвалась (agent_end, 300 Б) и пропущена.",
 				"Журнал: harnessd, ref abcd1234.",
 			].join("\n"),
@@ -141,6 +152,7 @@ describe("stop and input-failure wording", () => {
 		expect(
 			stopNoticeText(
 				"Pi RPC stdout is corrupted: more than 20 consecutive invalid records",
+				{ reason: "stream_corrupted" },
 				{
 					...base,
 					kind: "corrupted_stream",
@@ -149,26 +161,67 @@ describe("stop and input-failure wording", () => {
 				},
 			),
 		).toBe(
-			"Pi остановлен: поток RPC повреждён, больше 20 некорректных записей подряд.\nЖурнал: harnessd, ref abcd1234.",
-		);
-		expect(stopNoticeText("something new")).toBe(
-			"Pi остановлен: something new.",
+			"Процесс сессии остановлен: поток RPC повреждён, больше 20 некорректных записей подряд.\nЖурнал: harnessd, ref abcd1234.",
 		);
 	});
 
-	it("words definite input failures in Russian", () => {
-		expect(inputFailureText("Pi rejected the prompt: Agent is busy")).toBe(
+	it.each<[HarnessStop, string]>([
+		[{ reason: "process_exited" }, "процесс завершился"],
+		[{ reason: "process_exited", exit: "1" }, "процесс завершился (1)"],
+		[{ reason: "stream_corrupted" }, "поток RPC повреждён"],
+		[{ reason: "stdout_not_closed" }, "вывод не закрылся"],
+		[{ reason: "stdout_closed_early" }, "вывод процесса закрылся раньше"],
+		[{ reason: "channel_failed", channel: "stdin" }, "ошибка канала stdin"],
+		[{ reason: "event_stream_failed" }, "поток событий сессии прервался"],
+	])(
+		"words stop reason %o by code, not by the English detail",
+		(stop, text) => {
+			const notice = stopNoticeText("any changed English detail", stop);
+			expect(notice).toContain(text);
+			expect(notice).not.toContain("English");
+			expect(notice).not.toMatch(/\bPi\b/);
+		},
+	);
+
+	it("falls back to the English detail for a stop without a reason, without naming Pi", () => {
+		expect(stopNoticeText("Claude protocol error")).toBe(
+			"Процесс сессии остановлен: Claude protocol error.",
+		);
+	});
+
+	it.each<[InputFailure, string, string]>([
+		[
+			{ reason: "prompt_rejected", text: "Agent is busy" },
 			"не принят — Pi отклонил сообщение: Agent is busy",
-		);
-		expect(inputFailureText("Pi rejected the prompt")).toBe(
+			"Pi не принял сообщение",
+		],
+		[
+			{ reason: "prompt_rejected" },
 			"не принят — Pi отклонил сообщение",
+			"Pi не принял сообщение",
+		],
+		[
+			{ reason: "hold_timeout" },
+			"не отправлен — Pi слишком долго сжимал контекст",
+			"Не отправлено: Pi долго сжимал контекст",
+		],
+		[
+			{ reason: "held_and_stopped" },
+			"не отправлен — Pi остановился, пока сообщение ждало конца сжатия",
+			"Не отправлено: Pi остановился",
+		],
+		[{ reason: "canceled" }, "отменён пользователем", "Отменено пользователем"],
+	])("words input failure %o by its reason code", (failure, text, status) => {
+		expect(inputFailureText(failure)).toBe(text);
+		expect(inputFailureStatus(failure)).toBe(status);
+	});
+
+	it("has no wording for an input failure without a reason code", () => {
+		expect(inputFailureText(undefined)).toBeUndefined();
+		expect(inputFailureStatus(undefined)).toBeUndefined();
+		expect(inputFailureStatus({ reason: "prompt_rejected" }, "вложение")).toBe(
+			"Pi не принял вложение",
 		);
-		expect(
-			inputFailureText(
-				"Pi compaction did not finish in time; the input was not sent",
-			),
-		).toBe("не отправлен — Pi слишком долго сжимал контекст");
-		expect(inputFailureText("Input canceled")).toBeUndefined();
 	});
 });
 

@@ -321,6 +321,7 @@ describe("Pi RPC protocol anomalies", () => {
 		expect(events.find((event) => event.kind === "error")).toMatchObject({
 			fatal: true,
 			text: expect.stringContaining("more than 20 consecutive"),
+			stop: { reason: "stream_corrupted" },
 		});
 		await instance.shutdown();
 	});
@@ -352,7 +353,10 @@ describe("Pi RPC stop and prompt delivery", () => {
 		]);
 		const errors = events.filter((event) => event.kind === "error");
 		expect(errors).toEqual([
-			expect.objectContaining({ text: "Pi process exited (SIGTERM)" }),
+			expect.objectContaining({
+				text: "Pi process exited (SIGTERM)",
+				stop: { reason: "process_exited", exit: "SIGTERM" },
+			}),
 		]);
 		await instance.shutdown();
 	});
@@ -426,8 +430,12 @@ describe("Pi RPC stop and prompt delivery", () => {
 				inputId: "late",
 				state: "failed",
 				detail: "Pi compaction did not finish in time; the input was not sent",
+				failure: { reason: "hold_timeout" },
 			},
 		]);
+		await sending.catch((error: InputNotDeliveredError) =>
+			expect(error.failure).toEqual({ reason: "hold_timeout" }),
+		);
 		expect(anomalies(events).map((item) => item.kind)).toEqual([
 			"prompt_held",
 			"prompt_hold_timeout",
@@ -451,6 +459,7 @@ describe("Pi RPC stop and prompt delivery", () => {
 			inputId: "stopped",
 			state: "failed",
 			detail: "Pi stopped before the held input was sent",
+			failure: { reason: "held_and_stopped" },
 		});
 		await instance.shutdown();
 	});
@@ -467,10 +476,20 @@ describe("Pi RPC stop and prompt delivery", () => {
 			"Pi rejected the prompt: Cannot submit a prompt while compaction is in progress. token=[REDACTED]",
 		);
 		expect(
-			events.find((event) => event.inputEvent?.state === "failed")?.inputEvent
-				?.detail,
-		).toBe(
-			"Pi rejected the prompt: Cannot submit a prompt while compaction is in progress. token=[REDACTED]",
+			events.find((event) => event.inputEvent?.state === "failed")?.inputEvent,
+		).toMatchObject({
+			detail:
+				"Pi rejected the prompt: Cannot submit a prompt while compaction is in progress. token=[REDACTED]",
+			failure: {
+				reason: "prompt_rejected",
+				text: "Cannot submit a prompt while compaction is in progress. token=[REDACTED]",
+			},
+		});
+		await sending.catch((error: InputNotDeliveredError) =>
+			expect(error.failure).toEqual({
+				reason: "prompt_rejected",
+				text: "Cannot submit a prompt while compaction is in progress. token=[REDACTED]",
+			}),
 		);
 		expect(anomalies(events)).toEqual([
 			expect.objectContaining({
@@ -568,11 +587,101 @@ describe("Pi RPC stop and prompt delivery", () => {
 				events.filter((event) => event.inputEvent).map((e) => e.inputEvent),
 			).toEqual([
 				{ inputId: "held-cancel", state: "pending" },
-				{ inputId: "held-cancel", state: "failed", detail: "Input canceled" },
+				{
+					inputId: "held-cancel",
+					state: "failed",
+					detail: "Input canceled",
+					failure: { reason: "canceled" },
+				},
 			]);
 			await instance.shutdown();
 		},
 	);
+
+	describe("compaction recheck window", () => {
+		async function inRecheck() {
+			const fake = fakeProvider({ exitOnTerm: false, holdLaterGetState: true });
+			const instance = await new PiRpcHarnessAdapter(fake.provider, {
+				executable: "pi",
+				startupTimeoutMs: 200,
+				shutdownTimeoutMs: 20,
+				exitDrainTimeoutMs: 100,
+				compactionHoldTimeoutMs: 20,
+			}).launch(request);
+			const events: HarnessEvent[] = [];
+			void (async () => {
+				for await (const event of instance.events) events.push(event);
+			})();
+			fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
+			await tick();
+			const sending = instance.send(input("held", "recheck"));
+			sending.catch(() => {});
+			// The hold timed out and the get_state recheck is outstanding.
+			await vi.waitFor(() =>
+				expect(
+					fake.commands.filter((item) => item.type === "get_state"),
+				).toHaveLength(2),
+			);
+			const inputs = () =>
+				events.filter((event) => event.inputEvent).map((e) => e.inputEvent);
+			return { fake, instance, sending, inputs };
+		}
+
+		it.each(["exact", "current"] as const)(
+			"cancels the held prompt (%s cancel) while Pi's state is rechecked",
+			async (how) => {
+				const { fake, instance, sending, inputs } = await inRecheck();
+				if (how === "exact") await instance.cancel("recheck" as InputId);
+				else await instance.cancelCurrent?.();
+				// Even if Pi then reports that compaction is over, the input stays canceled.
+				const recheck = fake.commands.at(-1) as { id: string };
+				fake.stdout.write(
+					`${JSON.stringify({
+						type: "response",
+						id: recheck.id,
+						command: "get_state",
+						success: true,
+						data: { sessionId: "native-exact", isCompacting: false },
+					})}\n`,
+				);
+				await expect(sending).rejects.toMatchObject({
+					failure: { reason: "canceled" },
+				});
+				expect(fake.commands.some((item) => item.type === "prompt")).toBe(
+					false,
+				);
+				expect(inputs()).toEqual([
+					{ inputId: "recheck", state: "pending" },
+					{
+						inputId: "recheck",
+						state: "failed",
+						detail: "Input canceled",
+						failure: { reason: "canceled" },
+					},
+				]);
+				await instance.shutdown();
+			},
+		);
+
+		it("reports a Pi stop during the recheck as not delivered, not uncertain", async () => {
+			const { fake, instance, sending, inputs } = await inRecheck();
+			await fake.child.sendSignal("SIGTERM");
+			await expect(sending).rejects.toBeInstanceOf(InputNotDeliveredError);
+			await expect(sending).rejects.toMatchObject({
+				failure: { reason: "held_and_stopped" },
+			});
+			expect(inputs()).toEqual([
+				{ inputId: "recheck", state: "pending" },
+				{
+					inputId: "recheck",
+					state: "failed",
+					detail: "Pi stopped before the held input was sent",
+					failure: { reason: "held_and_stopped" },
+				},
+			]);
+			await instance.shutdown();
+		});
+	});
 
 	it("does not settle a held prompt when a run settles during the hold", async () => {
 		const { fake, instance, events } = await launch({
