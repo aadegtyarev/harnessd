@@ -42,7 +42,10 @@ import {
 	AGENT_FILE_SEND_TOKEN_ENV,
 	AGENT_FILE_SEND_URL_ENV,
 } from "./agent-file-send-protocol.js";
-import { UncertainInputDeliveryError } from "./input-delivery-error.js";
+import {
+	InputNotDeliveredError,
+	UncertainInputDeliveryError,
+} from "./input-delivery-error.js";
 import {
 	bashExitDetail,
 	coordinationSummary,
@@ -83,7 +86,10 @@ const RELOAD_COMMAND_ENV = "HARNESSD_PI_RELOAD_COMMAND";
 const RELOAD_COMMAND_DESCRIPTION = "harnessd internal reload command";
 const COST_REPORT_CUSTOM_TYPE = "pi-ad-session-usage:report";
 
-export { UncertainInputDeliveryError } from "./input-delivery-error.js";
+export {
+	InputNotDeliveredError,
+	UncertainInputDeliveryError,
+} from "./input-delivery-error.js";
 
 export type PiStartupErrorCode =
 	| "PI_EXECUTABLE_NOT_FOUND"
@@ -485,8 +491,8 @@ interface ActiveInput {
 	uncertain: boolean;
 	uncertainReported: boolean;
 	canceling: boolean;
-	/** Waiting for Pi compaction to finish; not yet written. */
-	held?: boolean;
+	/** Waiting for Pi compaction to finish; not yet written. Ends the hold early. */
+	held?: (outcome: "canceled") => void;
 }
 function recordValue(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -604,6 +610,9 @@ function toolActivitySummary(name: string, value: unknown): string {
 	}
 	return truncateDiagnostic(redactDiagnosticText(summary), 700);
 }
+const HELD_INPUT_TIMEOUT =
+	"Pi compaction did not finish in time; the input was not sent";
+const HELD_INPUT_STOPPED = "Pi stopped before the held input was sent";
 /** "Pi rejected the prompt" plus Pi's own redacted, bounded reason when it sent one. */
 function promptRejection(
 	response: Record<string, unknown>,
@@ -646,7 +655,10 @@ class PiRpcInstance implements HarnessInstance {
 	private abortOutcomeUncertain = false;
 	private nativeId?: string;
 	private agentRunning = false;
+	/** Pi reports any compaction (manual or automatic); reload waits for it. */
 	private compacting = false;
+	/** Pi reports manual compaction, the only kind during which it rejects prompts. */
+	private manualCompaction = false;
 	private reloadExtensionError = false;
 	private reloadPending = false;
 	private reloadDispatched = false;
@@ -666,9 +678,9 @@ class PiRpcInstance implements HarnessInstance {
 	private buffer = "";
 	private bufferBytes = 0;
 	/** Set while discarding the rest of an oversized line; keeps only a bounded head. */
-	private oversized?: { head: string; bytes: number };
+	private oversized?: { head: string; bytes: number; endsWithCr: boolean };
 	/** Partial record left at stdout EOF, reported when the process stops. */
-	private eofLeftover?: { bytes: number; head?: string };
+	private eofLeftover?: { bytes: number; head?: string; recordType?: string };
 	private consecutiveAnomalies = 0;
 	private readonly compactionWaiters: (() => void)[] = [];
 	private writeChain: Promise<void> = Promise.resolve();
@@ -1061,14 +1073,16 @@ class PiRpcInstance implements HarnessInstance {
 			const oversized = this.oversized;
 			if (oversized) {
 				this.oversized = undefined;
+				// A trailing CR belongs to the delimiter, not the record.
+				const bytes = oversized.bytes - (oversized.endsWithCr ? 1 : 0);
 				try {
-					this.handleOversized(oversized.head, oversized.bytes);
+					this.handleOversized(oversized.head, bytes);
 				} catch (error) {
 					this.reportAnomaly({
 						kind: "handler_error",
 						action: "skipped",
 						harnessRunning: true,
-						bytes: oversized.bytes,
+						bytes,
 						recordType:
 							safeToken(scanRecordHead(oversized.head).get("type")) ??
 							"unknown",
@@ -1077,7 +1091,8 @@ class PiRpcInstance implements HarnessInstance {
 							this.redactions,
 						),
 					});
-					this.countAnomaly();
+					// A harnessd bug says nothing about Pi's stream.
+					this.consecutiveAnomalies = 0;
 				}
 				continue;
 			}
@@ -1093,6 +1108,7 @@ class PiRpcInstance implements HarnessInstance {
 		const bytes = Buffer.byteLength(piece, "utf8");
 		if (this.oversized) {
 			this.oversized.bytes += bytes;
+			this.oversized.endsWithCr = piece.endsWith("\r");
 			return;
 		}
 		if (this.bufferBytes + bytes <= this.maxRecordBytes) {
@@ -1106,7 +1122,11 @@ class PiRpcInstance implements HarnessInstance {
 				? this.buffer.slice(0, OVERSIZED_HEAD_CHARS)
 				: this.buffer +
 					piece.slice(0, OVERSIZED_HEAD_CHARS - this.buffer.length);
-		this.oversized = { head, bytes: this.bufferBytes + bytes };
+		this.oversized = {
+			head,
+			bytes: this.bufferBytes + bytes,
+			endsWithCr: piece.endsWith("\r"),
+		};
 		this.buffer = "";
 		this.bufferBytes = 0;
 	}
@@ -1170,7 +1190,9 @@ class PiRpcInstance implements HarnessInstance {
 			...(recordType ? { recordType } : {}),
 			...extra,
 		});
-		this.countAnomaly();
+		// A harnessd handling bug is not evidence of a corrupted Pi stream.
+		if (kind === "handler_error") this.consecutiveAnomalies = 0;
+		else this.countAnomaly();
 	}
 	private countAnomaly(): void {
 		this.consecutiveAnomalies++;
@@ -1199,18 +1221,23 @@ class PiRpcInstance implements HarnessInstance {
 				"agent_settled",
 				"turn_start",
 				"turn_end",
+				"compaction_start",
+				"compaction_end",
+				"auto_compaction_start",
+				"auto_compaction_end",
 			].includes(type)
 		) {
-			this.event({ type });
+			const reason = safeToken(head.get("reason"));
+			this.event({ type, ...(reason ? { reason } : {}) });
 			handled = true;
 		} else if (
 			type === "tool_execution_end" &&
 			typeof head.get("toolCallId") === "string"
 		) {
-			// The result (and so a bash exit code) lies past the head; only a failure
-			// flag read from the head is reported.
+			// Pi writes isError after the (large) result, so the outcome is usually
+			// unknown here: report the tool as finished without claiming success.
 			const toolCallId = head.get("toolCallId") as string;
-			const failed = head.get("isError") === true;
+			const isError = head.get("isError");
 			const toolName =
 				safeToken(head.get("toolName")) ?? this.toolNames.get(toolCallId);
 			this.toolNames.delete(toolCallId);
@@ -1220,8 +1247,10 @@ class PiRpcInstance implements HarnessInstance {
 				activityEvent: {
 					type: "tool_end",
 					toolCallId,
-					failed,
-					...(toolName === "bash" && failed ? { detail: "error" } : {}),
+					...(typeof isError === "boolean" ? { failed: isError } : {}),
+					...(toolName === "bash" && isError === true
+						? { detail: "error" }
+						: {}),
 				},
 			});
 			handled = true;
@@ -1279,11 +1308,20 @@ class PiRpcInstance implements HarnessInstance {
 	/** Keep (bounded) any partial record left at stdout EOF; reported when Pi stops. */
 	private keepEofLeftover(): void {
 		const oversized = this.oversized;
-		if (oversized) this.eofLeftover = { bytes: oversized.bytes };
+		const kept = oversized?.head ?? this.buffer;
+		const recordType = kept
+			? safeToken(scanRecordHead(kept).get("type"))
+			: undefined;
+		if (oversized)
+			this.eofLeftover = {
+				bytes: oversized.bytes,
+				...(recordType ? { recordType } : {}),
+			};
 		else if (this.buffer.length)
 			this.eofLeftover = {
 				bytes: this.bufferBytes,
 				head: anomalyText(this.buffer, this.redactions),
+				...(recordType ? { recordType } : {}),
 			};
 		this.oversized = undefined;
 		this.buffer = "";
@@ -1622,12 +1660,16 @@ class PiRpcInstance implements HarnessInstance {
 			}
 			return;
 		}
-		if (["auto_compaction_start", "compaction_start"].includes(record.type))
+		if (["auto_compaction_start", "compaction_start"].includes(record.type)) {
 			this.compacting = true;
-		if (["auto_compaction_end", "compaction_end"].includes(record.type)) {
-			this.compacting = false;
-			this.releaseCompactionWaiters();
+			// Pi 1.3 marks manual compaction with reason "manual"; older Pi used
+			// auto_compaction_* for automatic compaction and no reason.
+			this.manualCompaction =
+				record.type === "compaction_start" &&
+				(record.reason === undefined || record.reason === "manual");
 		}
+		if (["auto_compaction_end", "compaction_end"].includes(record.type))
+			this.endCompaction();
 		if (["agent_start", "agent_end", "agent_settled"].includes(record.type)) {
 			this.emit({
 				sessionId: this.sessionId,
@@ -1639,6 +1681,8 @@ class PiRpcInstance implements HarnessInstance {
 				this.agentRunning = false;
 				// Settlement for an aborting run says nothing about native queued inputs.
 				for (const input of this.activeInputs.values()) {
+					// A held input has not been sent, so this run says nothing about it.
+					if (input.held) continue;
 					if (this.abortInFlight && !input.canceling) continue;
 					if (input.accepted || !input.sentAsSteer) input.settled = true;
 					if (input.uncertain) this.activeInputs.delete(input.id);
@@ -1868,11 +1912,12 @@ class PiRpcInstance implements HarnessInstance {
 		};
 		this.activeInputs.set(input.id, active);
 		this.delivery(input.id, "pending");
-		if (this.compacting) {
+		if (this.manualCompaction) {
 			await this.holdDuringCompaction(active);
 			// An abort that started while the prompt was held still gates it.
 			await this.waitForAbortGate();
-			if (this.eventsClosed) throw new Error("Pi harness is closed");
+			if (this.eventsClosed)
+				throw new InputNotDeliveredError(input.id, HELD_INPUT_STOPPED);
 		}
 		active.sentAsSteer = this.agentRunning || this.activeInputs.size > 1;
 		let response: Record<string, unknown>;
@@ -1911,50 +1956,78 @@ class PiRpcInstance implements HarnessInstance {
 			throw new UncertainInputDeliveryError(input.id, { cause: error });
 		}
 		if (response.success !== true)
-			throw new Error(promptRejection(response, this.redactions));
+			throw new InputNotDeliveredError(
+				input.id,
+				promptRejection(response, this.redactions),
+			);
 	}
 	/**
-	 * Pi rejects prompts while it compacts, so hold this one until compaction ends.
-	 * The wait is bounded; on timeout or process stop the input fails without being sent.
+	 * Pi rejects prompts during manual compaction, so hold this one until it ends.
+	 * The hold is bounded: on timeout Pi's state is rechecked once and the input is sent
+	 * if compaction has in fact ended (a lost end event); otherwise, and on cancel or
+	 * process stop, the input fails without being sent.
 	 */
 	private async holdDuringCompaction(active: ActiveInput): Promise<void> {
-		active.held = true;
 		this.reportAnomaly({
 			kind: "prompt_held",
 			action: "held_prompt",
 			harnessRunning: true,
 		});
-		let release!: () => void;
-		const ended = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		this.compactionWaiters.push(release);
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timedOut = await Promise.race([
-			ended.then(() => false),
-			new Promise<boolean>((resolve) => {
-				timer = setTimeout(
-					() => resolve(true),
-					this.options.compactionHoldTimeoutMs ?? 300_000,
-				);
-			}),
-		]);
-		if (timer) clearTimeout(timer);
-		active.held = false;
-		const waiter = this.compactionWaiters.indexOf(release);
-		if (waiter >= 0) this.compactionWaiters.splice(waiter, 1);
-		if (this.eventsClosed) throw new Error("Pi harness is closed");
-		if (!timedOut) return;
+		let outcome = await this.waitForCompactionEnd(active);
+		if (outcome === "timeout" && !this.eventsClosed) {
+			let stillCompacting = true;
+			try {
+				const state = await this.command("get_state");
+				stillCompacting = recordValue(state.data)?.isCompacting !== false;
+			} catch {
+				/* unknown: keep failing safe */
+			}
+			// A lost end event: Pi says it is idle, so stop waiting for it.
+			if (!stillCompacting) this.endCompaction();
+			if (!this.manualCompaction) outcome = "ended";
+		}
+		if (outcome === "ended" || this.eventsClosed) return;
 		this.activeInputs.delete(active.id);
-		const detail =
-			"Pi compaction did not finish in time; the input was not sent";
+		if (outcome === "canceled") {
+			this.delivery(active.id, "failed", "Input canceled");
+			throw new InputNotDeliveredError(active.id, "Input canceled");
+		}
 		this.reportAnomaly({
 			kind: "prompt_hold_timeout",
 			action: "failed_input",
 			harnessRunning: true,
 		});
-		this.delivery(active.id, "failed", detail);
-		throw new Error(detail);
+		this.delivery(active.id, "failed", HELD_INPUT_TIMEOUT);
+		throw new InputNotDeliveredError(active.id, HELD_INPUT_TIMEOUT);
+	}
+	private async waitForCompactionEnd(
+		active: ActiveInput,
+	): Promise<"ended" | "timeout" | "canceled"> {
+		let release!: () => void;
+		let finish!: (outcome: "ended" | "timeout" | "canceled") => void;
+		const outcome = new Promise<"ended" | "timeout" | "canceled">((resolve) => {
+			finish = resolve;
+			release = () => resolve("ended");
+		});
+		this.compactionWaiters.push(release);
+		active.held = finish;
+		const timer = setTimeout(
+			() => finish("timeout"),
+			this.options.compactionHoldTimeoutMs ?? 300_000,
+		);
+		try {
+			return await outcome;
+		} finally {
+			clearTimeout(timer);
+			active.held = undefined;
+			const waiter = this.compactionWaiters.indexOf(release);
+			if (waiter >= 0) this.compactionWaiters.splice(waiter, 1);
+		}
+	}
+	private endCompaction(): void {
+		this.compacting = false;
+		this.manualCompaction = false;
+		this.releaseCompactionWaiters();
 	}
 	private async waitForAbortGate(): Promise<void> {
 		while (this.abortInFlight) await this.abortInFlight.promise;
@@ -1969,7 +2042,14 @@ class PiRpcInstance implements HarnessInstance {
 		this.delivery(active.id, "completed");
 	}
 	async cancelCurrent(): Promise<void> {
-		const active = [...this.activeInputs.values()].filter(
+		const inputs = [...this.activeInputs.values()];
+		const held = inputs.filter((input) => input.held);
+		// With nothing sent, the current input is the one waiting for compaction.
+		if (held.length === 1 && held.length === inputs.length) {
+			await this.cancelInput((held[0] as ActiveInput).id, true);
+			return;
+		}
+		const active = inputs.filter(
 			(input) => !input.sentAsSteer && input.accepted && !input.uncertain,
 		);
 		if (active.length !== 1)
@@ -1989,6 +2069,11 @@ class PiRpcInstance implements HarnessInstance {
 		if (this.reloadPending) throw new PiControlError("RELOAD_BUSY");
 		const active = this.activeInputs.get(inputId);
 		if (!active) throw new Error("Input is not active");
+		if (active.held) {
+			// Not yet sent to Pi: cancelling only ends the hold; send() reports it.
+			active.held("canceled");
+			return;
+		}
 		if (!preserveQueued && this.activeInputs.size > 1)
 			throw new Error(
 				"Pi cannot cancel one input while others are queued; no input was canceled",
@@ -2104,6 +2189,8 @@ class PiRpcInstance implements HarnessInstance {
 				action: "skipped",
 				harnessRunning: false,
 				bytes: leftover.bytes,
+				...(this.shuttingDown ? { stopRequested: true } : {}),
+				...(leftover.recordType ? { recordType: leftover.recordType } : {}),
 				...(leftover.head ? { head: leftover.head } : {}),
 				detail: anomalyDetail(
 					this.shuttingDown
@@ -2123,11 +2210,7 @@ class PiRpcInstance implements HarnessInstance {
 		for (const active of this.activeInputs.values()) {
 			if (active.held)
 				// A held prompt was never written, so its failure is definite.
-				this.delivery(
-					active.id,
-					"failed",
-					"Pi stopped before the held input was sent",
-				);
+				this.delivery(active.id, "failed", HELD_INPUT_STOPPED);
 			else if (!active.uncertainReported)
 				this.delivery(active.id, "uncertain", detail);
 		}

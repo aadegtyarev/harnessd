@@ -13,6 +13,24 @@ import {
 } from "../src/telegram-run-card.js";
 
 describe("run card", () => {
+	it("shows a tool with an unknown outcome as finished without a success or failure mark", () => {
+		const events: RunCardEvent[] = [];
+		addToolEvent(events, "w1", "write: big.txt", "10:00", 0);
+		addToolEvent(events, "b1", "bash: cat big.log", "10:01", 0);
+		expect(finishToolEvent(events, "w1", undefined, undefined, 5_000)).toBe(
+			true,
+		);
+		finishToolEvent(events, "b1", undefined, undefined, 10);
+		expect(events.map((event) => event.state)).toEqual([
+			"finished",
+			"finished",
+		]);
+		expect(events.map(formatRunCardEvent)).toEqual([
+			"10:00 ✏️ big.txt · 5с",
+			"10:01 $ cat big.log",
+		]);
+	});
+
 	it("collapses consecutive reads but keeps bash calls separate", () => {
 		const events: RunCardEvent[] = [];
 		addToolEvent(events, "r1", "read: a.ts", "10:00", 0);

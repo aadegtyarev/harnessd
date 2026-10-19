@@ -81,7 +81,8 @@ export type HarnessActivityEvent =
 	| {
 			readonly type: "tool_end";
 			readonly toolCallId: string;
-			readonly failed: boolean;
+			/** Absent when the harness could not read the outcome. */
+			readonly failed?: boolean;
 			/** Short outcome such as a bash exit code. */
 			readonly detail?: string;
 	  }
@@ -145,6 +146,8 @@ export interface HarnessAnomaly {
 	readonly action: HarnessAnomalyAction;
 	/** Whether the harness process keeps running after this anomaly. */
 	readonly harnessRunning: boolean;
+	/** The harness was being stopped by harnessd itself (not an unexpected exit). */
+	readonly stopRequested?: boolean;
 	/** Short correlation reference shared by the journal line and chat notice. */
 	readonly ref: string;
 	/** Record type when known (a short safe token). */

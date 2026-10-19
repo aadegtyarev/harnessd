@@ -10,3 +10,19 @@ export class UncertainInputDeliveryError extends Error {
 		this.name = "UncertainInputDeliveryError";
 	}
 }
+
+/**
+ * Definite non-delivery: Pi rejected the input, or harnessd never sent it (a held
+ * input that timed out, was cancelled, or outlived Pi). The input event stream has
+ * already reported the failure with the same safe detail.
+ */
+export class InputNotDeliveredError extends Error {
+	readonly code = "INPUT_NOT_DELIVERED";
+	constructor(
+		readonly inputId: InputId,
+		detail: string,
+	) {
+		super(detail);
+		this.name = "InputNotDeliveredError";
+	}
+}

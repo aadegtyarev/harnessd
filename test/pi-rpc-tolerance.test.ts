@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { HarnessEvent } from "../src/core/types.js";
+import type { HarnessEvent, InputId } from "../src/core/types.js";
 import {
+	InputNotDeliveredError,
 	PiRpcHarnessAdapter,
 	UncertainInputDeliveryError,
 } from "../src/harness/index.js";
@@ -114,7 +115,7 @@ describe("Pi RPC oversized records", () => {
 		await instance.shutdown();
 	});
 
-	it("emits tool-finished activity for a large tool_execution_end", async () => {
+	it("emits tool-finished activity with unknown outcome for a large tool_execution_end", async () => {
 		const { fake, instance, events } = await launch({}, 4096);
 		fake.stdout.write(
 			`${JSON.stringify({
@@ -134,7 +135,8 @@ describe("Pi RPC oversized records", () => {
 		expect(
 			events.find((event) => event.activityEvent?.type === "tool_end")
 				?.activityEvent,
-		).toEqual({ type: "tool_end", toolCallId: "call-1", failed: false });
+			// Pi writes isError after the result, so the outcome is not claimed.
+		).toEqual({ type: "tool_end", toolCallId: "call-1" });
 		expect(anomalies(events)[0]).toMatchObject({
 			kind: "oversized_record",
 			action: "handled",
@@ -285,6 +287,25 @@ describe("Pi RPC protocol anomalies", () => {
 		await instance.shutdown();
 	});
 
+	it("does not count harnessd handler errors towards the corrupted-stream threshold", async () => {
+		const { fake, instance, events } = await launch();
+		const target = instance as unknown as {
+			event(record: Record<string, unknown>): void;
+		};
+		target.event = () => {
+			throw new Error("handler bug");
+		};
+		fake.stdout.write(
+			`${"bad\n".repeat(15)}${'{"type":"turn_start"}\n'.repeat(25)}${"bad\n".repeat(15)}`,
+		);
+		await vi.waitFor(() => expect(anomalies(events)).toHaveLength(55));
+		expect(
+			anomalies(events).some((item) => item.kind === "corrupted_stream"),
+		).toBe(false);
+		await stillRunning(fake);
+		await instance.shutdown();
+	});
+
 	it("stops Pi after more than 20 consecutive anomalies", async () => {
 		const { fake, instance, events, isDone } = await launch();
 		fake.stdout.write("bad\n".repeat(21));
@@ -338,20 +359,22 @@ describe("Pi RPC stop and prompt delivery", () => {
 
 	it("reports a partial record during harnessd shutdown as that shutdown", async () => {
 		const { fake, instance, events } = await launch({ exitOnTerm: true });
-		fake.stdout.write('{"type":"agent_e');
+		fake.stdout.write('{"type":"agent_end","messages":[{"role":"assi');
 		await instance.shutdown();
 		expect(anomalies(events)).toEqual([
 			expect.objectContaining({
 				kind: "truncated_record",
 				detail: "Pi harness shut down",
+				stopRequested: true,
+				recordType: "agent_end",
 			}),
 		]);
 		expect(events.some((event) => event.kind === "error")).toBe(false);
 	});
 
-	it("holds a prompt during compaction and sends it after compaction_end", async () => {
+	it("holds a prompt during manual compaction and sends it after compaction_end", async () => {
 		const { fake, instance, events } = await launch();
-		fake.stdout.write('{"type":"compaction_start","reason":"threshold"}\n');
+		fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
 		await tick();
 		const sending = instance.send(input("after compaction", "held"));
 		await new Promise((resolve) => setTimeout(resolve, 20));
@@ -363,7 +386,7 @@ describe("Pi RPC stop and prompt delivery", () => {
 				harnessRunning: true,
 			}),
 		]);
-		fake.stdout.write('{"type":"compaction_end","reason":"threshold"}\n');
+		fake.stdout.write('{"type":"compaction_end","reason":"manual"}\n');
 		await expect(sending).resolves.toBeUndefined();
 		expect(fake.commands.find((item) => item.type === "prompt")).toMatchObject({
 			message: "after compaction",
@@ -383,11 +406,17 @@ describe("Pi RPC stop and prompt delivery", () => {
 		void (async () => {
 			for await (const event of instance.events) events.push(event);
 		})();
-		fake.stdout.write('{"type":"auto_compaction_start"}\n');
+		fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
 		await tick();
-		await expect(instance.send(input("late", "late"))).rejects.toThrow(
+		const sending = instance.send(input("late", "late"));
+		await expect(sending).rejects.toBeInstanceOf(InputNotDeliveredError);
+		await expect(sending).rejects.toThrow(
 			"Pi compaction did not finish in time; the input was not sent",
 		);
+		// The recheck asked Pi whether it still compacts.
+		expect(
+			fake.commands.filter((item) => item.type === "get_state"),
+		).toHaveLength(2);
 		expect(fake.commands.some((item) => item.type === "prompt")).toBe(false);
 		expect(
 			events.filter((event) => event.inputEvent).map((e) => e.inputEvent),
@@ -413,7 +442,7 @@ describe("Pi RPC stop and prompt delivery", () => {
 		const sending = instance.send(input("held", "stopped"));
 		await tick();
 		await fake.child.sendSignal("SIGTERM");
-		await expect(sending).rejects.toThrow("closed");
+		await expect(sending).rejects.toBeInstanceOf(InputNotDeliveredError);
 		expect(
 			events.find(
 				(event) => event.inputEvent && event.inputEvent.state !== "pending",
@@ -432,7 +461,9 @@ describe("Pi RPC stop and prompt delivery", () => {
 		const { fake, instance, events } = await launch({
 			rpcResponses: { prompt: { success: false, error: reason } },
 		});
-		await expect(instance.send(input("q", "rejected"))).rejects.toThrow(
+		const sending = instance.send(input("q", "rejected"));
+		await expect(sending).rejects.toBeInstanceOf(InputNotDeliveredError);
+		await expect(sending).rejects.toThrow(
 			"Pi rejected the prompt: Cannot submit a prompt while compaction is in progress. token=[REDACTED]",
 		);
 		expect(
@@ -450,6 +481,156 @@ describe("Pi RPC stop and prompt delivery", () => {
 			}),
 		]);
 		expect(JSON.stringify(events)).not.toContain("hunter2secret");
+		await stillRunning(fake);
+		await instance.shutdown();
+	});
+
+	it("does not hold prompts during automatic compaction", async () => {
+		const { fake, instance } = await launch();
+		fake.stdout.write(
+			'{"type":"compaction_start","reason":"threshold"}\n{"type":"auto_compaction_start"}\n',
+		);
+		await tick();
+		await instance.send(input("during auto", "auto"));
+		expect(fake.commands.find((item) => item.type === "prompt")).toMatchObject({
+			message: "during auto",
+		});
+		await instance.shutdown();
+	});
+
+	it("ends a manual compaction hold on an oversized compaction_end", async () => {
+		const { fake, instance, events } = await launch(
+			{ promptDisposition: "handled" },
+			4096,
+		);
+		fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
+		await tick();
+		const sending = instance.send(input("after big summary", "big-end"));
+		await tick();
+		fake.stdout.write(
+			`${JSON.stringify({
+				type: "compaction_end",
+				reason: "manual",
+				result: { summary: "s".repeat(20_000) },
+				aborted: false,
+			})}\n`,
+		);
+		await expect(sending).resolves.toBeUndefined();
+		expect(anomalies(events).at(-1)).toMatchObject({
+			kind: "oversized_record",
+			action: "handled",
+			recordType: "compaction_end",
+		});
+		// Reload is no longer blocked by a stale compaction flag.
+		await expect(instance.control?.reload?.()).resolves.toBeUndefined();
+		await instance.shutdown();
+	});
+
+	it("sends a held prompt after the hold timeout when Pi reports compaction is over", async () => {
+		const fake = fakeProvider({
+			rpcResponses: {
+				get_state: {
+					data: { sessionId: "native-exact", isCompacting: false },
+				},
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 200,
+			compactionHoldTimeoutMs: 20,
+		}).launch(request);
+		fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
+		await tick();
+		await expect(
+			instance.send(input("lost end", "lost")),
+		).resolves.toBeUndefined();
+		expect(fake.commands.find((item) => item.type === "prompt")).toMatchObject({
+			message: "lost end",
+		});
+		await instance.shutdown();
+	});
+
+	it.each(["exact", "current"] as const)(
+		"cancels a held prompt (%s cancel) without sending it",
+		async (how) => {
+			const { fake, instance, events } = await launch();
+			fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
+			await tick();
+			const sending = instance.send(input("never sent", "held-cancel"));
+			await tick();
+			if (how === "exact") await instance.cancel("held-cancel" as InputId);
+			else await instance.cancelCurrent?.();
+			await expect(sending).rejects.toBeInstanceOf(InputNotDeliveredError);
+			fake.stdout.write('{"type":"compaction_end","reason":"manual"}\n');
+			await tick();
+			expect(fake.commands.some((item) => item.type === "prompt")).toBe(false);
+			expect(
+				events.filter((event) => event.inputEvent).map((e) => e.inputEvent),
+			).toEqual([
+				{ inputId: "held-cancel", state: "pending" },
+				{ inputId: "held-cancel", state: "failed", detail: "Input canceled" },
+			]);
+			await instance.shutdown();
+		},
+	);
+
+	it("does not settle a held prompt when a run settles during the hold", async () => {
+		const { fake, instance, events } = await launch({
+			promptDisposition: "started",
+		});
+		fake.stdout.write('{"type":"compaction_start","reason":"manual"}\n');
+		await tick();
+		const sending = instance.send(input("held", "held-settle"));
+		await tick();
+		fake.stdout.write('{"type":"agent_settled"}\n');
+		await tick();
+		fake.stdout.write('{"type":"compaction_end","reason":"manual"}\n');
+		await expect(sending).resolves.toBeUndefined();
+		const states = () =>
+			events
+				.filter((event) => event.inputEvent?.inputId === "held-settle")
+				.map((event) => event.inputEvent?.state);
+		await vi.waitFor(() => expect(states()).toEqual(["pending", "accepted"]));
+		fake.stdout.write('{"type":"agent_start"}\n{"type":"agent_settled"}\n');
+		await vi.waitFor(() =>
+			expect(states()).toEqual(["pending", "accepted", "completed"]),
+		);
+		await instance.shutdown();
+	});
+
+	it("frames records split across chunks inside multi-byte characters and CRLF", async () => {
+		const { fake, instance, events } = await launch({}, 4096);
+		const small = Buffer.from(
+			`${JSON.stringify({
+				type: "message_update",
+				assistantMessageEvent: { type: "text_delta", delta: "привет 🙂" },
+			})}\r\n`,
+		);
+		const bigBody = JSON.stringify({ type: "mystery", text: "ж".repeat(5000) });
+		const big = Buffer.from(`${bigBody}\r\n`);
+		const all = Buffer.concat([small, big]);
+		// Split inside the emoji, between CR and LF, and inside a Cyrillic letter.
+		const cuts = [
+			small.indexOf(Buffer.from("🙂")) + 2,
+			small.length - 1,
+			small.length + 101,
+			all.length - 1,
+		];
+		let from = 0;
+		for (const cut of [...cuts, all.length]) {
+			fake.stdout.write(all.subarray(from, cut));
+			from = cut;
+			await tick();
+		}
+		await vi.waitFor(() => expect(anomalies(events)).toHaveLength(1));
+		expect(events.find((event) => event.kind === "output")?.text).toBe(
+			"привет 🙂",
+		);
+		expect(anomalies(events)[0]).toMatchObject({
+			kind: "oversized_record",
+			recordType: "mystery",
+			bytes: Buffer.byteLength(bigBody),
+		});
 		await stillRunning(fake);
 		await instance.shutdown();
 	});

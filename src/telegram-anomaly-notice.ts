@@ -17,17 +17,39 @@ function times(count: number): string {
 	return ones >= 2 && ones <= 4 ? "раза" : "раз";
 }
 
-/** The process-stop detail in Russian: exit code or signal, or harnessd's own shutdown. */
-function stopDetail(detail: string | undefined): string {
-	if (!detail) return "";
-	if (/shut down/i.test(detail)) return ": harnessd завершал сессию";
-	const exit = /exited \(([^)]{1,32})\)/.exec(detail)?.[1];
-	return exit ? `: процесс завершился (${exit})` : "";
+/** How Telegram presents an anomaly: its own notice, journal only, or folded into the stop message. */
+export type AnomalyRoute = "notice" | "journal" | "stop";
+
+/**
+ * Chats hear only about real problems: a skipped record, a failed command, a harnessd
+ * bug, or Pi stopping. Healthy tolerance (an oversized record handled by type, a prompt
+ * held during compaction) is journal only; failures that already have a chat message
+ * (input failures, Pi stopping) are folded into that message instead of duplicated.
+ */
+export function anomalyRoute(anomaly: HarnessAnomaly): AnomalyRoute {
+	switch (anomaly.kind) {
+		case "prompt_held":
+		case "prompt_rejected":
+		case "prompt_hold_timeout":
+			return "journal";
+		case "corrupted_stream":
+			return "stop";
+		case "truncated_record":
+			return anomaly.stopRequested ? "notice" : "stop";
+		case "oversized_record":
+			return anomaly.action === "handled" ? "journal" : "notice";
+		default:
+			return "notice";
+	}
+}
+
+function facts(anomaly: HarnessAnomaly): string {
+	const known = [anomaly.recordType, size(anomaly.bytes)].filter(Boolean);
+	return known.length ? ` (${known.join(", ")})` : "";
 }
 
 function what(anomaly: HarnessAnomaly): string {
-	const facts = [anomaly.recordType, size(anomaly.bytes)].filter(Boolean);
-	const about = facts.length ? ` (${facts.join(", ")})` : "";
+	const about = facts(anomaly);
 	const command = anomaly.command ? ` ${anomaly.command}` : "";
 	switch (anomaly.kind) {
 		case "oversized_record":
@@ -43,11 +65,11 @@ function what(anomaly: HarnessAnomaly): string {
 		case "malformed_response":
 			return `Pi прислал некорректный ответ на команду${command}.`;
 		case "handler_error":
-			return `Внутренняя ошибка harnessd при обработке события Pi${about}.`;
+			return `Ошибка в harnessd при обработке события Pi${about}; поток Pi в порядке.`;
 		case "truncated_record":
-			return `Pi остановился, не дописав последнюю запись RPC${about}${stopDetail(anomaly.detail)}.`;
+			return `Последняя запись RPC оборвалась при остановке Pi${about}.`;
 		case "corrupted_stream":
-			return "Поток RPC от Pi повреждён: слишком много некорректных записей подряд.";
+			return "Поток RPC от Pi повреждён: больше 20 некорректных записей подряд.";
 		case "prompt_held":
 			return "Pi сжимает контекст и пока не принимает сообщения.";
 		case "prompt_hold_timeout":
@@ -58,6 +80,8 @@ function what(anomaly: HarnessAnomaly): string {
 }
 
 function did(anomaly: HarnessAnomaly): string {
+	if (anomaly.kind === "handler_error")
+		return "harnessd не обработал это событие.";
 	switch (anomaly.action) {
 		case "skipped":
 			return "harnessd пропустил эту запись.";
@@ -74,6 +98,13 @@ function did(anomaly: HarnessAnomaly): string {
 	}
 }
 
+function running(anomaly: HarnessAnomaly): string {
+	if (anomaly.harnessRunning) return "Pi продолжает работать.";
+	return anomaly.stopRequested
+		? "Pi остановлен по запросу harnessd; восстанавливать нечего."
+		: "Pi остановлен.";
+}
+
 /** Plain-Russian chat notice: what happened, what harnessd did, and whether Pi keeps running. */
 export function anomalyNoticeText(
 	anomaly: HarnessAnomaly,
@@ -82,14 +113,73 @@ export function anomalyNoticeText(
 	return [
 		what(anomaly),
 		did(anomaly),
-		anomaly.harnessRunning
-			? "Pi продолжает работать."
-			: "Pi остановлен; сессия восстанавливается как обычно.",
+		running(anomaly),
 		...(repeats > 0
 			? [`Повторилось ещё ${repeats} ${times(repeats)} за минуту.`]
 			: []),
 		`Журнал: harnessd, ref ${anomaly.ref}.`,
 	].join("\n");
+}
+
+const STOP_DETAILS: readonly [RegExp, (match: RegExpExecArray) => string][] = [
+	[
+		/^Pi process exited \(([^)]{1,32})\)$/,
+		(m) => `процесс завершился (${m[1]})`,
+	],
+	[
+		/^Pi RPC stdout is corrupted/,
+		() => "поток RPC повреждён, больше 20 некорректных записей подряд",
+	],
+	[
+		/^Pi stdout did not close after process exit$/,
+		() => "процесс завершился, но его вывод не закрылся",
+	],
+	[
+		/^Pi stdout closed before process exit$/,
+		() => "вывод процесса закрылся раньше самого процесса",
+	],
+	[/^Pi (stdout|stdin|stderr) failed$/, (m) => `ошибка канала ${m[1]}`],
+	[/^Harness event stream failed$/, () => "поток событий сессии прервался"],
+];
+
+/**
+ * The one chat message for Pi stopping, in Russian, with a folded stop anomaly
+ * (a record cut by the stop, or a corrupted stream) and its journal reference.
+ */
+export function stopNoticeText(
+	detail: string,
+	folded?: HarnessAnomaly,
+): string {
+	let reason = detail;
+	for (const [pattern, render] of STOP_DETAILS) {
+		const match = pattern.exec(detail);
+		if (match) {
+			reason = render(match);
+			break;
+		}
+	}
+	return [
+		`Pi остановлен: ${reason}.`,
+		...(folded?.kind === "truncated_record"
+			? [`Последняя запись RPC оборвалась${facts(folded)} и пропущена.`]
+			: []),
+		...(folded ? [`Журнал: harnessd, ref ${folded.ref}.`] : []),
+	].join("\n");
+}
+
+/** Russian wording for a definite input non-delivery the harness explained, if known. */
+export function inputFailureText(
+	detail: string | undefined,
+): string | undefined {
+	if (!detail) return undefined;
+	const rejected = /^Pi rejected the prompt(?:: ([\s\S]+))?$/.exec(detail);
+	if (rejected)
+		return `не принят — Pi отклонил сообщение${rejected[1] ? `: ${rejected[1]}` : ""}`;
+	if (detail === "Pi compaction did not finish in time; the input was not sent")
+		return "не отправлен — Pi слишком долго сжимал контекст";
+	if (detail === "Pi stopped before the held input was sent")
+		return "не отправлен — Pi остановился, пока сообщение ждало конца сжатия";
+	return undefined;
 }
 
 interface KindState {

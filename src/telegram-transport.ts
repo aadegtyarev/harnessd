@@ -34,6 +34,7 @@ import type {
 import type {
 	AdapterId,
 	HarnessActivityEvent,
+	HarnessAnomaly,
 	HarnessEvent,
 	InputDeliveryState,
 	InputId,
@@ -62,7 +63,12 @@ import {
 	renderAgentBoard,
 	shortRunId,
 } from "./telegram-agent-board.js";
-import { AnomalyNoticeCoalescer } from "./telegram-anomaly-notice.js";
+import {
+	AnomalyNoticeCoalescer,
+	anomalyRoute,
+	inputFailureText,
+	stopNoticeText,
+} from "./telegram-anomaly-notice.js";
 import {
 	extensionCommands,
 	isNativeTelegramCommand,
@@ -1248,6 +1254,10 @@ function safeResultError(error: {
 }): string {
 	if (error.code === "UNCERTAIN_INPUT_DELIVERY")
 		return `Статус доставки ввода неизвестен (${uncertainDeliveryNotice(error.inputId)})${error.message ? `\n${error.message}` : ""}`;
+	if (error.code === "INPUT_NOT_DELIVERED")
+		return error.message === "Input canceled"
+			? "Отменено пользователем"
+			: (inputFailureText(error.message) ?? "Сообщение не доставлено");
 	return error.message;
 }
 const NO_SESSION_SELECTED_MESSAGE =
@@ -1376,6 +1386,8 @@ export class TelegramTransportAdapter
 	private readonly sessionNames = new Map<SessionId, string>();
 	private readonly knownSessions = new Set<SessionId>();
 	private readonly reportedErrors = new Map<SessionId, Set<string>>();
+	/** A stop anomaly waiting to be folded into the session's fatal error message. */
+	private readonly stopAnomalies = new Map<SessionId, HarnessAnomaly>();
 	/** Coalesced plain-Russian notices for tolerated harness anomalies. */
 	private readonly anomalyNotices = new AnomalyNoticeCoalescer(
 		(sessionId, text) =>
@@ -1825,6 +1837,7 @@ export class TelegramTransportAdapter
 		for (const timer of this.typingTimers.values()) clearInterval(timer);
 		this.typingTimers.clear();
 		this.anomalyNotices.stop();
+		this.stopAnomalies.clear();
 		this.typingChats.clear();
 		this.activeTypingSessions.clear();
 		for (const queue of this.queues.values()) {
@@ -4354,6 +4367,22 @@ export class TelegramTransportAdapter
 		},
 		inputText?: string,
 	): Promise<void> {
+		if (error.code === "INPUT_NOT_DELIVERED") {
+			// The input event already told the chats selecting this session; only a chat
+			// that submitted to another session (a reply route) needs its own line.
+			if (this.selected.get(chatId) === sessionId) return;
+			const text =
+				error.message === "Input canceled"
+					? "отменён пользователем"
+					: (inputFailureText(error.message) ?? "не доставлен");
+			return this.sendDirect(
+				chatId,
+				redactDiagnosticText(
+					`Ввод${error.inputId ? ` ${error.inputId}` : ""}: ${text}`,
+					[this.options.token],
+				),
+			);
+		}
 		const withInput = (message: string) =>
 			inputText
 				? `${message}\n\nСообщение:\n${truncateDiagnostic(inputText, 1200)}`
@@ -8236,12 +8265,21 @@ export class TelegramTransportAdapter
 			return;
 		}
 		if (event.kind === "anomaly" && event.anomalyEvent) {
-			this.anomalyNotices.push(event.sessionId, event.anomalyEvent);
+			const route = anomalyRoute(event.anomalyEvent);
+			if (route === "notice")
+				this.anomalyNotices.push(event.sessionId, event.anomalyEvent);
+			else if (route === "stop")
+				this.stopAnomalies.set(event.sessionId, event.anomalyEvent);
 			return;
 		}
 		if (event.kind === "status") {
 			if (event.text === "harness_recovered")
 				this.reportedErrors.delete(event.sessionId);
+			if (
+				event.text === "harness_restarting" ||
+				event.text === "harness_recovered"
+			)
+				this.stopAnomalies.delete(event.sessionId);
 			if (
 				event.text === "harness_restarting" ||
 				event.text === "harness_recovered" ||
@@ -8339,6 +8377,14 @@ export class TelegramTransportAdapter
 				[this.options.token],
 			);
 			const fingerprint = detail;
+			const folded = event.fatal
+				? this.stopAnomalies.get(event.sessionId)
+				: undefined;
+			if (event.fatal) this.stopAnomalies.delete(event.sessionId);
+			// Pi stopping gets one Russian message, with any stop anomaly folded in.
+			const presented = event.fatal
+				? stopNoticeText(detail, folded)
+				: `Pi error: ${detail}`;
 			let seen = this.reportedErrors.get(event.sessionId);
 			if (!seen) {
 				seen = new Set();
@@ -8352,12 +8398,14 @@ export class TelegramTransportAdapter
 				this.flushTurn(event.sessionId, true);
 			}
 			for (const activity of this.activitiesForSession(event.sessionId)) {
-				activity.notices.push(`⚠️ ${detail}`);
+				activity.notices.push(
+					`⚠️ ${event.fatal ? (presented.split("\n")[0] ?? detail) : detail}`,
+				);
 				if (event.fatal) this.stopLiveActivityStats(activity);
 				activity.status = event.fatal ? "Ошибка сессии" : activity.status;
 				this.renderLiveActivity(activity);
 			}
-			this.enqueueForSelected(event.sessionId, `Pi error: ${detail}`);
+			this.enqueueForSelected(event.sessionId, presented);
 			return;
 		}
 		if (event.kind === "input" && event.inputEvent) {
@@ -8365,9 +8413,13 @@ export class TelegramTransportAdapter
 			const canceledByUser =
 				state === "failed" && detail?.toLowerCase() === "input canceled";
 			this.trackInputEvent(event.sessionId, inputId, state, canceledByUser);
+			const notDelivered =
+				state === "failed" ? inputFailureText(detail) : undefined;
 			const inputPresentation = canceledByUser
 				? `Ввод ${inputId}: отменён пользователем`
-				: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`;
+				: notDelivered
+					? `Ввод ${inputId}: ${redactDiagnosticText(notDelivered, [this.options.token])}`
+					: `Ввод ${inputId}: ${state}${state === "uncertain" ? " (повторно не отправлялся)" : ""}`;
 			if (state === "failed" || state === "uncertain")
 				this.stopTyping(event.sessionId);
 			if (state === "accepted") return;
@@ -8381,7 +8433,7 @@ export class TelegramTransportAdapter
 				if (state === "failed" || state === "uncertain")
 					this.enqueueForSelected(
 						event.sessionId,
-						`${inputPresentation}${!canceledByUser && detail ? ` · ${redactDiagnosticText(detail, [this.options.token])}` : ""}`,
+						`${inputPresentation}${!canceledByUser && !notDelivered && detail ? ` · ${redactDiagnosticText(detail, [this.options.token])}` : ""}`,
 						{ inputId, state },
 					);
 				return;
@@ -8539,7 +8591,7 @@ export class TelegramTransportAdapter
 						activity.tools,
 						event.toolCallId,
 						undefined,
-						event.failed,
+						event.failed ?? "unknown",
 					);
 					if (!rowChanged && !cardChanged) continue;
 					if (role && activity.childStatuses.has(role) && !cardChanged)
@@ -9081,6 +9133,7 @@ export class TelegramTransportAdapter
 		this.sessionCwds.delete(sessionId);
 		this.reportedErrors.delete(sessionId);
 		this.anomalyNotices.forget(sessionId);
+		this.stopAnomalies.delete(sessionId);
 		this.announcedFailures.delete(sessionId);
 		for (const [token, intent] of this.restoreIntents)
 			if (intent.sessionId === sessionId) this.restoreIntents.delete(token);

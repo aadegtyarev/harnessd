@@ -1,6 +1,7 @@
 /** Live run card: one Telegram message that shows where a run is heading. */
 
-export type RunCardEventState = "running" | "done" | "failed";
+/** `finished` means the tool ended with an outcome the harness could not read. */
+export type RunCardEventState = "running" | "done" | "failed" | "finished";
 
 export type RunCardEvent = {
 	/** Tool call ID, or a synthetic key for thoughts. */
@@ -98,13 +99,13 @@ export function addToolEvent(
 export function finishToolEvent(
 	events: RunCardEvent[],
 	id: string,
-	failed: boolean,
+	failed: boolean | undefined,
 	detail: string | undefined,
 	nowMs: number,
 ): boolean {
 	const event = events.find((candidate) => candidate.id === id);
 	if (event?.state !== "running") return false;
-	event.state = failed ? "failed" : "done";
+	event.state = failed === undefined ? "finished" : failed ? "failed" : "done";
 	if (detail) event.detail = detail;
 	if (event.startedAtMs !== undefined)
 		event.durationMs = nowMs - event.startedAtMs;
@@ -178,7 +179,7 @@ export function formatRunCardEvent(event: RunCardEvent): string {
 					? ` ❌${duration}`
 					: event.state === "done"
 						? ` ✓${duration}`
-						: "";
+						: duration;
 	return `${event.at} ${icon}${count}${clip(text, 110)}${outcome}`;
 }
 

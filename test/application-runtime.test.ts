@@ -23,6 +23,7 @@ import type {
 } from "../src/core/types.js";
 import { ClaudeCodeHarnessAdapter } from "../src/harness/claude-code-harness.js";
 import {
+	InputNotDeliveredError,
 	PiControlError,
 	PiRpcHarnessAdapter,
 	UncertainInputDeliveryError,
@@ -863,6 +864,11 @@ describe("application runtime", () => {
 					async send(input) {
 						if (input.text === "uncertain private prompt")
 							throw new UncertainInputDeliveryError(input.id);
+						if (input.text === "not delivered private prompt")
+							throw new InputNotDeliveredError(
+								input.id,
+								"Pi rejected the prompt: Agent is busy",
+							);
 						if (input.text === "resumed rejected prompt")
 							throw new Error("delivery rejected after resume");
 						if (input.text === "sensitive failure")
@@ -1106,6 +1112,25 @@ describe("application runtime", () => {
 		if (uncertain.ok) throw new Error("Expected uncertain input result");
 		expect(uncertain.error.inputId).toBeTruthy();
 		expect(JSON.stringify(uncertain)).not.toContain("uncertain private prompt");
+		const notDelivered = await dispatch({
+			requestId: "request-not-delivered",
+			principalId: "operator",
+			kind: "submit",
+			sessionId: created.value.id,
+			text: "not delivered private prompt",
+		});
+		// Only the harness's safe reason, with the input ID; no stack or prompt text.
+		expect(notDelivered).toMatchObject({
+			ok: false,
+			error: {
+				code: "INPUT_NOT_DELIVERED",
+				message: "Pi rejected the prompt: Agent is busy",
+				inputId: expect.any(String),
+			},
+		});
+		expect(JSON.stringify(notDelivered)).not.toContain(
+			"not delivered private prompt",
+		);
 		const cancel = await dispatch({
 			requestId: "request-cancel",
 			principalId: "operator",
