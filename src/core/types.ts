@@ -65,10 +65,49 @@ export type InputDeliveryState =
 	| "uncertain"
 	| "failed";
 
+/** Fixed reason a harness reports for a definite input non-delivery. */
+export type InputFailureReason =
+	/** The harness process explicitly rejected the input. */
+	| "prompt_rejected"
+	/** The input was held (for example during compaction) and the hold timed out unsent. */
+	| "hold_timeout"
+	/** The harness process stopped while the input was held unsent. */
+	| "held_and_stopped"
+	/** The operator canceled the input. */
+	| "canceled";
+
+/** Structured cause of a definite input non-delivery, for presentation by code. */
+export interface InputFailure {
+	readonly reason: InputFailureReason;
+	/** Harness-supplied, redacted and bounded reason text (for example Pi's own rejection message). */
+	readonly text?: string;
+}
+
 export interface InputEvent {
 	readonly inputId: InputId;
 	readonly state: InputDeliveryState;
+	/** English safe detail for journals and fallback presentation. */
 	readonly detail?: string;
+	/** Structured cause of a `failed` state when the harness knows it. */
+	readonly failure?: InputFailure;
+}
+
+/** Fixed reason a harness process stopped unexpectedly (a fatal session error). */
+export type HarnessStopReason =
+	| "process_exited"
+	| "stream_corrupted"
+	| "stdout_not_closed"
+	| "stdout_closed_early"
+	| "channel_failed"
+	| "event_stream_failed";
+
+/** Structured cause of a fatal session error, for presentation by code. */
+export interface HarnessStop {
+	readonly reason: HarnessStopReason;
+	/** Exit code or signal for `process_exited`, when known. */
+	readonly exit?: string;
+	/** Failed stdio channel for `channel_failed`. */
+	readonly channel?: "stdin" | "stdout" | "stderr";
 }
 
 export type HarnessActivityEvent =
@@ -173,6 +212,8 @@ export interface HarnessEvent {
 		| "anomaly";
 	readonly text?: string;
 	readonly fatal?: boolean;
+	/** Structured cause of a fatal error when the harness knows it; `text` stays the English fallback. */
+	readonly stop?: HarnessStop;
 	readonly inputEvent?: InputEvent;
 	readonly activityEvent?: HarnessActivityEvent;
 	readonly anomalyEvent?: HarnessAnomaly;

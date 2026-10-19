@@ -53,7 +53,10 @@ export function createClaudeInstance(
 	const framer = new ClaudeJsonlFramer((line) =>
 		protocol.accept(parseClaudeRecord(line)),
 	);
-	const fail = () => protocol.failProtocol("Claude protocol error");
+	const fail = () =>
+		protocol.failProtocol("Claude protocol error", {
+			reason: "stream_corrupted",
+		});
 	stdout.on("data", (chunk: Buffer) => {
 		try {
 			framer.push(chunk);

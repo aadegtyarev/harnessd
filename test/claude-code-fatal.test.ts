@@ -42,7 +42,12 @@ describe("Claude fatal protocol handling", () => {
 		).rejects.toThrow("CLAUDE_NOT_READY_OR_BUSY");
 		const iterator = instance.events[Symbol.asyncIterator]();
 		expect(await iterator.next()).toMatchObject({
-			value: { kind: "error", fatal: true },
+			value: {
+				kind: "error",
+				fatal: true,
+				text: "Claude protocol error",
+				stop: { reason: "stream_corrupted" },
+			},
 			done: false,
 		});
 		expect(await iterator.next()).toMatchObject({ done: true });

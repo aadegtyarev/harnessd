@@ -1,6 +1,6 @@
 import type { Writable } from "node:stream";
 import type { ToolPermissionHandler } from "../core/ports.js";
-import type { InputId, SessionId } from "../core/types.js";
+import type { HarnessStop, InputId, SessionId } from "../core/types.js";
 import { ClaudeInputDelivery } from "./claude-code-delivery-state.js";
 import { ClaudeCodeRecords } from "./claude-code-records.js";
 import { ClaudeCodeTurn } from "./claude-code-turn.js";
@@ -71,10 +71,12 @@ export class ClaudeCodeProtocol {
 			if (this.permissions.accept(record)) return;
 			this.records.accept(record);
 		} catch {
-			this.failProtocol("Claude protocol error");
+			this.failProtocol("Claude protocol error", {
+				reason: "stream_corrupted",
+			});
 		}
 	}
-	failProtocol(detail: string): void {
+	failProtocol(detail: string, stop?: HarnessStop): void {
 		if (this.failed) return;
 		this.failed = true;
 		this.closed = true;
@@ -87,6 +89,7 @@ export class ClaudeCodeProtocol {
 			kind: "error",
 			text: detail,
 			fatal: true,
+			...(stop ? { stop } : {}),
 		});
 		this.onFatal();
 	}

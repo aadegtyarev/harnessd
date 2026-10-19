@@ -603,6 +603,9 @@ export class ApplicationRuntime {
 					inputId
 						? { inputId }
 						: {}),
+					...(error instanceof InputNotDeliveredError
+						? { failure: error.failure }
+						: {}),
 				},
 			};
 		}

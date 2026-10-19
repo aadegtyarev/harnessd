@@ -4,6 +4,19 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-19
+
+### Changed
+
+- The fatal-stop chat message is harness-neutral (`Сессия остановлена: …`, an unknown exit shown as «неизвестно») and never says «Pi» for a non-Pi session; a Claude protocol error is worded in Russian too.
+- A record cut while harnessd itself stops a session (operator `/stop`, delete, option relaunch, service shutdown) is journal-only; no chat notice.
+- Input non-delivery and session stops carry fixed reason codes (`prompt_rejected`, `hold_timeout`, `held_and_stopped`, `canceled`; `process_exited`, `stream_corrupted`, …). Telegram picks its Russian text by code instead of matching English details, which remain for the journal and as a fallback.
+- The live run card status reflects the actual reason: a cancel shows `Отменено пользователем` and a hold timeout `Не отправлено: Pi долго сжимал контекст`, not «Pi не принял сообщение»; the not-delivered line appears on the card once.
+
+### Fixed
+
+- A prompt held during manual compaction stays held while harnessd rechecks Pi's state after the hold timeout, so a cancel in that window succeeds and a Pi stop in that window reports the input as not delivered instead of uncertain.
+
 ## [0.3.2] - 2026-10-19
 
 ### Added
