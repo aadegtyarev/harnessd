@@ -9,6 +9,18 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 ### Added
 
 - **Переименовать** on the main Telegram panel for the session it shows, starting the same rename flow as the session card; absent when no session is shown.
+- Pi RPC anomaly reports: every tolerated protocol anomaly writes one `harnessd: … harness_anomaly` journal line (kind, action, record type, size, reference, redacted head) and a plain-Russian Telegram notice for the session, coalesced to at most one per kind and minute with a repeat count.
+
+### Changed
+
+- Every Pi prompt carries `streamingBehavior: "steer"`, so a prompt racing an unseen `agent_start` is queued instead of rejected.
+- A prompt submitted while Pi compacts is held and sent after compaction ends (bounded; fails explicitly on timeout). A rejected prompt shows Pi's own redacted reason.
+- Pi extension `set_editor_text` requests are ignored silently instead of reported as unsupported.
+
+### Fixed
+
+- A long Pi run no longer gets Pi killed at its end: a stdout line over the 1 MiB record limit (such as `agent_end` carrying the whole run) is streamed with only a 16 KiB head kept and handled by its type, so the run settles and its answer is delivered.
+- Non-JSON lines, records without a type, id-less or mismatched responses, and handler errors are skipped and reported instead of stopping Pi; only stream errors, EOF/exit, or more than 20 consecutive anomalies stop it. A partial record at EOF is reported as the process stopping.
 
 ## [0.3.0] - 2026-10-19
 
