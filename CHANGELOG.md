@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-19
+
+### Added
+
+- **Переименовать** on the main Telegram panel for the session it shows, starting the same rename flow as the session card; absent when no session is shown.
+
 ## [0.3.0] - 2026-10-19
 
 ### Added
