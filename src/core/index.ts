@@ -74,6 +74,8 @@ export type {
 	InputEvent,
 	InputId,
 	ProcessId,
+	SessionFailure,
+	SessionFailureReason,
 	SessionId,
 	SessionStatus,
 	SessionSummary,

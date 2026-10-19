@@ -341,6 +341,7 @@ export class ApplicationRuntime {
 			return runtime;
 		} catch (error) {
 			const failures: unknown[] = [error];
+			manager?.beginClose();
 			for (const transport of started.reverse())
 				try {
 					await transport.stop();
@@ -607,6 +608,8 @@ export class ApplicationRuntime {
 
 	private async closeAll(): Promise<void> {
 		const failures: unknown[] = [];
+		// From here on a harness exit is shutdown, not a crash to recover from.
+		this.manager.beginClose();
 		for (const transport of [...this.transports].reverse())
 			try {
 				await transport.stop();

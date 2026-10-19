@@ -64,6 +64,7 @@ export interface PiRpcHarnessOptions {
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_RECORD_BYTES = 64 * 1024 * 1024;
+const STDERR_TAIL_LIMIT = 2048;
 const RELOAD_COMMAND_ENV = "HARNESSD_PI_RELOAD_COMMAND";
 const RELOAD_COMMAND_DESCRIPTION = "harnessd internal reload command";
 const COST_REPORT_CUSTOM_TYPE = "pi-ad-session-usage:report";
@@ -393,7 +394,21 @@ export class PiRpcHarnessAdapter implements HarnessAdapterPort {
 			return instance;
 		} catch (error) {
 			await instance.shutdown().catch(() => {});
-			throw toPiStartupError(error, "ready");
+			let failure: unknown;
+			try {
+				failure = toPiStartupError(error, "ready");
+			} catch (unmapped) {
+				failure = unmapped;
+			}
+			const tail = instance.diagnosticTail();
+			if (tail && failure instanceof Error && Object.isExtensible(failure))
+				// Journal-only: non-enumerable so it is not serialized with the error.
+				Object.defineProperty(failure, "diagnosticTail", {
+					value: tail,
+					enumerable: false,
+					configurable: true,
+				});
+			throw failure;
 		}
 	}
 }
@@ -613,6 +628,8 @@ class PiRpcInstance implements HarnessInstance {
 	private stdoutEnded = false;
 	private exitDrainTimer?: ReturnType<typeof setTimeout>;
 	private exitDetail?: string;
+	/** Bounded Pi stderr tail; journal-only diagnostics, never forwarded or stored. */
+	private stderrTail = "";
 	private readonly stdoutEndWaiters: (() => void)[] = [];
 	private buffer = "";
 	private writeChain: Promise<void> = Promise.resolve();
@@ -645,7 +662,10 @@ class PiRpcInstance implements HarnessInstance {
 			else this.scheduleExitDrain();
 		});
 		stdin.on("error", () => this.failProcess("Pi stdin failed"));
-		stderr.on("data", () => {});
+		stderr.setEncoding("utf8");
+		stderr.on("data", (chunk: string) => {
+			this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
+		});
 		stderr.on("error", () => this.failProcess("Pi stderr failed"));
 		void child.exit.then((exit) => {
 			this.childExited = true;
@@ -658,6 +678,10 @@ class PiRpcInstance implements HarnessInstance {
 	}
 	get nativeSessionId(): string | undefined {
 		return this.nativeId;
+	}
+	diagnosticTail(): string | undefined {
+		const tail = this.stderrTail.trim();
+		return tail ? redactDiagnosticText(tail) : undefined;
 	}
 	private async controlData(
 		command: string,

@@ -22,6 +22,22 @@ export interface SessionSummary {
 	readonly nativeSessionId?: string;
 	readonly adapterOptions?: AdapterOptions;
 	readonly status: SessionStatus;
+	/** Fixed cause of the last transition to `failed`; cleared when the session runs again. */
+	readonly failureReason?: SessionFailureReason;
+	/** ISO-8601 time of the last transition to `failed`; cleared with `failureReason`. */
+	readonly failedAt?: string;
+}
+
+export type SessionFailureReason =
+	| "launch_failed"
+	| "unexpected_exit"
+	| "resume_unavailable"
+	| "native_id_mismatch"
+	| "options_replacement_failed";
+
+export interface SessionFailure {
+	readonly reason: SessionFailureReason;
+	readonly at: string;
 }
 
 export type SessionStatus =

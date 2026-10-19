@@ -1137,7 +1137,7 @@ describe("SQLite session management", () => {
 		}
 	});
 
-	it("reconciles stale running and starting records after a supervisor restart", async () => {
+	it("reconciles stale running, starting and resumable failed records after a supervisor restart", async () => {
 		const state = await temporaryDirectory();
 		const store = await SqliteSessionStore.open(state);
 		const harness: HarnessAdapter = {
@@ -1176,9 +1176,31 @@ describe("SQLite session management", () => {
 					cwd: os.tmpdir(),
 				});
 				await first.stop(session.id);
-				await store.setStatus(session.id, status);
+				await store.setStatus(
+					session.id,
+					status,
+					status === "failed"
+						? { reason: "unexpected_exit", at: "2026-10-19T10:00:00.000Z" }
+						: undefined,
+				);
 				ids.push(session.id);
 			}
+			// A failed record without a native ID cannot be resumed and stays failed.
+			const unresumable = await first.create({
+				harnessId: harness.descriptor.id,
+				cwd: os.tmpdir(),
+			});
+			await first.stop(unresumable.id);
+			await store.update({
+				...(await first.get(unresumable.id)),
+				nativeSessionId: undefined,
+				status: "stopped",
+			});
+			await store.setStatus(unresumable.id, "failed", {
+				reason: "resume_unavailable",
+				at: "2026-10-19T10:00:00.000Z",
+			});
+			ids.push(unresumable.id);
 		} finally {
 			await first.close();
 		}
@@ -1190,9 +1212,16 @@ describe("SQLite session management", () => {
 				"stopped",
 				"stopped",
 				"stopped",
-				"failed",
+				"stopped",
 				"uncertain",
+				"failed",
 			]);
+			// The failure cause survives reconciliation to stopped.
+			expect(after[3]).toMatchObject({
+				failureReason: "unexpected_exit",
+				failedAt: "2026-10-19T10:00:00.000Z",
+			});
+			expect(after[5]).toMatchObject({ failureReason: "resume_unavailable" });
 		} finally {
 			await second.close();
 			store.close();

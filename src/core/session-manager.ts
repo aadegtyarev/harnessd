@@ -43,9 +43,21 @@ import type {
 	HarnessEvent,
 	Input,
 	InputId,
+	SessionFailureReason,
 	SessionId,
 	SessionSummary,
 } from "./types.js";
+
+/** Delays before each automatic recovery `resume` attempt. */
+const RECOVERY_DELAYS_MS = [250, 1000, 4000] as const;
+
+/** Writes one supervisor journal line (stderr under systemd). */
+export type SessionJournal = (line: string) => void;
+
+interface ExitInfo {
+	readonly code: number | null;
+	readonly signal: string | null;
+}
 
 export interface CreateSessionRequest {
 	readonly harnessId?: AdapterId;
@@ -98,6 +110,9 @@ export class SessionManager {
 	private readonly optionOwnedShutdowns = new WeakSet<HarnessInstance>();
 	private readonly reloadWaiters = new Map<SessionId, (() => void)[]>();
 	private readonly recoveryErrors = new Map<SessionId, unknown>();
+	private readonly lastExits = new Map<SessionId, ExitInfo>();
+	private readonly lastDiagnostics = new Map<SessionId, string>();
+	private readonly journal: SessionJournal;
 
 	constructor(
 		private readonly store: SessionStore,
@@ -106,8 +121,10 @@ export class SessionManager {
 			readonly defaultHarnessId?: string;
 			readonly adapterOptions?: AdapterOptions;
 			readonly toolPermissionHandler?: ToolPermissionHandler;
+			readonly journal?: SessionJournal;
 		} = {},
 	) {
+		this.journal = options.journal ?? ((line) => console.error(line));
 		const registered = new Map<AdapterId, HarnessAdapter>();
 		for (const harness of harnesses) {
 			const id = harness.descriptor.id;
@@ -147,7 +164,14 @@ export class SessionManager {
 
 	async reconcileAfterRestart(): Promise<void> {
 		for (const session of await this.store.list()) {
-			if (session.status !== "running" && session.status !== "starting")
+			// A failed record that can be resumed becomes stopped; its cause is kept.
+			const resumableFailure =
+				session.status === "failed" && session.nativeSessionId !== undefined;
+			if (
+				session.status !== "running" &&
+				session.status !== "starting" &&
+				!resumableFailure
+			)
 				continue;
 			if (
 				this.instances.has(session.id) ||
@@ -200,6 +224,9 @@ export class SessionManager {
 		this.eventPumps.delete(id);
 		this.unsettledInputs.delete(id);
 		this.recoveryErrors.delete(id);
+		this.attempts.delete(id);
+		this.lastExits.delete(id);
+		this.lastDiagnostics.delete(id);
 	}
 
 	create(request: CreateSessionRequest): Promise<SessionSummary> {
@@ -309,7 +336,7 @@ export class SessionManager {
 					}
 					if (recordCreated) {
 						try {
-							await this.store.setStatus(id, "failed");
+							await this.markFailed(id, "launch_failed", error);
 						} catch (statusError) {
 							failures.push(statusError);
 						}
@@ -333,6 +360,15 @@ export class SessionManager {
 		} finally {
 			this.creating.delete(id);
 		}
+	}
+
+	/**
+	 * Mark the manager as closing without stopping anything yet. Called by runtime
+	 * shutdown before transports stop, so a harness exit observed from then on is
+	 * treated as shutdown rather than a crash; `close()` then stops the sessions.
+	 */
+	beginClose(): void {
+		this.closing = true;
 	}
 
 	close(): Promise<void> {
@@ -444,6 +480,8 @@ export class SessionManager {
 				failures.push(error);
 			}
 		}
+		// An operator stop resets the automatic-recovery budget.
+		this.attempts.delete(id);
 		if (failures.length)
 			throw new AggregateError(
 				failures,
@@ -558,7 +596,10 @@ export class SessionManager {
 			}
 			throw new SessionNotResumableError(id);
 		}
-		const running: SessionSummary = { ...session, status: "running" };
+		const running: SessionSummary = {
+			...withoutFailure(session),
+			status: "running",
+		};
 		try {
 			await this.store.update(running);
 		} catch (error) {
@@ -587,6 +628,7 @@ export class SessionManager {
 			}
 			throw new SessionNotResumableError(id);
 		}
+		this.attempts.delete(id);
 		this.startEventPump(id, replacement);
 		this.watchExit(id, replacement);
 		return running;
@@ -877,7 +919,9 @@ export class SessionManager {
 		try {
 			await instance.shutdown();
 		} catch (error) {
-			await this.store.setStatus(id, "failed").catch(() => {});
+			await this.markFailed(id, "options_replacement_failed", error).catch(
+				() => {},
+			);
 			throw new AggregateError([error], "HARNESS_OPTIONS_SHUTDOWN_UNCONFIRMED");
 		}
 		this.instances.delete(id);
@@ -887,7 +931,9 @@ export class SessionManager {
 			try {
 				await pump.promise;
 			} catch (error) {
-				await this.store.setStatus(id, "failed").catch(() => {});
+				await this.markFailed(id, "options_replacement_failed", error).catch(
+					() => {},
+				);
 				throw new AggregateError(
 					[error],
 					"HARNESS_OPTIONS_EVENT_DRAIN_UNCONFIRMED",
@@ -903,9 +949,9 @@ export class SessionManager {
 				await persistOptions
 					.call(this.store, id, previousOptions)
 					.catch((rollbackError) => failures.push(rollbackError));
-				await this.store
-					.setStatus(id, "failed")
-					.catch((statusError) => failures.push(statusError));
+				await this.markFailed(id, "options_replacement_failed", error).catch(
+					(statusError) => failures.push(statusError),
+				);
 				throw new AggregateError(
 					failures,
 					"HARNESS_OPTIONS_REPLACEMENT_CLEANUP_UNCONFIRMED",
@@ -916,9 +962,11 @@ export class SessionManager {
 				await this.launchOptionResume(session, harness, previousOptions);
 			} catch (rollbackError) {
 				failures.push(rollbackError);
-				await this.store
-					.setStatus(id, "failed")
-					.catch((statusError) => failures.push(statusError));
+				await this.markFailed(
+					id,
+					"options_replacement_failed",
+					rollbackError,
+				).catch((statusError) => failures.push(statusError));
 				throw new AggregateError(
 					failures,
 					"HARNESS_OPTIONS_RESTART_AND_ROLLBACK_FAILED",
@@ -963,7 +1011,11 @@ export class SessionManager {
 			}
 			throw new SessionNotResumableError(session.id);
 		}
-		const running = { ...session, adapterOptions, status: "running" as const };
+		const running = {
+			...withoutFailure(session),
+			adapterOptions,
+			status: "running" as const,
+		};
 		try {
 			if (!this.store.setAdapterOptions)
 				throw new Error("ADAPTER_OPTION_PERSISTENCE_UNSUPPORTED");
@@ -1100,7 +1152,7 @@ export class SessionManager {
 
 	private watchExit(id: SessionId, instance: HarnessInstance): void {
 		void instance.exit
-			.then(async () => {
+			.then(async (exit) => {
 				if (
 					this.instances.get(id) !== instance ||
 					this.optionOwnedShutdowns.has(instance) ||
@@ -1117,6 +1169,7 @@ export class SessionManager {
 					this.closing
 				)
 					return;
+				this.recordExit(id, instance, exit);
 				for (const inputId of this.unsettledInputs.get(id) ?? []) {
 					this.publishEvent({
 						sessionId: id,
@@ -1133,53 +1186,87 @@ export class SessionManager {
 						this.recoveryErrors.set(id, error);
 						if (this.terminal.has(id) || this.closing) return;
 						try {
-							await this.store.setStatus(id, "failed");
+							await this.markFailed(id, "unexpected_exit", error);
 						} catch (statusError) {
 							this.recoveryErrors.set(
 								id,
 								new AggregateError([error, statusError], "Recovery failed"),
 							);
-							if (!this.terminal.has(id) && !this.closing)
-								this.publishEvent({
-									sessionId: id,
-									kind: "status",
-									text: "harness_recovery_failed",
-								});
-							return;
 						}
 						if (!this.terminal.has(id) && !this.closing)
-							this.publishEvent({
-								sessionId: id,
-								kind: "status",
-								text: "harness_recovery_failed",
-							});
+							this.publishRecoveryFailed(id);
 					})
 					.finally(() => {
 						if (this.recovery.get(id) === task) this.recovery.delete(id);
 					});
 				this.recovery.set(id, task);
-				try {
-					await task;
-				} catch (error) {
-					this.recoveryErrors.set(id, error);
-					try {
-						await this.store.setStatus(id, "failed");
-						this.publishEvent({
-							sessionId: id,
-							kind: "status",
-							text: "harness_recovery_failed",
-						});
-					} catch (statusError) {
-						this.recoveryErrors.set(
-							id,
-							new AggregateError([error, statusError], "Recovery failed"),
-						);
-					}
-				} finally {
-					if (this.recovery.get(id) === task) this.recovery.delete(id);
-				}
+				await task;
 			})
 			.catch(() => {});
+	}
+
+	private recordExit(
+		id: SessionId,
+		instance: HarnessInstance,
+		exit: ExitInfo | undefined,
+	): void {
+		if (exit) this.lastExits.set(id, { code: exit.code, signal: exit.signal });
+		try {
+			const tail = instance.diagnosticTail?.();
+			if (tail) this.lastDiagnostics.set(id, tail);
+			else this.lastDiagnostics.delete(id);
+		} catch {
+			this.lastDiagnostics.delete(id);
+		}
+	}
+
+	/** Persist `failed` with its cause and journal it. */
+	private async markFailed(
+		id: SessionId,
+		reason: SessionFailureReason,
+		error?: unknown,
+	): Promise<void> {
+		this.writeJournal(id, "failed", reason, error);
+		await this.store.setStatus(id, "failed", {
+			reason,
+			at: new Date().toISOString(),
+		});
+	}
+
+	private writeJournal(
+		id: SessionId,
+		event: string,
+		reason: SessionFailureReason,
+		error?: unknown,
+	): void {
+		const tail = diagnosticTailOf(error) ?? this.lastDiagnostics.get(id);
+		const code = safeErrorCode(error);
+		const attempt = this.attempts.get(id) ?? 0;
+		try {
+			this.journal(
+				`harnessd: session ${id} ${event} reason=${reason} attempt=${attempt}/${RECOVERY_DELAYS_MS.length} exit=${formatExit(this.lastExits.get(id))}${code ? ` error=${code}` : ""}${tail ? ` stderr=${JSON.stringify(tail)}` : ""}`,
+			);
+		} catch {
+			// Journal failure must not change lifecycle handling.
+		}
+	}
+
+	private publishRecoveryFailed(id: SessionId): void {
+		this.publishEvent({
+			sessionId: id,
+			kind: "status",
+			text: "harness_recovery_failed",
+		});
+	}
+
+	private async failRecovery(
+		id: SessionId,
+		reason: SessionFailureReason,
+		error?: unknown,
+	): Promise<void> {
+		if (this.terminal.has(id) || this.closing) return;
+		await this.markFailed(id, reason, error);
+		if (!this.terminal.has(id) && !this.closing) this.publishRecoveryFailed(id);
 	}
 
 	private async recover(id: SessionId): Promise<void> {
@@ -1196,22 +1283,11 @@ export class SessionManager {
 			resume &&
 			harness.descriptor.capabilities.includes("harness.resume") &&
 			session.nativeSessionId;
-		if (!canResume) {
-			if (this.terminal.has(id) || this.closing) return;
-			await this.store.setStatus(id, "failed");
-			if (!this.terminal.has(id) && !this.closing)
-				this.publishEvent({
-					sessionId: id,
-					kind: "status",
-					text: "harness_recovery_failed",
-				});
-			return;
-		}
+		if (!canResume) return this.failRecovery(id, "resume_unavailable");
 		await this.store.setStatus(id, "starting");
 		if (this.terminal.has(id) || this.closing) return;
-		const waits = [250, 1000, 4000];
-		while ((this.attempts.get(id) ?? 0) < waits.length) {
-			const delay = waits[this.attempts.get(id) ?? 0] as number;
+		while ((this.attempts.get(id) ?? 0) < RECOVERY_DELAYS_MS.length) {
+			const delay = RECOVERY_DELAYS_MS[this.attempts.get(id) ?? 0] as number;
 			if (this.terminal.has(id) || this.closing) return;
 			await this.waitRecoveryDelay(id, delay);
 			if (this.terminal.has(id) || this.closing) return;
@@ -1232,33 +1308,23 @@ export class SessionManager {
 						? { toolPermissionHandler: this.toolPermissionHandler }
 						: {}),
 				});
-			} catch {
-				if (attempt >= waits.length) {
-					if (this.terminal.has(id) || this.closing) return;
-					await this.store.setStatus(id, "failed");
-					if (!this.terminal.has(id) && !this.closing)
-						this.publishEvent({
-							sessionId: id,
-							kind: "status",
-							text: "harness_recovery_failed",
-						});
-					return;
-				}
+			} catch (error) {
+				if (this.terminal.has(id) || this.closing) return;
+				this.writeJournal(
+					id,
+					"recovery attempt failed",
+					"unexpected_exit",
+					error,
+				);
+				if (attempt >= RECOVERY_DELAYS_MS.length)
+					return this.failRecovery(id, "unexpected_exit", error);
 				continue;
 			}
 			this.instances.set(id, replacement);
 			if (replacement.nativeSessionId !== session.nativeSessionId) {
 				await replacement.shutdown();
 				this.instances.delete(id);
-				if (this.terminal.has(id) || this.closing) return;
-				await this.store.setStatus(id, "failed");
-				if (!this.terminal.has(id) && !this.closing)
-					this.publishEvent({
-						sessionId: id,
-						kind: "status",
-						text: "harness_recovery_failed",
-					});
-				return;
+				return this.failRecovery(id, "native_id_mismatch");
 			}
 			if (this.terminal.has(id) || this.closing) {
 				await replacement.shutdown();
@@ -1284,6 +1350,8 @@ export class SessionManager {
 				this.instances.delete(id);
 				return;
 			}
+			// A successful automatic recovery resets the budget for the next crash.
+			this.attempts.delete(id);
 			this.startEventPump(id, replacement);
 			this.watchExit(id, replacement);
 			this.publishEvent({
@@ -1293,15 +1361,7 @@ export class SessionManager {
 			});
 			return;
 		}
-		if (!this.terminal.has(id) && !this.closing) {
-			await this.store.setStatus(id, "failed");
-			if (!this.terminal.has(id) && !this.closing)
-				this.publishEvent({
-					sessionId: id,
-					kind: "status",
-					text: "harness_recovery_failed",
-				});
-		}
+		return this.failRecovery(id, "unexpected_exit");
 	}
 
 	private waitRecoveryDelay(
@@ -1444,6 +1504,32 @@ export class SessionManager {
 			}
 		}
 	}
+}
+
+function withoutFailure(session: SessionSummary): SessionSummary {
+	const { failureReason: _reason, failedAt: _at, ...rest } = session;
+	return rest;
+}
+
+function formatExit(exit: ExitInfo | undefined): string {
+	if (!exit) return "none";
+	if (exit.signal) return `signal:${exit.signal}`;
+	return exit.code === null ? "unknown" : `code:${exit.code}`;
+}
+
+/** A fixed, safe error code (for example a Pi startup code), never free text. */
+function safeErrorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	const code = (error as { readonly code?: unknown }).code;
+	return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)
+		? code
+		: undefined;
+}
+
+function diagnosticTailOf(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	const tail = (error as { readonly diagnosticTail?: unknown }).diagnosticTail;
+	return typeof tail === "string" && tail ? tail : undefined;
 }
 
 function isUncertainDelivery(error: unknown, inputId: InputId): boolean {
