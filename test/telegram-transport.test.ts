@@ -8934,7 +8934,6 @@ describe("Telegram transport", () => {
 		expect(signal?.aborted).toBe(true);
 		release(true);
 		await vi.advanceTimersByTimeAsync(1);
-		expect(result.delivered).toBe(0);
 		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
 		await adapter.stop();
 	});

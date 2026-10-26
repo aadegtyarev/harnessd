@@ -8,7 +8,7 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ### Fixed
 
-- Outgoing document uploads now have a 120-second deadline per recipient instead of sharing the five-second message deadline. Ordinary messages/panel calls retain their short deadline; workspace, authorization and size checks are unchanged. Timed-out uploads are aborted and never automatically retried.
+- Outgoing document uploads now have a 120-second deadline per recipient instead of sharing the five-second message deadline. Ordinary messages/panel calls retain their short deadline; workspace, authorization and size checks are unchanged. Timed-out uploads are aborted and never automatically retried. A slow `/send` upload can hold other Telegram commands for up to those 120 seconds.
 - Claude's file-send forwarding budget is now five minutes so it does not cut off a single permitted upload after 30 seconds. Whole-operation uncertainty remains possible for multiple sequential recipients; it never triggers a replay.
 
 ## [0.3.6] - 2026-10-26
