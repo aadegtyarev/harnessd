@@ -117,6 +117,7 @@ const TELEGRAM_LIMIT = 4096;
 const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
 const ACTIVITY_OVERFLOW_INPUT_LIMIT = 128;
 const SEND_TIMEOUT_MS = 5000;
+const FILE_SEND_TIMEOUT_MS = 120_000;
 const STOP_TIMEOUT_MS = 6000;
 const MAX_QUEUED_MESSAGES = 32;
 const MAX_OUTPUT_MESSAGES = 24;
@@ -2571,13 +2572,15 @@ export class TelegramTransportAdapter
 			const data = await readBoundedFile(canonicalRoot, canonicalFile);
 			if (this.stopping || this.selected.get(chatId) !== sessionId)
 				return "session";
-			const sent = await this.telegramCall((signal) =>
-				this.bot.api.sendDocument(
-					chatId,
-					new InputFile(data, path.basename(canonicalFile)),
-					caption === undefined ? {} : { caption },
-					signal,
-				),
+			const sent = await this.telegramCall(
+				(signal) =>
+					this.bot.api.sendDocument(
+						chatId,
+						new InputFile(data, path.basename(canonicalFile)),
+						caption === undefined ? {} : { caption },
+						signal,
+					),
+				FILE_SEND_TIMEOUT_MS,
 			);
 			if (!sent.ok) {
 				this.reportError("Telegram agent file delivery failed", sent.error, [
@@ -9479,6 +9482,7 @@ export class TelegramTransportAdapter
 
 	private async telegramCall<T>(
 		operation: (signal: AbortSignal) => Promise<T>,
+		timeoutMs = SEND_TIMEOUT_MS,
 	): Promise<
 		| { readonly ok: true; readonly value: T }
 		| { readonly ok: false; readonly error: unknown }
@@ -9489,7 +9493,7 @@ export class TelegramTransportAdapter
 		this.pendingSends.add(controller);
 		let sending: Promise<T>;
 		try {
-			sending = withDeadline(operation(controller.signal), SEND_TIMEOUT_MS);
+			sending = withDeadline(operation(controller.signal), timeoutMs);
 		} catch (error) {
 			this.pendingSends.delete(controller);
 			return { ok: false, error };

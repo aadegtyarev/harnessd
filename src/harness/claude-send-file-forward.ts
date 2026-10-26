@@ -4,7 +4,8 @@ import {
 } from "./agent-file-send-protocol.js";
 import { validateClaudeSendFileArguments } from "./claude-send-file-arguments.js";
 
-const FORWARD_TIMEOUT_MS = 30_000;
+// The Telegram transport allows 120s per upload; keep this outer bound longer.
+const FORWARD_TIMEOUT_MS = 300_000;
 
 export async function forwardClaudeSendFile(
 	params: unknown,

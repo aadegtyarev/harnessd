@@ -8858,6 +8858,121 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("allows one document upload beyond the ordinary five-second deadline", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await writeFile(path.join(directory, "report.txt"), "report");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: directory,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		let entered!: () => void;
+		let release!: (value: boolean) => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const held = new Promise<boolean>((resolve) => {
+			release = resolve;
+		});
+		let signal: AbortSignal | undefined;
+		bot.api.sendDocument = vi.fn((_chat, _document, _options, abort) => {
+			signal = abort;
+			entered();
+			return held;
+		});
+		vi.useFakeTimers();
+		const sending = adapter.sendAgentFile({
+			sessionId: "sid" as SessionId,
+			path: "report.txt",
+		});
+		await started;
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(signal?.aborted).toBe(false);
+		release(true);
+		expect(await sending).toMatchObject({ delivered: 1, recipients: 1 });
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		await adapter.stop();
+	});
+
+	it("bounds document upload at 120 seconds without retry or late delivery credit", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await writeFile(path.join(directory, "report.txt"), "report");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: directory,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		let entered!: () => void;
+		let release!: (value: boolean) => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const held = new Promise<boolean>((resolve) => {
+			release = resolve;
+		});
+		let signal: AbortSignal | undefined;
+		bot.api.sendDocument = vi.fn((_chat, _document, _options, abort) => {
+			signal = abort;
+			entered();
+			return held;
+		});
+		vi.useFakeTimers();
+		const sending = adapter.sendAgentFile({
+			sessionId: "sid" as SessionId,
+			path: "report.txt",
+		});
+		await started;
+		await vi.advanceTimersByTimeAsync(119_999);
+		expect(signal?.aborted).toBe(false);
+		await vi.advanceTimersByTimeAsync(2);
+		const result = await sending;
+		expect(result).toMatchObject({ delivered: 0, recipients: 1 });
+		expect(signal?.aborted).toBe(true);
+		release(true);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+		await adapter.stop();
+	});
+
+	it("aborts a pending long document upload when the transport stops", async () => {
+		const bot = new MockBot();
+		const directory = await temp();
+		await writeFile(path.join(directory, "report.txt"), "report");
+		sessions.set("sid", {
+			...(sessions.get("sid") as SessionSummary),
+			cwd: directory,
+		});
+		const { adapter } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		let entered!: () => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let signal: AbortSignal | undefined;
+		bot.api.sendDocument = vi.fn((_chat, _document, _options, abort) => {
+			signal = abort;
+			return new Promise<boolean>((_resolve, reject) => {
+				abort?.addEventListener("abort", () => reject(new Error("aborted")), {
+					once: true,
+				});
+				entered();
+			});
+		});
+		const sending = adapter.sendAgentFile({
+			sessionId: "sid" as SessionId,
+			path: "report.txt",
+		});
+		await started;
+		await adapter.stop();
+		expect(signal?.aborted).toBe(true);
+		expect(await sending).toMatchObject({ delivered: 0, recipients: 1 });
+		expect(bot.api.sendDocument).toHaveBeenCalledOnce();
+	});
+
 	it("restricts /send to regular files inside the selected session cwd", async () => {
 		const bot = new MockBot();
 		const dir = await temp();
