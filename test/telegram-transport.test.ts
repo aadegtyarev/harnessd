@@ -3205,6 +3205,37 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("shows context compaction on the turn card and returns to work after it", async () => {
+		sessions.set("sid", sessionWith("sid", { name: "Review task" }));
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run the requested checks");
+		await vi.waitFor(() =>
+			expect(bot.sent.at(-1)?.text).toContain("Ход · Отправляю в Pi"),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "status", "compaction_start"));
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("сжимаю контекст…")),
+			).toBe(true),
+		);
+		const editsBeforeEnd = bot.edited.length;
+		emit(harnessEvent("sid", "status", "compaction_end"));
+		await vi.waitFor(() =>
+			expect(
+				bot.edited
+					.slice(editsBeforeEnd)
+					.some(({ text }) => !text.includes("сжимаю контекст…")),
+			).toBe(true),
+		);
+		expect(
+			bot.sent.some(({ text }) => text.includes("Статус сессии изменился")),
+		).toBe(false);
+		await adapter.stop();
+	});
+
 	it("edits one reply card with Pi tool activity, sends the final answer separately, then collapses the card", async () => {
 		sessions.set("sid", sessionWith("sid", { name: "Review task" }));
 		const bot = new MockBot();

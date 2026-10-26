@@ -1734,9 +1734,20 @@ class PiRpcInstance implements HarnessInstance {
 			this.manualCompaction =
 				record.type === "compaction_start" &&
 				(record.reason === undefined || record.reason === "manual");
+			this.emit({
+				sessionId: this.sessionId,
+				kind: "status",
+				text: "compaction_start",
+			});
 		}
-		if (["auto_compaction_end", "compaction_end"].includes(record.type))
+		if (["auto_compaction_end", "compaction_end"].includes(record.type)) {
 			this.endCompaction();
+			this.emit({
+				sessionId: this.sessionId,
+				kind: "status",
+				text: "compaction_end",
+			});
+		}
 		if (["agent_start", "agent_end", "agent_settled"].includes(record.type)) {
 			this.emit({
 				sessionId: this.sessionId,
@@ -2128,14 +2139,14 @@ class PiRpcInstance implements HarnessInstance {
 			await this.cancelInput((held[0] as ActiveInput).id, true);
 			return;
 		}
-		const active = inputs.filter(
-			(input) => !input.sentAsSteer && input.accepted && !input.uncertain,
+		// Pi aborts its whole run, so any acknowledged input can carry the abort;
+		// prefer the one that started the run.
+		const acknowledged = inputs.filter(
+			(input) => !input.held && input.accepted && !input.uncertain,
 		);
-		if (active.length !== 1)
-			throw new Error("Pi current active input is unavailable or ambiguous");
-		const current = active[0];
-		if (!current)
-			throw new Error("Pi current active input is unavailable or ambiguous");
+		const current =
+			acknowledged.find((input) => !input.sentAsSteer) ?? acknowledged[0];
+		if (!current) throw new Error("Pi has no acknowledged input to cancel");
 		await this.cancelInput(current.id, true);
 	}
 	async cancel(inputId: InputId): Promise<void> {
