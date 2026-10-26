@@ -315,7 +315,7 @@ export class TelegramInbox {
 		return files;
 	}
 
-	/** Removes the oldest received files until one more of `bytes` fits the quota. */
+	/** Removes the oldest received files so that one more of `bytes` fits the quota. */
 	private async evictOldestFor(
 		directory: string,
 		bytes: number,
@@ -323,24 +323,21 @@ export class TelegramInbox {
 		const files = await this.readFiles(directory);
 		let count = files.length;
 		let total = files.reduce((sum, file) => sum + file.size, 0);
-		const oldestFirst = files
+		const fits = () =>
+			count < TELEGRAM_INBOX_MAX_FILES_PER_SESSION &&
+			total + bytes <= TELEGRAM_INBOX_MAX_BYTES_PER_SESSION;
+		const evictable = files
 			.filter((file) => FILE_NAME_PATTERN.test(path.basename(file.path)))
-			.sort((a, b) => a.path.localeCompare(b.path));
-		for (const file of oldestFirst) {
-			if (
-				count < TELEGRAM_INBOX_MAX_FILES_PER_SESSION &&
-				total + bytes <= TELEGRAM_INBOX_MAX_BYTES_PER_SESSION
-			)
-				return;
-			await unlink(file.path);
+			.sort((a, b) => (a.path < b.path ? -1 : 1));
+		const evicted = [];
+		for (const file of evictable) {
+			if (fits()) break;
+			evicted.push(file);
 			count--;
 			total -= file.size;
 		}
-		if (
-			count >= TELEGRAM_INBOX_MAX_FILES_PER_SESSION ||
-			total + bytes > TELEGRAM_INBOX_MAX_BYTES_PER_SESSION
-		)
-			throw new Error("Inbox holds files it cannot evict");
+		if (!fits()) throw new Error("Inbox holds files it cannot evict");
+		for (const file of evicted) await unlink(file.path);
 	}
 
 	private async removeExpiredFiles(directory: string): Promise<void> {

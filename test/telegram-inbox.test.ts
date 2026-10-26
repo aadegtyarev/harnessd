@@ -92,7 +92,8 @@ describe("TelegramInbox", () => {
 	});
 
 	it("rejects an oversized file and evicts the oldest files to fit count and byte limits", async () => {
-		const inbox = new TelegramInbox(await temporaryDirectory());
+		let now = 1_800_000_000_000;
+		const inbox = new TelegramInbox(await temporaryDirectory(), () => now++);
 		await expect(
 			inbox.save(
 				"sid" as SessionId,
@@ -140,19 +141,28 @@ describe("TelegramInbox", () => {
 		expect(await readFile(recent, "utf8")).toBe("x");
 	});
 
-	it("never evicts files it did not name", async () => {
+	it("never evicts files it did not name, and evicts nothing when the upload cannot fit", async () => {
 		const stateDirectory = await temporaryDirectory();
 		const inbox = new TelegramInbox(stateDirectory);
 		const directory = path.join(stateDirectory, "inbox", "sid");
 		await mkdir(directory, { recursive: true, mode: 0o700 });
-		for (let index = 0; index < 10; index++)
-			await writeFile(path.join(directory, `foreign-${index}`), "x", {
-				mode: 0o600,
-			});
+		await writeFile(
+			path.join(directory, "0000000000000-aaaaaaaaaaaaaaaa-named.txt"),
+			"x",
+			{ mode: 0o600 },
+		);
+		await writeFile(
+			path.join(directory, "foreign"),
+			Buffer.alloc(TELEGRAM_INBOX_MAX_BYTES_PER_SESSION),
+			{ mode: 0o600 },
+		);
 		await expect(
 			inbox.save("sid" as SessionId, "new.txt", Buffer.from("y")),
 		).rejects.toBeInstanceOf(TelegramInboxError);
-		expect(await readdir(directory)).toHaveLength(10);
+		expect((await readdir(directory)).sort()).toEqual([
+			"0000000000000-aaaaaaaaaaaaaaaa-named.txt",
+			"foreign",
+		]);
 	});
 
 	it("expires files only after the session is terminal and removes deleted-session inboxes", async () => {
