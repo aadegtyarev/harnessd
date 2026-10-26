@@ -91,9 +91,8 @@ describe("TelegramInbox", () => {
 		expect(await readdir(workspace)).toEqual([]);
 	});
 
-	it("rejects an oversized file and evicts the oldest files to fit count and byte limits", async () => {
-		let now = 1_800_000_000_000;
-		const inbox = new TelegramInbox(await temporaryDirectory(), () => now++);
+	it("rejects an oversized file, keeps any number of small files, and evicts the oldest to fit the byte limit", async () => {
+		const inbox = new TelegramInbox(await temporaryDirectory());
 		await expect(
 			inbox.save(
 				"sid" as SessionId,
@@ -102,20 +101,12 @@ describe("TelegramInbox", () => {
 			),
 		).rejects.toThrow("Telegram inbox operation failed");
 		const stored = [];
-		for (let index = 0; index < 10; index++)
+		for (let index = 0; index < 30; index++)
 			stored.push(
 				await inbox.save("sid" as SessionId, `${index}.txt`, Buffer.from("x")),
 			);
-		const eleventh = await inbox.save(
-			"sid" as SessionId,
-			"eleventh.txt",
-			Buffer.from("y"),
-		);
-		await expect(readFile(stored[0].path)).rejects.toMatchObject({
-			code: "ENOENT",
-		});
-		for (const file of [...stored.slice(1), eleventh])
-			expect((await stat(file.path)).isFile()).toBe(true);
+		for (const file of stored)
+			expect(await readFile(file.path, "utf8")).toBe("x");
 
 		const stateDirectory = await temporaryDirectory();
 		const byteInbox = new TelegramInbox(stateDirectory);
@@ -267,7 +258,7 @@ describe("TelegramInbox", () => {
 		await inbox.save("sid" as SessionId, "eleventh.dat", Buffer.from("x"));
 		expect(
 			await readdir(path.join(stateDirectory, "inbox", "sid")),
-		).toHaveLength(10);
+		).toHaveLength(11);
 
 		const outside = path.join(stateDirectory, "outside");
 		await mkdir(outside);

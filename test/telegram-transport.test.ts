@@ -8663,16 +8663,16 @@ describe("Telegram transport", () => {
 		});
 		const inboxDirectory = path.join(stateDirectory, "inbox", "sid");
 		await mkdir(inboxDirectory, { recursive: true, mode: 0o700 });
-		for (let index = 0; index < 10; index++) {
-			await writeFile(
-				path.join(
-					inboxDirectory,
-					`${Date.now() + index}-aaaaaaaaaaaaaaaa-file-${index}.txt`,
-				),
-				"retained",
-				{ mode: 0o600 },
-			);
-		}
+		await writeFile(
+			path.join(inboxDirectory, "0000000000000-aaaaaaaaaaaaaaaa-old.bin"),
+			Buffer.alloc(100 * 1024 * 1024 - 1),
+			{ mode: 0o600 },
+		);
+		await writeFile(
+			path.join(inboxDirectory, "0000000000001-aaaaaaaaaaaaaaaa-kept.txt"),
+			"",
+			{ mode: 0o600 },
+		);
 		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42);
@@ -8680,8 +8680,8 @@ describe("Telegram transport", () => {
 			requests.filter((request) => request.kind === "submit"),
 		).toHaveLength(1);
 		const remaining = await readdir(inboxDirectory);
-		expect(remaining).toHaveLength(10);
-		expect(remaining.some((name) => name.endsWith("-file-0.txt"))).toBe(false);
+		expect(remaining).toHaveLength(2);
+		expect(remaining).toContain("0000000000001-aaaaaaaaaaaaaaaa-kept.txt");
 		await adapter.stop();
 	});
 
