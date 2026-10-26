@@ -22,13 +22,6 @@ export const TELEGRAM_INBOX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const FILE_NAME_PATTERN = /^(\d{13})-([a-f0-9]{16})-(.+)$/;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-export class TelegramInboxQuotaError extends Error {
-	constructor() {
-		super("Telegram inbox quota exceeded");
-		this.name = "TelegramInboxQuotaError";
-	}
-}
-
 export class TelegramInboxError extends Error {
 	constructor(options?: ErrorOptions) {
 		super("Telegram inbox operation failed", options);
@@ -115,13 +108,7 @@ export class TelegramInbox {
 				await this.assertOutsideWorkspace(workspacePath, sessionId);
 			const directory = await this.ensureSessionDirectory(sessionId);
 			if (removeExpired) await this.removeExpiredFiles(directory);
-			const existing = await this.readFiles(directory);
-			if (
-				existing.length >= TELEGRAM_INBOX_MAX_FILES_PER_SESSION ||
-				existing.reduce((total, item) => total + item.size, 0) + data.length >
-					TELEGRAM_INBOX_MAX_BYTES_PER_SESSION
-			)
-				throw new TelegramInboxQuotaError();
+			await this.evictOldestFor(directory, data.length);
 
 			const name = safeAttachmentName(originalName);
 			const filename = `${String(this.now()).padStart(13, "0")}-${randomBytes(8).toString("hex")}-${name}`;
@@ -145,11 +132,7 @@ export class TelegramInbox {
 			}
 			return { path: canonicalFile, name, bytes: data.length };
 		} catch (error) {
-			if (
-				error instanceof TelegramInboxQuotaError ||
-				error instanceof TelegramInboxWorkspaceError
-			)
-				throw error;
+			if (error instanceof TelegramInboxWorkspaceError) throw error;
 			throw new TelegramInboxError({ cause: error });
 		}
 	}
@@ -330,6 +313,34 @@ export class TelegramInbox {
 			files.push({ path: filePath, size: info.size });
 		}
 		return files;
+	}
+
+	/** Removes the oldest received files until one more of `bytes` fits the quota. */
+	private async evictOldestFor(
+		directory: string,
+		bytes: number,
+	): Promise<void> {
+		const files = await this.readFiles(directory);
+		let count = files.length;
+		let total = files.reduce((sum, file) => sum + file.size, 0);
+		const oldestFirst = files
+			.filter((file) => FILE_NAME_PATTERN.test(path.basename(file.path)))
+			.sort((a, b) => a.path.localeCompare(b.path));
+		for (const file of oldestFirst) {
+			if (
+				count < TELEGRAM_INBOX_MAX_FILES_PER_SESSION &&
+				total + bytes <= TELEGRAM_INBOX_MAX_BYTES_PER_SESSION
+			)
+				return;
+			await unlink(file.path);
+			count--;
+			total -= file.size;
+		}
+		if (
+			count >= TELEGRAM_INBOX_MAX_FILES_PER_SESSION ||
+			total + bytes > TELEGRAM_INBOX_MAX_BYTES_PER_SESSION
+		)
+			throw new Error("Inbox holds files it cannot evict");
 	}
 
 	private async removeExpiredFiles(directory: string): Promise<void> {

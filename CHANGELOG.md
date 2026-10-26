@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-26
+
+### Changed
+
+- A Telegram upload into a full session inbox (10 files or 100 MiB) removes the session's oldest inbox files instead of being refused. A running session's inbox is never cleaned up and a user cannot delete files from it, so the old «Достигнут лимит хранилища сессии» reply left no way out for seven days; that reply is gone.
+
 ## [0.3.3] - 2026-10-19
 
 ### Changed

@@ -18,7 +18,6 @@ import {
 	TELEGRAM_INBOX_TTL_MS,
 	TelegramInbox,
 	TelegramInboxError,
-	TelegramInboxQuotaError,
 } from "../src/telegram-inbox.js";
 
 const roots: string[] = [];
@@ -92,7 +91,7 @@ describe("TelegramInbox", () => {
 		expect(await readdir(workspace)).toEqual([]);
 	});
 
-	it("enforces per-file, count, and aggregate byte limits without evicting files", async () => {
+	it("rejects an oversized file and evicts the oldest files to fit count and byte limits", async () => {
 		const inbox = new TelegramInbox(await temporaryDirectory());
 		await expect(
 			inbox.save(
@@ -106,33 +105,54 @@ describe("TelegramInbox", () => {
 			stored.push(
 				await inbox.save("sid" as SessionId, `${index}.txt`, Buffer.from("x")),
 			);
-		await expect(
-			inbox.save("sid" as SessionId, "eleventh.txt", Buffer.from("y")),
-		).rejects.toBeInstanceOf(TelegramInboxQuotaError);
-		for (const file of stored)
-			expect(await readFile(file.path, "utf8")).toBe("x");
+		const eleventh = await inbox.save(
+			"sid" as SessionId,
+			"eleventh.txt",
+			Buffer.from("y"),
+		);
+		await expect(readFile(stored[0].path)).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		for (const file of [...stored.slice(1), eleventh])
+			expect((await stat(file.path)).isFile()).toBe(true);
 
 		const stateDirectory = await temporaryDirectory();
 		const byteInbox = new TelegramInbox(stateDirectory);
 		const directory = path.join(stateDirectory, "inbox", "sid");
 		await mkdir(directory, { recursive: true, mode: 0o700 });
-		await writeFile(
-			path.join(directory, "0000000000000-aaaaaaaaaaaaaaaa-full.bin"),
-			"x",
-			{ mode: 0o600 },
-		);
 		const filler = path.join(
 			directory,
-			"0000000000000-bbbbbbbbbbbbbbbb-filler.bin",
+			"0000000000000-aaaaaaaaaaaaaaaa-filler.bin",
 		);
 		await writeFile(
 			filler,
 			Buffer.alloc(TELEGRAM_INBOX_MAX_BYTES_PER_SESSION - 1),
 			{ mode: 0o600 },
 		);
+		const recent = path.join(
+			directory,
+			"0000000000001-bbbbbbbbbbbbbbbb-recent.bin",
+		);
+		await writeFile(recent, "x", { mode: 0o600 });
+		await byteInbox.save("sid" as SessionId, "extra.txt", Buffer.from("x"));
+		expect(await readdir(directory)).toHaveLength(2);
+		await expect(stat(filler)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readFile(recent, "utf8")).toBe("x");
+	});
+
+	it("never evicts files it did not name", async () => {
+		const stateDirectory = await temporaryDirectory();
+		const inbox = new TelegramInbox(stateDirectory);
+		const directory = path.join(stateDirectory, "inbox", "sid");
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+		for (let index = 0; index < 10; index++)
+			await writeFile(path.join(directory, `foreign-${index}`), "x", {
+				mode: 0o600,
+			});
 		await expect(
-			byteInbox.save("sid" as SessionId, "extra.txt", Buffer.from("x")),
-		).rejects.toBeInstanceOf(TelegramInboxQuotaError);
+			inbox.save("sid" as SessionId, "new.txt", Buffer.from("y")),
+		).rejects.toBeInstanceOf(TelegramInboxError);
+		expect(await readdir(directory)).toHaveLength(10);
 	});
 
 	it("expires files only after the session is terminal and removes deleted-session inboxes", async () => {
@@ -234,9 +254,10 @@ describe("TelegramInbox", () => {
 			),
 		);
 		expect(concurrent).toHaveLength(10);
-		await expect(
-			inbox.save("sid" as SessionId, "eleventh.dat", Buffer.from("x")),
-		).rejects.toBeInstanceOf(TelegramInboxQuotaError);
+		await inbox.save("sid" as SessionId, "eleventh.dat", Buffer.from("x"));
+		expect(
+			await readdir(path.join(stateDirectory, "inbox", "sid")),
+		).toHaveLength(10);
 
 		const outside = path.join(stateDirectory, "outside");
 		await mkdir(outside);
