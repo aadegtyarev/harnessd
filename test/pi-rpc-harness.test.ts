@@ -1909,6 +1909,33 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.cancelCurrent?.();
 		const aborts = fake.commands.filter((command) => command.type === "abort");
 		expect(aborts).toHaveLength(1);
+		const states = (await collectEvents(instance, 6)).flatMap(
+			(event) => event?.inputEvent ?? [],
+		);
+		expect(states).toContainEqual(
+			expect.objectContaining({ inputId: "first", state: "failed" }),
+		);
+		expect(states).not.toContainEqual(
+			expect.objectContaining({ inputId: "second", state: "failed" }),
+		);
+		await instance.shutdown();
+	});
+
+	it("aborts a run Pi continues with no outstanding input, and refuses when idle", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await expect(instance.cancelCurrent?.()).rejects.toThrow(
+			"Pi has no running work to cancel",
+		);
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await collectEvents(instance, 1);
+		await instance.cancelCurrent?.();
+		expect(
+			fake.commands.filter((command) => command.type === "abort"),
+		).toHaveLength(1);
 		await instance.shutdown();
 	});
 

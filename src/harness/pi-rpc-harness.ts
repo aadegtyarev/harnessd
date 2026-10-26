@@ -498,6 +498,13 @@ interface ActiveInput {
 	/** Waiting for Pi compaction to finish; not yet written. Ends the hold early. */
 	held?: (outcome: "canceled") => void;
 }
+function newAbortGate(): AbortGate {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { promise, release: () => release() };
+}
 function recordValue(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
@@ -2146,8 +2153,24 @@ class PiRpcInstance implements HarnessInstance {
 		);
 		const current =
 			acknowledged.find((input) => !input.sentAsSteer) ?? acknowledged[0];
-		if (!current) throw new Error("Pi has no acknowledged input to cancel");
-		await this.cancelInput(current.id, true);
+		if (current) await this.cancelInput(current.id, true);
+		// A run Pi continues on its own after settling its inputs has no carrier.
+		else if (this.agentRunning || this.compacting) await this.abortRun();
+		else throw new Error("Pi has no running work to cancel");
+	}
+	private async abortRun(): Promise<void> {
+		if (this.reloadPending) throw new PiControlError("RELOAD_BUSY");
+		if (this.abortInFlight)
+			throw new Error("Input cancellation is already in progress");
+		const abortGate = newAbortGate();
+		this.abortInFlight = abortGate;
+		try {
+			const response = await this.command("abort");
+			if (response.success !== true)
+				throw new Error("Pi rejected the abort command");
+		} finally {
+			this.releaseAbortGate(abortGate);
+		}
 	}
 	async cancel(inputId: InputId): Promise<void> {
 		await this.cancelInput(inputId, false);
@@ -2173,13 +2196,7 @@ class PiRpcInstance implements HarnessInstance {
 		if (active.canceling)
 			throw new Error("Input cancellation is already in progress");
 		active.canceling = true;
-		let releaseAbort!: () => void;
-		const abortGate: AbortGate = {
-			promise: new Promise<void>((resolve) => {
-				releaseAbort = resolve;
-			}),
-			release: () => releaseAbort(),
-		};
+		const abortGate = newAbortGate();
 		this.abortInFlight = abortGate;
 		this.abortOutcomeUncertain = false;
 		let holdAbortGate = false;

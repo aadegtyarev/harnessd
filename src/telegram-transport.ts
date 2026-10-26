@@ -486,6 +486,8 @@ type LiveActivity = {
 	readonly childStatuses: Map<string, string>;
 	readonly notices: string[];
 	status: string;
+	/** The status a compaction replaced, restored when it ends. */
+	statusBeforeCompaction?: string;
 	subagentStatus?: string;
 	visibleModel?: string;
 	updatedAt?: string;
@@ -8355,10 +8357,16 @@ export class TelegramTransportAdapter
 				event.text === "compaction_end"
 			) {
 				for (const activity of this.activitiesForSession(event.sessionId)) {
-					if (event.text === "compaction_start")
+					if (event.text === "compaction_start") {
+						if (
+							!this.runningSessions.has(event.sessionId) ||
+							activity.status === COMPACTING_STATUS
+						)
+							continue;
+						activity.statusBeforeCompaction = activity.status;
 						activity.status = COMPACTING_STATUS;
-					else if (activity.status === COMPACTING_STATUS)
-						activity.status = "работает";
+					} else if (activity.status === COMPACTING_STATUS)
+						activity.status = activity.statusBeforeCompaction ?? "работает";
 					else continue;
 					this.renderLiveActivity(activity);
 				}
