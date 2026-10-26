@@ -15,7 +15,6 @@ import type { SessionId, SessionStatus, SessionSummary } from "./core/types.js";
 import { safeAttachmentName } from "./telegram-filesystem.js";
 
 export const TELEGRAM_INBOX_MAX_FILE_BYTES = 20 * 1024 * 1024;
-export const TELEGRAM_INBOX_MAX_FILES_PER_SESSION = 10;
 export const TELEGRAM_INBOX_MAX_BYTES_PER_SESSION = 100 * 1024 * 1024;
 export const TELEGRAM_INBOX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -321,11 +320,8 @@ export class TelegramInbox {
 		bytes: number,
 	): Promise<void> {
 		const files = await this.readFiles(directory);
-		let count = files.length;
 		let total = files.reduce((sum, file) => sum + file.size, 0);
-		const fits = () =>
-			count < TELEGRAM_INBOX_MAX_FILES_PER_SESSION &&
-			total + bytes <= TELEGRAM_INBOX_MAX_BYTES_PER_SESSION;
+		const fits = () => total + bytes <= TELEGRAM_INBOX_MAX_BYTES_PER_SESSION;
 		const evictable = files
 			.filter((file) => FILE_NAME_PATTERN.test(path.basename(file.path)))
 			.sort((a, b) => (a.path < b.path ? -1 : 1));
@@ -333,7 +329,6 @@ export class TelegramInbox {
 		for (const file of evictable) {
 			if (fits()) break;
 			evicted.push(file);
-			count--;
 			total -= file.size;
 		}
 		if (!fits()) throw new Error("Inbox holds files it cannot evict");

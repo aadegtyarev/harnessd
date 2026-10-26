@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-26
+
+### Changed
+
+- A session inbox has no file-count limit, only the 100 MiB one: a few dozen photos in one session no longer push out the earlier ones.
+
 ## [0.3.4] - 2026-10-26
 
 ### Changed
