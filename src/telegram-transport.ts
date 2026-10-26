@@ -486,6 +486,8 @@ type LiveActivity = {
 	readonly childStatuses: Map<string, string>;
 	readonly notices: string[];
 	status: string;
+	/** The status a compaction replaced, restored when it ends. */
+	statusBeforeCompaction?: string;
 	subagentStatus?: string;
 	visibleModel?: string;
 	updatedAt?: string;
@@ -1362,6 +1364,7 @@ function restoreErrorText(error: {
 	return `${known ?? "операция не удалась"} (${error.code}${reference ? `, ref ${reference}` : ""}). Подробности — в журнале harnessd.`;
 }
 
+const COMPACTING_STATUS = "сжимаю контекст…";
 function statusMessage(value: string | undefined): string {
 	switch (value) {
 		case "harness_restarting":
@@ -8346,6 +8349,26 @@ export class TelegramTransportAdapter
 					activity.thinking = false;
 					this.renderLiveActivity(activity);
 					void this.refreshLiveActivityStats(activity);
+				}
+				return;
+			}
+			if (
+				event.text === "compaction_start" ||
+				event.text === "compaction_end"
+			) {
+				for (const activity of this.activitiesForSession(event.sessionId)) {
+					if (event.text === "compaction_start") {
+						if (
+							!this.runningSessions.has(event.sessionId) ||
+							activity.status === COMPACTING_STATUS
+						)
+							continue;
+						activity.statusBeforeCompaction = activity.status;
+						activity.status = COMPACTING_STATUS;
+					} else if (activity.status === COMPACTING_STATUS)
+						activity.status = activity.statusBeforeCompaction ?? "работает";
+					else continue;
+					this.renderLiveActivity(activity);
 				}
 				return;
 			}

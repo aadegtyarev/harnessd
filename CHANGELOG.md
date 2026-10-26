@@ -4,6 +4,16 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-26
+
+### Changed
+
+- The turn card shows `сжимаю контекст…` while Pi compacts its context, so a long compaction no longer looks like a hung session.
+
+### Fixed
+
+- «Остановить» (bare `/cancel`) no longer fails with «Pi current active input is unavailable or ambiguous» when every message in the run was sent as a steer: Pi's run is aborted through the input that started it when known, otherwise the oldest acknowledged one, or with a bare Pi `abort` when Pi runs or compacts with no outstanding input.
+
 ## [0.3.5] - 2026-10-26
 
 ### Changed

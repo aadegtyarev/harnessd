@@ -1872,6 +1872,73 @@ describe("PiRpcHarnessAdapter", () => {
 		await instance.shutdown();
 	});
 
+	it("reports manual and automatic compaction as status events", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		fake.stdout.write(
+			'{"type":"auto_compaction_start"}\n{"type":"auto_compaction_end"}\n{"type":"compaction_start","reason":"manual"}\n{"type":"compaction_end","reason":"manual"}\n',
+		);
+		const events = await collectEvents(instance, 4);
+		expect(events.map((event) => event?.text)).toEqual([
+			"compaction_start",
+			"compaction_end",
+			"compaction_start",
+			"compaction_end",
+		]);
+		await instance.shutdown();
+	});
+
+	it("cancels the current run when every acknowledged input was sent as a steer", async () => {
+		const fake = fakeProvider({
+			beforeResponse(command, stdout) {
+				if (command.type === "abort")
+					stdout.write('{"type":"agent_settled"}\n');
+			},
+		});
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await collectEvents(instance, 1);
+		await instance.send(input("first steer", "first"));
+		await instance.send(input("second steer", "second"));
+		await instance.cancelCurrent?.();
+		const aborts = fake.commands.filter((command) => command.type === "abort");
+		expect(aborts).toHaveLength(1);
+		const states = (await collectEvents(instance, 6)).flatMap(
+			(event) => event?.inputEvent ?? [],
+		);
+		expect(states).toContainEqual(
+			expect.objectContaining({ inputId: "first", state: "failed" }),
+		);
+		expect(states).not.toContainEqual(
+			expect.objectContaining({ inputId: "second", state: "failed" }),
+		);
+		await instance.shutdown();
+	});
+
+	it("aborts a run Pi continues with no outstanding input, and refuses when idle", async () => {
+		const fake = fakeProvider();
+		const instance = await new PiRpcHarnessAdapter(fake.provider, {
+			executable: "pi",
+			startupTimeoutMs: 100,
+		}).launch(request);
+		await expect(instance.cancelCurrent?.()).rejects.toThrow(
+			"Pi has no running work to cancel",
+		);
+		fake.stdout.write('{"type":"agent_start"}\n');
+		await collectEvents(instance, 1);
+		await instance.cancelCurrent?.();
+		expect(
+			fake.commands.filter((command) => command.type === "abort"),
+		).toHaveLength(1);
+		await instance.shutdown();
+	});
+
 	it("rejects overlapping cancellation and binds abort replies to their input", async () => {
 		const fake = fakeProvider({ holdAbort: true });
 		const instance = await new PiRpcHarnessAdapter(fake.provider, {
