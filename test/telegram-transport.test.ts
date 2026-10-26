@@ -8652,7 +8652,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("reports incoming inbox quota without submitting or automatic retry", async () => {
+	it("evicts the oldest inbox file and submits an upload into a full inbox", async () => {
 		stubFileDownload();
 		const bot = new MockBot();
 		const stateDirectory = await temp();
@@ -8676,14 +8676,12 @@ describe("Telegram transport", () => {
 		const { adapter, requests } = await startAdapter(bot, stateDirectory);
 		await bot.update(42, "/use sid");
 		await bot.updateDocument(42);
-		expect(bot.sent.at(-1)?.text).toContain("Достигнут лимит хранилища сессии");
-		expect(bot.sent.at(-1)?.text).toContain(
-			"очистка пропускает работающие сессии",
-		);
-		expect(bot.sent.at(-1)?.text).not.toContain("повтор");
 		expect(
 			requests.filter((request) => request.kind === "submit"),
-		).toHaveLength(0);
+		).toHaveLength(1);
+		const remaining = await readdir(inboxDirectory);
+		expect(remaining).toHaveLength(10);
+		expect(remaining.some((name) => name.endsWith("-file-0.txt"))).toBe(false);
 		await adapter.stop();
 	});
 

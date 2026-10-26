@@ -90,7 +90,6 @@ import { parseNewHarnessSelection } from "./telegram-harness-selection.js";
 import {
 	TelegramInbox,
 	TelegramInboxError,
-	TelegramInboxQuotaError,
 	TelegramInboxWorkspaceError,
 } from "./telegram-inbox.js";
 import {
@@ -3110,11 +3109,6 @@ export class TelegramTransportAdapter
 					return this.sendDirect(
 						chatId,
 						"Вложение превышает лимит загрузки Telegram 20 MB.",
-					);
-				if (error instanceof TelegramInboxQuotaError)
-					return this.sendDirect(
-						chatId,
-						"Достигнут лимит хранилища сессии: 10 файлов или 100 MiB. Удалите ненужные файлы; очистка пропускает работающие сессии.",
 					);
 				if (error instanceof TelegramInboxWorkspaceError)
 					return this.sendDirect(
