@@ -499,6 +499,10 @@ type LiveActivity = {
 	unavailable: boolean;
 	liveStatus?: HarnessSessionStatus["live"];
 	renderQueue: Promise<void>;
+	runCardRetryTimer?: ReturnType<typeof setTimeout>;
+	runCardRetryAfterMs?: number;
+	pendingRunCardLifecycle?: "freeze" | "collapse";
+	pendingRunCardLifecycleGeneration?: number;
 	statsTimer?: NodeJS.Timeout;
 	statsInFlight: boolean;
 	pendingSubmissions: number;
@@ -1888,6 +1892,8 @@ export class TelegramTransportAdapter
 		for (const activity of this.liveActivities.values()) {
 			if (activity.statsTimer) clearInterval(activity.statsTimer);
 			if (activity.finishTimer) clearTimeout(activity.finishTimer);
+			if (activity.runCardRetryTimer) clearTimeout(activity.runCardRetryTimer);
+			activity.runCardRetryTimer = undefined;
 		}
 		this.liveActivities.clear();
 		this.turnBuffers.clear();
@@ -5850,16 +5856,39 @@ export class TelegramTransportAdapter
 					) !== activity
 				)
 					return;
+				if (
+					activity.runCardRetryAfterMs !== undefined &&
+					Date.now() < activity.runCardRetryAfterMs
+				) {
+					activity.pendingRunCardLifecycle = "freeze";
+					this.scheduleRunCardRetry(activity);
+					return;
+				}
+				activity.pendingRunCardLifecycle = undefined;
+				const text = this.liveActivityText(activity);
 				const frozen = await this.telegramCall((signal) =>
 					this.bot.api.editMessageText(
 						activity.chatId,
 						messageId,
-						activity.lastText as string,
+						text,
 						{ reply_markup: { inline_keyboard: [] } },
 						signal,
 					),
 				);
 				const gone = !frozen.ok && isMessageNotFound(frozen.error);
+				if (!frozen.ok && telegramErrorCode(frozen.error) === 429) {
+					const retryAfter = telegramRetryAfterMs(frozen.error);
+					if (retryAfter !== undefined && retryAfter > 0) {
+						activity.pendingRunCardLifecycle = "freeze";
+						activity.runCardRetryAfterMs = Date.now() + retryAfter;
+						this.scheduleRunCardRetry(activity);
+					}
+					this.reportError(
+						"Telegram run card freeze was deferred",
+						frozen.error,
+					);
+					return;
+				}
 				if (!frozen.ok && !gone && !isMessageNotModified(frozen.error)) {
 					// Keep the card where it is rather than stacking a second live card.
 					this.reportError(
@@ -6187,6 +6216,11 @@ export class TelegramTransportAdapter
 				current.pendingSubmissions === 0;
 			current.turnGeneration++;
 			current.pendingSubmissions++;
+			current.finishing = false;
+			if (current.pendingRunCardLifecycle === "collapse") {
+				current.pendingRunCardLifecycle = undefined;
+				current.pendingRunCardLifecycleGeneration = undefined;
+			}
 			if (current.finishTimer) clearTimeout(current.finishTimer);
 			current.finishTimer = undefined;
 			current.submittedWhileRunning = this.runningSessions.has(sessionId);
@@ -6422,6 +6456,14 @@ export class TelegramTransportAdapter
 					) !== activity
 				)
 					return;
+				if (activity.pendingRunCardLifecycle !== undefined) return;
+				if (
+					activity.runCardRetryAfterMs !== undefined &&
+					Date.now() < activity.runCardRetryAfterMs
+				) {
+					this.scheduleRunCardRetry(activity);
+					return;
+				}
 				const text = this.liveActivityText(activity, preserveUpdatedAtFor);
 				if (activity.messageId === undefined) {
 					const sent = await this.telegramCall((signal) =>
@@ -6485,7 +6527,14 @@ export class TelegramTransportAdapter
 						isTransientTelegramError(edited.error) &&
 						telegramErrorCode(edited.error) !== undefined
 					) {
-						// Rate limits and server errors: the next render retries the edit.
+						const retryAfter =
+							telegramErrorCode(edited.error) === 429
+								? telegramRetryAfterMs(edited.error)
+								: undefined;
+						if (retryAfter !== undefined && retryAfter > 0) {
+							activity.runCardRetryAfterMs = Date.now() + retryAfter;
+							this.scheduleRunCardRetry(activity);
+						}
 						this.reportError(
 							"Telegram run card edit was deferred",
 							edited.error,
@@ -6505,6 +6554,42 @@ export class TelegramTransportAdapter
 			.catch((error) => {
 				this.reportError("Telegram activity update failed", error);
 			});
+	}
+
+	private scheduleRunCardRetry(activity: LiveActivity): void {
+		if (this.stopping || activity.runCardRetryTimer) return;
+		const retryAfter = activity.runCardRetryAfterMs;
+		if (retryAfter === undefined) return;
+		const remaining = retryAfter - Date.now();
+		if (remaining <= 0) {
+			activity.runCardRetryAfterMs = undefined;
+			this.renderLiveActivity(activity);
+			return;
+		}
+		activity.runCardRetryTimer = setTimeout(
+			() => {
+				activity.runCardRetryTimer = undefined;
+				if (this.stopping) return;
+				if (Date.now() < (activity.runCardRetryAfterMs ?? 0)) {
+					this.scheduleRunCardRetry(activity);
+					return;
+				}
+				activity.runCardRetryAfterMs = undefined;
+				const lifecycle = activity.pendingRunCardLifecycle;
+				if (lifecycle === "freeze") {
+					this.freezeLiveActivity(activity);
+				} else if (
+					lifecycle === "collapse" &&
+					activity.pendingRunCardLifecycleGeneration !== undefined
+				) {
+					void this.deleteLiveActivity(
+						activity,
+						activity.pendingRunCardLifecycleGeneration,
+					);
+				} else this.renderLiveActivity(activity);
+			},
+			Math.min(remaining, 2_147_000_000),
+		);
 	}
 
 	private async refreshLiveActivityStats(
@@ -6733,57 +6818,117 @@ export class TelegramTransportAdapter
 				this.renderLiveActivity(activity);
 				continue;
 			}
-			await this.deleteLiveActivity(activity);
+			await this.deleteLiveActivity(activity, generation);
 		}
 	}
 
 	/** Collapses the finished card into a one-line summary and removes frozen pieces. */
-	private async deleteLiveActivity(activity: LiveActivity): Promise<void> {
-		await activity.renderQueue;
-		if (activity.statsTimer) clearInterval(activity.statsTimer);
-		activity.statsTimer = undefined;
-		if (activity.finishTimer) clearTimeout(activity.finishTimer);
-		activity.finishTimer = undefined;
-		const key = activityKey(activity.chatId, activity.sessionId);
-		if (this.liveActivities.get(key) === activity)
-			this.liveActivities.delete(key);
-		this.cardTokens.delete(activity.cardToken);
-		for (const frozen of activity.frozenMessageIds.splice(0)) {
-			const deleted = await this.telegramCall((signal) =>
-				this.bot.api.deleteMessage(activity.chatId, frozen, signal),
-			);
-			if (!deleted.ok)
-				this.reportError(
-					"Telegram run card piece could not be deleted",
-					deleted.error,
-				);
-		}
-		if (activity.messageId === undefined) return;
-		const actions = activity.actionCount;
-		const elapsed =
-			activity.startedAtMs !== undefined
-				? ` за ${formatDuration(this.activityNowMs() - activity.startedAtMs)}`
-				: "";
-		const cost = activity.liveStatus?.usage?.costUsd;
-		const summary = [
-			`✅ Ход завершён${elapsed}`,
-			...(actions ? [actionsLabel(actions)] : []),
-			...(cost !== undefined ? [`~$${cost.toFixed(2)}`] : []),
-		].join(" · ");
-		const edited = await this.telegramCall((signal) =>
-			this.bot.api.editMessageText(
-				activity.chatId,
-				activity.messageId as number,
-				summary,
-				{},
-				signal,
-			),
-		);
-		if (!edited.ok)
-			this.reportError(
-				"Telegram run card could not be collapsed",
-				edited.error,
-			);
+	private deleteLiveActivity(
+		activity: LiveActivity,
+		generation: number,
+	): Promise<void> {
+		activity.renderQueue = activity.renderQueue
+			.then(async () => {
+				const key = activityKey(activity.chatId, activity.sessionId);
+				const canCollapse = () =>
+					!this.stopping &&
+					this.liveActivities.get(key) === activity &&
+					activity.turnGeneration === generation &&
+					activity.finishing &&
+					activity.pendingSubmissions === 0 &&
+					!this.hasUnsettledActivityInputs(activity);
+				const ownsCollapseIntent = () =>
+					activity.pendingRunCardLifecycle === "collapse" &&
+					activity.pendingRunCardLifecycleGeneration === generation;
+				if (!canCollapse()) return;
+				if (
+					activity.runCardRetryAfterMs !== undefined &&
+					Date.now() < activity.runCardRetryAfterMs
+				) {
+					activity.pendingRunCardLifecycle = "collapse";
+					activity.pendingRunCardLifecycleGeneration = generation;
+					this.scheduleRunCardRetry(activity);
+					return;
+				}
+				activity.pendingRunCardLifecycle = "collapse";
+				activity.pendingRunCardLifecycleGeneration = generation;
+				if (activity.messageId !== undefined) {
+					const actions = activity.actionCount;
+					const elapsed =
+						activity.startedAtMs !== undefined
+							? ` за ${formatDuration(this.activityNowMs() - activity.startedAtMs)}`
+							: "";
+					const cost = activity.liveStatus?.usage?.costUsd;
+					const summary = [
+						`✅ Ход завершён${elapsed}`,
+						...(actions ? [actionsLabel(actions)] : []),
+						...(cost !== undefined ? [`~$${cost.toFixed(2)}`] : []),
+					].join(" · ");
+					if (!canCollapse() || !ownsCollapseIntent()) return;
+					const edited = await this.telegramCall((signal) =>
+						this.bot.api.editMessageText(
+							activity.chatId,
+							activity.messageId as number,
+							summary,
+							{},
+							signal,
+						),
+					);
+					if (!edited.ok && telegramErrorCode(edited.error) === 429) {
+						const retryAfter = telegramRetryAfterMs(edited.error);
+						if (retryAfter !== undefined && retryAfter > 0) {
+							activity.runCardRetryAfterMs = Date.now() + retryAfter;
+							if (canCollapse() && ownsCollapseIntent()) {
+								activity.pendingRunCardLifecycle = "collapse";
+								activity.pendingRunCardLifecycleGeneration = generation;
+							} else if (ownsCollapseIntent()) {
+								activity.pendingRunCardLifecycle = undefined;
+								activity.pendingRunCardLifecycleGeneration = undefined;
+							}
+							this.scheduleRunCardRetry(activity);
+							this.reportError(
+								"Telegram run card collapse was deferred",
+								edited.error,
+							);
+							return;
+						}
+					}
+					if (!canCollapse() || !ownsCollapseIntent()) return;
+					if (!edited.ok)
+						this.reportError(
+							"Telegram run card could not be collapsed",
+							edited.error,
+						);
+					else activity.lastText = summary;
+				}
+				if (!canCollapse() || !ownsCollapseIntent()) return;
+				activity.pendingRunCardLifecycle = undefined;
+				activity.pendingRunCardLifecycleGeneration = undefined;
+				if (activity.statsTimer) clearInterval(activity.statsTimer);
+				activity.statsTimer = undefined;
+				if (activity.finishTimer) clearTimeout(activity.finishTimer);
+				activity.finishTimer = undefined;
+				if (activity.runCardRetryTimer)
+					clearTimeout(activity.runCardRetryTimer);
+				activity.runCardRetryTimer = undefined;
+				activity.runCardRetryAfterMs = undefined;
+				this.liveActivities.delete(key);
+				this.cardTokens.delete(activity.cardToken);
+				for (const frozen of activity.frozenMessageIds.splice(0)) {
+					const deleted = await this.telegramCall((signal) =>
+						this.bot.api.deleteMessage(activity.chatId, frozen, signal),
+					);
+					if (!deleted.ok)
+						this.reportError(
+							"Telegram run card piece could not be deleted",
+							deleted.error,
+						);
+				}
+			})
+			.catch((error) => {
+				this.reportError("Telegram run card collapse failed", error);
+			});
+		return activity.renderQueue;
 	}
 
 	private async confirmInputAccepted(
