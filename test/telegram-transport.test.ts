@@ -9430,6 +9430,125 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("defers a message-end freeze through the run-card cooldown without delaying answer delivery", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const activities = (
+			adapter as unknown as {
+				liveActivities: Map<string, { renderQueue: Promise<void> }>;
+			}
+		).liveActivities;
+		const activity = activities.values().next().value;
+		await activity?.renderQueue;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await activity?.renderQueue;
+		bot.api.editMessageText.mockClear();
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				parameters: { retry_after: 209 },
+			}),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "before freeze" } as never,
+		});
+		await activity?.renderQueue;
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "latest freeze state" } as never,
+		});
+		emit(harnessEvent("sid", "output", "answer delivered during cooldown"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		await activity?.renderQueue;
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("answer delivered during cooldown"),
+			),
+		).toBe(true);
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(208_959);
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(1);
+		await vi.waitFor(() =>
+			expect(bot.api.editMessageText).toHaveBeenCalledTimes(2),
+		);
+		const frozen = bot.edited.at(-1);
+		expect(frozen?.text).toContain("latest freeze state");
+		expect(frozen?.options).toEqual({ reply_markup: { inline_keyboard: [] } });
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Ход · ")).length,
+		).toBeGreaterThan(1);
+		await adapter.stop();
+	});
+
+	it("defers the final run-card collapse through the cooldown and does not render stale state", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const activities = (
+			adapter as unknown as {
+				liveActivities: Map<string, { renderQueue: Promise<void> }>;
+			}
+		).liveActivities;
+		const activity = activities.values().next().value;
+		await activity?.renderQueue;
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await activity?.renderQueue;
+		bot.api.editMessageText.mockClear();
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				parameters: { retry_after: 209 },
+			}),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "before settlement" } as never,
+		});
+		await activity?.renderQueue;
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		emit(harnessEvent("sid", "output", "final answer during cooldown"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(40);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("final answer during cooldown"),
+			),
+		).toBe(true);
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(208_959);
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(1);
+		await vi.waitFor(() =>
+			expect(bot.api.editMessageText).toHaveBeenCalledTimes(2),
+		);
+		expect(bot.edited.at(-1)?.text).toContain("✅ Ход завершён");
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(activities.size).toBe(0);
+		await adapter.stop();
+	});
+
 	it("cancels a delayed run-card retry on shutdown", async () => {
 		vi.useFakeTimers();
 		const bot = new MockBot();
