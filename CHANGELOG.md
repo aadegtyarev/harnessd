@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-01
+
+### Fixed
+
+- Run-card edits now honor Telegram 429 `retry_after` intervals, coalesce to the newest state, and keep card throttling isolated from event delivery.
+
 ## [0.3.7] - 2026-10-26
 
 ### Fixed

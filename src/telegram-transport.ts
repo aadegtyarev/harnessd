@@ -499,6 +499,8 @@ type LiveActivity = {
 	unavailable: boolean;
 	liveStatus?: HarnessSessionStatus["live"];
 	renderQueue: Promise<void>;
+	runCardRetryTimer?: ReturnType<typeof setTimeout>;
+	runCardRetryAfterMs?: number;
 	statsTimer?: NodeJS.Timeout;
 	statsInFlight: boolean;
 	pendingSubmissions: number;
@@ -1888,6 +1890,8 @@ export class TelegramTransportAdapter
 		for (const activity of this.liveActivities.values()) {
 			if (activity.statsTimer) clearInterval(activity.statsTimer);
 			if (activity.finishTimer) clearTimeout(activity.finishTimer);
+			if (activity.runCardRetryTimer) clearTimeout(activity.runCardRetryTimer);
+			activity.runCardRetryTimer = undefined;
 		}
 		this.liveActivities.clear();
 		this.turnBuffers.clear();
@@ -6422,6 +6426,13 @@ export class TelegramTransportAdapter
 					) !== activity
 				)
 					return;
+				if (
+					activity.runCardRetryAfterMs !== undefined &&
+					Date.now() < activity.runCardRetryAfterMs
+				) {
+					this.scheduleRunCardRetry(activity);
+					return;
+				}
 				const text = this.liveActivityText(activity, preserveUpdatedAtFor);
 				if (activity.messageId === undefined) {
 					const sent = await this.telegramCall((signal) =>
@@ -6485,7 +6496,14 @@ export class TelegramTransportAdapter
 						isTransientTelegramError(edited.error) &&
 						telegramErrorCode(edited.error) !== undefined
 					) {
-						// Rate limits and server errors: the next render retries the edit.
+						const retryAfter =
+							telegramErrorCode(edited.error) === 429
+								? telegramRetryAfterMs(edited.error)
+								: undefined;
+						if (retryAfter !== undefined && retryAfter > 0) {
+							activity.runCardRetryAfterMs = Date.now() + retryAfter;
+							this.scheduleRunCardRetry(activity);
+						}
 						this.reportError(
 							"Telegram run card edit was deferred",
 							edited.error,
@@ -6505,6 +6523,31 @@ export class TelegramTransportAdapter
 			.catch((error) => {
 				this.reportError("Telegram activity update failed", error);
 			});
+	}
+
+	private scheduleRunCardRetry(activity: LiveActivity): void {
+		if (this.stopping || activity.runCardRetryTimer) return;
+		const retryAfter = activity.runCardRetryAfterMs;
+		if (retryAfter === undefined) return;
+		const remaining = retryAfter - Date.now();
+		if (remaining <= 0) {
+			activity.runCardRetryAfterMs = undefined;
+			this.renderLiveActivity(activity);
+			return;
+		}
+		activity.runCardRetryTimer = setTimeout(
+			() => {
+				activity.runCardRetryTimer = undefined;
+				if (this.stopping) return;
+				if (Date.now() < (activity.runCardRetryAfterMs ?? 0)) {
+					this.scheduleRunCardRetry(activity);
+					return;
+				}
+				activity.runCardRetryAfterMs = undefined;
+				this.renderLiveActivity(activity);
+			},
+			Math.min(remaining, 2_147_000_000),
+		);
 	}
 
 	private async refreshLiveActivityStats(
@@ -6744,6 +6787,9 @@ export class TelegramTransportAdapter
 		activity.statsTimer = undefined;
 		if (activity.finishTimer) clearTimeout(activity.finishTimer);
 		activity.finishTimer = undefined;
+		if (activity.runCardRetryTimer) clearTimeout(activity.runCardRetryTimer);
+		activity.runCardRetryTimer = undefined;
+		activity.runCardRetryAfterMs = undefined;
 		const key = activityKey(activity.chatId, activity.sessionId);
 		if (this.liveActivities.get(key) === activity)
 			this.liveActivities.delete(key);

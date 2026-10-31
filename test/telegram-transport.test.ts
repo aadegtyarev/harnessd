@@ -9377,6 +9377,92 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("backs off run-card 429 edits and coalesces to the newest state without disabling events", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const cardActivities = (
+			adapter as unknown as {
+				liveActivities: Map<string, { renderQueue: Promise<void> }>;
+			}
+		).liveActivities;
+		await cardActivities.values().next().value?.renderQueue;
+		bot.api.editMessageText.mockClear();
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				description: "Too Many Requests: retry after 209",
+				parameters: { retry_after: 209 },
+			}),
+		);
+		const activity = (text: string) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: { type: "thought", text } as never,
+			});
+		activity("first throttled state");
+		await cardActivities.values().next().value?.renderQueue;
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		for (let index = 0; index < 12; index++) activity(`intermediate ${index}`);
+		activity("newest throttled state");
+		await cardActivities.values().next().value?.renderQueue;
+		await vi.advanceTimersByTimeAsync(208_999);
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		const queue = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues.get(42);
+		expect(queue?.failed).not.toBe(true);
+		const sendsBeforeEvent = bot.api.sendMessage.mock.calls.length;
+		emit(harnessEvent("sid", "status", "event while card is throttled"));
+		await vi.advanceTimersByTimeAsync(40);
+		expect(bot.api.sendMessage.mock.calls.length).toBeGreaterThan(
+			sendsBeforeEvent,
+		);
+		await vi.advanceTimersByTimeAsync(1);
+		await cardActivities.values().next().value?.renderQueue;
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toContain("newest throttled state");
+		expect(bot.edited.at(-1)?.text).not.toContain("intermediate 0");
+		await adapter.stop();
+	});
+
+	it("cancels a delayed run-card retry on shutdown", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "Run this once");
+		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
+		const cardActivities = (
+			adapter as unknown as {
+				liveActivities: Map<string, { renderQueue: Promise<void> }>;
+			}
+		).liveActivities;
+		await cardActivities.values().next().value?.renderQueue;
+		bot.api.editMessageText.mockClear();
+		bot.api.editMessageText.mockRejectedValueOnce(
+			Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				parameters: { retry_after: 209 },
+			}),
+		);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "throttled" } as never,
+		});
+		await cardActivities.values().next().value?.renderQueue;
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		const edits = bot.api.editMessageText.mock.calls.length;
+		await adapter.stop();
+		await vi.advanceTimersByTimeAsync(210_000);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(edits);
+	});
+
 	it("renders the run card with task, latest thought, recent events, and buttons", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
