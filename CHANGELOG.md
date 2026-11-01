@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-01
+
+### Fixed
+
+- Queued ordinary Telegram `sendMessage` deliveries now honor the full valid `retry_after` interval for HTTP 429 without failing the chat queue or reordering later messages; shutdown cancels the cooldown.
+
 ## [0.3.8] - 2026-11-01
 
 ### Fixed

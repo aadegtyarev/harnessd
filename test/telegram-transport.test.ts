@@ -9377,6 +9377,122 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("retries queued sendMessage after the full 429 delay without reordering or duplication", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		let rejected = false;
+		bot.sendMessageBehavior = async () => {
+			if (
+				!rejected &&
+				String(bot.api.sendMessage.mock.lastCall?.[1]).includes(
+					"First queued answer",
+				)
+			) {
+				rejected = true;
+				throw Object.assign(new Error("Too Many Requests"), {
+					error_code: 429,
+					parameters: { retry_after: 120 },
+				});
+			}
+		};
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		bot.sent = [];
+		emit(harnessEvent("sid", "output", "First queued answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", "Second queued answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+		const queue = (
+			adapter as unknown as {
+				queues: Map<number, { failed: boolean; messages: { text: string }[] }>;
+			}
+		).queues.get(42);
+		expect(queue?.failed).toBe(false);
+		expect(queue?.messages[0]?.text).toContain("Second queued answer");
+		await vi.advanceTimersByTimeAsync(119_999);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+		expect(bot.sent).toHaveLength(0);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(
+			bot.api.sendMessage.mock.calls.map(([, text]) => String(text)),
+		).toEqual([
+			expect.stringContaining("First queued answer"),
+			expect.stringContaining("First queued answer"),
+			expect.stringContaining("Second queued answer"),
+		]);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("First queued answer")),
+		).toHaveLength(1);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Second queued answer")),
+		).toHaveLength(1);
+		expect(queue?.failed).toBe(false);
+		await adapter.stop();
+	});
+
+	it("cancels a queued sendMessage 429 cooldown on shutdown", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		bot.sendMessageBehavior = async () => {
+			if (
+				String(bot.api.sendMessage.mock.lastCall?.[1]).includes(
+					"Throttled answer",
+				)
+			)
+				throw Object.assign(new Error("Too Many Requests"), {
+					error_code: 429,
+					parameters: { retry_after: 120 },
+				});
+		};
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		emit(harnessEvent("sid", "output", "Throttled answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		const queue = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues.get(42);
+		expect(queue?.failed).toBe(false);
+		await adapter.stop();
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		expect(queue?.failed).toBe(false);
+	});
+
+	it("keeps the existing queue failure policy for non-429 sendMessage errors", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		bot.sendMessageBehavior = async () => {
+			if (
+				String(bot.api.sendMessage.mock.lastCall?.[1]).includes(
+					"Rejected answer",
+				)
+			)
+				throw Object.assign(new Error("Forbidden"), { error_code: 403 });
+		};
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		emit(harnessEvent("sid", "output", "Rejected answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", "Must be discarded"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		const queue = (
+			adapter as unknown as {
+				queues: Map<number, { failed: boolean; messages: unknown[] }>;
+			}
+		).queues.get(42);
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		expect(queue?.failed).toBe(true);
+		expect(queue?.messages).toHaveLength(0);
+		await adapter.stop();
+	});
+
 	it("backs off run-card 429 edits and coalesces to the newest state without disabling events", async () => {
 		vi.useFakeTimers();
 		const bot = new MockBot();
