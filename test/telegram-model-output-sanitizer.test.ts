@@ -24,6 +24,7 @@ describe("stripModelOutputGarbageTail", () => {
 	it.each([
 		"Body\nxx\nhidden.\nStop.\nNo.\nEnd.\nMore text",
 		"```text\nxx\nhidden.\nStop.\nNo.\nEnd.\n```",
+		"```text\nxx\nhidden.\nStop.\nNo.\nEnd.",
 		"Body\nxx\nhidden.\nStop.\nNo.",
 		"Body\nxx\nhidden.\nStop.\nNo.\nUnknown.",
 		"At 500. is the legitimate limit.",

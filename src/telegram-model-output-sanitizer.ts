@@ -10,7 +10,8 @@ export function stripModelOutputGarbageTail(text: string): string {
 		offset += line.length + 1;
 	}
 	for (let start = 0; start < lines.length; start++) {
-		if (lineValue(lines[start] ?? "") !== "xx") continue;
+		if (lineValue(lines[start] ?? "") !== "xx" || isInsideFence(lines, start))
+			continue;
 		let cursor = start + 1;
 		while (cursor < lines.length && isBlank(lines[cursor] ?? "")) cursor++;
 		if (lineValue(lines[cursor] ?? "") !== "hidden.") continue;
@@ -40,4 +41,19 @@ function isBlank(line: string): boolean {
 
 function lineValue(line: string): string {
 	return line.endsWith("\r") ? line.slice(0, -1) : line;
+}
+
+function isInsideFence(lines: readonly string[], end: number): boolean {
+	let fence: { marker: string; length: number } | undefined;
+	for (let index = 0; index < end; index++) {
+		const match = /^ {0,3}(`{3,}|~{3,})/.exec(lineValue(lines[index] ?? ""));
+		if (!match) continue;
+		const marker = match[1]?.[0];
+		const length = match[1]?.length ?? 0;
+		if (!marker) continue;
+		if (!fence) fence = { marker, length };
+		else if (marker === fence.marker && length >= fence.length)
+			fence = undefined;
+	}
+	return fence !== undefined;
 }
