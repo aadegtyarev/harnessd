@@ -37,6 +37,7 @@ The package is pre-1.0 (`package.json` holds the current version), `private: tru
 - [Pi RPC harness](pi-rpc-harness.md)
 - [Direct Node process provider](process-provider.md)
 - [Transport adapter](transport-adapter.md)
+- [Standalone llm-sessiond API client](llm-sessiond-client.md)
 - [Telegram transport and CLI](telegram-transport.md)
 - [CLI configuration](cli-configuration.md)
 - [Per-user systemd service](user-service.md)
