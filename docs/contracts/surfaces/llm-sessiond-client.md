@@ -20,4 +20,3 @@ Events remain raw typed API v1 envelopes and are not coerced into `HarnessEvent`
 
 - Normative source contracts in the sibling `llm-sessiond` repository: `docs/contracts/surfaces/api-v1.md` and `session-lifecycle.md`.
 - [Package release](package-release.md)
-- [Feature contract](../features/llm-sessiond-client-v1.md)
