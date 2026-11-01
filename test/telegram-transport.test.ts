@@ -1536,49 +1536,33 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("delivers each assistant message at its end while the run continues", async () => {
+	it("buffers multiple assistant message ends until one final delivery", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		bot.sent = [];
 		emit(harnessEvent("sid", "status", "agent_start"));
-		emit(harnessEvent("sid", "output", "first answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
-		await vi.waitFor(() =>
-			expect(bot.sent.some(({ text }) => text.includes("first answer"))).toBe(
-				true,
-			),
-		);
-		emit(harnessEvent("sid", "output", "second answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
-		await vi.waitFor(() =>
-			expect(bot.sent.some(({ text }) => text.includes("second answer"))).toBe(
-				true,
-			),
-		);
-		emit(harnessEvent("sid", "output", "final answer"));
-		emit(harnessEvent("sid", "status", "agent_settled"));
+		for (const fragment of ["first answer", "second answer", "final answer"]) {
+			emit(harnessEvent("sid", "output", fragment));
+			emit(harnessEvent("sid", "status", "message_end"));
+		}
 		await new Promise((resolve) => setTimeout(resolve, 50));
-		const answers = bot.sent.filter(({ text }) => text.includes("answer"));
-		expect(answers).toHaveLength(3);
-		const optionsOf = (needle: string) =>
-			bot.sendOptions[bot.sent.findIndex(({ text }) => text.includes(needle))];
-		expect(optionsOf("first answer")).toMatchObject({
-			disable_notification: true,
-		});
-		expect(optionsOf("final answer")).not.toHaveProperty(
-			"disable_notification",
-		);
-		expect(answers[1]?.text).not.toContain("first answer");
-		expect(bot.sent.some(({ text }) => text.includes("message_end"))).toBe(
-			false,
-		);
+		expect(bot.api.sendMessage).not.toHaveBeenCalled();
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() => expect(bot.sent).toHaveLength(1));
+		expect(bot.sent[0]?.text).toContain("first answer");
+		expect(bot.sent[0]?.text).toContain("second answer");
+		expect(bot.sent[0]?.text).toContain("final answer");
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
 		await adapter.stop();
 	});
 
-	it("cleans assistant garbage tails at message_end and settled delivery", async () => {
+	it("cleans assistant garbage tails only at run settlement", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
+		bot.sent = [];
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(
 			harnessEvent(
@@ -1588,31 +1572,18 @@ describe("Telegram transport", () => {
 			),
 		);
 		emit(harnessEvent("sid", "status", "message_end"));
+		expect(bot.sent.some(({ text }) => text.includes("Русский ответ"))).toBe(
+			false,
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(bot.sent.some(({ text }) => text.includes("Русский ответ"))).toBe(
 				true,
 			),
 		);
-		emit(
-			harnessEvent(
-				"sid",
-				"output",
-				"Обычный финальный ответ\n\nxx\nhidden.\nStop.\nNo.\nDone.",
-			),
-		);
-		emit(harnessEvent("sid", "status", "agent_settled"));
-		await vi.waitFor(() =>
-			expect(
-				bot.sent.some(({ text }) => text.includes("Обычный финальный ответ")),
-			).toBe(true),
-		);
-		const answers = bot.sent.filter(({ text }) => text.includes("ответ"));
-		expect(answers.map(({ text }) => telegramBody(text))).toEqual([
-			"Русский ответ",
-			"Обычный финальный ответ",
-		]);
-		for (const { text } of answers)
-			expect(text).not.toMatch(/hidden\.|Stop\.|No\.|End\.|Done\./);
+		const answer = bot.sent.find(({ text }) => text.includes("Русский ответ"));
+		expect(telegramBody(answer?.text ?? "")).toBe("Русский ответ");
+		expect(answer?.text).not.toMatch(/hidden\.|Stop\.|No\.|End\.|Done\./);
 
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(
@@ -1623,6 +1594,8 @@ describe("Telegram transport", () => {
 			),
 		);
 		emit(harnessEvent("sid", "status", "message_end"));
+		expect(bot.sent).toHaveLength(1);
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(({ text }) =>
@@ -1630,11 +1603,11 @@ describe("Telegram transport", () => {
 				),
 			).toBe(true),
 		);
-		const midRunFence = bot.sent.find(({ text }) =>
+		const settledFence = bot.sent.find(({ text }) =>
 			telegramVisibleText(text).includes("Fence LF"),
 		);
-		expect(midRunFence).toBeDefined();
-		expect(telegramVisibleText(midRunFence?.text ?? "")).toContain(
+		expect(settledFence).toBeDefined();
+		expect(telegramVisibleText(settledFence?.text ?? "")).toContain(
 			"xx\nhidden.\nStop.\nNo.\nEnd.",
 		);
 
@@ -1653,11 +1626,11 @@ describe("Telegram transport", () => {
 				),
 			).toBe(true),
 		);
-		const settledFence = bot.sent.find(({ text }) =>
+		const settledFenceCrlf = bot.sent.find(({ text }) =>
 			telegramVisibleText(text).includes("Fence CRLF"),
 		);
-		expect(settledFence).toBeDefined();
-		expect(telegramVisibleText(settledFence?.text ?? "")).toContain(
+		expect(settledFenceCrlf).toBeDefined();
+		expect(telegramVisibleText(settledFenceCrlf?.text ?? "")).toContain(
 			"xx\nhidden.\nStop.\nNo.\nDone.",
 		);
 		await adapter.stop();
@@ -3612,6 +3585,15 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "progress report"));
 		emit(harnessEvent("sid", "status", "message_end"));
+		expect(bot.sent.some(({ text }) => text.includes("progress report"))).toBe(
+			false,
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as never, state: "completed" },
+		});
 		await vi.waitFor(() =>
 			expect(
 				bot.sent.some(
@@ -9567,9 +9549,9 @@ describe("Telegram transport", () => {
 		bot.api.sendMessage.mockClear();
 		bot.sent = [];
 		emit(harnessEvent("sid", "output", "First queued answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit(harnessEvent("sid", "output", "Second queued answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.advanceTimersByTimeAsync(40);
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
 		const queue = (
@@ -9652,9 +9634,9 @@ describe("Telegram transport", () => {
 		bot.api.sendMessage.mockClear();
 		bot.sent = [];
 		emit(harnessEvent("sid", "output", "Queued HTML answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit(harnessEvent("sid", "output", "Next FIFO answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.advanceTimersByTimeAsync(40);
 		await vi.advanceTimersByTimeAsync(1_000);
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(4);
@@ -9706,9 +9688,9 @@ describe("Telegram transport", () => {
 		bot.api.sendMessage.mockClear();
 		bot.sent = [];
 		emit(harnessEvent("sid", "output", "Queued HTML answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit(harnessEvent("sid", "output", "Next FIFO answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.advanceTimersByTimeAsync(40);
 		await vi.advanceTimersByTimeAsync(1_000);
 		expect(bot.api.sendMessage).toHaveBeenCalledTimes(3);
@@ -9759,7 +9741,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		bot.api.sendMessage.mockClear();
 		emit(harnessEvent("sid", "output", "Long cooldown answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.advanceTimersByTimeAsync(40);
 		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
 		await vi.advanceTimersByTimeAsync(2_147_483_647);
@@ -9792,7 +9774,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		bot.api.sendMessage.mockClear();
 		emit(harnessEvent("sid", "output", "Throttled answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.advanceTimersByTimeAsync(40);
 		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
 		const queue = (
@@ -9819,9 +9801,9 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use sid");
 		bot.api.sendMessage.mockClear();
 		emit(harnessEvent("sid", "output", "Rejected answer"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit(harnessEvent("sid", "output", "Must be discarded"));
-		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.advanceTimersByTimeAsync(40);
 		const queue = (
 			adapter as unknown as {
@@ -9887,7 +9869,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("defers a message-end freeze through the run-card cooldown without delaying answer delivery", async () => {
+	it("keeps message_end and final delivery independent of run-card 429 cooldown", async () => {
 		vi.useFakeTimers();
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
@@ -9913,39 +9895,39 @@ describe("Telegram transport", () => {
 		emit({
 			sessionId: "sid" as SessionId,
 			kind: "activity",
-			activityEvent: { type: "thought", text: "before freeze" } as never,
+			activityEvent: { type: "thought", text: "before cooldown" } as never,
 		});
 		await activity?.renderQueue;
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "activity",
-			activityEvent: { type: "thought", text: "latest freeze state" } as never,
-		});
 		emit(harnessEvent("sid", "output", "answer delivered during cooldown"));
 		emit(harnessEvent("sid", "status", "message_end"));
 		await vi.advanceTimersByTimeAsync(40);
-		await activity?.renderQueue;
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("answer delivered during cooldown"),
+			),
+		).toBe(false);
+		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(40);
 		expect(
 			bot.sent.some(({ text }) =>
 				text.includes("answer delivered during cooldown"),
 			),
 		).toBe(true);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
-		await vi.advanceTimersByTimeAsync(208_959);
+		await vi.advanceTimersByTimeAsync(208_919);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		await vi.advanceTimersByTimeAsync(1);
 		await vi.waitFor(() =>
 			expect(bot.api.editMessageText).toHaveBeenCalledTimes(2),
 		);
-		const frozen = bot.edited.at(-1);
-		expect(frozen?.text).toContain("latest freeze state");
-		expect(frozen?.options).toEqual({ reply_markup: { inline_keyboard: [] } });
-		await vi.advanceTimersByTimeAsync(1);
-		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
-		expect(
-			bot.sent.filter(({ text }) => text.includes("Ход · ")).length,
-		).toBeGreaterThan(1);
+		expect(bot.edited.at(-1)?.text).toContain("✅ Ход завершён");
 		await adapter.stop();
 	});
 
@@ -10288,53 +10270,42 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("freezes the card below a mid-run answer and opens a new one", async () => {
+	it("keeps the live card in place across message_end and delivers at settlement", async () => {
 		const bot = new MockBot();
-		const { adapter, emit, requests } = await startAdapter(bot, await temp());
+		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		await bot.update(42, "long run");
 		await vi.waitFor(() => expect(bot.sent.at(-1)?.text).toContain("Ход · "));
-		const firstCard = bot.lastMessageId as number;
+		const cardId = bot.lastMessageId as number;
+		const sentBefore = bot.sent.length;
+		const editsBefore = bot.api.editMessageText.mock.calls.length;
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "progress note"));
 		emit(harnessEvent("sid", "status", "message_end"));
-		await vi.waitFor(() => {
-			const answer = bot.sent.findIndex(({ text }) =>
-				text.includes("progress note"),
-			);
-			const nextCard = bot.sent.findIndex(
-				({ text, message_id }, index) =>
-					index > answer &&
-					answer >= 0 &&
-					text.includes("Ход · ") &&
-					message_id !== firstCard,
-			);
-			expect(nextCard).toBeGreaterThan(answer);
-		});
-		const frozen = bot.api.editMessageText.mock.calls.find(
-			([, messageId, , options]) =>
-				messageId === firstCard &&
-				JSON.stringify(options) === '{"reply_markup":{"inline_keyboard":[]}}',
-		);
-		expect(frozen).toBeDefined();
-		const newCard = bot.lastMessageId as number;
-		const report = callbackData(bot.sendOptions.at(-1), "card:report:");
-		await bot.callback(42, report, newCard);
-		expect(requests.at(-1)).toMatchObject({ kind: "submit", sessionId: "sid" });
-		await bot.callback(42, report, firstCard);
-		expect(requests.filter(({ kind }) => kind === "submit").length).toBe(2);
-		emit({
-			sessionId: "sid" as SessionId,
-			kind: "input",
-			inputEvent: { inputId: "input-1" as never, state: "completed" },
-		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(bot.sent).toHaveLength(sentBefore);
+		expect(bot.lastMessageId).toBe(cardId);
+		expect(
+			bot.api.editMessageText.mock.calls
+				.slice(editsBefore)
+				.some(
+					([, messageId, , options]) =>
+						messageId === cardId &&
+						JSON.stringify(options) ===
+							'{"reply_markup":{"inline_keyboard":[]}}',
+				),
+		).toBe(false);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
-			expect(bot.api.deleteMessage).toHaveBeenCalledWith(
-				42,
-				firstCard,
-				expect.anything(),
+			expect(bot.sent.some(({ text }) => text.includes("progress note"))).toBe(
+				true,
 			),
+		);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("progress note")),
+		).toHaveLength(1);
+		expect(bot.sent.filter(({ text }) => text.includes("Ход · "))).toHaveLength(
+			1,
 		);
 		await adapter.stop();
 	});

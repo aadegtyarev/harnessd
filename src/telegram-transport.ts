@@ -8525,10 +8525,7 @@ export class TelegramTransportAdapter
 				return;
 			}
 			if (event.text === "agent_end") return;
-			if (event.text === "message_end") {
-				this.flushTurnMessage(event.sessionId);
-				return;
-			}
+			if (event.text === "message_end") return;
 			if (event.text === "agent_settled") {
 				this.invalidateSessionConfirmations(event.sessionId);
 				this.runningSessions.delete(event.sessionId);
@@ -9155,45 +9152,6 @@ export class TelegramTransportAdapter
 				: TURN_OVERFLOW_NOTICE;
 		if (!text.trim()) return;
 		this.deliverTurnText(sessionId, buffer.recipients, text);
-	}
-
-	/** Delivers the assistant message that just ended while its run continues. */
-	private flushTurnMessage(sessionId: SessionId): void {
-		const buffer = this.turnBuffers.get(sessionId);
-		if (!buffer || buffer.settled || buffer.cancelled) return;
-		this.appendSubagentResult(
-			sessionId,
-			buffer,
-			buffer.subagentStream.consume("", true),
-		);
-		let text = stripModelOutputGarbageTail(buffer.chunks.join(""));
-		const overflow = buffer.overflow;
-		buffer.chunks.splice(0);
-		buffer.characters = 0;
-		buffer.overflow = false;
-		if (!text.trim()) {
-			if (!overflow) return;
-			text = TURN_OVERFLOW_NOTICE;
-		} else if (overflow) text += `\n\n${TURN_OVERFLOW_NOTICE}`;
-		const attributed = new Set(buffer.recipients);
-		for (const record of this.inputAttributions.values())
-			if (
-				record.turn === buffer &&
-				!record.terminal &&
-				record.chatId !== undefined &&
-				(record.state === "accepted" || record.state === "uncertain")
-			)
-				attributed.add(record.chatId);
-		// Mid-run answers arrive silently; the settled answer keeps the notification sound.
-		const recipients = this.deliverTurnText(sessionId, attributed, text, true);
-		// Keep the live card below the answer in the chats that received it.
-		for (const activity of this.activitiesForSession(sessionId))
-			if (
-				recipients.has(activity.chatId) &&
-				activity.messageId !== undefined &&
-				!activity.finishing
-			)
-				this.freezeLiveActivity(activity);
 	}
 
 	private deliverTurnText(
