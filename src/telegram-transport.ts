@@ -97,6 +97,7 @@ import {
 	renderTelegramMarkdown,
 	telegramHtmlToPlainText,
 } from "./telegram-markdown.js";
+import { stripModelOutputGarbageTail } from "./telegram-model-output-sanitizer.js";
 import { TelegramPanelIntent } from "./telegram-panel-intent.js";
 import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
@@ -9143,15 +9144,16 @@ export class TelegramTransportAdapter
 			this.turnBuffers.delete(sessionId);
 		if (buffer.cancelled || (buffer.characters === 0 && !buffer.overflow))
 			return;
-		let text = buffer.chunks.join("");
-		if (!text.trim()) {
-			if (!buffer.overflow) return;
-			text = TURN_OVERFLOW_NOTICE;
-		} else {
-			if (buffer.interrupted)
-				text += "\n\n[Response interrupted before completion.]";
-			if (buffer.overflow) text += `\n\n${TURN_OVERFLOW_NOTICE}`;
-		}
+		let text = stripModelOutputGarbageTail(buffer.chunks.join(""));
+		if (buffer.interrupted)
+			text = text.trim()
+				? `${text}\n\n[Response interrupted before completion.]`
+				: "[Response interrupted before completion.]";
+		if (buffer.overflow)
+			text = text.trim()
+				? `${text}\n\n${TURN_OVERFLOW_NOTICE}`
+				: TURN_OVERFLOW_NOTICE;
+		if (!text.trim()) return;
 		this.deliverTurnText(sessionId, buffer.recipients, text);
 	}
 
@@ -9164,7 +9166,7 @@ export class TelegramTransportAdapter
 			buffer,
 			buffer.subagentStream.consume("", true),
 		);
-		let text = buffer.chunks.join("");
+		let text = stripModelOutputGarbageTail(buffer.chunks.join(""));
 		const overflow = buffer.overflow;
 		buffer.chunks.splice(0);
 		buffer.characters = 0;
