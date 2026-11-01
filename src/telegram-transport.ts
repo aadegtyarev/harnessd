@@ -132,7 +132,7 @@ const PANEL_RETRY_MAX_DELAY_MS = 10_000;
 const TURN_OVERFLOW_NOTICE =
 	"[Additional output omitted because the response reached the queue limit.]";
 const INPUT_CHARACTER_RESERVE = 4096;
-const MAX_TURN_OUTPUT_CHARACTERS =
+const MAX_MULTIMESSAGE_TURN_CHARACTERS =
 	MAX_QUEUED_CHARACTERS - INPUT_CHARACTER_RESERVE - TELEGRAM_LIMIT;
 const OUTPUT_COALESCE_MS = 40;
 const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
@@ -9133,9 +9133,9 @@ export class TelegramTransportAdapter
 		if (!text) return;
 		const previousLength = buffer.currentMessage.length;
 		let current = buffer.currentMessage + text;
-		if (current.length > MAX_TURN_OUTPUT_CHARACTERS) {
-			current = current.slice(-MAX_TURN_OUTPUT_CHARACTERS);
-			if (/^[\uDC00-\uDFFF]/.test(current)) current = current.slice(1);
+		if (current.length > MAX_QUEUED_CHARACTERS) {
+			current = current.slice(0, MAX_QUEUED_CHARACTERS);
+			if (/[\uD800-\uDBFF]$/.test(current)) current = current.slice(0, -1);
 			buffer.overflow = true;
 		}
 		buffer.currentMessage = current;
@@ -9144,7 +9144,7 @@ export class TelegramTransportAdapter
 			buffer.characters += 2;
 		while (
 			buffer.chunks.length > 0 &&
-			buffer.characters > MAX_TURN_OUTPUT_CHARACTERS
+			buffer.characters > MAX_MULTIMESSAGE_TURN_CHARACTERS
 		) {
 			const removed = buffer.chunks.shift();
 			buffer.characters -= removed?.length ?? 0;

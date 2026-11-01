@@ -51,6 +51,11 @@ function telegramBody(text: string): string {
 		footerStart < 0 ? text : text.slice(0, footerStart),
 	);
 }
+function longAssistantMessage(id: string): string {
+	const beginning = `${id}-BEGIN`;
+	const ending = `${id}-END`;
+	return `${beginning}\n${"x".repeat(25_000 - beginning.length - ending.length - 2)}\n${ending}`;
+}
 function hasSessionFooter(text: string, sessionId: string): boolean {
 	const footerStart = text.lastIndexOf("\n\n");
 	if (footerStart < 0) return false;
@@ -1586,6 +1591,102 @@ describe("Telegram transport", () => {
 		);
 		expect(delivered).not.toContain(older);
 		expect(bot.sent.filter(({ text }) => text.includes(final))).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("delivers one 25,000-character completed assistant message without truncation", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		const message = longAssistantMessage("single-completed");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", message));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("single-completed-END")),
+			).toBe(true),
+		);
+		const parts = bot.sent.map(({ text }) => telegramBody(text));
+		expect(parts.join("")).toBe(message);
+		expect(parts.length).toBeGreaterThan(1);
+		await adapter.stop();
+	});
+
+	it("evicts older messages but preserves a 25,000-character final message", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		const older = `older-BEGIN${"o".repeat(20_000)}older-END`;
+		const final = longAssistantMessage("final-after-eviction");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", older));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", final));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("final-after-eviction-END")),
+			).toBe(true),
+		);
+		const parts = bot.sent.map(({ text }) => telegramBody(text));
+		expect(parts.join("")).toBe(
+			`${final}\n\n[Additional output omitted because the response reached the queue limit.]`,
+		);
+		expect(parts.join("")).not.toContain("older-BEGIN");
+		await adapter.stop();
+	});
+
+	it("preserves a 25,000-character unsettled assistant message at settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		const message = longAssistantMessage("unsettled-at-settlement");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", message));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) =>
+					text.includes("unsettled-at-settlement-END"),
+				),
+			).toBe(true),
+		);
+		const parts = bot.sent.map(({ text }) => telegramBody(text));
+		expect(parts.join("")).toBe(message);
+		await adapter.stop();
+	});
+
+	it("preserves a 25,000-character message through interrupted flush", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		const message = longAssistantMessage("interrupted-flush");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", message));
+		await bot.update(42, "/stop");
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("interrupted-flush-END")),
+			).toBe(true),
+		);
+		const parts = bot.sent
+			.filter(
+				({ text }) =>
+					text.length > 1000 ||
+					text.includes("interrupted-flush-END") ||
+					text.includes("[Response interrupted before completion.]"),
+			)
+			.map(({ text }) => telegramBody(text));
+		expect(parts.join("")).toBe(
+			`${message}\n\n[Response interrupted before completion.]`,
+		);
 		await adapter.stop();
 	});
 
