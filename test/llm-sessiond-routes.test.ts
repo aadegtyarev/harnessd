@@ -47,8 +47,11 @@ it("calls every HTTP v1 route with canonical method, body, and status", async ()
 	await client.listSessions();
 	await client.getSession(session.id);
 	await client.createSession({ harnessId: "pi", cwd: "/tmp", name: "x" });
-	const inputId = (await client.submitInput(session.id, { text: "prompt" }))
-		.inputId;
+	const input = {
+		text: "prompt",
+		images: [{ mimeType: "image/png", data: "aGVsbG8=" }],
+	};
+	const inputId = (await client.submitInput(session.id, input)).inputId;
 	await client.cancelInput(session.id, inputId);
 	await client.stopSession(session.id);
 	await client.resumeSession(session.id);
@@ -63,9 +66,11 @@ it("calls every HTTP v1 route with canonical method, body, and status", async ()
 		[`/api/v1/sessions/${session.id}/stop`, "POST"],
 		[`/api/v1/sessions/${session.id}/resume`, "POST"],
 	]);
-	expect(seen[4]?.[2]).toContain('"name":"x"');
+	expect(seen[4]?.[2]).toBe(
+		JSON.stringify({ harnessId: "pi", cwd: "/tmp", name: "x" }),
+	);
 	expect(seen[6]?.[2]).toBe(JSON.stringify({ inputId }));
-	expect(seen[5]?.[2]).toContain("prompt");
+	expect(seen[5]?.[2]).toBe(JSON.stringify(input));
 	expect(seen[7]?.[2]).toBe("{}");
 	expect(seen[8]?.[2]).toBe("{}");
 	await new Promise<void>((resolve) => server.close(() => resolve()));

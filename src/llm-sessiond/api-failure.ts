@@ -1,12 +1,17 @@
 import { LlmSessiondApiError, LlmSessiondProtocolError } from "./errors.js";
+import { readResponseText } from "./response-body.js";
 import { apiErrorSchema } from "./schemas.js";
 
-export async function apiFailure(response: Response): Promise<never> {
+export async function apiFailure(
+	response: Response,
+	signal: AbortSignal,
+): Promise<never> {
 	if (response.status === 204)
 		throw new LlmSessiondProtocolError("status", "unexpected HTTP status");
 	let value: unknown;
+	const text = await readResponseText(response, signal);
 	try {
-		value = JSON.parse(await response.text());
+		value = JSON.parse(text);
 	} catch {
 		throw new LlmSessiondProtocolError(
 			"json",

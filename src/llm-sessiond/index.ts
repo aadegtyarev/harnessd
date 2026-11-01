@@ -18,4 +18,5 @@ export type {
 	SessionSummary,
 	SessionsResponse,
 } from "./types.js";
-export type { Subscription, WebSocketFactory } from "./ws.js";
+export type { WebSocketFactory, WebSocketOptions } from "./ws.js";
+export type { Subscription } from "./ws-subscription.js";

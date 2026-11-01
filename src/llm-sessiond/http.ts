@@ -3,6 +3,7 @@ import {
 	LlmSessiondProtocolError,
 	LlmSessiondTransportError,
 } from "./errors.js";
+import { readResponseText } from "./response-body.js";
 
 export type FetchLike = typeof fetch;
 export type ClientOptions = {
@@ -21,6 +22,7 @@ export async function requestJson<T>(
 	expected: number,
 	schema: { parse(value: unknown): T },
 ): Promise<T> {
+	const signal = AbortSignal.timeout(timeoutMs);
 	let response: Response;
 	try {
 		response = await fetcher(`${baseUrl}/api/v1${path}`, {
@@ -28,20 +30,24 @@ export async function requestJson<T>(
 			headers:
 				body === undefined ? undefined : { "content-type": "application/json" },
 			body: body === undefined ? undefined : JSON.stringify(body),
-			signal: AbortSignal.timeout(timeoutMs),
+			signal,
+			redirect: "error",
 		});
 	} catch (error) {
-		const timeout = error instanceof Error && error.name === "TimeoutError";
+		const timeout =
+			signal.aborted ||
+			(error instanceof Error && error.name === "TimeoutError");
 		throw new LlmSessiondTransportError(
 			timeout ? "timeout" : "network",
 			timeout ? "request timed out" : "request failed",
 		);
 	}
-	if (response.status !== expected) return apiFailure(response);
+	if (response.status !== expected) return apiFailure(response, signal);
 	if (expected === 204) return undefined as T;
 	let value: unknown;
+	const text = await readResponseText(response, signal);
 	try {
-		value = JSON.parse(await response.text());
+		value = JSON.parse(text);
 	} catch {
 		throw new LlmSessiondProtocolError("json", "response was not valid JSON");
 	}

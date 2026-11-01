@@ -3,94 +3,74 @@ import {
 	LlmSessiondProtocolError,
 	LlmSessiondTransportError,
 } from "./errors.js";
-import { eventPayloadSchemas, eventSchema } from "./event-schema.js";
-import type { EventEnvelope, EventPayload } from "./types.js";
+import { parseEvent } from "./ws-event.js";
+import { EventSubscription, type Subscription } from "./ws-subscription.js";
 
-export type WebSocketFactory = (url: string) => WebSocket;
-export type Subscription = AsyncIterableIterator<EventEnvelope> & {
-	close(): void;
-	closed: Promise<void>;
-	error?: Error;
-};
-type Waiter = {
-	resolve(value: IteratorResult<EventEnvelope>): void;
-	reject(error: Error): void;
-};
+export type WebSocketOptions = { handshakeTimeout: number };
+export type WebSocketFactory = (
+	url: string,
+	options: WebSocketOptions,
+) => WebSocket;
 
 export function subscribe(
 	baseUrl: string,
-	sessionId?: string,
-	factory: WebSocketFactory = (url) => new WebSocket(url),
+	sessionId: string | undefined,
+	factory: WebSocketFactory | undefined,
+	timeoutMs: number,
 ): Subscription {
 	const url = new URL(`${baseUrl.replace(/^http/, "ws")}/api/v1/events`);
 	if (sessionId !== undefined) url.searchParams.set("sessionId", sessionId);
-	const socket = factory(url.toString());
-	const queue: EventEnvelope[] = [];
-	const waiters: Waiter[] = [];
-	let ended = false;
-	let failure: Error | undefined;
-	let closeResolve!: () => void;
-	const closed = new Promise<void>((resolve) => {
-		closeResolve = resolve;
+	let socket: WebSocket;
+	try {
+		socket = (
+			factory ?? ((address, options) => new WebSocket(address, options))
+		)(url.toString(), { handshakeTimeout: timeoutMs + 100 });
+	} catch {
+		throw new LlmSessiondTransportError(
+			"network",
+			"WebSocket connection failed",
+		);
+	}
+	let deadline: ReturnType<typeof setTimeout>;
+	const subscription = new EventSubscription(() => {
+		clearTimeout(deadline);
+		socket.close();
 	});
-	const finish = (error?: Error) => {
-		if (ended) return;
-		ended = true;
-		failure = error;
-		closeResolve();
-		for (const waiter of waiters.splice(0))
-			error
-				? waiter.reject(error)
-				: waiter.resolve({ done: true, value: undefined });
-	};
-	const iterator: Subscription = {
-		closed,
-		get error() {
-			return failure;
-		},
-		close() {
-			socket.close();
-			finish();
-		},
-		[Symbol.asyncIterator]() {
-			return this;
-		},
-		next() {
-			const event = queue.shift();
-			if (event) return Promise.resolve({ done: false, value: event });
-			if (failure) return Promise.reject(failure);
-			if (ended) return Promise.resolve({ done: true, value: undefined });
-			return new Promise((resolve, reject) =>
-				waiters.push({ resolve, reject }),
-			);
-		},
-	};
+	deadline = setTimeout(
+		() =>
+			subscription.fail(
+				new LlmSessiondTransportError(
+					"timeout",
+					"WebSocket connection timed out",
+				),
+			),
+		timeoutMs,
+	);
+	socket.once("open", () => clearTimeout(deadline));
 	socket.on("message", (data) => {
+		if (subscription.isTerminal) return;
 		try {
-			const raw = JSON.parse(data.toString()) as unknown;
-			const envelope = eventSchema.parse(raw);
-			const payload = eventPayloadSchemas[envelope.type].parse(
-				envelope.data,
-			) as EventPayload;
-			const event = { ...envelope, data: payload } as EventEnvelope;
-			const waiter = waiters.shift();
-			waiter
-				? waiter.resolve({ done: false, value: event })
-				: queue.push(event);
-		} catch {
-			const error = new LlmSessiondProtocolError(
-				"schema",
-				"WebSocket event did not match API v1 schema",
-			);
-			finish(error);
-			socket.close();
+			subscription.push(parseEvent(data.toString()));
+		} catch (error) {
+			const safe =
+				error instanceof LlmSessiondProtocolError
+					? error
+					: new LlmSessiondProtocolError(
+							"schema",
+							"WebSocket event was invalid",
+						);
+			subscription.fail(safe);
 		}
 	});
-	socket.on("error", () =>
-		finish(
-			new LlmSessiondTransportError("network", "WebSocket connection failed"),
-		),
-	);
-	socket.on("close", () => finish());
-	return iterator;
+	socket.on("error", () => {
+		if (!subscription.isTerminal)
+			subscription.fail(
+				new LlmSessiondTransportError("network", "WebSocket connection failed"),
+			);
+	});
+	socket.on("close", () => {
+		clearTimeout(deadline);
+		subscription.socketClosed();
+	});
+	return subscription;
 }
