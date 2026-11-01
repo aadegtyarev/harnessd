@@ -4,6 +4,13 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-02
+
+### Added
+
+- Standalone typed `LlmSessiondClient` for strict loopback API v1 HTTP and WebSocket access; it is not wired into application runtime and never retries operations.
+- Update Zod to 4.6.7 to address the high-severity production dependency advisory.
+
 ## [0.3.9] - 2026-11-01
 
 ### Fixed
