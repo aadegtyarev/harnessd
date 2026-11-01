@@ -117,6 +117,7 @@ const TELEGRAM_LIMIT = 4096;
 const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
 const ACTIVITY_OVERFLOW_INPUT_LIMIT = 128;
 const SEND_TIMEOUT_MS = 5000;
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
 const FILE_SEND_TIMEOUT_MS = 120_000;
 const STOP_TIMEOUT_MS = 6000;
 const MAX_QUEUED_MESSAGES = 32;
@@ -9578,6 +9579,7 @@ export class TelegramTransportAdapter
 									sessionIdEntity(plainText, message.sessionId)),
 							},
 						},
+				true,
 			);
 			if (!delivered && !this.stopping) {
 				queue.failed = true;
@@ -9595,33 +9597,38 @@ export class TelegramTransportAdapter
 		correlatedSessionId?: SessionId,
 		onSent?: (messageId: number | undefined) => void,
 		plainFallback?: { readonly text: string; readonly other: unknown },
+		retryQueued429 = false,
 	): Promise<boolean> {
 		let retryText = text;
 		let retryOther = other;
+		let usedPlainFallback = false;
 		let result = await this.telegramCall((signal) =>
 			this.bot.api.sendMessage(chatId, retryText, retryOther, signal),
 		);
-		if (!result.ok && plainFallback && isTelegramParseError(result.error)) {
-			// A formatting defect must not lose the reply: resend it once as plain text.
-			this.reportError(
-				"Telegram rejected HTML formatting; resending as plain text",
-				result.error,
-			);
-			retryText = plainFallback.text;
-			retryOther = plainFallback.other;
-			result = await this.telegramCall((signal) =>
-				this.bot.api.sendMessage(chatId, retryText, retryOther, signal),
-			);
-		}
-		while (!result.ok && telegramErrorCode(result.error) === 429) {
-			const retryAfter = telegramRetryAfterMs(result.error);
+		while (!result.ok) {
 			if (
-				retryAfter === undefined ||
-				!Number.isFinite(retryAfter) ||
-				retryAfter <= 0 ||
-				!(await this.waitForTelegramRetry(retryAfter))
-			)
-				break;
+				!usedPlainFallback &&
+				plainFallback &&
+				isTelegramParseError(result.error)
+			) {
+				// A formatting defect must not lose the reply: resend it once as plain text.
+				this.reportError(
+					"Telegram rejected HTML formatting; resending as plain text",
+					result.error,
+				);
+				usedPlainFallback = true;
+				retryText = plainFallback.text;
+				retryOther = plainFallback.other;
+			} else if (retryQueued429 && telegramErrorCode(result.error) === 429) {
+				const retryAfter = telegramRetryAfterMs(result.error);
+				if (
+					retryAfter === undefined ||
+					!Number.isFinite(retryAfter) ||
+					retryAfter <= 0 ||
+					!(await this.waitForTelegramRetry(retryAfter))
+				)
+					break;
+			} else break;
 			result = await this.telegramCall((signal) =>
 				this.bot.api.sendMessage(chatId, retryText, retryOther, signal),
 			);
@@ -9644,13 +9651,22 @@ export class TelegramTransportAdapter
 		return new Promise((resolve) => {
 			const signal = this.shutdownController.signal;
 			let timer: NodeJS.Timeout;
+			let remainingMs = delayMs;
 			const finish = (elapsed: boolean) => {
 				clearTimeout(timer);
 				signal.removeEventListener("abort", onAbort);
 				resolve(elapsed);
 			};
 			const onAbort = () => finish(false);
-			timer = setTimeout(() => finish(true), delayMs);
+			const scheduleChunk = () => {
+				const chunkMs = Math.min(remainingMs, MAX_NODE_TIMEOUT_MS);
+				timer = setTimeout(() => {
+					remainingMs -= chunkMs;
+					if (remainingMs <= 0) finish(true);
+					else scheduleChunk();
+				}, chunkMs);
+			};
+			scheduleChunk();
 			signal.addEventListener("abort", onAbort, { once: true });
 			if (signal.aborted) finish(false);
 		});

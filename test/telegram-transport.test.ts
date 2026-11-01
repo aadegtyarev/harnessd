@@ -9433,6 +9433,180 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("keeps direct sendMessage 429 replies time-bounded without retrying", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		bot.sendMessageBehavior = async () => {
+			throw Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				parameters: { retry_after: 120 },
+			});
+		};
+		const { adapter } = await startAdapter(bot, await temp());
+		bot.api.sendMessage.mockClear();
+		await (
+			adapter as unknown as {
+				sendDirect: (chatId: number, text: string) => Promise<void>;
+			}
+		).sendDirect(42, "Direct reply");
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		const queue = (
+			adapter as unknown as { queues: Map<number, { failed: boolean }> }
+		).queues.get(42);
+		expect(queue).toBeUndefined();
+		await adapter.stop();
+	});
+
+	it("uses plain fallback after queued 429 then Telegram parse rejection", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const retry = Object.assign(new Error("Too Many Requests"), {
+			error_code: 429,
+			parameters: { retry_after: 1 },
+		});
+		const parse = Object.assign(new Error("Bad Request"), {
+			error_code: 400,
+			description: "Bad Request: can't parse entities",
+		});
+		const errors: unknown[] = [retry, parse];
+		bot.sendMessageBehavior = async () => {
+			if (
+				String(bot.api.sendMessage.mock.lastCall?.[1]).includes(
+					"Queued HTML answer",
+				) &&
+				errors.length
+			)
+				throw errors.shift();
+		};
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		bot.sent = [];
+		emit(harnessEvent("sid", "output", "Queued HTML answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", "Next FIFO answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(4);
+		expect(bot.api.sendMessage.mock.calls[0]?.[2]).toMatchObject({
+			parse_mode: "HTML",
+		});
+		expect(bot.api.sendMessage.mock.calls[1]?.[2]).toMatchObject({
+			parse_mode: "HTML",
+		});
+		expect(bot.api.sendMessage.mock.calls[2]?.[2]).not.toHaveProperty(
+			"parse_mode",
+		);
+		expect(bot.api.sendMessage.mock.calls[3]?.[1]).toContain(
+			"Next FIFO answer",
+		);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Queued HTML answer")),
+		).toHaveLength(1);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Next FIFO answer")),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("keeps plain fallback across a further queued 429 and preserves FIFO", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const retry = () =>
+			Object.assign(new Error("Too Many Requests"), {
+				error_code: 429,
+				parameters: { retry_after: 1 },
+			});
+		const parse = Object.assign(new Error("Bad Request"), {
+			error_code: 400,
+			description: "Bad Request: can't parse entities",
+		});
+		const errors: unknown[] = [retry(), parse, retry()];
+		bot.sendMessageBehavior = async () => {
+			if (
+				String(bot.api.sendMessage.mock.lastCall?.[1]).includes(
+					"Queued HTML answer",
+				) &&
+				errors.length
+			)
+				throw errors.shift();
+		};
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		bot.sent = [];
+		emit(harnessEvent("sid", "output", "Queued HTML answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", "Next FIFO answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(3);
+		expect(bot.api.sendMessage.mock.calls[2]?.[2]).not.toHaveProperty(
+			"parse_mode",
+		);
+		await vi.advanceTimersByTimeAsync(999);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(3);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(5);
+		expect(bot.api.sendMessage.mock.calls[3]?.[1]).toContain(
+			"Queued HTML answer",
+		);
+		expect(bot.api.sendMessage.mock.calls[3]?.[2]).not.toHaveProperty(
+			"parse_mode",
+		);
+		expect(bot.api.sendMessage.mock.calls[4]?.[1]).toContain(
+			"Next FIFO answer",
+		);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Queued HTML answer")),
+		).toHaveLength(1);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Next FIFO answer")),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
+	it("chunks retry_after above the Node timer limit without retrying early", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		let rejected = false;
+		bot.sendMessageBehavior = async () => {
+			if (
+				!rejected &&
+				String(bot.api.sendMessage.mock.lastCall?.[1]).includes(
+					"Long cooldown answer",
+				)
+			) {
+				rejected = true;
+				throw Object.assign(new Error("Too Many Requests"), {
+					error_code: 429,
+					parameters: { retry_after: 2_147_484 },
+				});
+			}
+		};
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.api.sendMessage.mockClear();
+		emit(harnessEvent("sid", "output", "Long cooldown answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.advanceTimersByTimeAsync(40);
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(2_147_483_647);
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(352);
+		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("Long cooldown answer")),
+		).toHaveLength(1);
+		await adapter.stop();
+	});
+
 	it("cancels a queued sendMessage 429 cooldown on shutdown", async () => {
 		vi.useFakeTimers();
 		const bot = new MockBot();
