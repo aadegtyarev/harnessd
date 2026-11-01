@@ -1551,10 +1551,41 @@ describe("Telegram transport", () => {
 		expect(bot.api.sendMessage).not.toHaveBeenCalled();
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() => expect(bot.sent).toHaveLength(1));
-		expect(bot.sent[0]?.text).toContain("first answer");
-		expect(bot.sent[0]?.text).toContain("second answer");
-		expect(bot.sent[0]?.text).toContain("final answer");
+		expect(telegramBody(bot.sent[0]?.text ?? "")).toBe(
+			"first answer\n\nsecond answer\n\nfinal answer",
+		);
+		expect(
+			bot.sent.filter(({ text }) => telegramBody(text).includes("answer")),
+		).toHaveLength(1);
 		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await adapter.stop();
+	});
+
+	it("keeps the newest assistant message and final response within the run buffer limit", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		bot.api.sendMessage.mockClear();
+		const older = "O".repeat(20_000);
+		const newest = "N".repeat(20_000);
+		const final = "final assistant message without LF";
+		emit(harnessEvent("sid", "status", "agent_start"));
+		for (const message of [older, newest, final]) {
+			emit(harnessEvent("sid", "output", message));
+			emit(harnessEvent("sid", "status", "message_end"));
+		}
+		expect(bot.api.sendMessage).not.toHaveBeenCalled();
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes(final))).toBe(true),
+		);
+		const delivered = bot.sent.map(({ text }) => telegramBody(text)).join("");
+		expect(delivered).toBe(
+			`${newest}\n\n${final}\n\n[Additional output omitted because the response reached the queue limit.]`,
+		);
+		expect(delivered).not.toContain(older);
+		expect(bot.sent.filter(({ text }) => text.includes(final))).toHaveLength(1);
 		await adapter.stop();
 	});
 
@@ -9353,6 +9384,58 @@ describe("Telegram transport", () => {
 		expect(answer).toContain("Another useful detail.");
 		expect(answer).not.toContain("PI_SUBAGENT_ASYNC_JSON:");
 		expect(bot.sent).toHaveLength(messagesBeforeTurn + 1);
+		await adapter.stop();
+	});
+
+	it.each([
+		{
+			name: "an envelope without LF before ordinary text",
+			first:
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[],"id":"ENVELOPE_SENTINEL"}',
+			second: "ordinary response",
+			expected: "ordinary response",
+			sentinel: "ENVELOPE_SENTINEL",
+		},
+		{
+			name: "prose without LF before an envelope",
+			first: "prose without LF",
+			second:
+				'PI_SUBAGENT_ASYNC_JSON:{"kind":"pi-subagents.async-status-snapshot","runs":[],"id":"REVERSE_SENTINEL"}',
+			expected: "prose without LF",
+			sentinel: "REVERSE_SENTINEL",
+		},
+		{
+			name: "an oversized envelope without LF before ordinary text",
+			first: `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+				kind: "pi-subagents.async-status-snapshot",
+				runs: [],
+				id: "OVERSIZED_SENTINEL",
+				padding: "x".repeat(33_000),
+			})}`,
+			second: "message after oversized envelope",
+			expected: "message after oversized envelope",
+			sentinel: "OVERSIZED_SENTINEL",
+		},
+	])("finalizes subagent stream at message_end: $name", async (scenario) => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		bot.api.sendMessage.mockClear();
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "output", scenario.first));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", scenario.second));
+		emit(harnessEvent("sid", "status", "message_end"));
+		expect(bot.api.sendMessage).not.toHaveBeenCalled();
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() => expect(bot.sent).not.toHaveLength(0));
+		expect(bot.sent.map(({ text }) => telegramBody(text)).join(" ")).toBe(
+			scenario.expected,
+		);
+		const payload = bot.sent.map(({ text }) => text).join("\\n");
+		expect(payload).not.toContain("PI_SUBAGENT_ASYNC_JSON:");
+		expect(payload).not.toContain(scenario.sentinel);
 		await adapter.stop();
 	});
 
