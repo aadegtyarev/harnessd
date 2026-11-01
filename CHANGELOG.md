@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-01
+
+### Fixed
+
+- Telegram presentation now removes only the exact terminal model-garbage signature, preserving assistant content, history, and similar prose.
+
 ## [0.4.0] - 2026-11-02
 
 ### Added

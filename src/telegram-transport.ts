@@ -97,8 +97,8 @@ import {
 	renderTelegramMarkdown,
 	telegramHtmlToPlainText,
 } from "./telegram-markdown.js";
-import { TelegramPanelIntent } from "./telegram-panel-intent.js";
 import { stripModelOutputGarbageTail } from "./telegram-model-output-sanitizer.js";
+import { TelegramPanelIntent } from "./telegram-panel-intent.js";
 import { TelegramPanelRefreshScheduler } from "./telegram-panel-refresh.js";
 import { TelegramPanelStore } from "./telegram-panel-store.js";
 import {
