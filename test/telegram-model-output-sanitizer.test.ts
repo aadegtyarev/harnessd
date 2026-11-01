@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { stripModelOutputGarbageTail } from "../src/telegram-model-output-sanitizer.js";
 
 describe("stripModelOutputGarbageTail", () => {
-	it("removes the screenshot signature after Russian assistant text", () => {
+	it("removes the screenshot signature after Russian body text", () => {
 		expect(
 			stripModelOutputGarbageTail(
 				"Ответ готов\n\nxx\nhidden.\nStop.\nNo.\nEnd.",
@@ -25,6 +25,10 @@ describe("stripModelOutputGarbageTail", () => {
 		"Body\nxx\nhidden.\nStop.\nNo.\nEnd.\nMore text",
 		"```text\nxx\nhidden.\nStop.\nNo.\nEnd.\n```",
 		"```text\nxx\nhidden.\nStop.\nNo.\nEnd.",
+		"```text\n```not-close\nxx\nhidden.\nStop.\nNo.\nEnd.",
+		"```text\r\n```not-close\r\nxx\r\nhidden.\r\nStop.\r\nNo.\r\nEnd.",
+		"~~~text\n~~~not-close\nxx\nhidden.\nStop.\nNo.\nEnd.",
+		"~~~text\r\n~~~not-close\r\nxx\r\nhidden.\r\nStop.\r\nNo.\r\nEnd.",
 		"Body\nxx\nhidden.\nStop.\nNo.",
 		"Body\nxx\nhidden.\nStop.\nNo.\nUnknown.",
 		"At 500. is the legitimate limit.",

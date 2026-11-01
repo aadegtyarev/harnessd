@@ -9145,16 +9145,15 @@ export class TelegramTransportAdapter
 		if (buffer.cancelled || (buffer.characters === 0 && !buffer.overflow))
 			return;
 		let text = stripModelOutputGarbageTail(buffer.chunks.join(""));
-		if (!text.trim()) {
-			if (buffer.overflow) text = TURN_OVERFLOW_NOTICE;
-			else if (buffer.interrupted)
-				text = "[Response interrupted before completion.]";
-			else return;
-		} else {
-			if (buffer.interrupted)
-				text += "\n\n[Response interrupted before completion.]";
-			if (buffer.overflow) text += `\n\n${TURN_OVERFLOW_NOTICE}`;
-		}
+		if (buffer.interrupted)
+			text = text.trim()
+				? `${text}\n\n[Response interrupted before completion.]`
+				: "[Response interrupted before completion.]";
+		if (buffer.overflow)
+			text = text.trim()
+				? `${text}\n\n${TURN_OVERFLOW_NOTICE}`
+				: TURN_OVERFLOW_NOTICE;
+		if (!text.trim()) return;
 		this.deliverTurnText(sessionId, buffer.recipients, text);
 	}
 

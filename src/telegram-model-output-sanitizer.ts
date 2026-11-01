@@ -46,14 +46,22 @@ function lineValue(line: string): string {
 function isInsideFence(lines: readonly string[], end: number): boolean {
 	let fence: { marker: string; length: number } | undefined;
 	for (let index = 0; index < end; index++) {
-		const match = /^ {0,3}(`{3,}|~{3,})/.exec(lineValue(lines[index] ?? ""));
-		if (!match) continue;
-		const marker = match[1]?.[0];
-		const length = match[1]?.length ?? 0;
-		if (!marker) continue;
-		if (!fence) fence = { marker, length };
-		else if (marker === fence.marker && length >= fence.length)
-			fence = undefined;
+		const line = lineValue(lines[index] ?? "");
+		if (fence) {
+			const closing = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+			if (
+				closing?.[1]?.[0] === fence.marker &&
+				(closing[1]?.length ?? 0) >= fence.length
+			)
+				fence = undefined;
+			continue;
+		}
+		const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+		const run = opening?.[1];
+		const marker = run?.[0];
+		if (!run || !marker || (marker === "`" && opening?.[2]?.includes("`")))
+			continue;
+		fence = { marker, length: run.length };
 	}
 	return fence !== undefined;
 }

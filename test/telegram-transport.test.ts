@@ -1607,9 +1607,138 @@ describe("Telegram transport", () => {
 			).toBe(true),
 		);
 		const answers = bot.sent.filter(({ text }) => text.includes("ответ"));
-		expect(answers).toHaveLength(2);
+		expect(answers.map(({ text }) => telegramBody(text))).toEqual([
+			"Русский ответ",
+			"Обычный финальный ответ",
+		]);
 		for (const { text } of answers)
-			expect(text).not.toMatch(/hidden\\.|Stop\\.|No\\.|End\\.|Done\\./);
+			expect(text).not.toMatch(/hidden\.|Stop\.|No\.|End\.|Done\./);
+
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				"Fence LF\n```text\n```not-close\nxx\nhidden.\nStop.\nNo.\nEnd.",
+			),
+		);
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) =>
+					telegramVisibleText(text).includes("Fence LF"),
+				),
+			).toBe(true),
+		);
+		const midRunFence = bot.sent.find(({ text }) =>
+			telegramVisibleText(text).includes("Fence LF"),
+		);
+		expect(midRunFence).toBeDefined();
+		expect(telegramVisibleText(midRunFence?.text ?? "")).toContain(
+			"xx\nhidden.\nStop.\nNo.\nEnd.",
+		);
+
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				"Fence CRLF\r\n~~~text\r\n~~~not-close\r\nxx\r\nhidden.\r\nStop.\r\nNo.\r\nDone.",
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) =>
+					telegramVisibleText(text).includes("Fence CRLF"),
+				),
+			).toBe(true),
+		);
+		const settledFence = bot.sent.find(({ text }) =>
+			telegramVisibleText(text).includes("Fence CRLF"),
+		);
+		expect(settledFence).toBeDefined();
+		expect(telegramVisibleText(settledFence?.text ?? "")).toContain(
+			"xx\nhidden.\nStop.\nNo.\nDone.",
+		);
+		await adapter.stop();
+	});
+
+	it("keeps settlement notices independent for garbage-only output", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		const internals = adapter as unknown as {
+			turnBuffers: Map<
+				SessionId,
+				{
+					chunks: string[];
+					characters: number;
+					overflow: boolean;
+					recipients: Set<number>;
+				}
+			>;
+			flushTurn(sessionId: SessionId, interrupted?: boolean): void;
+		};
+		const cases = [
+			{ interrupted: false, overflow: false, expected: [] },
+			{ interrupted: true, overflow: false, expected: ["interrupted"] },
+			{ interrupted: false, overflow: true, expected: ["overflow"] },
+			{
+				interrupted: true,
+				overflow: true,
+				expected: ["interrupted", "overflow"],
+			},
+		];
+		for (const [index, scenario] of cases.entries()) {
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await vi.waitFor(() =>
+				expect(internals.turnBuffers.has("sid" as SessionId)).toBe(true),
+			);
+			const buffer = internals.turnBuffers.get("sid" as SessionId);
+			expect(buffer).toBeDefined();
+			const garbage = ["xx", "hidden.", "Stop.", "No.", "Done."].join("\n");
+			buffer?.chunks.splice(0, buffer.chunks.length, garbage);
+			if (buffer) {
+				buffer.characters = garbage.length;
+				buffer.overflow = scenario.overflow;
+			}
+			if (index === 3) {
+				buffer?.recipients.add(42);
+				await bot.update(42, "/use other");
+			}
+			const before = bot.sent.length;
+			internals.flushTurn("sid" as SessionId, scenario.interrupted);
+			if (scenario.expected.length === 0)
+				await new Promise((resolve) => setTimeout(resolve, 40));
+			else
+				await vi.waitFor(() =>
+					expect(
+						bot.sent
+							.slice(before)
+							.some(
+								({ text }) =>
+									text.includes("Response interrupted") ||
+									text.includes("response reached the queue limit"),
+							),
+					).toBe(true),
+				);
+			const delivery = bot.sent
+				.slice(before)
+				.map(({ text }) => text)
+				.join("\n");
+			expect(delivery.includes("Response interrupted")).toBe(
+				scenario.interrupted,
+			);
+			expect(delivery.includes("response reached the queue limit")).toBe(
+				scenario.overflow,
+			);
+			if (index === 3) {
+				expect(delivery).toContain("Фоновая сессия");
+				expect(delivery.indexOf("Response interrupted")).toBeLessThan(
+					delivery.indexOf("response reached the queue limit"),
+				);
+			}
+		}
 		await adapter.stop();
 	});
 
