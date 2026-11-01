@@ -132,6 +132,8 @@ const PANEL_RETRY_MAX_DELAY_MS = 10_000;
 const TURN_OVERFLOW_NOTICE =
 	"[Additional output omitted because the response reached the queue limit.]";
 const INPUT_CHARACTER_RESERVE = 4096;
+const MAX_MULTIMESSAGE_TURN_CHARACTERS =
+	MAX_QUEUED_CHARACTERS - INPUT_CHARACTER_RESERVE - TELEGRAM_LIMIT;
 const OUTPUT_COALESCE_MS = 40;
 const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_DOWNLOAD_BYTES = 20_000_000;
@@ -414,6 +416,7 @@ type ChatQueue = {
 };
 type TurnBuffer = {
 	readonly chunks: string[];
+	currentMessage: string;
 	readonly subagentStream: SubagentTextStream;
 	subagentStatus?: string;
 	readonly recipients: Set<number>;
@@ -8476,6 +8479,7 @@ export class TelegramTransportAdapter
 				this.startTyping(event.sessionId);
 				const turn: TurnBuffer = {
 					chunks: [],
+					currentMessage: "",
 					subagentStream: new SubagentTextStream(),
 					recipients: new Set(),
 					statusRecipients: new Set(),
@@ -8526,7 +8530,7 @@ export class TelegramTransportAdapter
 			}
 			if (event.text === "agent_end") return;
 			if (event.text === "message_end") {
-				this.flushTurnMessage(event.sessionId);
+				this.finishTurnMessage(event.sessionId);
 				return;
 			}
 			if (event.text === "agent_settled") {
@@ -9057,6 +9061,7 @@ export class TelegramTransportAdapter
 		if (!buffer) {
 			buffer = {
 				chunks: [],
+				currentMessage: "",
 				subagentStream: new SubagentTextStream(),
 				recipients: new Set(),
 				statusRecipients: new Set(),
@@ -9107,21 +9112,45 @@ export class TelegramTransportAdapter
 		}
 	}
 
+	private finishTurnMessage(sessionId: SessionId): void {
+		const buffer = this.turnBuffers.get(sessionId);
+		if (!buffer || buffer.settled || buffer.cancelled) return;
+		this.appendSubagentResult(
+			sessionId,
+			buffer,
+			buffer.subagentStream.consume("", true),
+		);
+		this.commitTurnMessage(buffer);
+	}
+
+	private commitTurnMessage(buffer: TurnBuffer): void {
+		if (!buffer.currentMessage) return;
+		buffer.chunks.push(buffer.currentMessage);
+		buffer.currentMessage = "";
+	}
+
 	private appendTurnVisible(buffer: TurnBuffer, text: string): void {
-		const remaining = MAX_QUEUED_CHARACTERS - buffer.characters;
-		if (remaining <= 0) {
-			buffer.overflow = true;
-			return;
-		}
-		let kept = text;
-		if (kept.length > remaining) {
-			kept = kept.slice(0, remaining);
-			if (/[\uD800-\uDBFF]/.test(kept.at(-1) ?? "")) kept = kept.slice(0, -1);
+		if (!text) return;
+		const previousLength = buffer.currentMessage.length;
+		let current = buffer.currentMessage + text;
+		if (current.length > MAX_QUEUED_CHARACTERS) {
+			current = current.slice(0, MAX_QUEUED_CHARACTERS);
+			if (/[\uD800-\uDBFF]$/.test(current)) current = current.slice(0, -1);
 			buffer.overflow = true;
 		}
-		if (kept) {
-			buffer.chunks.push(kept);
-			buffer.characters += kept.length;
+		buffer.currentMessage = current;
+		buffer.characters += current.length - previousLength;
+		if (!previousLength && current && buffer.chunks.length > 0)
+			buffer.characters += 2;
+		while (
+			buffer.chunks.length > 0 &&
+			buffer.characters > MAX_MULTIMESSAGE_TURN_CHARACTERS
+		) {
+			const removed = buffer.chunks.shift();
+			buffer.characters -= removed?.length ?? 0;
+			if (buffer.chunks.length > 0 || buffer.currentMessage)
+				buffer.characters -= 2;
+			buffer.overflow = true;
 		}
 	}
 
@@ -9139,12 +9168,13 @@ export class TelegramTransportAdapter
 			buffer,
 			buffer.subagentStream.consume("", true),
 		);
+		this.commitTurnMessage(buffer);
 		if (buffer.pendingInputs.size > 0) return;
 		if (this.turnBuffers.get(sessionId) === buffer)
 			this.turnBuffers.delete(sessionId);
 		if (buffer.cancelled || (buffer.characters === 0 && !buffer.overflow))
 			return;
-		let text = stripModelOutputGarbageTail(buffer.chunks.join(""));
+		let text = stripModelOutputGarbageTail(buffer.chunks.join("\n\n"));
 		if (buffer.interrupted)
 			text = text.trim()
 				? `${text}\n\n[Response interrupted before completion.]`
@@ -9155,45 +9185,6 @@ export class TelegramTransportAdapter
 				: TURN_OVERFLOW_NOTICE;
 		if (!text.trim()) return;
 		this.deliverTurnText(sessionId, buffer.recipients, text);
-	}
-
-	/** Delivers the assistant message that just ended while its run continues. */
-	private flushTurnMessage(sessionId: SessionId): void {
-		const buffer = this.turnBuffers.get(sessionId);
-		if (!buffer || buffer.settled || buffer.cancelled) return;
-		this.appendSubagentResult(
-			sessionId,
-			buffer,
-			buffer.subagentStream.consume("", true),
-		);
-		let text = stripModelOutputGarbageTail(buffer.chunks.join(""));
-		const overflow = buffer.overflow;
-		buffer.chunks.splice(0);
-		buffer.characters = 0;
-		buffer.overflow = false;
-		if (!text.trim()) {
-			if (!overflow) return;
-			text = TURN_OVERFLOW_NOTICE;
-		} else if (overflow) text += `\n\n${TURN_OVERFLOW_NOTICE}`;
-		const attributed = new Set(buffer.recipients);
-		for (const record of this.inputAttributions.values())
-			if (
-				record.turn === buffer &&
-				!record.terminal &&
-				record.chatId !== undefined &&
-				(record.state === "accepted" || record.state === "uncertain")
-			)
-				attributed.add(record.chatId);
-		// Mid-run answers arrive silently; the settled answer keeps the notification sound.
-		const recipients = this.deliverTurnText(sessionId, attributed, text, true);
-		// Keep the live card below the answer in the chats that received it.
-		for (const activity of this.activitiesForSession(sessionId))
-			if (
-				recipients.has(activity.chatId) &&
-				activity.messageId !== undefined &&
-				!activity.finishing
-			)
-				this.freezeLiveActivity(activity);
 	}
 
 	private deliverTurnText(
