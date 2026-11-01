@@ -13,6 +13,7 @@ Add a typed public `LlmSessiondClient` for local `llm-sessiond` API v1 use.
 - Restrict base URLs to loopback HTTP; use global Node fetch and a stable `ws` client with injectable factories.
 - Represent API, protocol/schema/status, transport, and timeout failures distinctly and safely.
 - Preserve exact input IDs and never retry or replay operations.
+- Operator-approved scope expansion: update Zod from `^4.1.12` to `^4.6.7` to close the known high-severity production advisory and keep the production dependency audit at zero vulnerabilities.
 
 ## Non-goals
 
@@ -30,4 +31,4 @@ Public exports are scoped to `src/llm-sessiond/index.ts`. WebSocket events remai
 
 ## Acceptance and validation
 
-Cover all methods/routes/statuses and request bodies with deterministic local HTTP/WS fixtures; test strict malformed/unknown response rejection, API status/code mapping, filtered event envelopes/close behavior, and no retries. Run focused and full project gates, audit, diff check, and <=100-line checks for new authored source/test/docs. Bump to 0.4.0 with dated changelog and lockstep dependency updates.
+Cover all methods/routes/statuses and request bodies with deterministic local HTTP/WS fixtures; test strict malformed/unknown response rejection, API status/code mapping, filtered event envelopes/close behavior, and no retries. Run focused and full project gates, audit, diff check, and <=100-line checks for new authored source/test/docs. Bump to 0.4.0 with dated changelog and lockstep dependency updates. Verify `npm audit --omit=dev --audit-level=high` reports zero vulnerabilities with Zod `^4.6.7`.
