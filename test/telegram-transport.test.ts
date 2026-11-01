@@ -1575,6 +1575,44 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("cleans assistant garbage tails at message_end and settled delivery", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				"Русский ответ\n\nxx\nhidden.\nStop.\nNo.\nEnd.",
+			),
+		);
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("Русский ответ"))).toBe(
+				true,
+			),
+		);
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				"Обычный финальный ответ\n\nxx\nhidden.\nStop.\nNo.\nDone.",
+			),
+		);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("Обычный финальный ответ")),
+			).toBe(true),
+		);
+		const answers = bot.sent.filter(({ text }) => text.includes("ответ"));
+		expect(answers).toHaveLength(2);
+		for (const { text } of answers)
+			expect(text).not.toMatch(/hidden\\.|Stop\\.|No\\.|End\\.|Done\\./);
+		await adapter.stop();
+	});
+
 	it("delivers buffered output as interrupted when the session is stopped mid-run", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
