@@ -4,6 +4,18 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-02
+
+### Changed
+
+- Authorized Telegram cancellation is handled independently of ordinary updates, so a blocked reply or file transfer does not prevent later cancellation from reaching the runtime. Ordinary updates remain ordered in a bounded FIFO of 100 admitted updates including active work; overflow is refused without submission and feedback is coalesced. Cancellation and acknowledgement work are independently bounded.
+- Run-card progress and terminal edits share a newest-intent, single-flight scheduler with 500 ms spacing. Transient edit failures receive at most two retries; valid Telegram 429 cooldowns are honored in full, including responses arriving after a local deadline. Underlying calls retain ownership until settlement.
+- Exhausted cards receive best-effort, bounded deletion attempts, with a later attempt only when another card closes. There is no background cleanup timer, and failed cleanup may leave an old card visible. Final answers and newer-card closure do not wait for cleanup.
+
+### Added
+
+- Bounded, coalesced cancellation-phase diagnostics distinguish authorized observation/admission, runtime dispatch and outcome, and acknowledgement outcome using safe fixed fields and opaque references. Diagnostic failures cannot change cancellation behavior.
+
 ## [0.4.1] - 2026-11-01
 
 ### Fixed
