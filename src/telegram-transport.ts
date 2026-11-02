@@ -4,6 +4,7 @@ import { open, readFile, realpath, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Bot, InputFile } from "grammy";
+import type { Update } from "grammy/types";
 import {
 	getTelegramCommands,
 	getTelegramHelpLines,
@@ -72,6 +73,19 @@ import {
 	stopNoticeText,
 } from "./telegram-anomaly-notice.js";
 import {
+	type CancelAckChannel,
+	type CancelTrace,
+	cancelResultOutcome,
+	TelegramCancelDiagnostics,
+} from "./telegram-cancel-diagnostics.js";
+import {
+	type CardCallResult,
+	cardRetryAfterMs,
+	TelegramCardCleanup,
+	TelegramCardDiagnostics,
+	TelegramCardScheduler,
+} from "./telegram-card-delivery.js";
+import {
 	extensionCommands,
 	isNativeTelegramCommand,
 	paginateTelegramHelp,
@@ -113,6 +127,7 @@ import {
 	runCardStateIcon,
 } from "./telegram-run-card.js";
 import { SubagentTextStream } from "./telegram-subagent-stream.js";
+import { TelegramUpdateIngress } from "./telegram-update-ingress.js";
 
 const TELEGRAM_LIMIT = 4096;
 const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
@@ -179,6 +194,7 @@ const NAME_PROMPT_COPY_VARIANTS = [
 const MAX_CORRELATED_MESSAGES_PER_CHAT = 128;
 const MAX_INPUT_ATTRIBUTIONS = 512;
 type UpdateContext = {
+	cancelTrace?: CancelTrace;
 	from?: { id: number };
 	chat?: { id: number; type: string };
 	message?: {
@@ -214,10 +230,16 @@ type UpdateContext = {
 		message?: { message_id: number };
 	};
 };
+type AuthorizedUpdateContext = UpdateContext & {
+	from: { id: number };
+	chat: { id: number; type: string };
+};
 type TelegramPhotoSize = NonNullable<
 	NonNullable<UpdateContext["message"]>["photo"]
 >[number];
 type TelegramBot = {
+	/** grammY's public update entry point, also used by its polling batch loop. */
+	handleUpdate?(update: Update): Promise<void>;
 	api: {
 		sendMessage(
 			chatId: number,
@@ -504,7 +526,10 @@ type LiveActivity = {
 	unavailable: boolean;
 	liveStatus?: HarnessSessionStatus["live"];
 	renderQueue: Promise<void>;
-	runCardRetryTimer?: ReturnType<typeof setTimeout>;
+	cardScheduler?: TelegramCardScheduler;
+	cardExhausted?: boolean;
+	lastCardEditGeneration?: number;
+	lastCardEditMessageId?: number;
 	runCardRetryAfterMs?: number;
 	pendingRunCardLifecycle?: "freeze" | "collapse";
 	pendingRunCardLifecycleGeneration?: number;
@@ -1564,6 +1589,30 @@ export class TelegramTransportAdapter
 	private resolvePollingFinished!: () => void;
 	private ready = false;
 	private stopping = false;
+	private readonly cardDiagnostics = new TelegramCardDiagnostics();
+	private readonly cancelDiagnostics = new TelegramCancelDiagnostics();
+	private readonly cardCleanup = new TelegramCardCleanup(
+		(chatId, messageId, signal) =>
+			this.bot.api.deleteMessage(chatId, messageId, signal),
+		(error) => this.cardFailurePolicy(error),
+		(error) =>
+			isMessageNotFound(error) ||
+			(apiErrorDescription(error)
+				?.toLowerCase()
+				.includes("message to delete not found") ??
+				false),
+		(kind) => this.cardDiagnostics.report(kind),
+	);
+	private readonly ingress = new TelegramUpdateIngress(() => {
+		// Detached work must not leak exception/update contents or leave a broken poller alive.
+		console.error("harnessd: Telegram ingress handler failed");
+		if (this.stopping) return;
+		try {
+			this.options.onFatal?.();
+		} finally {
+			void this.stop().catch(() => {});
+		}
+	});
 
 	constructor(private readonly options: TelegramTransportOptions) {
 		this.authorized = new Set(options.allowedUserIds);
@@ -1607,6 +1656,7 @@ export class TelegramTransportAdapter
 			if (this.options.signal?.aborted)
 				throw new Error("Telegram startup aborted");
 			this.unsubscribe = subscribe((event) => this.onEvent(event));
+			this.installUpdateIngress();
 			this.bot.use(async (ctx, next) => {
 				if (this.isAuthorized(ctx)) await next();
 			});
@@ -1828,6 +1878,8 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		const ingressDrained = this.ingress.close();
+		this.cardCleanup.stop();
 		this.shutdownController.abort();
 		for (const requestId of this.permissionRequests.keys())
 			this.finishPermissionRequest(requestId, {
@@ -1899,8 +1951,7 @@ export class TelegramTransportAdapter
 		for (const activity of this.liveActivities.values()) {
 			if (activity.statsTimer) clearInterval(activity.statsTimer);
 			if (activity.finishTimer) clearTimeout(activity.finishTimer);
-			if (activity.runCardRetryTimer) clearTimeout(activity.runCardRetryTimer);
-			activity.runCardRetryTimer = undefined;
+			activity.cardScheduler?.stop();
 		}
 		this.liveActivities.clear();
 		this.turnBuffers.clear();
@@ -1923,6 +1974,7 @@ export class TelegramTransportAdapter
 				STOP_TIMEOUT_MS,
 			);
 			await withDeadline(this.bot.stop(), STOP_TIMEOUT_MS);
+			await withDeadline(ingressDrained, STOP_TIMEOUT_MS);
 			if (this.pollingPromise) {
 				await withDeadline(this.pollingPromise, STOP_TIMEOUT_MS);
 				await withDeadline(this.pollingFinished, STOP_TIMEOUT_MS);
@@ -2186,7 +2238,7 @@ export class TelegramTransportAdapter
 		return task;
 	}
 
-	private isAuthorized(ctx: UpdateContext): boolean {
+	private isAuthorized(ctx: UpdateContext): ctx is AuthorizedUpdateContext {
 		if (
 			ctx.from === undefined ||
 			!Number.isSafeInteger(ctx.from.id) ||
@@ -2199,6 +2251,189 @@ export class TelegramTransportAdapter
 		return true;
 	}
 
+	/** grammY polling calls this public entry point once per update, including within a batch. */
+	private installUpdateIngress(): void {
+		const handleUpdate = this.bot.handleUpdate?.bind(this.bot);
+		if (!handleUpdate) return;
+		this.bot.handleUpdate = async (update) => {
+			if (this.stopping) return;
+			const message = update.message;
+			const callback = update.callback_query;
+			const ctx: UpdateContext = {
+				from: message?.from ?? callback?.from,
+				chat: message?.chat ?? callback?.message?.chat,
+				message,
+				callbackQuery: callback,
+			};
+			if (!this.isAuthorized(ctx)) return;
+			const chatId = ctx.chat.id;
+			const cancel = this.isCancellationUpdate(ctx);
+			const trace = cancel
+				? this.cancelDiagnostics.begin(
+						this.cancelSource(ctx),
+						"adapter_ingress",
+					)
+				: undefined;
+			ctx.cancelTrace = trace;
+			const current = cancel
+				? this.captureCancellationCurrency(ctx)
+				: undefined;
+			const admitted = this.ingress.admit(
+				cancel,
+				async () => {
+					if (!cancel) return handleUpdate(update);
+					// A naming flow may have changed while waiting in the cancel lane.
+					if (!this.isCancellationUpdate(ctx)) {
+						this.cancelDiagnostics.result(trace, "refused");
+						this.cancelDiagnostics.ack(trace, "operation", "dropped");
+						return;
+					}
+					if (!current?.()) {
+						await this.cancelReply(
+							chatId,
+							"Сессия или ход изменились; отмена не выполнялась.",
+							trace,
+						);
+						if (ctx.callbackQuery)
+							this.answerCancellationCallback(ctx.callbackQuery.id, trace);
+						return;
+					}
+					if (ctx.callbackQuery)
+						return this.onCallback(ctx as CallbackQueryContext);
+					await this.onText(ctx);
+				},
+				() =>
+					this.sendDirect(
+						chatId,
+						cancel
+							? "Бот занят: отмена не выполнялась. Повторите позже."
+							: "Бот занят: это действие не выполнено. Повторите позже; /cancel остаётся доступен.",
+					),
+			);
+			if (trace) {
+				this.cancelDiagnostics.admission(
+					trace,
+					admitted ? "admitted" : "refused",
+				);
+				if (!admitted) {
+					this.cancelDiagnostics.result(trace, "refused");
+					this.cancelDiagnostics.ack(trace, "operation", "dropped");
+				}
+			}
+		};
+	}
+
+	private cancelSource(ctx: UpdateContext): "slash" | "card" | "keyboard" {
+		return ctx.callbackQuery?.data?.startsWith("card:")
+			? "card"
+			: ctx.callbackQuery
+				? "keyboard"
+				: "slash";
+	}
+
+	private ensureCancellationTrace(ctx: UpdateContext): CancelTrace | undefined {
+		if (ctx.cancelTrace) return ctx.cancelTrace;
+		if (!this.isCancellationUpdate(ctx) || !this.isAuthorized(ctx)) return;
+		const trace = this.cancelDiagnostics.begin(
+			this.cancelSource(ctx),
+			"handler",
+		);
+		ctx.cancelTrace = trace;
+		this.cancelDiagnostics.admission(trace, "handler");
+		return trace;
+	}
+
+	private presentCancellationFeedback(
+		trace: CancelTrace | undefined,
+		channel: CancelAckChannel,
+		work: () => Promise<boolean>,
+	): void {
+		this.ingress.present(
+			async () => {
+				try {
+					const confirmed = await work();
+					this.cancelDiagnostics.ack(
+						trace,
+						channel,
+						confirmed ? "confirmed" : "unconfirmed",
+					);
+				} catch (error) {
+					this.cancelDiagnostics.ack(trace, channel, "unconfirmed");
+					throw error;
+				}
+			},
+			() => this.cancelDiagnostics.ack(trace, channel, "dropped"),
+		);
+	}
+
+	private captureCancellationCurrency(
+		ctx: AuthorizedUpdateContext,
+	): () => boolean {
+		const data = ctx.callbackQuery?.data;
+		if (data?.startsWith("card:stop:")) {
+			const token = data.slice(10);
+			const activity = this.cardTokens.get(token);
+			if (!activity) return () => true; // The handler still refuses unknown tokens.
+			const turn = this.turnBuffers.get(activity.sessionId);
+			return () =>
+				this.cardTokens.get(token) === activity &&
+				this.turnBuffers.get(activity.sessionId) === turn;
+		}
+		const chatId = ctx.chat.id;
+		const sessionId = this.selected.get(chatId);
+		const currency = this.selectionCurrency.get(chatId) ?? 0;
+		return () =>
+			this.selected.get(chatId) === sessionId &&
+			(this.selectionCurrency.get(chatId) ?? 0) === currency;
+	}
+
+	private answerCancellationCallback(id: string, trace?: CancelTrace): void {
+		this.presentCancellationFeedback(trace, "callback", async () => {
+			const result = await this.telegramCall((signal) =>
+				this.bot.api.answerCallbackQuery(id, {}, signal),
+			);
+			return result.ok && result.value !== false;
+		});
+	}
+
+	private isCancellationUpdate(ctx: UpdateContext): boolean {
+		const data = ctx.callbackQuery?.data;
+		if (data !== undefined)
+			return (
+				data.length <= 64 && /^(?:card:stop|run-cancel:yes):[^:]+$/.test(data)
+			);
+		if (!/^\/cancel(?:@[^\s]+)?(?:\s+\S+)?\s*$/i.test(ctx.message?.text ?? ""))
+			return false;
+		const reply = ctx.message?.reply_to_message;
+		const replyId = reply?.message_id;
+		if (replyId === undefined) return true;
+		const chatId = ctx.chat?.id;
+		if (chatId === undefined) return false;
+		if (this.pendingNames.get(chatId)?.promptMessageId === replyId)
+			return false;
+		return (
+			this.replyRoutes.get(chatId)?.has(replyId) === true ||
+			(!this.isStaleNamePrompt(chatId, replyId) &&
+				!this.isNamePromptEnvelope(reply?.text))
+		);
+	}
+
+	private cancelReply(
+		chatId: number,
+		text: string,
+		trace?: CancelTrace,
+	): Promise<void> {
+		this.cancelDiagnostics.result(trace, "refused");
+		this.presentCancellationFeedback(trace, "reply", async () => {
+			let confirmed = false;
+			await this.sendDirect(chatId, text, (delivered) => {
+				confirmed = delivered;
+			});
+			return confirmed;
+		});
+		return Promise.resolve();
+	}
+
 	private async onText(
 		ctx: UpdateContext,
 		routedSessionId?: SessionId,
@@ -2209,6 +2444,7 @@ export class TelegramTransportAdapter
 		const text = ctx.message?.text;
 		if (chatId === undefined || sender === undefined || text === undefined)
 			return;
+		const cancelTrace = this.ensureCancellationTrace(ctx);
 		let activity: LiveActivity | undefined;
 		let submissionPending = false;
 		try {
@@ -2255,7 +2491,13 @@ export class TelegramTransportAdapter
 					"Запрос имени устарел. Начните действие заново.",
 				);
 			if (text.startsWith("/")) {
-				await this.command(chatId, sender, text, ctx.message?.message_id);
+				await this.command(
+					chatId,
+					sender,
+					text,
+					ctx.message?.message_id,
+					cancelTrace,
+				);
 			} else {
 				if (this.eventChannelDisabled(chatId))
 					return this.sendDirect(
@@ -2326,6 +2568,7 @@ export class TelegramTransportAdapter
 				submissionPending = false;
 				this.finishActivitySubmission(activity);
 			}
+			this.cancelDiagnostics.result(cancelTrace, "error");
 			const reference = this.reportError(
 				"Telegram update handler failed",
 				error,
@@ -2338,10 +2581,24 @@ export class TelegramTransportAdapter
 					notice: `Request failed (ref ${reference})`,
 				});
 			}
-			await this.sendDiagnostic(
-				chatId,
-				`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}`,
-			);
+			let ackConfirmed = false;
+			try {
+				await this.sendDiagnostic(
+					chatId,
+					`Request failed (ref ${reference}). Details are recorded in the harnessd journal.\n\n${describeError(error, [this.options.token, text])}`,
+					cancelTrace
+						? (confirmed) => {
+								ackConfirmed = confirmed;
+							}
+						: undefined,
+				);
+			} finally {
+				this.cancelDiagnostics.ack(
+					cancelTrace,
+					"reply",
+					ackConfirmed ? "confirmed" : "unconfirmed",
+				);
+			}
 		}
 	}
 
@@ -3152,6 +3409,7 @@ export class TelegramTransportAdapter
 		sender: number,
 		raw: string,
 		messageId?: number,
+		cancelTrace?: CancelTrace,
 	): Promise<void> {
 		this.invalidatePanelIntent(chatId);
 		raw = raw.replace(/^\/(\S+)/, (token) => token.toLowerCase());
@@ -3931,7 +4189,11 @@ export class TelegramTransportAdapter
 		if (name === "/cancel" && args.length <= 1) {
 			const sessionId = this.selected.get(chatId);
 			if (!sessionId)
-				return this.sendDirect(chatId, NO_SESSION_SELECTED_MESSAGE);
+				return this.cancelReply(
+					chatId,
+					NO_SESSION_SELECTED_MESSAGE,
+					cancelTrace,
+				);
 			const selectionCurrency = this.selectionCurrency.get(chatId) ?? 0;
 			let supportsCancel = false;
 			try {
@@ -3943,23 +4205,27 @@ export class TelegramTransportAdapter
 				supportsCancel = false;
 			}
 			if (
+				this.stopping ||
 				this.selected.get(chatId) !== sessionId ||
 				(this.selectionCurrency.get(chatId) ?? 0) !== selectionCurrency
 			)
-				return this.sendDirect(
+				return this.cancelReply(
 					chatId,
 					"Выбор сессии изменился; отмена не выполнялась.",
+					cancelTrace,
 				);
 			if (!supportsCancel)
-				return this.sendDirect(
+				return this.cancelReply(
 					chatId,
 					"Отмена ввода для выбранной сессии не поддерживается.",
+					cancelTrace,
 				);
 			return this.cancelRunInputs(
 				chatId,
 				sender,
 				sessionId,
 				args[0] as InputId | undefined,
+				cancelTrace,
 			);
 		}
 		const extensionName = commandToken.split("@")[0]?.toLowerCase() ?? "";
@@ -4755,6 +5021,15 @@ export class TelegramTransportAdapter
 		sender: number,
 		request: TelegramRequest,
 	): Promise<TransportResult> {
+		if (this.stopping)
+			return Promise.resolve({
+				requestId: randomUUID(),
+				ok: false,
+				error: {
+					code: "TRANSPORT_STOPPING",
+					message: "Transport is stopping.",
+				},
+			});
 		if (!this.dispatch) throw new Error("Transport is not started");
 		return this.dispatch({
 			...request,
@@ -5417,7 +5692,25 @@ export class TelegramTransportAdapter
 			messageId === undefined
 		)
 			return;
+		const cancelTrace = this.ensureCancellationTrace(ctx);
 		if (this.retiredPanelIds.get(chatId)?.has(messageId)) {
+			if (this.isCancellationUpdate(ctx)) {
+				this.cancelDiagnostics.result(cancelTrace, "refused");
+				this.presentCancellationFeedback(cancelTrace, "callback", async () => {
+					const answered = await this.telegramCall((signal) =>
+						this.bot.api.answerCallbackQuery(
+							callback.id,
+							{
+								text: "Эта панель устарела. Нажмите «📋 Панель» для актуальной.",
+							},
+							signal,
+						),
+					);
+					await this.refreshExistingPanel(chatId, sender);
+					return answered.ok && answered.value !== false;
+				});
+				return;
+			}
 			// A tap on a replaced panel never re-adopts it (that would spawn yet another panel).
 			await this.telegramCall((signal) =>
 				this.bot.api.answerCallbackQuery(
@@ -5429,6 +5722,34 @@ export class TelegramTransportAdapter
 			return this.refreshExistingPanel(chatId, sender);
 		}
 		this.invalidatePanelIntent(chatId);
+		const cancelData = callback.data;
+		if (cancelData && this.isCancellationUpdate(ctx)) {
+			try {
+				if (cancelData.startsWith("card:"))
+					await this.dispatchCardAction(
+						chatId,
+						sender,
+						cancelData,
+						messageId,
+						cancelTrace,
+					);
+				else
+					await this.dispatchCancelConfirmation(
+						chatId,
+						sender,
+						cancelData,
+						messageId,
+						cancelTrace,
+					);
+			} catch (error) {
+				this.cancelDiagnostics.result(cancelTrace, "error");
+				throw error;
+			} finally {
+				this.cancelDiagnostics.result(cancelTrace, "refused");
+				this.answerCancellationCallback(callback.id, cancelTrace);
+			}
+			return;
+		}
 		await this.telegramCall((signal) =>
 			this.bot.api.answerCallbackQuery(callback.id, {}, signal),
 		);
@@ -5725,6 +6046,7 @@ export class TelegramTransportAdapter
 		sender: number,
 		sessionId: SessionId,
 		inputId: InputId | undefined,
+		trace?: CancelTrace,
 	): Promise<void> {
 		const activeInput = inputId
 			? this.inputAttributions.get(inputId)
@@ -5752,12 +6074,16 @@ export class TelegramTransportAdapter
 		}
 		let result: TransportResult;
 		try {
+			this.cancelDiagnostics.dispatch(trace);
 			result = await this.request(
 				sender,
 				inputId
 					? { kind: "cancel", sessionId, inputId }
 					: { kind: "cancel_current", sessionId },
 			);
+		} catch (error) {
+			this.cancelDiagnostics.result(trace, "error");
+			throw error;
 		} finally {
 			if (trackedInput) {
 				const pendingCancels =
@@ -5778,11 +6104,16 @@ export class TelegramTransportAdapter
 				}
 			}
 		}
-		return this.sendDirect(
+		this.cancelDiagnostics.result(
+			trace,
+			result.ok ? "confirmed" : cancelResultOutcome(result.error.code),
+		);
+		return this.cancelReply(
 			chatId,
 			result.ok
 				? `Запрошена отмена ввода для ${sessionId}.`
 				: result.error.message,
+			trace,
 		);
 	}
 
@@ -5791,6 +6122,7 @@ export class TelegramTransportAdapter
 		sender: number,
 		data: string,
 		messageId: number,
+		trace?: CancelTrace,
 	): Promise<void> {
 		const [, action, token] = data.split(":");
 		const activity = token ? this.cardTokens.get(token) : undefined;
@@ -5802,6 +6134,7 @@ export class TelegramTransportAdapter
 		)
 			return;
 		if (action === "stop") {
+			const turn = this.turnBuffers.get(activity.sessionId);
 			let supportsCancel = false;
 			try {
 				supportsCancel =
@@ -5811,6 +6144,12 @@ export class TelegramTransportAdapter
 			} catch {
 				supportsCancel = false;
 			}
+			if (
+				this.stopping ||
+				!this.cardActionable(activity) ||
+				this.turnBuffers.get(activity.sessionId) !== turn
+			)
+				return;
 			if (!supportsCancel)
 				return this.updateLiveActivity(activity, {
 					notice: "Прерывание этой сессии не поддерживается.",
@@ -5820,6 +6159,7 @@ export class TelegramTransportAdapter
 				sender,
 				activity.sessionId,
 				undefined,
+				trace,
 			);
 		}
 		if (action !== "report") return;
@@ -5843,78 +6183,13 @@ export class TelegramTransportAdapter
 		});
 	}
 
-	/** Freezes the live card in place (no buttons) so the next render opens a new one below. */
+	/** Lifecycle intent shares the same bounded, raw-owned edit lane as progress. */
+	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: Preserve the existing freeze lifecycle entry point, exercised by regression tests.
 	private freezeLiveActivity(activity: LiveActivity): void {
-		if (activity.freezePending) return;
+		if (activity.freezePending || activity.finishing) return;
 		activity.freezePending = true;
-		activity.renderQueue = activity.renderQueue
-			.then(async () => {
-				const delivered = await this.waitForEventQueue(activity.chatId);
-				const messageId = activity.messageId;
-				if (
-					!delivered ||
-					this.stopping ||
-					activity.unavailable ||
-					activity.finishing ||
-					messageId === undefined ||
-					activity.lastText === undefined ||
-					this.liveActivities.get(
-						activityKey(activity.chatId, activity.sessionId),
-					) !== activity
-				)
-					return;
-				if (
-					activity.runCardRetryAfterMs !== undefined &&
-					Date.now() < activity.runCardRetryAfterMs
-				) {
-					activity.pendingRunCardLifecycle = "freeze";
-					this.scheduleRunCardRetry(activity);
-					return;
-				}
-				activity.pendingRunCardLifecycle = undefined;
-				const text = this.liveActivityText(activity);
-				const frozen = await this.telegramCall((signal) =>
-					this.bot.api.editMessageText(
-						activity.chatId,
-						messageId,
-						text,
-						{ reply_markup: { inline_keyboard: [] } },
-						signal,
-					),
-				);
-				const gone = !frozen.ok && isMessageNotFound(frozen.error);
-				if (!frozen.ok && telegramErrorCode(frozen.error) === 429) {
-					const retryAfter = telegramRetryAfterMs(frozen.error);
-					if (retryAfter !== undefined && retryAfter > 0) {
-						activity.pendingRunCardLifecycle = "freeze";
-						activity.runCardRetryAfterMs = Date.now() + retryAfter;
-						this.scheduleRunCardRetry(activity);
-					}
-					this.reportError(
-						"Telegram run card freeze was deferred",
-						frozen.error,
-					);
-					return;
-				}
-				if (!frozen.ok && !gone && !isMessageNotModified(frozen.error)) {
-					// Keep the card where it is rather than stacking a second live card.
-					this.reportError(
-						"Telegram run card could not be frozen",
-						frozen.error,
-					);
-					return;
-				}
-				if (!gone) activity.frozenMessageIds.push(messageId);
-				activity.messageId = undefined;
-				activity.lastText = undefined;
-				activity.lastButtons = undefined;
-			})
-			.catch((error) => {
-				this.reportError("Telegram run card could not be frozen", error);
-			})
-			.finally(() => {
-				activity.freezePending = false;
-			});
+		activity.pendingRunCardLifecycle = "freeze";
+		activity.pendingRunCardLifecycleGeneration = activity.turnGeneration;
 		this.renderLiveActivity(activity);
 	}
 
@@ -6135,13 +6410,17 @@ export class TelegramTransportAdapter
 		sender: number,
 		data: string,
 		messageId: number,
+		trace?: CancelTrace,
 	): Promise<void> {
 		const [, answer, token] = data.split(":");
 		const intent = token ? this.cancelIntents.get(token) : undefined;
 		const edit = async (text: string) => {
-			await this.telegramCall((signal) =>
-				this.bot.api.editMessageText(chatId, messageId, text, {}, signal),
-			);
+			this.presentCancellationFeedback(trace, "confirmation", async () => {
+				const result = await this.telegramCall((signal) =>
+					this.bot.api.editMessageText(chatId, messageId, text, {}, signal),
+				);
+				return result.ok && result.value !== false;
+			});
 		};
 		if (!intent) return edit("Подтверждение устарело; ход не прерывался.");
 		if (
@@ -6160,7 +6439,13 @@ export class TelegramTransportAdapter
 		if (this.selected.get(chatId) !== intent.sessionId)
 			return edit("Выбор сессии изменился; ход не прерывался.");
 		// Start the cancel before any await so the checked selection is the one cancelled.
-		const cancelling = this.command(chatId, sender, "/cancel");
+		const cancelling = this.command(
+			chatId,
+			sender,
+			"/cancel",
+			undefined,
+			trace,
+		);
 		await edit("Прерывание запрошено.");
 		await cancelling;
 	}
@@ -6177,7 +6462,11 @@ export class TelegramTransportAdapter
 		);
 	}
 
-	private async sendDirect(chatId: number, text: string): Promise<void> {
+	private async sendDirect(
+		chatId: number,
+		text: string,
+		onDelivered?: (confirmed: boolean) => void,
+	): Promise<void> {
 		const errorPrefixes = [
 			"Invalid ",
 			"Unsupported ",
@@ -6205,9 +6494,13 @@ export class TelegramTransportAdapter
 			text.includes("\n\nError:") ||
 			errorPrefixes.some((prefix) => text.startsWith(prefix))
 		)
-			return this.sendDiagnostic(chatId, text);
-		for (const chunk of chunks(text || " "))
-			await this.sendWithDeadline(chatId, chunk);
+			return this.sendDiagnostic(chatId, text, onDelivered);
+		let confirmed = true;
+		for (const chunk of chunks(text || " ")) {
+			const delivered = await this.sendWithDeadline(chatId, chunk);
+			confirmed = delivered && confirmed;
+		}
+		onDelivered?.(confirmed);
 	}
 
 	private beginLiveActivity(
@@ -6218,15 +6511,24 @@ export class TelegramTransportAdapter
 		let activity = this.liveActivities.get(activityKey(chatId, sessionId));
 		if (activity && activity.sessionId === sessionId) {
 			const current = activity;
+			if (current.cardExhausted) {
+				current.cardScheduler = undefined;
+				current.cardExhausted = false;
+				current.unavailable = false;
+				current.messageId = undefined;
+				current.lastText = undefined;
+				current.lastButtons = undefined;
+			}
 			const startsIndependentTurn =
 				!this.runningSessions.has(sessionId) &&
 				current.pendingSubmissions === 0;
 			current.turnGeneration++;
 			current.pendingSubmissions++;
 			current.finishing = false;
-			if (current.pendingRunCardLifecycle === "collapse") {
+			if (current.pendingRunCardLifecycle !== undefined) {
 				current.pendingRunCardLifecycle = undefined;
 				current.pendingRunCardLifecycleGeneration = undefined;
+				current.freezePending = false;
 			}
 			if (current.finishTimer) clearTimeout(current.finishTimer);
 			current.finishTimer = undefined;
@@ -6246,13 +6548,7 @@ export class TelegramTransportAdapter
 				current.untrackedInputOverflow = false;
 				current.untrackedFailureOverflow = false;
 			}
-			if (!current.statsTimer) {
-				current.statsTimer = setInterval(
-					() => void this.refreshLiveActivityStats(current),
-					2500,
-				);
-				current.statsTimer.unref();
-			}
+			this.startLiveActivityStats(current);
 			current.status = current.submittedWhileRunning
 				? "В очереди Pi"
 				: "Отправляю в Pi";
@@ -6292,11 +6588,7 @@ export class TelegramTransportAdapter
 		this.cardTokens.set(activity.cardToken, activity);
 		this.liveActivities.set(activityKey(chatId, sessionId), activity);
 		this.renderLiveActivity(activity);
-		activity.statsTimer = setInterval(
-			() => void this.refreshLiveActivityStats(activity),
-			2500,
-		);
-		activity.statsTimer.unref();
+		this.startLiveActivityStats(activity);
 		return activity;
 	}
 
@@ -6449,154 +6741,271 @@ export class TelegramTransportAdapter
 		);
 	}
 
+	private cardFailurePolicy(error: unknown): {
+		transient: boolean;
+		retryAfterMs?: number;
+		confirmed?: boolean;
+	} {
+		if (isMessageNotModified(error))
+			return { transient: false, confirmed: true };
+		return {
+			transient: isTransientTelegramError(error),
+			...(telegramErrorCode(error) === 429
+				? { retryAfterMs: cardRetryAfterMs(error) }
+				: {}),
+		};
+	}
+
 	private renderLiveActivity(
 		activity: LiveActivity,
 		preserveUpdatedAtFor?: string,
 	): void {
-		activity.renderQueue = activity.renderQueue
-			.then(async () => {
-				if (
-					this.stopping ||
-					activity.unavailable ||
-					this.liveActivities.get(
-						activityKey(activity.chatId, activity.sessionId),
-					) !== activity
-				)
-					return;
-				if (activity.pendingRunCardLifecycle !== undefined) return;
-				if (
-					activity.runCardRetryAfterMs !== undefined &&
-					Date.now() < activity.runCardRetryAfterMs
-				) {
-					this.scheduleRunCardRetry(activity);
-					return;
-				}
-				const text = this.liveActivityText(activity, preserveUpdatedAtFor);
-				if (activity.messageId === undefined) {
-					const sent = await this.telegramCall((signal) =>
-						this.bot.api.sendMessage(
-							activity.chatId,
-							text,
-							{
-								...(this.cardActionable(activity)
-									? { reply_markup: this.runCardKeyboard(activity) }
-									: {}),
-								disable_notification: true,
-								...(activity.sourceMessageId === undefined ||
-								activity.frozenMessageIds.length > 0
-									? {}
-									: {
-											reply_parameters: {
-												message_id: activity.sourceMessageId,
-											},
-										}),
-							},
-							signal,
-						),
-					);
-					if (!sent.ok) {
-						activity.unavailable = true;
-						this.reportError(
-							"Telegram activity bubble could not be sent",
-							sent.error,
-						);
-						return;
-					}
-					activity.messageId = messageIdFrom(sent.value);
-					if (activity.messageId !== undefined)
-						this.rememberReplyRoute(
-							activity.chatId,
-							activity.messageId,
-							activity.sessionId,
-						);
-					activity.lastText = text;
-					activity.lastButtons = this.cardActionable(activity);
-					return;
-				}
-				const buttons = this.cardActionable(activity);
-				if (activity.lastText === text && activity.lastButtons === buttons)
-					return;
-				const edited = await this.telegramCall((signal) =>
-					this.bot.api.editMessageText(
-						activity.chatId,
-						activity.messageId as number,
-						text,
-						{ reply_markup: this.runCardKeyboard(activity) },
-						signal,
-					),
-				);
-				if (!edited.ok) {
-					if (isMessageNotFound(edited.error)) {
-						activity.messageId = undefined;
-						activity.lastText = undefined;
-						this.renderLiveActivity(activity);
-					} else if (
-						isTransientTelegramError(edited.error) &&
-						telegramErrorCode(edited.error) !== undefined
-					) {
-						const retryAfter =
-							telegramErrorCode(edited.error) === 429
-								? telegramRetryAfterMs(edited.error)
-								: undefined;
-						if (retryAfter !== undefined && retryAfter > 0) {
-							activity.runCardRetryAfterMs = Date.now() + retryAfter;
-							this.scheduleRunCardRetry(activity);
-						}
-						this.reportError(
-							"Telegram run card edit was deferred",
-							edited.error,
-						);
-					} else {
-						activity.unavailable = true;
-						this.reportError(
-							"Telegram activity bubble could not be updated",
-							edited.error,
-						);
-					}
-					return;
-				}
-				activity.lastText = text;
-				activity.lastButtons = buttons;
-			})
-			.catch((error) => {
-				this.reportError("Telegram activity update failed", error);
-			});
+		if (this.stopping || activity.unavailable) return;
+		// Preserve the existing semantic timestamp behavior without retaining per-event closures.
+		if (preserveUpdatedAtFor !== undefined)
+			this.liveActivityText(activity, preserveUpdatedAtFor);
+		activity.cardScheduler ??= new TelegramCardScheduler(
+			async () => {
+				activity.renderQueue =
+					activity.cardScheduler?.task ?? Promise.resolve();
+				await this.presentRunCard(activity);
+			},
+			(error) => this.cardFailurePolicy(error),
+			(notBefore) => this.exhaustRunCard(activity, notBefore),
+			(kind) => this.cardDiagnostics.report(kind),
+		);
+		activity.cardScheduler.schedule();
+		activity.renderQueue = activity.cardScheduler.task;
 	}
 
-	private scheduleRunCardRetry(activity: LiveActivity): void {
-		if (this.stopping || activity.runCardRetryTimer) return;
-		const retryAfter = activity.runCardRetryAfterMs;
-		if (retryAfter === undefined) return;
-		const remaining = retryAfter - Date.now();
-		if (remaining <= 0) {
-			activity.runCardRetryAfterMs = undefined;
+	private exhaustRunCard(activity: LiveActivity, notBefore: number): void {
+		const messageId = activity.lastCardEditMessageId;
+		const generation = activity.lastCardEditGeneration;
+		activity.cardScheduler?.stop();
+		activity.cardExhausted = true;
+		activity.unavailable = true;
+		this.stopLiveActivityStats(activity);
+		if (messageId !== undefined && generation !== undefined)
+			this.cardCleanup.exhausted(
+				activity.chatId,
+				messageId,
+				generation,
+				notBefore,
+			);
+		// A newer operator input already owns a new turn: its card is not the exhausted message.
+		if (
+			generation !== undefined &&
+			generation !== activity.turnGeneration &&
+			!this.stopping
+		) {
+			activity.cardScheduler = undefined;
+			activity.cardExhausted = false;
+			activity.unavailable = false;
+			activity.messageId = undefined;
+			activity.lastText = undefined;
+			activity.lastButtons = undefined;
+			this.startLiveActivityStats(activity);
+			this.renderLiveActivity(activity);
+		} else if (
+			activity.finishing &&
+			activity.pendingSubmissions === 0 &&
+			!this.hasUnsettledActivityInputs(activity)
+		) {
+			this.retireRunCard(activity);
+		}
+	}
+
+	private async editRunCard(
+		activity: LiveActivity,
+		text: string,
+		other: unknown,
+	): Promise<CardCallResult> {
+		const scheduler = activity.cardScheduler;
+		const messageId = activity.messageId;
+		if (!scheduler || messageId === undefined)
+			return { ok: false, error: new Error("card unavailable") };
+		activity.lastCardEditMessageId = messageId;
+		activity.lastCardEditGeneration = activity.turnGeneration;
+		const result = await scheduler.edit((signal) =>
+			this.bot.api.editMessageText(
+				activity.chatId,
+				messageId,
+				text,
+				other,
+				signal,
+			),
+		);
+		activity.runCardRetryAfterMs = scheduler.retryAt;
+		if (!result.ok) {
+			// An uncertain edit may have landed; never deduplicate its repair against old text.
+			activity.lastText = undefined;
+			activity.lastButtons = undefined;
+		}
+		return result;
+	}
+
+	private async presentRunCard(activity: LiveActivity): Promise<void> {
+		const key = activityKey(activity.chatId, activity.sessionId);
+		const current = () =>
+			!this.stopping &&
+			!activity.unavailable &&
+			this.liveActivities.get(key) === activity;
+		if (!current()) return;
+		const lifecycle = activity.pendingRunCardLifecycle;
+		const generation = activity.pendingRunCardLifecycleGeneration;
+		const ownsIntent = () =>
+			current() &&
+			activity.pendingRunCardLifecycle === lifecycle &&
+			activity.pendingRunCardLifecycleGeneration === generation &&
+			activity.turnGeneration === generation;
+		if (lifecycle === "collapse") {
+			if (
+				!ownsIntent() ||
+				!activity.finishing ||
+				activity.pendingSubmissions > 0 ||
+				this.hasUnsettledActivityInputs(activity)
+			)
+				return;
+			if (activity.messageId !== undefined) {
+				const elapsed =
+					activity.startedAtMs !== undefined
+						? ` за ${formatDuration(this.activityNowMs() - activity.startedAtMs)}`
+						: "";
+				const cost = activity.liveStatus?.usage?.costUsd;
+				const summary = [
+					`✅ Ход завершён${elapsed}`,
+					...(activity.actionCount ? [actionsLabel(activity.actionCount)] : []),
+					...(cost !== undefined ? [`~$${cost.toFixed(2)}`] : []),
+				].join(" · ");
+				const result = await this.editRunCard(activity, summary, {
+					reply_markup: { inline_keyboard: [] },
+				});
+				if (!ownsIntent()) {
+					activity.lastText = undefined;
+					this.renderLiveActivity(activity);
+					return;
+				}
+				if (!result.ok && !isMessageNotFound(result.error)) {
+					if (!this.cardFailurePolicy(result.error).transient)
+						this.retireRunCard(activity);
+					return;
+				}
+				activity.lastText = summary;
+			}
+			if (ownsIntent()) this.retireRunCard(activity);
+			return;
+		}
+		if (lifecycle === "freeze") {
+			const delivered = await this.waitForEventQueue(activity.chatId);
+			if (!delivered || !ownsIntent() || activity.finishing) return;
+			const messageId = activity.messageId;
+			if (messageId === undefined) return;
+			const text = this.liveActivityText(activity);
+			const result =
+				activity.lastText === text && activity.lastButtons === false
+					? { ok: true as const, value: undefined }
+					: await this.editRunCard(activity, text, {
+							reply_markup: { inline_keyboard: [] },
+						});
+			if (!ownsIntent()) return;
+			if (!result.ok && !isMessageNotFound(result.error)) {
+				if (!this.cardFailurePolicy(result.error).transient) {
+					activity.unavailable = true;
+					activity.pendingRunCardLifecycle = undefined;
+					activity.freezePending = false;
+					this.cardDiagnostics.report("edit_rejected");
+				}
+				return;
+			}
+			if (result.ok) activity.frozenMessageIds.push(messageId);
+			activity.messageId = undefined;
+			activity.lastText = undefined;
+			activity.lastButtons = undefined;
+			activity.freezePending = false;
+			activity.pendingRunCardLifecycle = undefined;
+			activity.pendingRunCardLifecycleGeneration = undefined;
 			this.renderLiveActivity(activity);
 			return;
 		}
-		activity.runCardRetryTimer = setTimeout(
-			() => {
-				activity.runCardRetryTimer = undefined;
-				if (this.stopping) return;
-				if (Date.now() < (activity.runCardRetryAfterMs ?? 0)) {
-					this.scheduleRunCardRetry(activity);
-					return;
-				}
-				activity.runCardRetryAfterMs = undefined;
-				const lifecycle = activity.pendingRunCardLifecycle;
-				if (lifecycle === "freeze") {
-					this.freezeLiveActivity(activity);
-				} else if (
-					lifecycle === "collapse" &&
-					activity.pendingRunCardLifecycleGeneration !== undefined
-				) {
-					void this.deleteLiveActivity(
-						activity,
-						activity.pendingRunCardLifecycleGeneration,
-					);
-				} else this.renderLiveActivity(activity);
-			},
-			Math.min(remaining, 2_147_000_000),
+		if (activity.finishing) return;
+		const text = this.liveActivityText(activity);
+		const buttons = this.cardActionable(activity);
+		if (activity.messageId === undefined) {
+			// Initial sends retain their existing deadline and no-retry uncertainty behavior.
+			const sent = await this.telegramCall((signal) =>
+				this.bot.api.sendMessage(
+					activity.chatId,
+					text,
+					{
+						...(buttons
+							? { reply_markup: this.runCardKeyboard(activity) }
+							: {}),
+						disable_notification: true,
+						...(activity.sourceMessageId === undefined ||
+						activity.frozenMessageIds.length > 0
+							? {}
+							: { reply_parameters: { message_id: activity.sourceMessageId } }),
+					},
+					signal,
+				),
+			);
+			if (!sent.ok) {
+				activity.unavailable = true;
+				this.reportError(
+					"Telegram activity bubble could not be sent",
+					sent.error,
+				);
+				return;
+			}
+			activity.messageId = messageIdFrom(sent.value);
+			if (activity.messageId !== undefined)
+				this.rememberReplyRoute(
+					activity.chatId,
+					activity.messageId,
+					activity.sessionId,
+				);
+			activity.lastText = text;
+			activity.lastButtons = buttons;
+			return;
+		}
+		if (activity.lastText === text && activity.lastButtons === buttons) return;
+		const result = await this.editRunCard(activity, text, {
+			reply_markup: this.runCardKeyboard(activity),
+		});
+		if (!current()) return;
+		if (!result.ok) {
+			if (isMessageNotFound(result.error)) {
+				activity.messageId = undefined;
+				this.renderLiveActivity(activity);
+			} else if (!this.cardFailurePolicy(result.error).transient) {
+				activity.unavailable = true;
+				this.cardDiagnostics.report("edit_rejected");
+			}
+			return;
+		}
+		activity.lastText = text;
+		activity.lastButtons = buttons;
+	}
+
+	private retireRunCard(activity: LiveActivity): void {
+		activity.pendingRunCardLifecycle = undefined;
+		activity.pendingRunCardLifecycleGeneration = undefined;
+		activity.cardScheduler?.stop();
+		this.stopLiveActivityStats(activity);
+		if (activity.finishTimer) clearTimeout(activity.finishTimer);
+		this.liveActivities.delete(
+			activityKey(activity.chatId, activity.sessionId),
 		);
+		this.cardTokens.delete(activity.cardToken);
+		if (!activity.cardExhausted) {
+			this.cardCleanup.onClosure();
+			for (const frozen of activity.frozenMessageIds.splice(0))
+				this.cardCleanup.exhausted(
+					activity.chatId,
+					frozen,
+					activity.turnGeneration,
+				);
+		} else activity.frozenMessageIds.length = 0;
 	}
 
 	private async refreshLiveActivityStats(
@@ -6729,6 +7138,15 @@ export class TelegramTransportAdapter
 		this.renderLiveActivity(activity);
 	}
 
+	private startLiveActivityStats(activity: LiveActivity): void {
+		if (this.stopping || activity.statsTimer) return;
+		activity.statsTimer = setInterval(
+			() => void this.refreshLiveActivityStats(activity),
+			2500,
+		);
+		activity.statsTimer.unref();
+	}
+
 	private stopLiveActivityStats(activity: LiveActivity): void {
 		if (activity.statsTimer) clearInterval(activity.statsTimer);
 		activity.statsTimer = undefined;
@@ -6809,7 +7227,6 @@ export class TelegramTransportAdapter
 			activity.thinking = false;
 			this.renderLiveActivity(activity);
 			const delivered = await this.waitForEventQueue(activity.chatId);
-			await activity.renderQueue;
 			if (
 				activity.turnGeneration !== generation ||
 				activity.pendingSubmissions > 0 ||
@@ -6829,113 +7246,21 @@ export class TelegramTransportAdapter
 		}
 	}
 
-	/** Collapses the finished card into a one-line summary and removes frozen pieces. */
+	/** Terminal intent supersedes pending progress; answer delivery never waits for card backoff. */
 	private deleteLiveActivity(
 		activity: LiveActivity,
 		generation: number,
 	): Promise<void> {
-		activity.renderQueue = activity.renderQueue
-			.then(async () => {
-				const key = activityKey(activity.chatId, activity.sessionId);
-				const canCollapse = () =>
-					!this.stopping &&
-					this.liveActivities.get(key) === activity &&
-					activity.turnGeneration === generation &&
-					activity.finishing &&
-					activity.pendingSubmissions === 0 &&
-					!this.hasUnsettledActivityInputs(activity);
-				const ownsCollapseIntent = () =>
-					activity.pendingRunCardLifecycle === "collapse" &&
-					activity.pendingRunCardLifecycleGeneration === generation;
-				if (!canCollapse()) return;
-				if (
-					activity.runCardRetryAfterMs !== undefined &&
-					Date.now() < activity.runCardRetryAfterMs
-				) {
-					activity.pendingRunCardLifecycle = "collapse";
-					activity.pendingRunCardLifecycleGeneration = generation;
-					this.scheduleRunCardRetry(activity);
-					return;
-				}
-				activity.pendingRunCardLifecycle = "collapse";
-				activity.pendingRunCardLifecycleGeneration = generation;
-				if (activity.messageId !== undefined) {
-					const actions = activity.actionCount;
-					const elapsed =
-						activity.startedAtMs !== undefined
-							? ` за ${formatDuration(this.activityNowMs() - activity.startedAtMs)}`
-							: "";
-					const cost = activity.liveStatus?.usage?.costUsd;
-					const summary = [
-						`✅ Ход завершён${elapsed}`,
-						...(actions ? [actionsLabel(actions)] : []),
-						...(cost !== undefined ? [`~$${cost.toFixed(2)}`] : []),
-					].join(" · ");
-					if (!canCollapse() || !ownsCollapseIntent()) return;
-					const edited = await this.telegramCall((signal) =>
-						this.bot.api.editMessageText(
-							activity.chatId,
-							activity.messageId as number,
-							summary,
-							{},
-							signal,
-						),
-					);
-					if (!edited.ok && telegramErrorCode(edited.error) === 429) {
-						const retryAfter = telegramRetryAfterMs(edited.error);
-						if (retryAfter !== undefined && retryAfter > 0) {
-							activity.runCardRetryAfterMs = Date.now() + retryAfter;
-							if (canCollapse() && ownsCollapseIntent()) {
-								activity.pendingRunCardLifecycle = "collapse";
-								activity.pendingRunCardLifecycleGeneration = generation;
-							} else if (ownsCollapseIntent()) {
-								activity.pendingRunCardLifecycle = undefined;
-								activity.pendingRunCardLifecycleGeneration = undefined;
-							}
-							this.scheduleRunCardRetry(activity);
-							this.reportError(
-								"Telegram run card collapse was deferred",
-								edited.error,
-							);
-							return;
-						}
-					}
-					if (!canCollapse() || !ownsCollapseIntent()) return;
-					if (!edited.ok)
-						this.reportError(
-							"Telegram run card could not be collapsed",
-							edited.error,
-						);
-					else activity.lastText = summary;
-				}
-				if (!canCollapse() || !ownsCollapseIntent()) return;
-				activity.pendingRunCardLifecycle = undefined;
-				activity.pendingRunCardLifecycleGeneration = undefined;
-				if (activity.statsTimer) clearInterval(activity.statsTimer);
-				activity.statsTimer = undefined;
-				if (activity.finishTimer) clearTimeout(activity.finishTimer);
-				activity.finishTimer = undefined;
-				if (activity.runCardRetryTimer)
-					clearTimeout(activity.runCardRetryTimer);
-				activity.runCardRetryTimer = undefined;
-				activity.runCardRetryAfterMs = undefined;
-				this.liveActivities.delete(key);
-				this.cardTokens.delete(activity.cardToken);
-				for (const frozen of activity.frozenMessageIds.splice(0)) {
-					const deleted = await this.telegramCall((signal) =>
-						this.bot.api.deleteMessage(activity.chatId, frozen, signal),
-					);
-					if (!deleted.ok)
-						this.reportError(
-							"Telegram run card piece could not be deleted",
-							deleted.error,
-						);
-				}
-			})
-			.catch((error) => {
-				this.reportError("Telegram run card collapse failed", error);
-			});
-		return activity.renderQueue;
+		if (activity.turnGeneration !== generation || this.stopping)
+			return Promise.resolve();
+		if (activity.cardExhausted || activity.unavailable) {
+			this.retireRunCard(activity);
+			return Promise.resolve();
+		}
+		activity.pendingRunCardLifecycle = "collapse";
+		activity.pendingRunCardLifecycleGeneration = generation;
+		this.renderLiveActivity(activity);
+		return Promise.resolve();
 	}
 
 	private async confirmInputAccepted(
@@ -6987,7 +7312,11 @@ export class TelegramTransportAdapter
 		}
 	}
 
-	private async sendDiagnostic(chatId: number, text: string): Promise<void> {
+	private async sendDiagnostic(
+		chatId: number,
+		text: string,
+		onDelivered?: (confirmed: boolean) => void,
+	): Promise<void> {
 		let body = "";
 		for (const character of redactDiagnosticText(text, [this.options.token])) {
 			const escaped = escapeHtml(character);
@@ -6997,9 +7326,14 @@ export class TelegramTransportAdapter
 			}
 			body += escaped;
 		}
-		await this.sendWithDeadline(chatId, `<pre><code>${body}</code></pre>`, {
-			parse_mode: "HTML",
-		});
+		const confirmed = await this.sendWithDeadline(
+			chatId,
+			`<pre><code>${body}</code></pre>`,
+			{
+				parse_mode: "HTML",
+			},
+		);
+		onDelivered?.(confirmed);
 	}
 
 	private reportError(

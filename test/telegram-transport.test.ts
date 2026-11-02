@@ -163,6 +163,34 @@ function panelIdOf(adapter: unknown, chatId = 42): number | undefined {
 	).panelMessageIds.get(chatId);
 }
 
+function liveCardOf(adapter: unknown) {
+	const card = (
+		adapter as {
+			liveActivities: Map<
+				string,
+				{
+					messageId?: number;
+					renderQueue: Promise<void>;
+					runCardRetryAfterMs?: number;
+					turnGeneration: number;
+					cardExhausted?: boolean;
+					statsTimer?: NodeJS.Timeout;
+					pendingRunCardLifecycle?: string;
+				}
+			>;
+		}
+	).liveActivities
+		.values()
+		.next().value;
+	if (!card) throw new Error("No live card");
+	return card;
+}
+function cardRetryDeadline(adapter: unknown): number {
+	const deadline = liveCardOf(adapter).runCardRetryAfterMs;
+	if (deadline === undefined) throw new Error("No card cooldown");
+	return deadline;
+}
+
 class MockBot {
 	botInfo = { id: 999 };
 	middleware?: (ctx: Context, next: () => Promise<void>) => Promise<void>;
@@ -3300,11 +3328,13 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
-		expect(
-			bot.edited.some(({ text }) =>
-				text.includes("Ввод input-1: uncertain (повторно не отправлялся)"),
-			),
-		).toBe(true);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) =>
+					text.includes("Ввод input-1: uncertain (повторно не отправлялся)"),
+				),
+			).toBe(true),
+		);
 		await adapter.stop();
 	});
 
@@ -3331,11 +3361,13 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
-		expect(
-			bot.edited.some(({ text }) =>
-				text.includes("Ввод input-180: uncertain (повторно не отправлялся)"),
-			),
-		).toBe(true);
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) =>
+					text.includes("Ввод input-180: uncertain (повторно не отправлялся)"),
+				),
+			).toBe(true),
+		);
 		await adapter.stop();
 	});
 
@@ -3560,6 +3592,11 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: { type: "tool_end", toolCallId: "tool-2", failed: true },
 		});
+		await vi.waitFor(() =>
+			expect(
+				bot.edited.some(({ text }) => text.includes("🔎 secret token ❌")),
+			).toBe(true),
+		);
 		emit(harnessEvent("sid", "output", "All checks passed."));
 		emit({
 			sessionId: "sid" as SessionId,
@@ -3630,6 +3667,9 @@ describe("Telegram transport", () => {
 			expect(bot.edited.at(-1)?.text).toContain("Обновлено: 12:00:01"),
 		);
 		await new Promise((resolve) => setTimeout(resolve, 20));
+		await vi.waitFor(() =>
+			expect(bot.edited.at(-1)?.text).toContain("53.3%/145k/272k (auto)"),
+		);
 		const changedTimestamp = bot.edited
 			.at(-1)
 			?.text?.match(/Обновлено: (\d{2}:\d{2}:\d{2})/)?.[1];
@@ -4103,9 +4143,13 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "queued message");
 		expect(submitCount).toBe(2);
-		expect(
-			[...bot.sent, ...bot.edited].some(({ text }) => text.includes("queued")),
-		).toBe(true);
+		await vi.waitFor(() =>
+			expect(
+				[...bot.sent, ...bot.edited].some(({ text }) =>
+					text.includes("queued"),
+				),
+			).toBe(true),
+		);
 		await bot.update(42, "/cancel");
 		expect(bot.sent.at(-1)?.text).toContain("Запрошена отмена ввода");
 		expect(
@@ -10000,6 +10044,455 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it.each(["progress", "freeze", "collapse"])(
+		"honors a late raw 429 after the %s edit deadline without overlapping or bypassing its cooldown",
+		async (lifecycle) => {
+			vi.useFakeTimers();
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			await bot.update(42, "start");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await vi.advanceTimersByTimeAsync(1000);
+			const card = liveCardOf(adapter);
+			const originalEdit = bot.api.editMessageText.getMockImplementation();
+			if (!originalEdit) throw new Error("Missing edit implementation");
+			let reject!: (error: unknown) => void;
+			const held = new Promise<void>((_resolve, fail) => {
+				reject = fail;
+			});
+			let startedAt = 0;
+			bot.api.editMessageText.mockClear();
+			bot.api.editMessageText.mockImplementationOnce(async (...args) => {
+				startedAt = Date.now();
+				await held;
+				return originalEdit(...args);
+			});
+			const thought = (text: string) =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "activity",
+					activityEvent: { type: "thought", text } as never,
+				});
+			if (lifecycle === "progress") thought("start late edit");
+			else if (lifecycle === "freeze")
+				(
+					adapter as unknown as { freezeLiveActivity(card: unknown): void }
+				).freezeLiveActivity(card);
+			else {
+				emit(
+					harnessEvent("sid", "output", "answer independent of late raw 429"),
+				);
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+				});
+				emit(harnessEvent("sid", "status", "agent_settled"));
+			}
+			await vi.waitFor(() =>
+				expect(bot.api.editMessageText).toHaveBeenCalledTimes(1),
+			);
+			await vi.advanceTimersByTimeAsync(startedAt + 5000 - Date.now());
+			for (let i = 0; i < 1000; i++) thought(`late progress ${i}`);
+			if (lifecycle === "collapse")
+				expect(
+					bot.sent.some(({ text }) =>
+						text.includes("answer independent of late raw 429"),
+					),
+				).toBe(true);
+			await vi.advanceTimersByTimeAsync(startedAt + 6000 - Date.now());
+			reject({ error_code: 429, parameters: { retry_after: 209 } });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(208_999);
+			expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+			if (lifecycle === "collapse")
+				expect(bot.edited.at(-1)?.text).toMatch(/^✅ Ход завершён/);
+			else if (lifecycle === "progress")
+				expect(bot.edited.at(-1)?.text).toContain("late progress 999");
+			else
+				expect(bot.edited.at(-1)?.options).toEqual({
+					reply_markup: { inline_keyboard: [] },
+				});
+			await adapter.stop();
+		},
+	);
+
+	it("carries a late raw edit 429 through exhaustion into exact-target closure-only cleanup", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		let inputs = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: `input-${++inputs}` as InputId,
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "old turn");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const oldCard = liveCardOf(adapter);
+		const oldId = oldCard.messageId;
+		let reject!: (error: unknown) => void;
+		const held = new Promise<void>((_resolve, fail) => {
+			reject = fail;
+		});
+		let startedAt = 0;
+		bot.api.editMessageText
+			.mockRejectedValueOnce({ error_code: 502 })
+			.mockRejectedValueOnce({ error_code: 502 })
+			.mockImplementationOnce(async (_chat, messageId) => {
+				startedAt = Date.now();
+				await held;
+				return { message_id: messageId };
+			});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "exhausting edits" } as never,
+		});
+		await vi.advanceTimersByTimeAsync(1500);
+		await vi.advanceTimersByTimeAsync(startedAt + 6000 - Date.now());
+		const eligibleAt = Date.now() + 209_000;
+		reject({ error_code: 429, parameters: { retry_after: 209 } });
+		await vi.advanceTimersByTimeAsync(0);
+		expect(oldCard.cardExhausted).toBe(true);
+		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(40);
+		const completeNewCard = async (label: string) => {
+			await bot.update(42, label);
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await vi.advanceTimersByTimeAsync(500);
+			const messageId = liveCardOf(adapter).messageId;
+			emit(harnessEvent("sid", "output", `answer ${label}`));
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: {
+					inputId: `input-${inputs}` as InputId,
+					state: "completed",
+				},
+			});
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(
+				bot.edited.some(
+					(entry) =>
+						entry.messageId === messageId &&
+						entry.text.startsWith("✅ Ход завершён"),
+				),
+			).toBe(true);
+		};
+		await completeNewCard("before cooldown");
+		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(eligibleAt - Date.now());
+		expect(bot.api.deleteMessage).not.toHaveBeenCalled();
+		await completeNewCard("after cooldown");
+		expect(bot.api.deleteMessage.mock.calls.map((call) => call[1])).toEqual([
+			oldId,
+		]);
+		expect(
+			bot.sent.some(({ text }) => text.includes("answer before cooldown")),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it("bounds run-card progress bursts and deduplicates identical text and buttons", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "start");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const card = liveCardOf(adapter);
+		bot.api.editMessageText.mockClear();
+		const render = () =>
+			(
+				adapter as unknown as { renderLiveActivity(card: unknown): void }
+			).renderLiveActivity(card);
+		for (let i = 0; i < 10_000; i++) render();
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.api.editMessageText).not.toHaveBeenCalled();
+		const thought = (text: string) =>
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: { type: "thought", text } as never,
+			});
+		thought("first");
+		await vi.advanceTimersByTimeAsync(0);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+		const task = card.renderQueue;
+		for (let i = 0; i < 10_000; i++) thought(`progress ${i}`);
+		thought("newest");
+		expect(card.renderQueue).toBe(task);
+		await vi.advanceTimersByTimeAsync(499);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toContain("newest");
+		for (let i = 0; i < 1000; i++) render();
+		await vi.advanceTimersByTimeAsync(500);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		await adapter.stop();
+	});
+
+	it("cleans only an exhausted physical card and retries it once at a later closure without holding the answer or new card", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		let inputs = 0;
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? {
+							requestId: request.requestId,
+							ok: true,
+							value: `input-${++inputs}` as InputId,
+						}
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(42, "first input");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const oldCard = liveCardOf(adapter);
+		const oldId = oldCard.messageId;
+		const originalEdit = bot.api.editMessageText.getMockImplementation();
+		if (!originalEdit) throw new Error("Missing edit implementation");
+		bot.api.editMessageText.mockRejectedValue({
+			error_code: 502,
+			description: "Bad Gateway",
+		});
+		bot.api.deleteMessage.mockRejectedValue({ error_code: 502 });
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "fail card edits" } as never,
+		});
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(oldCard.cardExhausted).toBe(true);
+		expect(bot.api.deleteMessage).toHaveBeenCalledTimes(1);
+		expect(bot.api.deleteMessage.mock.calls[0]?.slice(0, 2)).toEqual([
+			42,
+			oldId,
+		]);
+		const editCount = bot.api.editMessageText.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(editCount);
+		expect(bot.api.deleteMessage).toHaveBeenCalledTimes(1);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(40);
+		bot.api.editMessageText.mockImplementation(originalEdit);
+		await bot.update(42, "new turn");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const newId = liveCardOf(adapter).messageId;
+		expect(newId).not.toBe(oldId);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		bot.api.deleteMessage.mockImplementation(async () => {
+			await held;
+			throw { error_code: 502 };
+		});
+		emit(harnessEvent("sid", "output", "independent final answer"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-2" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(
+			bot.sent.some(({ text }) => text.includes("independent final answer")),
+		).toBe(true);
+		expect(
+			bot.edited.some(
+				({ messageId, text }) =>
+					messageId === newId && text.startsWith("✅ Ход завершён"),
+			),
+		).toBe(true);
+		expect(bot.api.deleteMessage).toHaveBeenCalledTimes(2);
+		expect(
+			bot.api.deleteMessage.mock.calls.every((call) => call[1] === oldId),
+		).toBe(true);
+		release();
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(bot.api.deleteMessage).toHaveBeenCalledTimes(2);
+		await adapter.stop();
+	});
+
+	it("retires exhausted terminal-card state without replaying or deleting the independently delivered answer", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "start");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const oldId = liveCardOf(adapter).messageId;
+		bot.api.editMessageText.mockRejectedValue({ error_code: 502 });
+		emit(harnessEvent("sid", "output", "terminal answer stays"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(
+			(adapter as unknown as { liveActivities: Map<string, unknown> })
+				.liveActivities.size,
+		).toBe(0);
+		expect(
+			bot.sent.filter(({ text }) => text.includes("terminal answer stays")),
+		).toHaveLength(1);
+		expect(bot.api.deleteMessage.mock.calls.map((call) => call[1])).toEqual([
+			oldId,
+		]);
+		const edits = bot.api.editMessageText.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(edits);
+		await adapter.stop();
+	});
+
+	it("does not exhaust or delete the newer card when an old failed edit settles after a new input", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "first");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const oldId = liveCardOf(adapter).messageId;
+		const originalEdit = bot.api.editMessageText.getMockImplementation();
+		if (!originalEdit) throw new Error("Missing edit implementation");
+		let reject!: (error: unknown) => void;
+		const held = new Promise<void>((_resolve, fail) => {
+			reject = fail;
+		});
+		bot.api.editMessageText
+			.mockRejectedValueOnce({ error_code: 502 })
+			.mockRejectedValueOnce({ error_code: 502 })
+			.mockImplementationOnce(async (_chatId, messageId) => {
+				await held;
+				return { message_id: messageId };
+			});
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "activity",
+			activityEvent: { type: "thought", text: "old failed edit" } as never,
+		});
+		await vi.advanceTimersByTimeAsync(1500);
+		await bot.update(42, "new input while edit is in flight");
+		reject({ error_code: 502 });
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(500);
+		const current = liveCardOf(adapter);
+		expect(current.messageId).not.toBe(oldId);
+		expect(current.cardExhausted).toBe(false);
+		expect(current.statsTimer).toBeDefined();
+		expect(
+			bot.api.deleteMessage.mock.calls.every((call) => call[1] === oldId),
+		).toBe(true);
+		await adapter.stop();
+	});
+
+	it.each([400, 403])(
+		"does not retry a definite freeze rejection %s on progress floods",
+		async (code) => {
+			vi.useFakeTimers();
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			await bot.update(42, "start");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await vi.advanceTimersByTimeAsync(1000);
+			const card = liveCardOf(adapter);
+			bot.api.editMessageText.mockClear();
+			bot.api.editMessageText.mockRejectedValue({
+				error_code: code,
+				description: "definite rejection",
+			});
+			(
+				adapter as unknown as { freezeLiveActivity(card: unknown): void }
+			).freezeLiveActivity(card);
+			await vi.advanceTimersByTimeAsync(0);
+			for (let i = 0; i < 1000; i++)
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "activity",
+					activityEvent: { type: "thought", text: `progress ${i}` } as never,
+				});
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+			await adapter.stop();
+		},
+	);
+
+	it("shares freeze/collapse rate-limit ownership and never waits on card cooldown to deliver the final answer", async () => {
+		vi.useFakeTimers();
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "first");
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(1000);
+		const card = liveCardOf(adapter);
+		bot.api.editMessageText.mockClear();
+		bot.api.editMessageText.mockRejectedValueOnce({
+			error_code: 429,
+			parameters: { retry_after: 2 },
+		});
+		(
+			adapter as unknown as { freezeLiveActivity(card: unknown): void }
+		).freezeLiveActivity(card);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+		emit(harnessEvent("sid", "output", "answer during freeze cooldown"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(40);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("answer during freeze cooldown"),
+			),
+		).toBe(true);
+		await vi.advanceTimersByTimeAsync(
+			cardRetryDeadline(adapter) - Date.now() - 1,
+		);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(bot.api.editMessageText).toHaveBeenCalledTimes(2);
+		expect(bot.edited.at(-1)?.text).toContain("✅ Ход завершён");
+		await adapter.stop();
+	});
+
 	it("backs off run-card 429 edits and coalesces to the newest state without disabling events", async () => {
 		vi.useFakeTimers();
 		const bot = new MockBot();
@@ -10028,12 +10521,15 @@ describe("Telegram transport", () => {
 				activityEvent: { type: "thought", text } as never,
 			});
 		activity("first throttled state");
+		await vi.advanceTimersByTimeAsync(500);
 		await cardActivities.values().next().value?.renderQueue;
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		for (let index = 0; index < 12; index++) activity(`intermediate ${index}`);
 		activity("newest throttled state");
 		await cardActivities.values().next().value?.renderQueue;
-		await vi.advanceTimersByTimeAsync(208_999);
+		await vi.advanceTimersByTimeAsync(
+			cardRetryDeadline(adapter) - Date.now() - 1,
+		);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		const queue = (
 			adapter as unknown as { queues: Map<number, { failed: boolean }> }
@@ -10081,6 +10577,7 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: { type: "thought", text: "before cooldown" } as never,
 		});
+		await vi.advanceTimersByTimeAsync(500);
 		await activity?.renderQueue;
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		emit(harnessEvent("sid", "output", "answer delivered during cooldown"));
@@ -10105,7 +10602,9 @@ describe("Telegram transport", () => {
 			),
 		).toBe(true);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
-		await vi.advanceTimersByTimeAsync(208_919);
+		await vi.advanceTimersByTimeAsync(
+			cardRetryDeadline(adapter) - Date.now() - 1,
+		);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		await vi.advanceTimersByTimeAsync(1);
 		await vi.waitFor(() =>
@@ -10143,6 +10642,7 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: { type: "thought", text: "before settlement" } as never,
 		});
+		await vi.advanceTimersByTimeAsync(500);
 		await activity?.renderQueue;
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		emit(harnessEvent("sid", "output", "final answer during cooldown"));
@@ -10159,7 +10659,9 @@ describe("Telegram transport", () => {
 			),
 		).toBe(true);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
-		await vi.advanceTimersByTimeAsync(208_959);
+		await vi.advanceTimersByTimeAsync(
+			cardRetryDeadline(adapter) - Date.now() - 1,
+		);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		await vi.advanceTimersByTimeAsync(1);
 		await vi.waitFor(() =>
@@ -10207,6 +10709,7 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: { type: "thought", text: "old turn" } as never,
 		});
+		await vi.advanceTimersByTimeAsync(500);
 		await card.renderQueue;
 		emit({
 			sessionId: "sid" as SessionId,
@@ -10283,6 +10786,7 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: { type: "thought", text: "old turn" } as never,
 		});
+		await vi.advanceTimersByTimeAsync(500);
 		await card.renderQueue;
 		emit({
 			sessionId: "sid" as SessionId,
@@ -10324,6 +10828,7 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_start"));
 		releaseCollapse();
 		await card.renderQueue;
+		await vi.advanceTimersByTimeAsync(500);
 		expect(activities.get(JSON.stringify([42, "sid"]))).toBe(card);
 		expect(card.finishing).toBe(false);
 		expect(card.lastText).not.toContain("✅ Ход завершён");
@@ -10367,6 +10872,7 @@ describe("Telegram transport", () => {
 			kind: "activity",
 			activityEvent: { type: "thought", text: "throttled" } as never,
 		});
+		await vi.advanceTimersByTimeAsync(500);
 		await cardActivities.values().next().value?.renderQueue;
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		const edits = bot.api.editMessageText.mock.calls.length;
