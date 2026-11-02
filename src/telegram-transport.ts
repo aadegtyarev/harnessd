@@ -459,9 +459,11 @@ type InputAttribution = {
 	pendingSeen: boolean;
 	steered: boolean;
 	waitingForRun: boolean;
+	/** Run origin (including reassociated native inputs), not proof of consumption. */
+	runOrigin?: boolean;
+	finalRecipient?: boolean;
 	turn?: TurnBuffer;
 };
-type InFlightSubmission = { readonly chatId: number };
 type FolderIntent = {
 	readonly chatId: number;
 	messageId: number;
@@ -1490,10 +1492,7 @@ export class TelegramTransportAdapter
 	private readonly inputAttributions = new Map<InputId, InputAttribution>();
 	private readonly cancelingInputs = new Map<InputId, number>();
 	private readonly cancelingCurrentRunInputs = new Map<InputId, number>();
-	private readonly inFlightSubmissions = new Map<
-		SessionId,
-		InFlightSubmission
-	>();
+	private readonly inFlightSubmissions = new Map<SessionId, symbol>();
 	private readonly currentDirectories = new Map<number, string>();
 	private readonly panelMessageIds = new Map<number, number>();
 	/** Panels whose staleness is shown to the operator (notice posted, or restored after restart). */
@@ -4982,7 +4981,7 @@ export class TelegramTransportAdapter
 		sender: number,
 		request: Extract<TelegramRequest, { kind: "submit" }>,
 	): Promise<TransportResult> {
-		const pending: InFlightSubmission = { chatId };
+		const pending = Symbol();
 		this.inFlightSubmissions.set(request.sessionId, pending);
 		try {
 			const result = await this.dispatchRequest(sender, request);
@@ -5002,8 +5001,21 @@ export class TelegramTransportAdapter
 				);
 			return result;
 		} finally {
-			if (this.inFlightSubmissions.get(request.sessionId) === pending)
+			if (this.inFlightSubmissions.get(request.sessionId) === pending) {
 				this.inFlightSubmissions.delete(request.sessionId);
+				// Unmatched chat-less inputs are foreign once this local result settles.
+				// Include old settled turns retained by the bounded attribution records.
+				const turns = new Set<TurnBuffer>();
+				const current = this.turnBuffers.get(request.sessionId);
+				if (current) turns.add(current);
+				for (const record of this.inputAttributions.values())
+					if (record.sessionId === request.sessionId && record.turn)
+						turns.add(record.turn);
+				for (const turn of turns)
+					if (turn.settled)
+						this.flushTurn(request.sessionId, turn.interrupted, turn);
+					else this.deliverCompletedTurnMessages(request.sessionId, turn);
+			}
 		}
 	}
 
@@ -8830,7 +8842,7 @@ export class TelegramTransportAdapter
 						record.waitingForRun &&
 						!record.terminal
 					)
-						this.associateInputWithTurn(record, turn);
+						this.associateInputWithTurn(record, turn, true);
 				for (const activity of this.activitiesForSession(event.sessionId)) {
 					activity.tools.splice(0);
 					activity.subagentStatus = undefined;
@@ -9174,7 +9186,9 @@ export class TelegramTransportAdapter
 	private associateInputWithTurn(
 		record: InputAttribution,
 		turn: TurnBuffer,
+		startsRun = false,
 	): void {
+		record.runOrigin = startsRun || !record.steered;
 		record.turn = turn;
 		record.waitingForRun = false;
 		turn.pendingInputs.add(record.inputId);
@@ -9211,8 +9225,32 @@ export class TelegramTransportAdapter
 		state: "accepted" | "uncertain" | "failed",
 	): void {
 		const record = this.getInputAttribution(sessionId, inputId);
-		if (!record || record.terminal) return;
+		if (!record) return;
 		record.chatId = chatId;
+		if (
+			!record.terminal &&
+			record.turn &&
+			record.turn.statusRecipients.size < 128
+		) {
+			record.turn.statusRecipients.add(chatId);
+			if (record.turn.subagentStatus)
+				this.applySubagentStatus(
+					sessionId,
+					new Set([chatId]),
+					record.turn.subagentStatus,
+				);
+		}
+		// The terminal event can precede the submit response that identifies its chat.
+		if (record.terminal) {
+			if (record.turn) {
+				if (record.finalRecipient && record.turn.recipients.size < 128)
+					record.turn.recipients.add(chatId);
+				this.deliverCompletedTurnMessages(sessionId, record.turn);
+				if (record.turn.settled)
+					this.flushTurn(sessionId, record.turn.interrupted, record.turn);
+			}
+			return;
+		}
 		record.state = state;
 		if (state === "accepted" && !record.pendingSeen)
 			record.steered =
@@ -9224,6 +9262,7 @@ export class TelegramTransportAdapter
 						!other.terminal,
 				);
 		if (state === "failed") {
+			record.runOrigin = false;
 			this.finishInputAttribution(record, false);
 			return;
 		}
@@ -9235,6 +9274,7 @@ export class TelegramTransportAdapter
 			record.turn.recipients.size < 128
 		)
 			record.turn.recipients.add(chatId);
+		if (record.turn) this.deliverCompletedTurnMessages(sessionId, record.turn);
 		if (record.turn?.settled && state === "uncertain")
 			this.finishInputAttribution(record, true);
 	}
@@ -9258,9 +9298,9 @@ export class TelegramTransportAdapter
 							!other.terminal,
 					);
 			record.pendingSeen = true;
-			const flight = this.inFlightSubmissions.get(sessionId);
-			if (flight) record.chatId ??= flight.chatId;
 			if (!record.turn) this.associateInputWithObservedRun(record);
+			if (record.turn)
+				this.deliverCompletedTurnMessages(sessionId, record.turn);
 			return;
 		}
 		const previousState = record.state;
@@ -9271,6 +9311,8 @@ export class TelegramTransportAdapter
 			if (record.turn.recipients.size < 128)
 				record.turn.recipients.add(record.chatId);
 		if (state === "uncertain") {
+			if (record.turn)
+				this.deliverCompletedTurnMessages(sessionId, record.turn);
 			if (record.turn?.settled) this.finishInputAttribution(record, true);
 			return;
 		}
@@ -9283,6 +9325,8 @@ export class TelegramTransportAdapter
 				record.steered &&
 				record.turn !== undefined &&
 				!record.turn.settled;
+			if (handledWithoutRunOutput || (state === "failed" && !canceledByUser))
+				record.runOrigin = false;
 			this.finishInputAttribution(
 				record,
 				state === "completed" && !handledWithoutRunOutput,
@@ -9295,6 +9339,7 @@ export class TelegramTransportAdapter
 		includeRecipient: boolean,
 	): void {
 		if (record.terminal) return;
+		record.finalRecipient = includeRecipient;
 		record.terminal = true;
 		record.waitingForRun = false;
 		const turn = record.turn;
@@ -9306,6 +9351,7 @@ export class TelegramTransportAdapter
 		)
 			turn.recipients.add(record.chatId);
 		turn.pendingInputs.delete(record.inputId);
+		this.deliverCompletedTurnMessages(record.sessionId, turn);
 		if (turn.settled && turn.pendingInputs.size === 0)
 			this.flushTurn(record.sessionId, turn.interrupted, turn);
 	}
@@ -9455,6 +9501,45 @@ export class TelegramTransportAdapter
 			buffer.subagentStream.consume("", true),
 		);
 		this.commitTurnMessage(buffer);
+		this.deliverCompletedTurnMessages(sessionId, buffer);
+	}
+
+	private deliverCompletedTurnMessages(
+		sessionId: SessionId,
+		buffer: TurnBuffer,
+	): boolean {
+		// This guard also protects final partial-only flushes before destructive cleanup.
+		// Status recipients also include queued/handled steers: they are not run origins.
+		const recipients = new Set(buffer.recipients);
+		for (const record of this.inputAttributions.values()) {
+			if (
+				record.turn !== buffer ||
+				(!record.runOrigin &&
+					record.state !== "uncertain" &&
+					!record.finalRecipient)
+			)
+				continue;
+			if (record.chatId === undefined) {
+				// Only an outstanding local result can still identify this input's chat.
+				// Foreign runtime/transport inputs must not block known or selected chats.
+				if (this.inFlightSubmissions.has(sessionId)) return false;
+				continue;
+			}
+			if (recipients.size < 128) recipients.add(record.chatId);
+		}
+		if (!buffer.chunks.length) return true;
+		for (const [index, message] of buffer.chunks.entries()) {
+			let text = stripModelOutputGarbageTail(message);
+			if (buffer.overflow && index === buffer.chunks.length - 1)
+				text = text.trim()
+					? `${text}\n\n${TURN_OVERFLOW_NOTICE}`
+					: TURN_OVERFLOW_NOTICE;
+			if (text.trim()) this.deliverTurnText(sessionId, recipients, text, true);
+		}
+		buffer.chunks.splice(0);
+		buffer.characters = buffer.currentMessage.length;
+		buffer.overflow = false;
+		return true;
 	}
 
 	private commitTurnMessage(buffer: TurnBuffer): void {
@@ -9497,18 +9582,21 @@ export class TelegramTransportAdapter
 		if (!buffer) return;
 		buffer.settled = true;
 		buffer.interrupted ||= interrupted;
+		if (!this.deliverCompletedTurnMessages(sessionId, buffer)) return;
 		this.appendSubagentResult(
 			sessionId,
 			buffer,
 			buffer.subagentStream.consume("", true),
 		);
-		this.commitTurnMessage(buffer);
 		if (buffer.pendingInputs.size > 0) return;
+		this.commitTurnMessage(buffer);
 		if (this.turnBuffers.get(sessionId) === buffer)
 			this.turnBuffers.delete(sessionId);
-		if (buffer.cancelled || (buffer.characters === 0 && !buffer.overflow))
-			return;
 		let text = stripModelOutputGarbageTail(buffer.chunks.join("\n\n"));
+		buffer.chunks.splice(0);
+		const empty = buffer.characters === 0 && !buffer.overflow;
+		buffer.characters = 0;
+		if (buffer.cancelled || empty) return;
 		if (buffer.interrupted)
 			text = text.trim()
 				? `${text}\n\n[Response interrupted before completion.]`
@@ -9517,6 +9605,7 @@ export class TelegramTransportAdapter
 			text = text.trim()
 				? `${text}\n\n${TURN_OVERFLOW_NOTICE}`
 				: TURN_OVERFLOW_NOTICE;
+		buffer.overflow = false;
 		if (!text.trim()) return;
 		this.deliverTurnText(sessionId, buffer.recipients, text);
 	}

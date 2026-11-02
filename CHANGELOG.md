@@ -4,6 +4,14 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-02
+
+### Changed
+
+- Completed assistant messages enter the bounded Telegram delivery queue at each message boundary instead of waiting for the entire agent turn to settle. Messages remain ordered and are not resent at settlement; tool and subagent progress stays on the live run card.
+- Early output uses observed run-origin and uncertain-input attribution rather than treating queued steering inputs as consumed. Unknown origin identities defer delivery within existing bounds; selection changes retain background-delivery routing.
+- Cancellation preserves completed queued output. Settlement, stop and recovery handle only the remaining partial tail, preserving existing interruption, formatting, redaction and overflow protections. A completed message does not close or replace the still-live run card.
+
 ## [0.5.0] - 2026-11-02
 
 ### Changed

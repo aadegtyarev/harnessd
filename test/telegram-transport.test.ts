@@ -1569,56 +1569,1390 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("buffers multiple assistant message ends until one final delivery", async () => {
+	it("delivers completed messages in order while tools wait, without a settlement duplicate", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
-		bot.api.sendMessage.mockClear();
 		bot.sent = [];
 		emit(harnessEvent("sid", "status", "agent_start"));
 		for (const fragment of ["first answer", "second answer", "final answer"]) {
-			emit(harnessEvent("sid", "output", fragment));
+			emit(
+				harnessEvent(
+					"sid",
+					"output",
+					fragment === "first answer"
+						? `${fragment}\n\nxx\nhidden.\nStop.\nNo.\nEnd.`
+						: fragment,
+				),
+			);
 			emit(harnessEvent("sid", "status", "message_end"));
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "activity",
+				activityEvent: {
+					type: "tool_start",
+					toolCallId: fragment,
+					summary: "bg_wait · ждёт агентов",
+				},
+			});
 		}
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(bot.api.sendMessage).not.toHaveBeenCalled();
+		await vi.waitFor(() => expect(bot.sent).toHaveLength(3));
+		expect(bot.sent.map(({ text }) => telegramBody(text))).toEqual([
+			"first answer",
+			"second answer",
+			"final answer",
+		]);
+		const buffer = (
+			adapter as unknown as {
+				turnBuffers: Map<string, { chunks: string[]; characters: number }>;
+			}
+		).turnBuffers.get("sid");
+		expect(buffer?.chunks).toEqual([]);
+		expect(buffer?.characters).toBe(0);
+		emit(harnessEvent("sid", "status", "message_end"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
-		await vi.waitFor(() => expect(bot.sent).toHaveLength(1));
-		expect(telegramBody(bot.sent[0]?.text ?? "")).toBe(
-			"first answer\n\nsecond answer\n\nfinal answer",
-		);
-		expect(
-			bot.sent.filter(({ text }) => telegramBody(text).includes("answer")),
-		).toHaveLength(1);
-		expect(bot.api.sendMessage).toHaveBeenCalledOnce();
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(bot.sent).toHaveLength(3);
 		await adapter.stop();
 	});
 
-	it("keeps the newest assistant message and final response within the run buffer limit", async () => {
+	it("bounds backpressured completed-message delivery with queue omission notices", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
 		bot.sent = [];
-		bot.api.sendMessage.mockClear();
-		const older = "O".repeat(20_000);
-		const newest = "N".repeat(20_000);
-		const final = "final assistant message without LF";
 		emit(harnessEvent("sid", "status", "agent_start"));
-		for (const message of [older, newest, final]) {
+		for (let index = 0; index < 4; index++) {
+			emit(harnessEvent("sid", "output", `${index}:${"x".repeat(20_000)}`));
+			emit(harnessEvent("sid", "status", "message_end"));
+		}
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(
+			bot.sent.some(({ text }) =>
+				text.includes("omitted because the queue is full"),
+			),
+		).toBe(true);
+		expect(
+			bot.sent.every(({ text }) => telegramVisibleText(text).length <= 4096),
+		).toBe(true);
+		expect(
+			(
+				adapter as unknown as {
+					turnBuffers: Map<string, { chunks: string[]; characters: number }>;
+				}
+			).turnBuffers.get("sid")?.characters,
+		).toBe(0);
+		const count = bot.sent.length;
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(bot.sent).toHaveLength(count);
+		await adapter.stop();
+	});
+
+	it.each(["settlement", "stop", "recovery"])(
+		"flushes only the partial tail after completed output on %s",
+		async (ending) => {
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			bot.sent = [];
+			emit(harnessEvent("sid", "status", "agent_start"));
+			emit(harnessEvent("sid", "output", "completed message"));
+			emit(harnessEvent("sid", "status", "message_end"));
+			await vi.waitFor(() =>
+				expect(
+					bot.sent.some(({ text }) => text.includes("completed message")),
+				).toBe(true),
+			);
+			emit(harnessEvent("sid", "output", "remaining partial tail"));
+			if (ending === "stop") await bot.update(42, "/stop");
+			else
+				emit(
+					harnessEvent(
+						"sid",
+						"status",
+						ending === "recovery" ? "harness_restarting" : "agent_settled",
+					),
+				);
+			await vi.waitFor(() =>
+				expect(
+					bot.sent.some(({ text }) => text.includes("remaining partial tail")),
+				).toBe(true),
+			);
+			const completed = bot.sent.filter(({ text }) =>
+				text.includes("completed message"),
+			);
+			const partial = bot.sent.filter(({ text }) =>
+				text.includes("remaining partial tail"),
+			);
+			expect(completed).toHaveLength(1);
+			expect(completed[0]?.text).not.toContain("interrupted");
+			expect(partial).toHaveLength(1);
+			expect(partial[0]?.text.includes("interrupted")).toBe(
+				ending !== "settlement",
+			);
+			// A second recovery/settlement boundary must not retain/replay the tail.
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await (
+				adapter as unknown as {
+					waitForEventQueue(chatId: number): Promise<boolean>;
+				}
+			).waitForEventQueue(42);
+			expect(
+				bot.sent.filter(({ text }) => text.includes("remaining partial tail")),
+			).toHaveLength(1);
+			await adapter.stop();
+		},
+	);
+
+	it("retains already queued completed messages on cancel but suppresses the incomplete tail", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		await bot.update(42, "run to cancel");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const send = bot.api.sendMessage.getMockImplementation();
+		if (!send) throw new Error("missing send mock");
+		bot.api.sendMessage.mockImplementation(async (...args) => {
+			if (args[1].includes("first completed before cancel")) await gate;
+			return send(...args);
+		});
+		emit(harnessEvent("sid", "output", "first completed before cancel"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(
+				bot.api.sendMessage.mock.calls.some(([, text]) =>
+					text.includes("first completed before cancel"),
+				),
+			).toBe(true),
+		);
+		emit(harnessEvent("sid", "output", "second completed before cancel"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		emit(harnessEvent("sid", "output", "incomplete canceled tail"));
+		await bot.update(42, "/cancel");
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: {
+				inputId: "input-1" as InputId,
+				state: "failed",
+				failure: { reason: "canceled" },
+			},
+		});
+		release();
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(
+			bot.sent
+				.filter(({ text }) => text.includes("completed before cancel"))
+				.map(({ text }) => telegramBody(text)),
+		).toEqual([
+			"first completed before cancel",
+			"second completed before cancel",
+		]);
+		expect(
+			bot.sent.some(({ text }) => text.includes("incomplete canceled tail")),
+		).toBe(false);
+		await adapter.stop();
+	});
+
+	it("does not attribute early answers to queued or handled steer submitters", async () => {
+		let submitted = 0;
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) =>
+				request.kind === "submit"
+					? { ...result(request), value: `input-${++submitted}` as never }
+					: result(request),
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		await bot.update(42, "origin input");
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "pending" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await bot.update(43, "handled extension or queued steer");
+		for (const state of ["pending", "accepted"] as const)
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: { inputId: "input-2" as InputId, state },
+			});
+		await bot.update(42, "/use other");
+		for (const message of [
+			"answer while steer queued",
+			"answer after steer handled",
+		]) {
+			emit(harnessEvent("sid", "output", message));
+			emit(harnessEvent("sid", "status", "message_end"));
+			await vi.waitFor(() =>
+				expect(bot.sent.some(({ text }) => text.includes(message))).toBe(true),
+			);
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: { inputId: "input-2" as InputId, state: "completed" },
+			});
+		}
+		const answers = bot.sent.filter(
+			({ text }) =>
+				text.includes("answer while steer") ||
+				text.includes("answer after steer"),
+		);
+		expect(answers).toHaveLength(2);
+		expect(
+			answers.every(
+				({ chatId, text }) =>
+					chatId === 42 && text.startsWith("Фоновая сессия"),
+			),
+		).toBe(true);
+		expect(
+			(
+				adapter as unknown as {
+					inputAttributions: Map<string, { terminal: boolean }>;
+				}
+			).inputAttributions.get("input-1")?.terminal,
+		).toBe(false);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		await adapter.stop();
+	});
+
+	it.each(["accepted", "uncertain"] as const)(
+		"defers a pending origin until its actual %s submit response and preserves a later selection change",
+		async (outcome) => {
+			let release!: (value: TransportResult) => void;
+			let request: TransportEvent | undefined;
+			const gate = new Promise<TransportResult>((resolve) => {
+				release = resolve;
+			});
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				dispatch: async (next) => {
+					if (next.kind === "submit") {
+						request = next;
+						return gate;
+					}
+					return result(next);
+				},
+			});
+			await bot.update(42, "/use sid");
+			await bot.update(43, "/use sid");
+			const submitting = bot.update(42, "origin pending reply");
+			await vi.waitFor(() => expect(request).toBeDefined());
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: { inputId: "input-1" as InputId, state: "pending" },
+			});
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await bot.update(42, "/use other");
+			emit(
+				harnessEvent("sid", "output", "early answer before submit response"),
+			);
+			emit(harnessEvent("sid", "status", "message_end"));
+			await (
+				adapter as unknown as {
+					waitForEventQueue(chatId: number): Promise<boolean>;
+				}
+			).waitForEventQueue(43);
+			expect(
+				bot.sent.some(({ text }) =>
+					text.includes("early answer before submit response"),
+				),
+			).toBe(false);
+			if (!request) throw new Error("missing request");
+			release(
+				outcome === "accepted"
+					? result(request)
+					: {
+							requestId: request.requestId,
+							ok: false,
+							error: {
+								code: "UNCERTAIN_INPUT_DELIVERY",
+								message: "ack lost",
+								inputId: "input-1" as InputId,
+							},
+						},
+			);
+			await submitting;
+			expect(
+				(
+					adapter as unknown as {
+						turnBuffers: Map<string, { statusRecipients: Set<number> }>;
+					}
+				).turnBuffers
+					.get("sid")
+					?.statusRecipients.has(42),
+			).toBe(true);
+			expect(
+				(
+					adapter as unknown as {
+						turnBuffers: Map<string, { statusRecipients: Set<number> }>;
+					}
+				).turnBuffers
+					.get("sid")
+					?.statusRecipients.has(43),
+			).toBe(false);
+			await vi.waitFor(() =>
+				expect(
+					bot.sent.filter(({ text }) =>
+						text.includes("early answer before submit response"),
+					),
+				).toHaveLength(1),
+			);
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+			});
+			await (
+				adapter as unknown as {
+					waitForEventQueue(chatId: number): Promise<boolean>;
+				}
+			).waitForEventQueue(42);
+			const answers = bot.sent.filter(({ text }) =>
+				text.includes("early answer before submit response"),
+			);
+			expect(answers).toHaveLength(1);
+			expect(answers[0]).toMatchObject({ chatId: 42 });
+			expect(answers[0]?.text).toContain("Фоновая сессия");
+			await adapter.stop();
+		},
+	);
+
+	it.each(
+		[
+			"normal origin",
+			"uncertain origin",
+			"canceled origin",
+			"uncertain active steer",
+			"queued next-run origin",
+		].flatMap((source) =>
+			[false, true].map((localOrigin) => ({ source, localOrigin })),
+		),
+	)(
+		"does not let a foreign $source block completed output (local origin: $localOrigin)",
+		async ({ source, localOrigin }) => {
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) =>
+					request.kind === "submit"
+						? { ...result(request), value: "local-input" as never }
+						: result(request),
+			});
+			await bot.update(42, "/use sid");
+			if (localOrigin) await bot.update(43, "/use sid");
+			const foreignInput = (
+				state: "pending" | "accepted" | "uncertain" | "completed" | "failed",
+			) =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: {
+						inputId: "foreign-input" as InputId,
+						state,
+						...(state === "failed"
+							? { failure: { reason: "canceled" as const } }
+							: {}),
+					},
+				});
+			if (source === "queued next-run origin") {
+				emit(harnessEvent("sid", "status", "agent_start"));
+				foreignInput("pending");
+				emit(harnessEvent("sid", "status", "agent_settled"));
+			} else if (source !== "uncertain active steer") {
+				foreignInput("pending");
+				if (source === "uncertain origin") foreignInput("uncertain");
+			}
+			if (localOrigin)
+				await bot.update(42, "local origin alongside foreign work");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			if (source === "uncertain active steer") {
+				foreignInput("pending");
+				foreignInput("uncertain");
+			}
+			if (localOrigin) await bot.update(42, "/use other");
+			emit(harnessEvent("sid", "output", "completed foreign-run answer"));
+			emit(harnessEvent("sid", "status", "message_end"));
+			await vi.waitFor(() =>
+				expect(
+					bot.sent.filter(({ text }) =>
+						text.includes("completed foreign-run answer"),
+					),
+				).toHaveLength(1),
+			);
+			const answer = bot.sent.find(({ text }) =>
+				text.includes("completed foreign-run answer"),
+			);
+			expect(answer?.chatId).toBe(42);
+			expect(answer?.text.includes("Фоновая сессия")).toBe(localOrigin);
+			const internals = adapter as unknown as {
+				turnBuffers: Map<
+					string,
+					{ chunks: string[]; currentMessage: string; characters: number }
+				>;
+				inputAttributions: Map<string, { terminal: boolean }>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			expect(internals.turnBuffers.get("sid")).toMatchObject({
+				chunks: [],
+				currentMessage: "",
+				characters: 0,
+			});
+			if (source === "canceled origin") foreignInput("failed");
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			if (source !== "canceled origin") foreignInput("completed");
+			if (localOrigin)
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: "local-input" as InputId, state: "completed" },
+				});
+			emit(harnessEvent("sid", "status", "harness_restarting"));
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await Promise.all([
+				internals.waitForEventQueue(42),
+				internals.waitForEventQueue(43),
+			]);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("completed foreign-run answer"),
+				),
+			).toHaveLength(1);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			expect(internals.inputAttributions.size).toBeLessThanOrEqual(2);
+			expect(
+				[...internals.inputAttributions.values()].every(
+					({ terminal }) => terminal,
+				),
+			).toBe(true);
+			await adapter.stop();
+		},
+	);
+
+	it.each(["stop", "recovery"])(
+		"flushes a foreign run's partial tail on %s without retaining or replaying completed output",
+		async (ending) => {
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			const foreignInput = (state: "pending" | "completed") =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: "foreign-input" as InputId, state },
+				});
+			foreignInput("pending");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			emit(
+				harnessEvent("sid", "output", "foreign completed before interruption"),
+			);
+			emit(harnessEvent("sid", "status", "message_end"));
+			emit(harnessEvent("sid", "output", "foreign partial at interruption"));
+			// Complete the input without settling the run, so interruption owns the tail.
+			foreignInput("completed");
+			if (ending === "stop") await bot.update(42, "/stop");
+			else emit(harnessEvent("sid", "status", "harness_restarting"));
+			const internals = adapter as unknown as {
+				turnBuffers: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await internals.waitForEventQueue(42);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("foreign completed before interruption"),
+				),
+			).toHaveLength(1);
+			const partial = bot.sent.filter(({ text }) =>
+				text.includes("foreign partial at interruption"),
+			);
+			expect(partial).toHaveLength(1);
+			expect(partial[0]?.text).toContain(
+				"Response interrupted before completion",
+			);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await internals.waitForEventQueue(42);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("foreign completed before interruption"),
+				),
+			).toHaveLength(1);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("foreign partial at interruption"),
+				),
+			).toHaveLength(1);
+			await adapter.stop();
+		},
+	);
+
+	it.each(
+		["origin", "active steer"].flatMap((placement) =>
+			[
+				"accepted",
+				"uncertain",
+				"rejected with InputId",
+				"rejected without InputId",
+				"thrown",
+			].flatMap((outcome) =>
+				[false, true].map((settlesFirst) => ({
+					placement,
+					outcome,
+					settlesFirst,
+				})),
+			),
+		),
+	)(
+		"correlates concurrent foreign/local pending inputs: $placement, $outcome, settlement first: $settlesFirst",
+		async ({ placement, outcome, settlesFirst }) => {
+			let release!: (value: TransportResult) => void;
+			let reject!: (error: Error) => void;
+			let submitRequest: TransportEvent | undefined;
+			const gate = new Promise<TransportResult>((resolve, rejectGate) => {
+				release = resolve;
+				reject = rejectGate;
+			});
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind === "submit") {
+						submitRequest = request;
+						return gate;
+					}
+					return result(request);
+				},
+			});
+			await bot.update(42, "/use sid");
+			await bot.update(43, "/use sid");
+			if (placement === "active steer")
+				emit(harnessEvent("sid", "status", "agent_start"));
+			const submitting = bot
+				.update(42, "local prompt racing foreign input")
+				.catch(() => undefined);
+			await vi.waitFor(() => expect(submitRequest).toBeDefined());
+			const input = (
+				inputId: string,
+				state: "pending" | "accepted" | "uncertain" | "completed" | "failed",
+			) =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: inputId as InputId, state },
+				});
+			// These events overlap a real local dispatch, but only its result identifies
+			// which InputId (if any) is owned by that Telegram chat.
+			input("foreign-overlap", "pending");
+			if (placement === "active steer") input("foreign-overlap", "uncertain");
+			input("actual-local", "pending");
+			input("actual-local", "accepted");
+			if (placement === "origin")
+				emit(harnessEvent("sid", "status", "agent_start"));
+			await bot.update(42, "/use other");
+			emit(harnessEvent("sid", "output", "answer from concurrent inputs"));
+			emit(harnessEvent("sid", "status", "message_end"));
+			if (settlesFirst) emit(harnessEvent("sid", "status", "agent_settled"));
+			const internals = adapter as unknown as {
+				turnBuffers: Map<string, { characters: number }>;
+				inFlightSubmissions: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await Promise.all([
+				internals.waitForEventQueue(42),
+				internals.waitForEventQueue(43),
+			]);
+			expect(
+				bot.sent.some(({ text }) =>
+					text.includes("answer from concurrent inputs"),
+				),
+			).toBe(false);
+			expect(internals.turnBuffers.get("sid")?.characters).toBeLessThan(32_768);
+			if (!submitRequest) throw new Error("missing local submit request");
+			if (outcome === "thrown") reject(new Error("mock submit failure"));
+			else if (outcome === "accepted")
+				release({
+					requestId: submitRequest.requestId,
+					ok: true,
+					value: "actual-local" as InputId,
+				});
+			else
+				release({
+					requestId: submitRequest.requestId,
+					ok: false,
+					error: {
+						code:
+							outcome === "uncertain"
+								? "UNCERTAIN_INPUT_DELIVERY"
+								: "INPUT_NOT_DELIVERED",
+						message: "mock submit outcome",
+						...(outcome === "rejected without InputId"
+							? {}
+							: { inputId: "actual-local" as InputId }),
+					},
+				});
+			await submitting;
+			await vi.waitFor(() =>
+				expect(
+					bot.sent.filter(({ text }) =>
+						text.includes("answer from concurrent inputs"),
+					),
+				).toHaveLength(1),
+			);
+			const hasEligibleLocalRecipient =
+				outcome === "uncertain" ||
+				(outcome === "accepted" && placement === "origin");
+			const answer = bot.sent.find(({ text }) =>
+				text.includes("answer from concurrent inputs"),
+			);
+			expect(answer?.chatId).toBe(hasEligibleLocalRecipient ? 42 : 43);
+			expect(answer?.text.includes("Фоновая сессия")).toBe(
+				hasEligibleLocalRecipient,
+			);
+			if (!settlesFirst) emit(harnessEvent("sid", "status", "agent_settled"));
+			input("foreign-overlap", "completed");
+			input(
+				"actual-local",
+				outcome === "accepted" || outcome === "uncertain"
+					? "completed"
+					: "failed",
+			);
+			emit(harnessEvent("sid", "status", "harness_restarting"));
+			await Promise.all([
+				internals.waitForEventQueue(42),
+				internals.waitForEventQueue(43),
+			]);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("answer from concurrent inputs"),
+				),
+			).toHaveLength(1);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			expect(internals.inFlightSubmissions.size).toBe(0);
+			await adapter.stop();
+		},
+	);
+
+	it.each(
+		[
+			"settlement",
+			"fatal uncertainty",
+			"recovery uncertainty",
+			"stop",
+			"canceled",
+		].flatMap((ending) =>
+			["accepted", "uncertain", "rejected", "thrown"].flatMap((outcome) =>
+				[false, true]
+					.filter(
+						(knownPeer) =>
+							outcome !== "thrown" || knownPeer || ending === "canceled",
+					)
+					.map((knownPeer) => ({ ending, outcome, knownPeer })),
+			),
+		),
+	)(
+		"guards partial-only output before local correlation: $ending, $outcome, known peer: $knownPeer",
+		async ({ ending, outcome, knownPeer }) => {
+			let release!: (value: TransportResult) => void;
+			let reject!: (error: Error) => void;
+			let submitRequest: TransportEvent | undefined;
+			const gate = new Promise<TransportResult>((resolve, rejectGate) => {
+				release = resolve;
+				reject = rejectGate;
+			});
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				allowedUserIds: [42, 43, 44],
+				dispatch: async (request) => {
+					if (request.kind !== "submit") return result(request);
+					if (request.principalId === "42") {
+						submitRequest = request;
+						return gate;
+					}
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: "known-peer" as InputId,
+					};
+				},
+			});
+			for (const chatId of [42, 43, 44]) await bot.update(chatId, "/use sid");
+			if (knownPeer) {
+				await bot.update(43, "known peer input", { userId: 43 });
+				await bot.update(43, "/use other");
+			}
+			const submitting = bot
+				.update(42, "actual held local submission")
+				.catch(() => undefined);
+			await vi.waitFor(() => expect(submitRequest).toBeDefined());
+			const input = (
+				inputId: string,
+				state: "pending" | "uncertain" | "completed" | "failed",
+			) =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: {
+						inputId: inputId as InputId,
+						state,
+						...(state === "failed"
+							? { failure: { reason: "canceled" as const } }
+							: {}),
+					},
+				});
+			input("held-partial", "pending");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await bot.update(42, "/use other");
+			// No completed chunk precedes this tail. Fatal cases also leave it in the
+			// parser's unterminated physical line, matching Pi protocolFailure ordering.
+			emit(
+				harnessEvent(
+					"sid",
+					"output",
+					`private partial-only tail${ending === "settlement" ? "\n" : ""}`,
+				),
+			);
+			if (ending === "fatal uncertainty") {
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "error",
+					text: "protocol channel failed",
+					fatal: true,
+					stop: { reason: "stream_corrupted" },
+				});
+				input("held-partial", "uncertain");
+			} else if (ending === "recovery uncertainty") {
+				emit(harnessEvent("sid", "status", "harness_restarting"));
+				input("held-partial", "uncertain");
+			} else if (ending === "stop") {
+				await bot.update(44, "/stop sid");
+				input("held-partial", "completed");
+			} else {
+				input("held-partial", ending === "canceled" ? "failed" : "completed");
+				emit(harnessEvent("sid", "status", "agent_settled"));
+			}
+			if (knownPeer) input("known-peer", "completed");
+			const internals = adapter as unknown as {
+				turnBuffers: Map<
+					string,
+					{ chunks: string[]; currentMessage: string; characters: number }
+				>;
+				inFlightSubmissions: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await Promise.all(
+				[42, 43, 44].map((chatId) => internals.waitForEventQueue(chatId)),
+			);
+			expect(
+				bot.sent.some(({ text }) => text.includes("private partial-only tail")),
+			).toBe(false);
+			const buffer = internals.turnBuffers.get("sid");
+			expect(buffer).toBeDefined();
+			expect(buffer?.chunks).toEqual([]);
+			expect(buffer?.characters).toBeLessThanOrEqual(32_768);
+			if (!submitRequest) throw new Error("missing local submit request");
+			if (outcome === "thrown") reject(new Error("mock submit failure"));
+			else if (outcome === "accepted")
+				release({
+					requestId: submitRequest.requestId,
+					ok: true,
+					value: "held-partial" as InputId,
+				});
+			else
+				release({
+					requestId: submitRequest.requestId,
+					ok: false,
+					error: {
+						code:
+							outcome === "uncertain"
+								? "UNCERTAIN_INPUT_DELIVERY"
+								: "INPUT_NOT_DELIVERED",
+						message: "mock submit outcome",
+						inputId: "held-partial" as InputId,
+					},
+				});
+			await submitting;
+			emit(harnessEvent("sid", "status", "harness_recovered"));
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await Promise.all(
+				[42, 43, 44].map((chatId) => internals.waitForEventQueue(chatId)),
+			);
+			const tails = bot.sent.filter(({ text }) =>
+				text.includes("private partial-only tail"),
+			);
+			const expectedChats =
+				ending === "canceled"
+					? []
+					: [...(outcome === "thrown" ? [] : [42]), ...(knownPeer ? [43] : [])];
+			expect(tails.map(({ chatId }) => chatId).sort()).toEqual(expectedChats);
+			for (const tail of tails) {
+				expect(tail.text).toContain("Фоновая сессия");
+				expect(
+					tail.text.includes("Response interrupted before completion"),
+				).toBe(ending !== "settlement");
+			}
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			expect(internals.inFlightSubmissions.size).toBe(0);
+			expect(buffer).toMatchObject({
+				chunks: [],
+				currentMessage: "",
+				characters: 0,
+			});
+			await adapter.stop();
+		},
+	);
+
+	it.each(["accepted", "uncertain", "rejected", "thrown"])(
+		"retains a terminal steer's partial-only recipient eligibility until its %s result",
+		async (outcome) => {
+			let release!: (value: TransportResult) => void;
+			let reject!: (error: Error) => void;
+			let submitRequest: TransportEvent | undefined;
+			const gate = new Promise<TransportResult>((resolve, rejectGate) => {
+				release = resolve;
+				reject = rejectGate;
+			});
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				allowedUserIds: [42, 43, 44],
+				dispatch: async (request) => {
+					if (request.kind !== "submit") return result(request);
+					if (request.principalId === "43") {
+						submitRequest = request;
+						return gate;
+					}
+					return {
+						requestId: request.requestId,
+						ok: true,
+						value: "known-origin" as InputId,
+					};
+				},
+			});
+			for (const chatId of [42, 43, 44]) await bot.update(chatId, "/use sid");
+			await bot.update(42, "known origin prompt");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			const submitting = bot
+				.update(43, "pending steer", { userId: 43 })
+				.catch(() => undefined);
+			await vi.waitFor(() => expect(submitRequest).toBeDefined());
+			const input = (
+				inputId: string,
+				state: "pending" | "accepted" | "completed",
+			) =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: inputId as InputId, state },
+				});
+			input("held-steer", "pending");
+			input("held-steer", "accepted");
+			await bot.update(42, "/use other");
+			await bot.update(43, "/use other");
+			emit(harnessEvent("sid", "output", "partial-only terminal steer tail\n"));
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			input("held-steer", "completed");
+			input("known-origin", "completed");
+			const internals = adapter as unknown as {
+				turnBuffers: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await Promise.all(
+				[42, 43, 44].map((chatId) => internals.waitForEventQueue(chatId)),
+			);
+			expect(
+				bot.sent.some(({ text }) =>
+					text.includes("partial-only terminal steer tail"),
+				),
+			).toBe(false);
+			if (!submitRequest) throw new Error("missing steer submit request");
+			if (outcome === "thrown") reject(new Error("mock submit failure"));
+			else if (outcome === "accepted")
+				release({
+					requestId: submitRequest.requestId,
+					ok: true,
+					value: "held-steer" as InputId,
+				});
+			else
+				release({
+					requestId: submitRequest.requestId,
+					ok: false,
+					error: {
+						code:
+							outcome === "uncertain"
+								? "UNCERTAIN_INPUT_DELIVERY"
+								: "INPUT_NOT_DELIVERED",
+						message: "mock submit outcome",
+						inputId: "held-steer" as InputId,
+					},
+				});
+			await submitting;
+			emit(harnessEvent("sid", "status", "harness_restarting"));
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await Promise.all(
+				[42, 43, 44].map((chatId) => internals.waitForEventQueue(chatId)),
+			);
+			expect(
+				bot.sent
+					.filter(({ text }) =>
+						text.includes("partial-only terminal steer tail"),
+					)
+					.map(({ chatId }) => chatId)
+					.sort(),
+			).toEqual(outcome === "thrown" ? [42] : [42, 43]);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			await adapter.stop();
+		},
+	);
+
+	it.each(["settlement", "fatal", "recovery", "stop"])(
+		"keeps foreign partial-only fallback available after %s",
+		async (ending) => {
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp());
+			await bot.update(42, "/use sid");
+			const input = (state: "pending" | "uncertain" | "completed") =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: "foreign-partial" as InputId, state },
+				});
+			input("pending");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			emit(harnessEvent("sid", "output", "foreign partial-only fallback"));
+			if (ending === "fatal") {
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "error",
+					text: "protocol channel failed",
+					fatal: true,
+				});
+				input("uncertain");
+			} else if (ending === "recovery") {
+				emit(harnessEvent("sid", "status", "harness_restarting"));
+				input("uncertain");
+			} else if (ending === "stop") {
+				input("completed");
+				await bot.update(42, "/stop sid");
+			} else {
+				emit(harnessEvent("sid", "status", "agent_settled"));
+				input("completed");
+			}
+			const internals = adapter as unknown as {
+				turnBuffers: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await internals.waitForEventQueue(42);
+			const tails = bot.sent.filter(({ text }) =>
+				text.includes("foreign partial-only fallback"),
+			);
+			expect(tails).toHaveLength(1);
+			expect(tails[0]?.chatId).toBe(42);
+			expect(
+				tails[0]?.text.includes("Response interrupted before completion"),
+			).toBe(ending !== "settlement");
+			emit(harnessEvent("sid", "status", "harness_recovered"));
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			await internals.waitForEventQueue(42);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("foreign partial-only fallback"),
+				),
+			).toHaveLength(1);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			await adapter.stop();
+		},
+	);
+
+	it.each(
+		["accepted", "uncertain"].flatMap((outcome) =>
+			["live", "settlement", "recovery", "cancel"].map((ending) => ({
+				outcome,
+				ending,
+			})),
+		),
+	)(
+		"correlates an outstanding local $outcome result after $ending without selected-chat fallback",
+		async ({ outcome, ending }) => {
+			let release!: (value: TransportResult) => void;
+			let submitRequest: TransportEvent | undefined;
+			const gate = new Promise<TransportResult>((resolve) => {
+				release = resolve;
+			});
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind === "submit") {
+						submitRequest = request;
+						return gate;
+					}
+					return result(request);
+				},
+			});
+			await bot.update(42, "/use sid");
+			await bot.update(43, "/use sid");
+			const submitting = bot.update(
+				42,
+				"local prompt awaiting its actual result",
+			);
+			await vi.waitFor(() => expect(submitRequest).toBeDefined());
+			// An adapter may observe acceptance before a pending event. Only this actual
+			// outstanding submit result can resolve the event's still-unknown chat.
+			const input = (state: "accepted" | "completed" | "failed") =>
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: {
+						inputId: "local-correlated" as InputId,
+						state,
+						...(state === "failed"
+							? { failure: { reason: "canceled" as const } }
+							: {}),
+					},
+				});
+			input("accepted");
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await bot.update(42, "/use other");
+			emit(
+				harnessEvent("sid", "output", "locally correlated completed answer"),
+			);
+			emit(harnessEvent("sid", "status", "message_end"));
+			emit(harnessEvent("sid", "output", "locally correlated partial tail"));
+			if (ending === "cancel") input("failed");
+			if (ending === "settlement" || ending === "cancel")
+				emit(harnessEvent("sid", "status", "agent_settled"));
+			if (ending === "recovery")
+				emit(harnessEvent("sid", "status", "harness_restarting"));
+			const internals = adapter as unknown as {
+				turnBuffers: Map<string, { characters: number }>;
+				inFlightSubmissions: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await Promise.all([
+				internals.waitForEventQueue(42),
+				internals.waitForEventQueue(43),
+			]);
+			expect(
+				bot.sent.some(({ text }) => text.includes("locally correlated")),
+			).toBe(false);
+			expect(internals.turnBuffers.get("sid")?.characters).toBeLessThan(32_768);
+			if (!submitRequest) throw new Error("missing local submit request");
+			release(
+				outcome === "accepted"
+					? {
+							requestId: submitRequest.requestId,
+							ok: true,
+							value: "local-correlated" as InputId,
+						}
+					: {
+							requestId: submitRequest.requestId,
+							ok: false,
+							error: {
+								code: "UNCERTAIN_INPUT_DELIVERY",
+								message: "ack lost",
+								inputId: "local-correlated" as InputId,
+							},
+						},
+			);
+			await submitting;
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			if (ending !== "cancel") input("completed");
+			emit(harnessEvent("sid", "status", "harness_restarting"));
+			await Promise.all([
+				internals.waitForEventQueue(42),
+				internals.waitForEventQueue(43),
+			]);
+			const completed = bot.sent.filter(({ text }) =>
+				text.includes("locally correlated completed answer"),
+			);
+			expect(completed).toHaveLength(1);
+			expect(completed[0]?.chatId).toBe(42);
+			expect(completed[0]?.text).toContain("Фоновая сессия");
+			const partial = bot.sent.filter(({ text }) =>
+				text.includes("locally correlated partial tail"),
+			);
+			expect(partial).toHaveLength(ending === "cancel" ? 0 : 1);
+			if (ending !== "cancel") expect(partial[0]?.chatId).toBe(42);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			expect(internals.inFlightSubmissions.size).toBe(0);
+			await adapter.stop();
+		},
+	);
+
+	it.each(
+		[
+			"accepted with a different InputId",
+			"rejected without an InputId",
+		].flatMap((outcome) =>
+			[false, true].map((partialOnly) => ({ outcome, partialOnly })),
+		),
+	)(
+		"releases foreign output when a local result is $outcome (partial-only: $partialOnly)",
+		async ({ outcome, partialOnly }) => {
+			let release!: (value: TransportResult) => void;
+			let submitRequest: TransportEvent | undefined;
+			const gate = new Promise<TransportResult>((resolve) => {
+				release = resolve;
+			});
+			const bot = new MockBot();
+			const { adapter, emit } = await startAdapter(bot, await temp(), {
+				dispatch: async (request) => {
+					if (request.kind === "submit") {
+						submitRequest = request;
+						return gate;
+					}
+					return result(request);
+				},
+			});
+			await bot.update(42, "/use sid");
+			await bot.update(43, "/use sid");
+			const submitting = bot.update(42, "local queued prompt");
+			await vi.waitFor(() => expect(submitRequest).toBeDefined());
+			// Public runtime events need not belong to the outstanding Telegram submit.
+			emit({
+				sessionId: "sid" as SessionId,
+				kind: "input",
+				inputEvent: {
+					inputId: "foreign-accepted" as InputId,
+					state: "accepted",
+				},
+			});
+			emit(harnessEvent("sid", "status", "agent_start"));
+			await bot.update(42, "/use other");
+			emit(
+				harnessEvent(
+					"sid",
+					"output",
+					"foreign answer after unrelated local result",
+				),
+			);
+			if (partialOnly) {
+				emit(harnessEvent("sid", "status", "agent_settled"));
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: {
+						inputId: "foreign-accepted" as InputId,
+						state: "completed",
+					},
+				});
+			} else emit(harnessEvent("sid", "status", "message_end"));
+			const internals = adapter as unknown as {
+				turnBuffers: Map<string, unknown>;
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			};
+			await internals.waitForEventQueue(43);
+			expect(
+				bot.sent.some(({ text }) =>
+					text.includes("foreign answer after unrelated local result"),
+				),
+			).toBe(false);
+			if (!submitRequest) throw new Error("missing local submit request");
+			release(
+				outcome.startsWith("accepted")
+					? {
+							requestId: submitRequest.requestId,
+							ok: true,
+							value: "unrelated-local" as InputId,
+						}
+					: {
+							requestId: submitRequest.requestId,
+							ok: false,
+							error: { code: "INVALID_INPUT", message: "not delivered" },
+						},
+			);
+			await submitting;
+			await vi.waitFor(() =>
+				expect(
+					bot.sent.filter(({ text }) =>
+						text.includes("foreign answer after unrelated local result"),
+					),
+				).toHaveLength(1),
+			);
+			expect(
+				bot.sent.find(({ text }) =>
+					text.includes("foreign answer after unrelated local result"),
+				)?.chatId,
+			).toBe(43);
+			emit(harnessEvent("sid", "status", "agent_settled"));
+			for (const inputId of outcome.startsWith("accepted")
+				? ["foreign-accepted", "unrelated-local"]
+				: ["foreign-accepted"])
+				emit({
+					sessionId: "sid" as SessionId,
+					kind: "input",
+					inputEvent: { inputId: inputId as InputId, state: "completed" },
+				});
+			emit(harnessEvent("sid", "status", "harness_restarting"));
+			await Promise.all([
+				internals.waitForEventQueue(42),
+				internals.waitForEventQueue(43),
+			]);
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("foreign answer after unrelated local result"),
+				),
+			).toHaveLength(1);
+			expect(internals.turnBuffers.has("sid")).toBe(false);
+			await adapter.stop();
+		},
+	);
+
+	it("caps a completed message and reports omissions before settlement without retaining delivered text", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		bot.sent = [];
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(
+			harnessEvent(
+				"sid",
+				"output",
+				`oversized-BEGIN\n${"x".repeat(40_000)}\noversized-END`,
+			),
+		);
+		emit(harnessEvent("sid", "status", "message_end"));
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(bot.sent.some(({ text }) => text.includes("oversized-BEGIN"))).toBe(
+			true,
+		);
+		expect(bot.sent.some(({ text }) => text.includes("oversized-END"))).toBe(
+			false,
+		);
+		expect(bot.sent.some(({ text }) => text.includes("omitted"))).toBe(true);
+		const buffer = (
+			adapter as unknown as {
+				turnBuffers: Map<
+					string,
+					{ chunks: string[]; currentMessage: string; characters: number }
+				>;
+			}
+		).turnBuffers.get("sid");
+		expect(buffer).toMatchObject({
+			chunks: [],
+			currentMessage: "",
+			characters: 0,
+		});
+		const count = bot.sent.length;
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(bot.sent).toHaveLength(count);
+		await adapter.stop();
+	});
+
+	it("bounds completed messages waiting for recipient correlation and reports the evicted history once", async () => {
+		const bot = new MockBot();
+		let release!: (value: TransportResult) => void;
+		let submitRequest: TransportEvent | undefined;
+		const gate = new Promise<TransportResult>((resolve) => {
+			release = resolve;
+		});
+		const { adapter, emit } = await startAdapter(bot, await temp(), {
+			dispatch: async (request) => {
+				if (request.kind === "submit") {
+					submitRequest = request;
+					return gate;
+				}
+				return result(request);
+			},
+		});
+		await bot.update(42, "/use sid");
+		await bot.update(43, "/use sid");
+		const submitting = bot.update(42, "actual outstanding origin submission");
+		await vi.waitFor(() => expect(submitRequest).toBeDefined());
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "accepted" },
+		});
+		emit(harnessEvent("sid", "status", "agent_start"));
+		for (const message of [
+			`old-completed${"o".repeat(20_000)}`,
+			longAssistantMessage("retained-completed"),
+		]) {
 			emit(harnessEvent("sid", "output", message));
 			emit(harnessEvent("sid", "status", "message_end"));
 		}
-		expect(bot.api.sendMessage).not.toHaveBeenCalled();
+		expect(
+			bot.sent.some(({ text }) => text.includes("retained-completed")),
+		).toBe(false);
+		await bot.update(42, "/use other");
+		if (!submitRequest) throw new Error("missing local submit request");
+		release(result(submitRequest));
+		await submitting;
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		const answers = bot.sent.filter(
+			({ text }) =>
+				text.includes("retained-completed") ||
+				text.includes("response reached the queue limit"),
+		);
+		expect(answers.length).toBeGreaterThan(0);
+		expect(answers.every(({ chatId }) => chatId === 42)).toBe(true);
+		expect(bot.sent.some(({ text }) => text.includes("old-completed"))).toBe(
+			false,
+		);
+		expect(
+			bot.sent.filter(({ text }) =>
+				text.includes("response reached the queue limit"),
+			),
+		).toHaveLength(1);
+		const count = bot.sent.length;
 		emit(harnessEvent("sid", "status", "agent_settled"));
-		await vi.waitFor(() =>
-			expect(bot.sent.some(({ text }) => text.includes(final))).toBe(true),
-		);
-		const delivered = bot.sent.map(({ text }) => telegramBody(text)).join("");
-		expect(delivered).toBe(
-			`${newest}\n\n${final}\n\n[Additional output omitted because the response reached the queue limit.]`,
-		);
-		expect(delivered).not.toContain(older);
-		expect(bot.sent.filter(({ text }) => text.includes(final))).toHaveLength(1);
+		emit({
+			sessionId: "sid" as SessionId,
+			kind: "input",
+			inputEvent: { inputId: "input-1" as InputId, state: "completed" },
+		});
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
+		expect(bot.sent).toHaveLength(count);
 		await adapter.stop();
 	});
 
@@ -1643,7 +2977,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("evicts older messages but preserves a 25,000-character final message", async () => {
+	it("delivers successive long completed messages without retaining delivered history", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -1653,6 +2987,11 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", older));
 		emit(harnessEvent("sid", "status", "message_end"));
+		await (
+			adapter as unknown as {
+				waitForEventQueue(chatId: number): Promise<boolean>;
+			}
+		).waitForEventQueue(42);
 		emit(harnessEvent("sid", "output", final));
 		emit(harnessEvent("sid", "status", "message_end"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
@@ -1662,10 +3001,7 @@ describe("Telegram transport", () => {
 			).toBe(true),
 		);
 		const parts = bot.sent.map(({ text }) => telegramBody(text));
-		expect(parts.join("")).toBe(
-			`${final}\n\n[Additional output omitted because the response reached the queue limit.]`,
-		);
-		expect(parts.join("")).not.toContain("older-BEGIN");
+		expect(parts.join("")).toBe(`${older}${final}`);
 		await adapter.stop();
 	});
 
@@ -1718,7 +3054,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("cleans assistant garbage tails only at run settlement", async () => {
+	it("cleans each completed assistant garbage tail before settlement", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -1732,8 +3068,10 @@ describe("Telegram transport", () => {
 			),
 		);
 		emit(harnessEvent("sid", "status", "message_end"));
-		expect(bot.sent.some(({ text }) => text.includes("Русский ответ"))).toBe(
-			false,
+		await vi.waitFor(() =>
+			expect(bot.sent.some(({ text }) => text.includes("Русский ответ"))).toBe(
+				true,
+			),
 		);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
@@ -1804,7 +3142,7 @@ describe("Telegram transport", () => {
 			turnBuffers: Map<
 				SessionId,
 				{
-					chunks: string[];
+					currentMessage: string;
 					characters: number;
 					overflow: boolean;
 					recipients: Set<number>;
@@ -1830,7 +3168,7 @@ describe("Telegram transport", () => {
 			const buffer = internals.turnBuffers.get("sid" as SessionId);
 			expect(buffer).toBeDefined();
 			const garbage = ["xx", "hidden.", "Stop.", "No.", "Done."].join("\n");
-			buffer?.chunks.splice(0, buffer.chunks.length, garbage);
+			if (buffer) buffer.currentMessage = garbage;
 			if (buffer) {
 				buffer.characters = garbage.length;
 				buffer.overflow = scenario.overflow;
@@ -3713,6 +5051,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "start background answer");
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "Finished after switch."));
+		emit(harnessEvent("sid", "status", "message_end"));
 		await bot.update(42, "/use other");
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
@@ -3757,8 +5096,10 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "progress report"));
 		emit(harnessEvent("sid", "status", "message_end"));
-		expect(bot.sent.some(({ text }) => text.includes("progress report"))).toBe(
-			false,
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.some(({ text }) => text.includes("progress report")),
+			).toBe(true),
 		);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit({
@@ -3934,6 +5275,7 @@ describe("Telegram transport", () => {
 		});
 		await bot.update(42, "/use other");
 		emit(harnessEvent("sid", "output", "uncertain run answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() =>
 			expect(
@@ -4043,6 +5385,7 @@ describe("Telegram transport", () => {
 		await bot.update(42, "/use other");
 		await bot.update(43, "/use other");
 		emit(harnessEvent("sid", "output", "preceding run output"));
+		emit(harnessEvent("sid", "status", "message_end"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit({
 			sessionId: "sid" as SessionId,
@@ -4062,6 +5405,7 @@ describe("Telegram transport", () => {
 		await secondSend;
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "following run output"));
+		emit(harnessEvent("sid", "status", "message_end"));
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit({
 			sessionId: "sid" as SessionId,
@@ -4317,6 +5661,8 @@ describe("Telegram transport", () => {
 			kind: "input",
 			inputEvent: { inputId: "queued-b" as never, state: "accepted" },
 		});
+		emit(harnessEvent("sid", "output", "completed canceled-run answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
 		const cancel = bot.update(42, "/cancel");
 		await vi.waitFor(() => expect(cancelRequest).toBeDefined());
 		emit(
@@ -4374,6 +5720,14 @@ describe("Telegram transport", () => {
 		});
 		emit(harnessEvent("sid", "status", "agent_start"));
 		emit(harnessEvent("sid", "output", "follow-on continuation answer"));
+		emit(harnessEvent("sid", "status", "message_end"));
+		await vi.waitFor(() =>
+			expect(
+				bot.sent.filter(({ text }) =>
+					text.includes("follow-on continuation answer"),
+				),
+			).toHaveLength(2),
+		);
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		emit({
 			sessionId: "sid" as SessionId,
@@ -4409,6 +5763,11 @@ describe("Telegram transport", () => {
 				text.includes("canceled-run output must be suppressed"),
 			),
 		).toBe(false);
+		expect(
+			bot.sent
+				.filter(({ text }) => text.includes("completed canceled-run answer"))
+				.map(({ chatId }) => chatId),
+		).toEqual([42]);
 		expect(submitCount).toBe(3);
 		expect(
 			requests.filter(({ kind }) => kind === "cancel_current"),
@@ -9572,9 +10931,8 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "message_end"));
 		emit(harnessEvent("sid", "output", scenario.second));
 		emit(harnessEvent("sid", "status", "message_end"));
-		expect(bot.api.sendMessage).not.toHaveBeenCalled();
-		emit(harnessEvent("sid", "status", "agent_settled"));
 		await vi.waitFor(() => expect(bot.sent).not.toHaveLength(0));
+		emit(harnessEvent("sid", "status", "agent_settled"));
 		expect(bot.sent.map(({ text }) => telegramBody(text)).join(" ")).toBe(
 			scenario.expected,
 		);
@@ -10587,7 +11945,7 @@ describe("Telegram transport", () => {
 			bot.sent.some(({ text }) =>
 				text.includes("answer delivered during cooldown"),
 			),
-		).toBe(false);
+		).toBe(true);
 		expect(bot.api.editMessageText).toHaveBeenCalledOnce();
 		emit({
 			sessionId: "sid" as SessionId,
@@ -10960,7 +12318,7 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
-	it("keeps the live card in place across message_end and delivers at settlement", async () => {
+	it("keeps the live card active while completed messages are delivered before settlement", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());
 		await bot.update(42, "/use sid");
@@ -10973,8 +12331,8 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "output", "progress note"));
 		emit(harnessEvent("sid", "status", "message_end"));
 		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(bot.sent).toHaveLength(sentBefore);
-		expect(bot.lastMessageId).toBe(cardId);
+		expect(bot.sent).toHaveLength(sentBefore + 1);
+		expect(bot.sent.at(-1)?.text).toContain("progress note");
 		expect(
 			bot.api.editMessageText.mock.calls
 				.slice(editsBefore)
@@ -10985,7 +12343,17 @@ describe("Telegram transport", () => {
 							'{"reply_markup":{"inline_keyboard":[]}}',
 				),
 		).toBe(false);
+		const internals = adapter as unknown as {
+			liveActivities: Map<string, { messageId: number }>;
+			runCardKeyboard(activity: unknown): { inline_keyboard: unknown[][] };
+		};
+		const card = [...internals.liveActivities.values()].find(
+			(activity) => activity.messageId === cardId,
+		);
+		expect(card).toBeDefined();
+		expect(internals.runCardKeyboard(card).inline_keyboard[0]).toHaveLength(2);
 		emit(harnessEvent("sid", "status", "agent_settled"));
+		expect(internals.runCardKeyboard(card).inline_keyboard).toEqual([]);
 		await vi.waitFor(() =>
 			expect(bot.sent.some(({ text }) => text.includes("progress note"))).toBe(
 				true,
