@@ -91,6 +91,29 @@ describe("Telegram API aggregate metrics", () => {
 		metrics.stop();
 	});
 
+	it("does not emit after bounded shutdown when a raw call settles late", async () => {
+		vi.useFakeTimers();
+		const sink = vi.fn();
+		const metrics = new TelegramApiMetrics(sink);
+		let finish!: (value: unknown) => void;
+		const raw = new Promise((resolve) => {
+			finish = resolve;
+		});
+		const call = metrics.transformer(
+			(() => raw) as never,
+			"sendMessage",
+			{} as never,
+		);
+		metrics.stop();
+		finish({ ok: false, error_code: 429 });
+		await call;
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(sink).toHaveBeenCalledTimes(1);
+		const line = sink.mock.calls[0][0] as string;
+		expect(line).toContain('"started":1');
+		expect(line).toContain('"rateLimited":0');
+	});
+
 	it("flushes a partial startup window once on shutdown", async () => {
 		vi.useFakeTimers();
 		const sink = vi.fn();

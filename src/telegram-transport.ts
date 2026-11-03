@@ -50,7 +50,6 @@ import {
 	truncateDiagnostic,
 } from "./error-diagnostics.js";
 import { OVERFLOW_ID } from "./telegram-activity-ledger.js";
-import { TelegramApiMetrics } from "./telegram-api-metrics.js";
 import {
 	approvedSubagentRole,
 	localActivityTime,
@@ -73,6 +72,7 @@ import {
 	inputFailureText,
 	stopNoticeText,
 } from "./telegram-anomaly-notice.js";
+import { TelegramApiMetrics } from "./telegram-api-metrics.js";
 import {
 	type CancelAckChannel,
 	type CancelTrace,
@@ -1899,8 +1899,10 @@ export class TelegramTransportAdapter
 	}
 
 	stop(): Promise<void> {
-		this.apiMetrics?.stop();
-		if (!this.stopPromise) this.stopPromise = this.stopPolling();
+		if (!this.stopPromise)
+			this.stopPromise = this.stopPolling().finally(() =>
+				this.apiMetrics?.stop(),
+			);
 		return this.stopPromise;
 	}
 

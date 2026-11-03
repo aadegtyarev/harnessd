@@ -12,7 +12,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Bot } from "grammy";
+import { Bot, type Transformer } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	HarnessRegistryEntry,
@@ -13702,6 +13702,46 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "future event"));
 		await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
 		await adapter.stop();
+	});
+
+	it("includes in-flight and shutdown API calls in the final aggregate report", async () => {
+		const bot = new MockBot();
+		let transformer!: Transformer;
+		Object.assign(bot.api, {
+			config: {
+				use: (value: Transformer) => {
+					transformer = value;
+				},
+			},
+		});
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		let finish!: (value: unknown) => void;
+		const pending = new Promise((resolve) => {
+			finish = resolve;
+		});
+		const call = transformer(
+			(() => pending) as never,
+			"sendMessage",
+			{} as never,
+		);
+		bot.stopBehavior = async () => {
+			await transformer(
+				(async () => ({ ok: false, error_code: 429 })) as never,
+				"getUpdates",
+				{} as never,
+			);
+			finish({ ok: true, result: true });
+			await call;
+			bot.finishStart();
+		};
+		await adapter.stop();
+		const line = log.mock.calls
+			.map(([message]) => String(message))
+			.find((message) => message.includes("telegram_api_metrics"));
+		expect(line).toContain('"sendMessage":{"started":1,"ok":1');
+		expect(line).toContain('"getUpdates":{"started":1,"ok":0,"rateLimited":1');
+		log.mockRestore();
 	});
 
 	it("awaits async stop, joins polling, is idempotent, and releases lock only afterwards", async () => {
