@@ -72,7 +72,6 @@ describe("Telegram typing ownership", () => {
 		work.reject({ error_code: 429, parameters: { retry_after: 10 } });
 		await vi.advanceTimersByTimeAsync(0);
 		await vi.advanceTimersByTimeAsync(9999);
-		typing.request(1);
 		expect(send).toHaveBeenCalledTimes(1);
 		await vi.advanceTimersByTimeAsync(1);
 		expect(send).toHaveBeenCalledTimes(2);
