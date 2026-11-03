@@ -1431,6 +1431,12 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 	});
 }
 
+export class TelegramInitializationDeadlineError extends Error {
+	constructor(cause: unknown) {
+		super("Telegram initialization deadline exceeded", { cause });
+	}
+}
+
 export class TelegramTransportAdapter
 	implements TransportAdapter, AgentFileSendTransport, ToolPermissionTransport
 {
@@ -1707,9 +1713,7 @@ export class TelegramTransportAdapter
 					);
 				} catch (error) {
 					this.initializationAbort.abort();
-					throw new Error("Telegram initialization deadline exceeded", {
-						cause: error,
-					});
+					throw new TelegramInitializationDeadlineError(error);
 				}
 				if (!initialized.ok)
 					throw new Error("Telegram initialization failed", {

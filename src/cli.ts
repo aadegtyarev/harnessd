@@ -12,7 +12,10 @@ import { resolveStateDirectory } from "./core/session-store.js";
 import { loadDotEnv } from "./dotenv.js";
 import { describeError } from "./error-diagnostics.js";
 import { resolveInitialDirectory } from "./telegram-filesystem.js";
-import { TelegramTransportAdapter } from "./telegram-transport.js";
+import {
+	TelegramInitializationDeadlineError,
+	TelegramTransportAdapter,
+} from "./telegram-transport.js";
 import {
 	manageUserService,
 	type UserServiceAction,
@@ -156,7 +159,12 @@ export async function main(options: CliOptions = {}): Promise<void> {
 			});
 		} catch (error) {
 			if (!closeRequested) throw error;
-			if (error instanceof AggregateError) throw error;
+			if (
+				error instanceof AggregateError ||
+				(error instanceof Error &&
+					error.cause instanceof TelegramInitializationDeadlineError)
+			)
+				throw error;
 			return;
 		}
 		if (closeRequested && !closePromise) {

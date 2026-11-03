@@ -13,6 +13,11 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { HELP, isDirectInvocation, main } from "../src/cli.js";
+import {
+	acquireTelegramPollingLock,
+	TelegramInitializationDeadlineError,
+	telegramLockPath,
+} from "../src/telegram-transport.js";
 
 const EMPTY_CWD = path.join(os.tmpdir(), `harnessd-cli-${randomUUID()}`);
 
@@ -141,6 +146,42 @@ describe("CLI", () => {
 			expect(failedWithLiveHandle.stderr).toContain(
 				"HARNESSD_TELEGRAM_BOT_TOKEN is required",
 			);
+			const stalledPreload = path.join(cwd, "stalled-init.cjs");
+			await writeFile(
+				stalledPreload,
+				`
+const { Bot } = require(${JSON.stringify(path.join(root, "node_modules", "grammy"))});
+Bot.prototype.init = () => new Promise(() => { setInterval(() => {}, 1000); });
+const original = global.setTimeout;
+global.setTimeout = (fn, ms, ...args) => original(fn, ms === 30000 || ms === 6000 ? 10 : ms, ...args);
+`,
+			);
+			const stateDir = path.join(cwd, "state");
+			const stalled = spawnSync(
+				process.execPath,
+				["--require", stalledPreload, compiledCli],
+				{
+					cwd,
+					encoding: "utf8",
+					timeout: 8000,
+					env: {
+						HARNESSD_TELEGRAM_BOT_TOKEN: "test-token",
+						HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+						HARNESSD_STATE_DIR: stateDir,
+					},
+				},
+			);
+			expect(stalled.error).toBeUndefined();
+			expect(stalled.status, stalled.stderr).toBe(1);
+			expect(stalled.stderr).toContain(
+				"Telegram initialization deadline exceeded",
+			);
+			const { stat } = await import("node:fs/promises");
+			await expect(
+				stat(telegramLockPath("test-token", stateDir)),
+			).resolves.toBeDefined();
+			const release = await acquireTelegramPollingLock("test-token", stateDir);
+			await release();
 			for (const result of [nodeHelp, symlinkHelp]) {
 				expect(result.status, result.stderr).toBe(0);
 				expect(result.stdout).toContain(
@@ -465,6 +506,37 @@ describe("CLI", () => {
 		process.emit("SIGINT");
 		await failed;
 	});
+
+	it.each(["deadline before signal", "signal before deadline"])(
+		"does not hide a startup deadline when %s",
+		async (order) => {
+			let rejectStart!: (error: unknown) => void;
+			let signal!: AbortSignal;
+			const runtimeStart = vi.fn((options: unknown) => {
+				signal = transportOptions(options).signal;
+				return new Promise<never>((_resolve, reject) => {
+					rejectStart = reject;
+				});
+			});
+			const running = runMain({
+				argv: [],
+				env: {
+					HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
+					HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+				},
+				runtimeStart: runtimeStart as never,
+			});
+			const failed = expect(running).rejects.toThrow("startup failed");
+			await vi.waitFor(() => expect(signal).toBeDefined());
+			const error = new Error("startup failed", {
+				cause: new TelegramInitializationDeadlineError(new Error("deadline")),
+			});
+			if (order === "deadline before signal") rejectStart(error);
+			process.emit("SIGINT");
+			if (order === "signal before deadline") rejectStart(error);
+			await failed;
+		},
+	);
 
 	it("aborts runtime startup when a signal arrives before readiness", async () => {
 		let observedSignal!: AbortSignal;
