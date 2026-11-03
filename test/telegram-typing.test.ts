@@ -75,7 +75,23 @@ describe("Telegram typing ownership", () => {
 		typing.request(1);
 		expect(send).toHaveBeenCalledTimes(1);
 		await vi.advanceTimersByTimeAsync(1);
+		expect(send).toHaveBeenCalledTimes(2);
+		typing.stop();
+	});
+
+	it("dispatches a retained intent after a slow successful raw call settles", async () => {
+		vi.useFakeTimers();
+		const work = deferred();
+		const send = vi
+			.fn()
+			.mockReturnValueOnce(work.promise)
+			.mockResolvedValue(true);
+		const typing = new TelegramTyping(send);
 		typing.request(1);
+		await vi.advanceTimersByTimeAsync(5000);
+		typing.request(1);
+		work.resolve(true);
+		await vi.advanceTimersByTimeAsync(0);
 		expect(send).toHaveBeenCalledTimes(2);
 		typing.stop();
 	});
