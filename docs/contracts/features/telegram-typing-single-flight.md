@@ -1,6 +1,6 @@
 # Telegram typing single-flight
 
-Status: approved; CI smoke-test timeout extension approved
+Status: complete; verified and independently reviewed
 
 ## Goal and scenarios
 Reduce duplicate and overlapping Telegram `sendChatAction` calls without increasing the existing four-second refresh cadence. Coalesce typing intents per chat, allow at most one unresolved raw typing call per chat, and honor valid Telegram 429 `retry_after` before any next typing attempt for that chat. Continue showing typing for chats selecting an active session; stop on deselection, settlement, error or shutdown, and resume on reselect.
