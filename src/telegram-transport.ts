@@ -3,7 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import { open, readFile, realpath, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Bot, InputFile } from "grammy";
+import { Bot, InputFile, type Transformer } from "grammy";
 import type { Update } from "grammy/types";
 import {
 	getTelegramCommands,
@@ -72,6 +72,7 @@ import {
 	inputFailureText,
 	stopNoticeText,
 } from "./telegram-anomaly-notice.js";
+import { TelegramApiMetrics } from "./telegram-api-metrics.js";
 import {
 	type CancelAckChannel,
 	type CancelTrace,
@@ -242,6 +243,7 @@ type TelegramBot = {
 	/** grammY's public update entry point, also used by its polling batch loop. */
 	handleUpdate?(update: Update): Promise<void>;
 	api: {
+		config?: { use(transformer: Transformer): unknown };
 		sendMessage(
 			chatId: number,
 			text: string,
@@ -1578,6 +1580,7 @@ export class TelegramTransportAdapter
 	private readonly activeSends = new Set<Promise<boolean>>();
 	private readonly shutdownController = new AbortController();
 	private readonly bot: TelegramBot;
+	private apiMetrics?: TelegramApiMetrics;
 	private readonly authorized: Set<number>;
 	private readonly authorizedChatPrincipals = new Map<number, number>();
 	private dispatch?: (event: TransportEvent) => Promise<TransportResult>;
@@ -1626,6 +1629,15 @@ export class TelegramTransportAdapter
 			options.botFactory ??
 			((token) => new Bot(token) as unknown as TelegramBot)
 		)(options.token);
+		if (this.bot.api.config) {
+			const metrics = new TelegramApiMetrics();
+			try {
+				this.bot.api.config.use(metrics.transformer);
+				this.apiMetrics = metrics;
+			} catch {
+				metrics.stop();
+			}
+		}
 		this.pollingFinished = new Promise<void>((resolve) => {
 			this.resolvePollingFinished = resolve;
 		});
@@ -1887,7 +1899,12 @@ export class TelegramTransportAdapter
 	}
 
 	stop(): Promise<void> {
-		if (!this.stopPromise) this.stopPromise = this.stopPolling();
+		if (!this.stopPromise) {
+			this.apiMetrics?.pause();
+			this.stopPromise = this.stopPolling().finally(() =>
+				this.apiMetrics?.stop(),
+			);
+		}
 		return this.stopPromise;
 	}
 

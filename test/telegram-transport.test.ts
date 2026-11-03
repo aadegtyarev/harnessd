@@ -12,7 +12,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Bot } from "grammy";
+import { Bot, type Transformer } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	HarnessRegistryEntry,
@@ -13702,6 +13702,129 @@ describe("Telegram transport", () => {
 		emit(harnessEvent("sid", "status", "future event"));
 		await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
 		await adapter.stop();
+	});
+
+	it("includes in-flight and shutdown API calls in the final aggregate report", async () => {
+		const bot = new MockBot();
+		let transformer!: Transformer;
+		Object.assign(bot.api, {
+			config: {
+				use: (value: Transformer) => {
+					transformer = value;
+				},
+			},
+		});
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		let finish!: (value: unknown) => void;
+		const pending = new Promise((resolve) => {
+			finish = resolve;
+		});
+		const call = transformer(
+			(() => pending) as never,
+			"sendMessage",
+			{} as never,
+		);
+		bot.stopBehavior = async () => {
+			await transformer(
+				(async () => ({ ok: false, error_code: 429 })) as never,
+				"getUpdates",
+				{} as never,
+			);
+			finish({ ok: true, result: true });
+			await call;
+			bot.finishStart();
+		};
+		await adapter.stop();
+		const line = log.mock.calls
+			.map(([message]) => String(message))
+			.find((message) => message.includes("telegram_api_metrics"));
+		expect(line).toContain('"sendMessage":{"started":1,"ok":1');
+		expect(line).toContain('"getUpdates":{"started":1,"ok":0,"rateLimited":1');
+		log.mockRestore();
+	});
+
+	it("flushes bounded failure shutdown metrics and ignores late settlements", async () => {
+		const bot = new MockBot();
+		let transformer!: Transformer;
+		Object.assign(bot.api, {
+			config: {
+				use: (value: Transformer) => {
+					transformer = value;
+				},
+			},
+		});
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		let finish!: (value: unknown) => void;
+		const raw = new Promise((resolve) => {
+			finish = resolve;
+		});
+		const late = transformer((() => raw) as never, "sendMessage", {} as never);
+		bot.stopBehavior = async () => {
+			await transformer(
+				(async () => ({ ok: false, error_code: 400 })) as never,
+				"getUpdates",
+				{} as never,
+			);
+			await expect(
+				transformer(
+					(async () => {
+						throw new Error("secret");
+					}) as never,
+					"editMessageText",
+					{} as never,
+				),
+			).rejects.toThrow();
+			throw new Error("stop failed");
+		};
+		await expect(adapter.stop()).rejects.toThrow("shutdown incomplete");
+		const lines = () =>
+			log.mock.calls
+				.map(([message]) => String(message))
+				.filter((message) => message.includes("telegram_api_metrics"));
+		expect(lines()).toHaveLength(1);
+		expect(lines()[0]).toContain(
+			'"getUpdates":{"started":1,"ok":0,"rateLimited":0,"rejected":1',
+		);
+		expect(lines()[0]).toContain(
+			'"editMessageText":{"started":1,"ok":0,"rateLimited":0,"rejected":0,"failed":1',
+		);
+		finish({ ok: false, error_code: 429 });
+		await late;
+		expect(lines()).toHaveLength(1);
+		log.mockRestore();
+	});
+
+	it("finalizes metrics when shutdown exceeds its deadline", async () => {
+		const bot = new MockBot();
+		let transformer!: Transformer;
+		Object.assign(bot.api, {
+			config: {
+				use: (value: Transformer) => {
+					transformer = value;
+				},
+			},
+		});
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { adapter } = await startAdapter(bot, await temp());
+		await transformer(
+			(async () => ({ ok: true, result: true })) as never,
+			"getMe",
+			{} as never,
+		);
+		bot.stopBehavior = () => new Promise<void>(() => {});
+		vi.useFakeTimers();
+		const stopping = adapter.stop();
+		const failed = expect(stopping).rejects.toThrow("shutdown incomplete");
+		await vi.advanceTimersByTimeAsync(6000);
+		await failed;
+		const lines = log.mock.calls
+			.map(([message]) => String(message))
+			.filter((message) => message.includes("telegram_api_metrics"));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain('"getMe":{"started":1,"ok":1');
+		log.mockRestore();
 	});
 
 	it("awaits async stop, joins polling, is idempotent, and releases lock only afterwards", async () => {
