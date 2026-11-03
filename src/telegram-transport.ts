@@ -133,6 +133,7 @@ const TELEGRAM_LIMIT = 4096;
 const ACTIVITY_INPUT_HISTORY_LIMIT = 32;
 const ACTIVITY_OVERFLOW_INPUT_LIMIT = 128;
 const SEND_TIMEOUT_MS = 5000;
+const INITIALIZATION_TIMEOUT_MS = 30_000;
 const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
 const FILE_SEND_TIMEOUT_MS = 120_000;
 const STOP_TIMEOUT_MS = 6000;
@@ -1698,7 +1699,18 @@ export class TelegramTransportAdapter
 							return { ok: false };
 						},
 					);
-				const initialized = await this.initializationPromise;
+				let initialized: { readonly ok: boolean };
+				try {
+					initialized = await withDeadline(
+						this.initializationPromise,
+						INITIALIZATION_TIMEOUT_MS,
+					);
+				} catch (error) {
+					this.initializationAbort.abort();
+					throw new Error("Telegram initialization deadline exceeded", {
+						cause: error,
+					});
+				}
 				if (!initialized.ok)
 					throw new Error("Telegram initialization failed", {
 						cause: initializationError,

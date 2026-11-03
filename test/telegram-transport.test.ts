@@ -13826,6 +13826,78 @@ describe("Telegram transport", () => {
 		await expect(stat(telegramLockPath("secret-token", dir))).rejects.toThrow();
 	});
 
+	it("times out initialization, aborts retries and permits a later start", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const adapter = new TelegramTransportAdapter({
+			token: "secret-token",
+			allowedUserIds: [42],
+			stateDirectory: dir,
+			initialCwd: "/work",
+			botFactory: () => bot as never,
+		});
+		let initStarted!: () => void;
+		const initialized = new Promise<void>((resolve) => {
+			initStarted = resolve;
+		});
+		bot.initBehavior = (signal) =>
+			new Promise<void>((_resolve, reject) => {
+				initStarted();
+				signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+					once: true,
+				});
+			});
+		vi.useFakeTimers();
+		const starting = adapter.start(
+			async (request) => result(request),
+			() => () => {},
+		);
+		const failed = expect(starting).rejects.toThrow("could not start");
+		await initialized;
+		await vi.advanceTimersByTimeAsync(30_000);
+		await failed;
+		expect(bot.initSignal?.aborted).toBe(true);
+		expect(bot.startOptions).toBeUndefined();
+		await expect(stat(telegramLockPath("secret-token", dir))).rejects.toThrow();
+		vi.useRealTimers();
+		const next = await startAdapter(new MockBot(), dir);
+		await next.adapter.stop();
+	});
+
+	it("retains the lock when timed-out initialization ignores abort", async () => {
+		const bot = new MockBot();
+		const dir = await temp();
+		const adapter = new TelegramTransportAdapter({
+			token: "secret-token",
+			allowedUserIds: [42],
+			stateDirectory: dir,
+			initialCwd: "/work",
+			botFactory: () => bot as never,
+		});
+		let initStarted!: () => void;
+		const initialized = new Promise<void>((resolve) => {
+			initStarted = resolve;
+		});
+		bot.initBehavior = () =>
+			new Promise<void>(() => {
+				initStarted();
+			});
+		vi.useFakeTimers();
+		const starting = adapter.start(
+			async (request) => result(request),
+			() => () => {},
+		);
+		const failed = expect(starting).rejects.toThrow("could not start");
+		await initialized;
+		await vi.advanceTimersByTimeAsync(36_000);
+		await failed;
+		expect(bot.initSignal?.aborted).toBe(true);
+		expect(bot.startOptions).toBeUndefined();
+		await expect(
+			stat(telegramLockPath("secret-token", dir)),
+		).resolves.toBeDefined();
+	});
+
 	it("rolls startup back on abort and monitors fatal polling failures", async () => {
 		const bot = new MockBot();
 		const dir = await temp();

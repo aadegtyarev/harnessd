@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-03
+
+### Fixed
+
+- Bound Telegram initialization to 30 seconds, aborting stalled retries and failing startup instead of silently running without polling. Cleanup retains the polling lock when initialization cannot be confirmed stopped.
+
 ## [0.6.0] - 2026-11-02
 
 ### Changed
