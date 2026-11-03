@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-03
+
+### Added
+
+- Privacy-preserving aggregate Telegram API attempt, result and concurrency diagnostics, including peak request starts per second, to help investigate combined request bursts. No message contents or chat identifiers are logged.
+
 ## [0.6.1] - 2026-11-03
 
 ### Fixed
