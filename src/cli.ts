@@ -12,7 +12,10 @@ import { resolveStateDirectory } from "./core/session-store.js";
 import { loadDotEnv } from "./dotenv.js";
 import { describeError } from "./error-diagnostics.js";
 import { resolveInitialDirectory } from "./telegram-filesystem.js";
-import { TelegramTransportAdapter } from "./telegram-transport.js";
+import {
+	TelegramInitializationDeadlineError,
+	TelegramTransportAdapter,
+} from "./telegram-transport.js";
 import {
 	manageUserService,
 	type UserServiceAction,
@@ -156,10 +159,12 @@ export async function main(options: CliOptions = {}): Promise<void> {
 			});
 		} catch (error) {
 			if (!closeRequested) throw error;
-			if (error instanceof AggregateError)
-				writeError(
-					"harnessd startup cleanup was incomplete; polling ownership remains protected\n",
-				);
+			if (
+				error instanceof AggregateError ||
+				(error instanceof Error &&
+					error.cause instanceof TelegramInitializationDeadlineError)
+			)
+				throw error;
 			return;
 		}
 		if (closeRequested && !closePromise) {
@@ -241,5 +246,8 @@ if (isDirectInvocation(import.meta.url, process.argv[1])) {
 		]);
 		process.stderr.write(`${message}\n${detail}\n`);
 		process.exitCode = 1;
+		// Failed bounded cleanup can leave a referenced network handle behind.
+		// Give diagnostics time to flush, then prevent a silently live service.
+		setTimeout(() => process.exit(1), 1000).unref();
 	});
 }
