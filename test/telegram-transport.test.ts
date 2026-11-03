@@ -10833,7 +10833,7 @@ describe("Telegram transport", () => {
 		);
 		await bot.update(42, "/use other");
 		expect(bot.api.sendChatAction.mock.calls.map(([chatId]) => chatId)).toEqual(
-			[42, 43, 43],
+			[42, 43],
 		);
 		const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
 		await bot.update(43, "/stop sid");
@@ -10854,13 +10854,81 @@ describe("Telegram transport", () => {
 
 		await bot.update(42, "/use other");
 		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		const now = Date.now();
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now + 4000);
 		await bot.update(42, "/use sid");
 		await vi.waitFor(() =>
 			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(2),
 		);
+		clock.mockRestore();
 
 		emit(harnessEvent("sid", "status", "agent_settled"));
 		await adapter.stop();
+	});
+
+	it("preserves typing cadence when a chat selects an active session off-phase", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(3900);
+		await bot.update(43, "/use sid", { userId: 42 });
+		const callsFor43 = () =>
+			bot.api.sendChatAction.mock.calls.filter(([chatId]) => chatId === 43)
+				.length;
+		expect(callsFor43()).toBe(1);
+		await vi.advanceTimersByTimeAsync(3999);
+		expect(callsFor43()).toBe(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(callsFor43()).toBe(2);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		vi.useRealTimers();
+		await adapter.stop();
+	});
+
+	it("suppresses a coalesced typing refresh after turn settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(0);
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		vi.useRealTimers();
+		await adapter.stop();
+	});
+
+	it("does not overlap stalled typing after selection changes and preserves other operations", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		let rejectTyping!: (error: unknown) => void;
+		bot.api.sendChatAction.mockImplementation(
+			() =>
+				new Promise((_resolve, reject) => {
+					rejectTyping = reject;
+				}),
+		);
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.waitFor(() =>
+			expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1),
+		);
+		await bot.update(42, "/use other");
+		await bot.update(42, "/use sid");
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		const beforeSessions = bot.sent.length;
+		await bot.update(42, "/sessions");
+		expect(bot.sent.length).toBeGreaterThan(beforeSessions);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await adapter.stop();
+		rejectTyping({ error_code: 429, parameters: { retry_after: 30 } });
+		await Promise.resolve();
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
 	});
 
 	it("filters internal status widgets without dropping surrounding assistant text", async () => {
