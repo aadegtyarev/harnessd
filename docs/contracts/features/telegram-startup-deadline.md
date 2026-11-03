@@ -1,6 +1,6 @@
 # Telegram startup deadline
 
-Status: approved; CLI process-exit extension approved
+Status: complete; verified and independently reviewed
 
 ## Goal and scenarios
 Bound Telegram initialization so persistent network failures or a stalled initialization cannot leave the service silently active but unable to poll. On deadline, abort initialization, fail startup and allow the service manager to restart it. Normal initialization and externally requested shutdown retain their existing behavior.
