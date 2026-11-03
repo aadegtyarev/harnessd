@@ -30,6 +30,34 @@ describe("Telegram typing ownership", () => {
 		typing.stop();
 	});
 
+	it("dispatches a coalesced off-phase refresh at the next four-second boundary", async () => {
+		vi.useFakeTimers();
+		const send = vi.fn(async () => true);
+		const typing = new TelegramTyping(send);
+		typing.request(1);
+		await vi.advanceTimersByTimeAsync(3900);
+		typing.request(1);
+		await vi.advanceTimersByTimeAsync(99);
+		expect(send).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(send).toHaveBeenCalledTimes(2);
+		typing.stop();
+	});
+
+	it("drops a pending refresh after deselection or settlement", async () => {
+		vi.useFakeTimers();
+		let eligible = true;
+		const send = vi.fn(async () => true);
+		const typing = new TelegramTyping(send, () => eligible);
+		typing.request(1);
+		await vi.advanceTimersByTimeAsync(1000);
+		typing.request(1);
+		eligible = false;
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(send).toHaveBeenCalledTimes(1);
+		typing.stop();
+	});
+
 	it("retains raw ownership after deadline and honors a late 429 from receipt", async () => {
 		vi.useFakeTimers();
 		const work = deferred();

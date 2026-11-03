@@ -10866,6 +10866,22 @@ describe("Telegram transport", () => {
 		await adapter.stop();
 	});
 
+	it("suppresses a coalesced typing refresh after turn settlement", async () => {
+		const bot = new MockBot();
+		const { adapter, emit } = await startAdapter(bot, await temp());
+		await bot.update(42, "/use sid");
+		vi.useFakeTimers();
+		emit(harnessEvent("sid", "status", "agent_start"));
+		await vi.advanceTimersByTimeAsync(0);
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		adapter["typing"].request(42);
+		emit(harnessEvent("sid", "status", "agent_settled"));
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(bot.api.sendChatAction).toHaveBeenCalledTimes(1);
+		vi.useRealTimers();
+		await adapter.stop();
+	});
+
 	it("does not overlap stalled typing after selection changes and preserves other operations", async () => {
 		const bot = new MockBot();
 		const { adapter, emit } = await startAdapter(bot, await temp());

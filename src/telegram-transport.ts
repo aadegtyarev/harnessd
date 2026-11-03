@@ -1573,8 +1573,17 @@ export class TelegramTransportAdapter
 		ReturnType<typeof setInterval>
 	>();
 	private readonly activeTypingSessions = new Set<SessionId>();
-	private readonly typing = new TelegramTyping((chatId, signal) =>
-		this.bot.api.sendChatAction(chatId, "typing", {}, signal),
+	private readonly typing = new TelegramTyping(
+		(chatId, signal) =>
+			this.bot.api.sendChatAction(chatId, "typing", {}, signal),
+		(chatId) => {
+			const sessionId = this.selected.get(chatId);
+			return (
+				!this.stopping &&
+				sessionId !== undefined &&
+				this.activeTypingSessions.has(sessionId)
+			);
+		},
 	);
 	private readonly sessionCwds = new Map<SessionId, string>();
 	private panelStore?: TelegramPanelStore;

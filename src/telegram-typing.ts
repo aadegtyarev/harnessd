@@ -6,10 +6,11 @@ const CAPACITY = 256;
 const MAX_TIMER_MS = 2_147_483_647;
 type Owner = {
 	inFlight: boolean;
+	pending: boolean;
 	notBefore: number;
 	controller?: AbortController;
 	deadline?: ReturnType<typeof setTimeout>;
-	retire?: ReturnType<typeof setTimeout>;
+	timer?: ReturnType<typeof setTimeout>;
 };
 
 /** Best-effort per-chat typing, with raw-call ownership across local deadlines. */
@@ -21,26 +22,49 @@ export class TelegramTyping {
 			chatId: number,
 			signal: AbortSignal,
 		) => Promise<unknown>,
+		private readonly eligible: (chatId: number) => boolean = () => true,
 	) {}
 
 	request(chatId: number): void {
-		if (this.stopped) return;
+		if (this.stopped || !this.eligible(chatId)) return;
 		let owner = this.owners.get(chatId);
 		if (!owner) {
 			if (this.owners.size >= CAPACITY) return;
-			owner = { inFlight: false, notBefore: 0 };
+			owner = { inFlight: false, pending: false, notBefore: 0 };
 			this.owners.set(chatId, owner);
 		}
-		if (owner.inFlight || Date.now() < owner.notBefore) return;
-		if (owner.retire) clearTimeout(owner.retire);
-		owner.retire = undefined;
+		owner.pending = true;
+		this.arm(chatId, owner);
+	}
+
+	private arm(chatId: number, owner: Owner): void {
+		if (this.stopped || this.owners.get(chatId) !== owner || owner.inFlight)
+			return;
+		if (owner.timer) clearTimeout(owner.timer);
+		owner.timer = undefined;
+		if (!this.eligible(chatId)) owner.pending = false;
+		const remaining = owner.notBefore - Date.now();
+		if (remaining > 0) {
+			if (remaining !== Infinity) {
+				owner.timer = setTimeout(
+					() => this.arm(chatId, owner),
+					Math.min(remaining, MAX_TIMER_MS),
+				);
+				owner.timer.unref();
+			}
+			return;
+		}
+		if (!owner.pending) {
+			this.owners.delete(chatId);
+			return;
+		}
+		owner.pending = false;
 		owner.inFlight = true;
 		owner.notBefore = Date.now() + TYPING_REFRESH_MS;
 		const controller = new AbortController();
 		owner.controller = controller;
 		owner.deadline = setTimeout(() => controller.abort(), DEADLINE_MS);
 		owner.deadline.unref();
-		const current = owner;
 		let raw: Promise<unknown>;
 		try {
 			raw = Promise.resolve(this.send(chatId, controller.signal));
@@ -48,8 +72,8 @@ export class TelegramTyping {
 			raw = Promise.reject(error);
 		}
 		void raw.then(
-			() => this.finish(chatId, current),
-			(error: unknown) => this.finish(chatId, current, error),
+			() => this.finish(chatId, owner),
+			(error: unknown) => this.finish(chatId, owner, error),
 		);
 	}
 
@@ -74,30 +98,14 @@ export class TelegramTyping {
 				);
 			}
 		}
-		this.retireWhenSafe(chatId, owner);
-	}
-
-	private retireWhenSafe(chatId: number, owner: Owner): void {
-		if (this.stopped || this.owners.get(chatId) !== owner || owner.inFlight)
-			return;
-		const remaining = owner.notBefore - Date.now();
-		if (remaining <= 0) {
-			this.owners.delete(chatId);
-			return;
-		}
-		if (remaining === Infinity) return;
-		owner.retire = setTimeout(
-			() => this.retireWhenSafe(chatId, owner),
-			Math.min(remaining, MAX_TIMER_MS),
-		);
-		owner.retire.unref();
+		this.arm(chatId, owner);
 	}
 
 	stop(): void {
 		this.stopped = true;
 		for (const owner of this.owners.values()) {
 			if (owner.deadline) clearTimeout(owner.deadline);
-			if (owner.retire) clearTimeout(owner.retire);
+			if (owner.timer) clearTimeout(owner.timer);
 			owner.controller?.abort();
 		}
 		this.owners.clear();
