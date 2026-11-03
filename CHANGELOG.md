@@ -4,6 +4,12 @@ All notable changes to harnessd are recorded here. Every behavior-changing pull 
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-03
+
+### Fixed
+
+- Coalesce Telegram typing refreshes per chat, prevent overlapping unresolved calls and honor 429 retry delays, including late results after a local deadline. Other chats and API operations remain independent.
+
 ## [0.7.0] - 2026-11-03
 
 ### Added

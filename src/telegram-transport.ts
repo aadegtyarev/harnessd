@@ -128,6 +128,7 @@ import {
 	runCardStateIcon,
 } from "./telegram-run-card.js";
 import { SubagentTextStream } from "./telegram-subagent-stream.js";
+import { TelegramTyping, TYPING_REFRESH_MS } from "./telegram-typing.js";
 import { TelegramUpdateIngress } from "./telegram-update-ingress.js";
 
 const TELEGRAM_LIMIT = 4096;
@@ -155,7 +156,6 @@ const OUTPUT_COALESCE_MS = 40;
 const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TELEGRAM_DOWNLOAD_BYTES = 20_000_000;
 const INBOX_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-const TYPING_REFRESH_MS = 4000;
 const OVERFLOW_NOTICE =
 	"Additional notifications were omitted because the queue is full.";
 const RETIRED_PANEL_NOTE = "Панель перенесена ниже ↓";
@@ -1572,8 +1572,10 @@ export class TelegramTransportAdapter
 		SessionId,
 		ReturnType<typeof setInterval>
 	>();
-	private readonly typingChats = new Map<SessionId, Set<number>>();
 	private readonly activeTypingSessions = new Set<SessionId>();
+	private readonly typing = new TelegramTyping((chatId, signal) =>
+		this.bot.api.sendChatAction(chatId, "typing", {}, signal),
+	);
 	private readonly sessionCwds = new Map<SessionId, string>();
 	private panelStore?: TelegramPanelStore;
 	private readonly pendingSends = new Set<AbortController>();
@@ -1910,6 +1912,7 @@ export class TelegramTransportAdapter
 
 	private async stopPolling(): Promise<void> {
 		this.stopping = true;
+		this.typing.stop();
 		const ingressDrained = this.ingress.close();
 		this.cardCleanup.stop();
 		this.shutdownController.abort();
@@ -1971,7 +1974,6 @@ export class TelegramTransportAdapter
 		this.typingTimers.clear();
 		this.anomalyNotices.stop();
 		this.stopAnomalies.clear();
-		this.typingChats.clear();
 		this.activeTypingSessions.clear();
 		for (const queue of this.queues.values()) {
 			if (queue.drainTimer) clearTimeout(queue.drainTimer);
@@ -8756,11 +8758,7 @@ export class TelegramTransportAdapter
 				.filter(([, id]) => id === sessionId)
 				.map(([chatId]) => chatId),
 		);
-		this.typingChats.set(sessionId, chats);
-		for (const chatId of chats)
-			void this.telegramCall((signal) =>
-				this.bot.api.sendChatAction(chatId, "typing", {}, signal),
-			);
+		for (const chatId of chats) this.typing.request(chatId);
 		if (!chats.size) this.clearTypingTimer(sessionId);
 	}
 
@@ -8773,7 +8771,6 @@ export class TelegramTransportAdapter
 		const timer = this.typingTimers.get(sessionId);
 		if (timer) clearInterval(timer);
 		this.typingTimers.delete(sessionId);
-		this.typingChats.delete(sessionId);
 	}
 
 	private onEvent(event: HarnessEvent): void {
