@@ -1,6 +1,6 @@
 # Telegram startup deadline
 
-Status: approved
+Status: approved; CLI process-exit extension approved
 
 ## Goal and scenarios
 Bound Telegram initialization so persistent network failures or a stalled initialization cannot leave the service silently active but unable to poll. On deadline, abort initialization, fail startup and allow the service manager to restart it. Normal initialization and externally requested shutdown retain their existing behavior.
@@ -11,10 +11,12 @@ No changes to polling protocol, normal delivery, rate-limit policy, persistence,
 ## Affected surfaces
 - [Telegram transport](../surfaces/telegram-transport.md)
 - [User service](../surfaces/user-service.md)
+- [CLI configuration](../surfaces/cli-configuration.md)
 - [Package release](../surfaces/package-release.md)
 
 ## Constraints and acceptance
 - Abort initialization on deadline; ensure startup fails with a safe diagnostic and cleanup respects existing polling lock ownership rules even if underlying calls do not settle.
+- On failed CLI startup or shutdown, guarantee nonzero process termination even when abandoned handles remain; an incomplete rollback on a startup signal is an error. Allow diagnostics to flush and retain lock ownership until process exit. Verify with a subprocess holding a live handle and existing lock recovery tests.
 - No overlapping pollers or retry of user input. Externally aborted startup continues to roll back.
 - Successful startup still polls; tests cover deadline, abort, cleanup and a subsequent successful start.
 - Patch release and dated changelog entry.

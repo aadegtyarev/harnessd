@@ -129,6 +129,18 @@ describe("CLI", () => {
 					),
 				},
 			});
+			const preload = path.join(cwd, "held-handle.cjs");
+			await writeFile(preload, "setInterval(() => {}, 1000);\n");
+			const failedWithLiveHandle = spawnSync(
+				process.execPath,
+				["--require", preload, compiledCli],
+				{ cwd, encoding: "utf8", env: {}, timeout: 5000 },
+			);
+			expect(failedWithLiveHandle.error).toBeUndefined();
+			expect(failedWithLiveHandle.status).toBe(1);
+			expect(failedWithLiveHandle.stderr).toContain(
+				"HARNESSD_TELEGRAM_BOT_TOKEN is required",
+			);
 			for (const result of [nodeHelp, symlinkHelp]) {
 				expect(result.status, result.stderr).toBe(0);
 				expect(result.stdout).toContain(
@@ -423,6 +435,35 @@ describe("CLI", () => {
 		expect(writeError).toHaveBeenCalledWith(
 			"Telegram polling failed; harnessd is shutting down.\n",
 		);
+	});
+
+	it("reports incomplete rollback after a startup signal", async () => {
+		let signal!: AbortSignal;
+		const runtimeStart = vi.fn((options: unknown) => {
+			signal = transportOptions(options).signal;
+			return new Promise<never>((_resolve, reject) => {
+				signal.addEventListener(
+					"abort",
+					() =>
+						reject(
+							new AggregateError([new Error("cleanup")], "rollback incomplete"),
+						),
+					{ once: true },
+				);
+			});
+		});
+		const running = runMain({
+			argv: [],
+			env: {
+				HARNESSD_TELEGRAM_BOT_TOKEN: "secret-token",
+				HARNESSD_TELEGRAM_ALLOWED_USER_IDS: "42",
+			},
+			runtimeStart: runtimeStart as never,
+		});
+		const failed = expect(running).rejects.toThrow("rollback incomplete");
+		await vi.waitFor(() => expect(signal).toBeDefined());
+		process.emit("SIGINT");
+		await failed;
 	});
 
 	it("aborts runtime startup when a signal arrives before readiness", async () => {
