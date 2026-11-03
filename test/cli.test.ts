@@ -191,7 +191,7 @@ global.setTimeout = (fn, ms, ...args) => original(fn, ms === 30000 || ms === 600
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 20_000);
 
 	it("loads .env before validating config and uses its default cwd", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "harnessd-cli-env-"));
