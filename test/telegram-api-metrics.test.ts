@@ -91,6 +91,24 @@ describe("Telegram API aggregate metrics", () => {
 		metrics.stop();
 	});
 
+	it("pauses periodic reporting while preserving shutdown accounting", async () => {
+		vi.useFakeTimers();
+		const sink = vi.fn();
+		const metrics = new TelegramApiMetrics(sink);
+		await vi.advanceTimersByTimeAsync(59_000);
+		metrics.pause();
+		await metrics.transformer(
+			(async () => ({ ok: true, result: true })) as never,
+			"getUpdates",
+			{} as never,
+		);
+		await vi.advanceTimersByTimeAsync(2_000);
+		expect(sink).not.toHaveBeenCalled();
+		metrics.stop();
+		expect(sink).toHaveBeenCalledOnce();
+		expect(sink.mock.calls[0][0]).toContain('"getUpdates":{"started":1,"ok":1');
+	});
+
 	it("does not emit after bounded shutdown when a raw call settles late", async () => {
 		vi.useFakeTimers();
 		const sink = vi.fn();

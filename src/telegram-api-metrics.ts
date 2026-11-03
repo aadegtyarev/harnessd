@@ -119,11 +119,15 @@ export class TelegramApiMetrics {
 		}
 	}
 
+	pause(): void {
+		clearInterval(this.timer);
+	}
+
 	stop(): void {
 		if (this.stopped) return;
+		this.pause();
 		this.flush();
 		this.stopped = true;
-		clearInterval(this.timer);
 		this.counts.clear();
 	}
 }

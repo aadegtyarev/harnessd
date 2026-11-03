@@ -1899,10 +1899,12 @@ export class TelegramTransportAdapter
 	}
 
 	stop(): Promise<void> {
-		if (!this.stopPromise)
+		if (!this.stopPromise) {
+			this.apiMetrics?.pause();
 			this.stopPromise = this.stopPolling().finally(() =>
 				this.apiMetrics?.stop(),
 			);
+		}
 		return this.stopPromise;
 	}
 
