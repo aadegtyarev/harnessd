@@ -1,6 +1,6 @@
 # Telegram outbound aggregate diagnostics
 
-Status: approved
+Status: complete; verified and independently reviewed
 
 ## Goal and scenarios
 Identify potential combined Telegram API request bursts without changing delivery. Count aggregate outbound calls at the grammY API boundary, including startup, polling, presentation, typing and retries. Report bounded per-method request starts, completed result classes, peak simultaneous requests and busiest fixed one-second bucket per periodic interval; synthetic tests reproduce overlapping lanes and bursts.
